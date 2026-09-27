@@ -64,13 +64,18 @@ ProcSubset=pid
 ReadOnlyPaths=/sys
 DevicePolicy=closed
 DeviceAllow=/dev/llama-light/aura rw
+DeviceAllow=/dev/llama-light/keyboard rw
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 [Install]
 WantedBy=multi-user.target";
 
-const RULE_GOLDEN: &str = r#"SUBSYSTEM=="hidraw", KERNELS=="0003:0B05:18F3.*", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/aura""#;
+const RULE_GOLDEN: &[&str] = &[
+    r#"SUBSYSTEM=="hidraw", KERNELS=="0003:0B05:18F3.*", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/aura""#,
+    r#"SUBSYSTEM=="hidraw", KERNELS=="0003:1B1C:1B48.*", ENV{LLAMA_LIGHT_KBD}="1""#,
+    r#"SUBSYSTEM=="hidraw", ENV{LLAMA_LIGHT_KBD}=="1", SUBSYSTEMS=="usb", ATTRS{bInterfaceNumber}=="01", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/keyboard""#,
+];
 
 #[test]
 fn the_unit_is_the_golden() {
@@ -80,13 +85,19 @@ fn the_unit_is_the_golden() {
 }
 
 #[test]
-fn the_unit_has_one_device_and_no_network_or_capabilities() {
+fn the_unit_has_two_devices_and_no_network_or_capabilities() {
     let got = directives(&packaging("llama-light.service"));
     let devices: Vec<&String> = got
         .iter()
         .filter(|l| l.starts_with("DeviceAllow="))
         .collect();
-    assert_eq!(devices, ["DeviceAllow=/dev/llama-light/aura rw"]);
+    assert_eq!(
+        devices,
+        [
+            "DeviceAllow=/dev/llama-light/aura rw",
+            "DeviceAllow=/dev/llama-light/keyboard rw"
+        ]
+    );
     assert!(got.contains(&"DevicePolicy=closed".to_owned()));
     assert!(got.contains(&"PrivateNetwork=yes".to_owned()));
     assert!(got.contains(&"CapabilityBoundingSet=".to_owned()));
@@ -101,7 +112,29 @@ fn the_unit_has_one_device_and_no_network_or_capabilities() {
 #[test]
 fn the_udev_rule_is_the_golden() {
     let got = directives(&packaging("94-llama-light-hidraw.rules"));
-    assert_eq!(got, [RULE_GOLDEN]);
+    assert_eq!(got, RULE_GOLDEN);
+}
+
+#[test]
+fn the_keyboard_rule_takes_only_the_lighting_interface() {
+    let text = packaging("94-llama-light-hidraw.rules");
+    let rules = directives(&text);
+    let keyboard: Vec<&String> = rules.iter().filter(|l| l.contains("keyboard")).collect();
+    assert_eq!(keyboard.len(), 1);
+    let rule = keyboard[0];
+    // The permission change and the symlink sit on the rule that is gated
+    // on interface 1; the rule that matches every keyboard interface only
+    // marks it.
+    assert!(rule.contains(r#"ATTRS{bInterfaceNumber}=="01""#));
+    assert!(rule.contains(r#"MODE="0660""#) && rule.contains(r#"TAG-="uaccess""#));
+    let marker = rules
+        .iter()
+        .find(|l| l.contains("1B1C:1B48"))
+        .expect("marker");
+    for key in ["GROUP", "MODE", "TAG", "SYMLINK", "OWNER", "RUN"] {
+        assert!(!marker.contains(key), "marker rule sets {key}: {marker}");
+    }
+    assert!(!text.to_ascii_lowercase().contains("1e71"));
 }
 
 #[test]

@@ -5,7 +5,9 @@
 //! - no i2c/SMBus, no NZXT vendor id, no pwm/hwmon (no cooling path at all);
 //! - filesystem calls only in the allowlisted files, no filesystem writes,
 //!   and path literals only from a fixed list;
-//! - a closed opcode table in `aura/proto.rs` with no save/commit opcode.
+//! - a closed opcode table in `aura/proto.rs` with no save/commit opcode;
+//! - a closed command and property table in `keyboard/proto.rs` with no
+//!   firmware, reset, profile-save, key-routing or read command.
 //!
 //! Comments are stripped before the scan. Each check also runs against a
 //! scratch tree that plants one violation, so a weakened scanner fails.
@@ -18,15 +20,20 @@ use std::path::{Path, PathBuf};
 /// Files that may touch the filesystem, relative to `src/`.
 ///
 /// `config.rs` reads the config named on the command line; `snapshot.rs`
-/// reads the published snapshot; `aura/device.rs` resolves the udev pin,
-/// reads sysfs and opens the one hidraw node; `keyboard.rs` reads sysfs ids.
-const FS_FILES: &[&str] = &["config.rs", "snapshot.rs", "aura/device.rs", "keyboard.rs"];
+/// reads the published snapshot; `hidraw.rs` resolves a udev pin, reads
+/// sysfs and opens the pinned hidraw node.
+const FS_FILES: &[&str] = &["config.rs", "snapshot.rs", "hidraw.rs"];
 
 /// The only file that may open anything for writing.
-const WRITE_OPEN_FILE: &str = "aura/device.rs";
+const WRITE_OPEN_FILE: &str = "hidraw.rs";
 
 /// Absolute path literals allowed, and where.
-const PATH_LITERALS: &[(&str, &str)] = &[("main.rs", "/dev"), ("main.rs", "/sys")];
+/// `keyboard/keymap.rs` names the `/` key.
+const PATH_LITERALS: &[(&str, &str)] = &[
+    ("main.rs", "/dev"),
+    ("main.rs", "/sys"),
+    ("keyboard/keymap.rs", "/"),
+];
 
 /// The closed opcode table.
 const OPCODES: &[u8] = &[0x35, 0x40];
@@ -34,6 +41,18 @@ const OPCODES: &[u8] = &[0x35, 0x40];
 /// Save/commit and config opcodes that must never appear as a literal.
 const FORBIDDEN_OPCODE_LITERALS: &[&str] = &["0x3F", "0x3E", "0x36", "0xB0", "0x82"];
 
+/// The keyboard's closed tables: commands, then write properties.
+const KB_OPCODES: &[u8] = &[0x07, 0x7F];
+const KB_PROPERTIES: &[u8] = &[0x05, 0x28];
+
+/// Keyboard property and command bytes that must never appear as a literal
+/// in `keyboard/proto.rs`: special function, poll rate, firmware update,
+/// profile and hardware-lighting saves, 9-bit commit, key input routing,
+/// and the read command. Reset (`07 02`) shares its byte with software mode
+/// and the apply flag, so the property table check below catches it.
+const KB_FORBIDDEN_LITERALS: &[&str] = &[
+    "0x04", "0x0A", "0x0C", "0x0D", "0x0E", "0x13", "0x14", "0x15", "0x16", "0x17", "0x27", "0x40",
+];
 #[test]
 fn llama_light_source_passes_s15() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -42,6 +61,9 @@ fn llama_light_source_passes_s15() {
         "main.rs",
         "aura/proto.rs",
         "aura/device.rs",
+        "hidraw.rs",
+        "keyboard/proto.rs",
+        "keyboard/device.rs",
         "service.rs",
         "config.rs",
     ] {
@@ -65,6 +87,24 @@ fn the_opcode_table_in_the_source_is_closed() {
         "OPCODES is not the two-entry table"
     );
     assert_eq!(llama_light::aura::proto::OPCODES.to_vec(), OPCODES.to_vec());
+}
+
+#[test]
+fn the_keyboard_tables_in_the_source_are_closed() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/keyboard/proto.rs");
+    let code = strip_comments(&fs::read_to_string(src).expect("proto.rs"));
+    assert_eq!(consts_named(&code, "const OP_"), KB_OPCODES.to_vec());
+    assert_eq!(consts_named(&code, "const PROP_"), KB_PROPERTIES.to_vec());
+    assert!(code.contains("pub const OPCODES: [u8; 2] = [OP_WRITE, OP_STREAM];"));
+    assert!(code.contains("pub const PROPERTIES: [u8; 2] = [PROP_LIGHTING, PROP_COMMIT];"));
+    assert_eq!(
+        llama_light::keyboard::proto::OPCODES.to_vec(),
+        KB_OPCODES.to_vec()
+    );
+    assert_eq!(
+        llama_light::keyboard::proto::PROPERTIES.to_vec(),
+        KB_PROPERTIES.to_vec()
+    );
 }
 
 // ---- plants: each must be caught ----------------------------------------
@@ -201,10 +241,16 @@ fn planted_filesystem_use_outside_the_allowlist_is_caught() {
         "filesystem",
     );
     assert_caught("brace", "service.rs", "use std::{fs, io};\n", "filesystem");
+    assert_caught(
+        "kbfs",
+        "keyboard/mod.rs",
+        "fn f() { std::fs::read(\"x\"); }\n",
+        "filesystem",
+    );
     // Allowed where listed.
     let hits = plant(
         "ok",
-        "keyboard.rs",
+        "hidraw.rs",
         "fn f() { let _ = std::fs::read_to_string(p); }\n",
     );
     assert!(hits.is_empty(), "{hits:?}");
@@ -250,10 +296,22 @@ fn planted_filesystem_writes_are_caught_everywhere() {
     );
     let hits = plant(
         "devw",
-        "aura/device.rs",
+        "hidraw.rs",
         "fn f() { let _ = std::fs::OpenOptions::new().write(true); }\n",
     );
     assert!(hits.is_empty(), "{hits:?}");
+    assert_caught(
+        "kbw",
+        "keyboard/device.rs",
+        "fn f() { let _ = std::fs::OpenOptions::new().write(true); }\n",
+        "open for writing",
+    );
+    assert_caught(
+        "auraw",
+        "aura/device.rs",
+        "fn f() { let _ = std::fs::OpenOptions::new().write(true); }\n",
+        "open for writing",
+    );
 }
 
 #[test]
@@ -317,6 +375,52 @@ fn planted_opcodes_are_caught() {
         "aura/proto.rs",
         "pub const OP_OTHER: u8 = 0x41;\n",
         "opcode table",
+    );
+}
+
+#[test]
+fn planted_keyboard_commands_are_caught() {
+    assert_caught(
+        "kb-read",
+        "keyboard/proto.rs",
+        "pub const OP_READ: u8 = 0x0E;\n",
+        "keyboard command table",
+    );
+    assert_caught(
+        "kb-prop",
+        "keyboard/proto.rs",
+        "pub const PROP_SPECIAL: u8 = 0x04;\n",
+        "keyboard property table",
+    );
+    assert_caught(
+        "kb-fw",
+        "keyboard/proto.rs",
+        "fn f() { let b = [0x07, 0x0C, 0xF0]; }\n",
+        "0x0C",
+    );
+    assert_caught(
+        "kb-save",
+        "keyboard/proto.rs",
+        "fn f() { let b = [0x07, 0x14]; }\n",
+        "0x14",
+    );
+    assert_caught(
+        "kb-keys",
+        "keyboard/proto.rs",
+        "fn f() { let b = [0x07, 0x40]; }\n",
+        "0x40",
+    );
+    assert_caught(
+        "kb-reset",
+        "keyboard/proto.rs",
+        "pub const PROP_RESET: u8 = 0x02;\n",
+        "keyboard property table",
+    );
+    assert_caught(
+        "kb-stream-op",
+        "keyboard/proto.rs",
+        "pub const OP_OTHER: u8 = 0x41;\n",
+        "keyboard command table",
     );
 }
 
@@ -513,7 +617,7 @@ fn scan_file(rel: &str, code: &str, literals: &[String]) -> Vec<String> {
             || joined.contains("OFlags::WRONLY")
             || joined.contains("OFlags::RDWR"))
     {
-        hit("open for writing outside aura/device.rs");
+        hit("open for writing outside hidraw.rs");
     }
     // Path literals.
     for literal in literals {
@@ -541,14 +645,39 @@ fn scan_file(rel: &str, code: &str, literals: &[String]) -> Vec<String> {
             ));
         }
     }
+    if rel == "keyboard/proto.rs" {
+        let ops = consts_named(code, "const OP_");
+        if ops.iter().any(|op| !KB_OPCODES.contains(op)) {
+            hit(&format!(
+                "keyboard command table has {ops:02x?}, allowed {KB_OPCODES:02x?}"
+            ));
+        }
+        let props = consts_named(code, "const PROP_");
+        if props.iter().any(|prop| !KB_PROPERTIES.contains(prop)) {
+            hit(&format!(
+                "keyboard property table has {props:02x?}, allowed {KB_PROPERTIES:02x?}"
+            ));
+        }
+        for literal in KB_FORBIDDEN_LITERALS {
+            if has_hex_literal(&joined, literal) {
+                hit(literal);
+            }
+        }
+    }
     hits
 }
 
 /// Values of `const OP_*: u8 = 0x..;` in order.
 fn opcode_consts(code: &str) -> Vec<u8> {
+    consts_named(code, "const OP_")
+}
+
+/// Values of `<prefix>*: u8 = 0x..;` in order. An unparseable value is
+/// `0xFF`, which no table holds.
+fn consts_named(code: &str, prefix: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut rest = code;
-    while let Some(at) = rest.find("const OP_") {
+    while let Some(at) = rest.find(prefix) {
         let after = &rest[at..];
         let Some(eq) = after.find('=') else { break };
         let Some(semi) = after.find(';') else { break };

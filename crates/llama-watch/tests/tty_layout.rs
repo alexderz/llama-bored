@@ -232,12 +232,15 @@ fn slot_context_fits_at_160x48_and_240x67() {
             meter.iter().any(|(ch, _)| matches!(*ch, '█' | '▐' | '▌')),
             "{cols}x{rows} context meter missing: {text}"
         );
-        assert!(
-            meter
-                .iter()
-                .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
-                .all(|(_, fg)| *fg == C16::BrightBlue),
-            "{cols}x{rows} 91k/262k should be the bright-blue step, {meter:?}"
+        let lit: Vec<C16> = meter
+            .iter()
+            .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
+            .map(|(_, fg)| *fg)
+            .collect();
+        assert_eq!(
+            steps_of(&lit),
+            [C16::Blue, C16::BrightBlue],
+            "{cols}x{rows} 91k/262k is a spectrum up to the bright-blue step, {meter:?}"
         );
     }
 }
@@ -282,7 +285,7 @@ fn zero_n_ctx_shows_the_ratio_without_a_fill() {
 }
 
 #[test]
-fn context_above_n_ctx_clamps_the_meter_to_full_red() {
+fn context_above_n_ctx_clamps_the_meter_to_a_full_spectrum() {
     let mut model = sample(WatchState::Generating);
     model.slots = vec![Slot {
         id: 0,
@@ -307,12 +310,15 @@ fn context_above_n_ctx_clamps_the_meter_to_full_red() {
         meter.iter().all(|(ch, _)| *ch != '░'),
         "overfull meter must be clamped full, got {meter:?}"
     );
-    assert!(
-        meter
-            .iter()
-            .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
-            .all(|(_, fg)| *fg == C16::BrightRed),
-        "overfull meter is the red step, {meter:?}"
+    let lit: Vec<C16> = meter
+        .iter()
+        .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
+        .map(|(_, fg)| *fg)
+        .collect();
+    assert_eq!(
+        steps_of(&lit),
+        STEPS,
+        "overfull meter shows every step and ends red, {meter:?}"
     );
 }
 
@@ -705,20 +711,42 @@ fn ceiling_rate_caps_the_bar_and_the_digits() {
     model.gen_tps = Some(300.0);
 
     let tall = draw(&model, 480, 135);
-    assert_eq!(fg_sgr(tall.get(242, 16).unwrap().fg), 97, "tall bar top");
-    assert_eq!(fg_sgr(tall.get(242, 17).unwrap().fg), 91, "tall bar body");
+    // The bar is still a spectrum: blue at its start, white-hot on red in
+    // its top step.
+    assert_eq!(tall.get(242, 16).unwrap().fg, C16::Blue, "tall bar start");
+    let top = bar_from(&tall, 16, 242);
+    let body = bar_from(&tall, 17, 242);
+    assert_eq!(fg_sgr(*top.last().unwrap()), 97, "tall bar top cap");
+    assert_eq!(fg_sgr(*body.last().unwrap()), 91, "tall bar body cap");
+    assert_eq!(
+        steps_of(&body),
+        STEPS,
+        "tall body runs every step, {body:?}"
+    );
     assert_eq!(tall.get(241, 5).unwrap().ch, '█');
     assert_eq!(fg_sgr(tall.get(241, 5).unwrap().fg), 97, "digit top rows");
     assert_eq!(tall.get(241, 9).unwrap().ch, '█');
     assert_eq!(fg_sgr(tall.get(241, 9).unwrap().fg), 91, "digit body");
 
     let short = draw(&model, 240, 67);
-    assert_eq!(fg_sgr(short.get(122, 10).unwrap().fg), 97, "1-row bar");
+    assert_eq!(short.get(122, 10).unwrap().fg, C16::Blue, "1-row bar start");
     assert_eq!(short.get(170, 10).unwrap().ch, '█');
     assert_eq!(
         fg_sgr(short.get(170, 10).unwrap().fg),
         97,
-        "1-row bar stays hot"
+        "1-row bar ends hot"
+    );
+    let row = bar_from(&short, 10, 122);
+    assert_eq!(
+        steps_of(&row),
+        [
+            C16::Blue,
+            C16::BrightBlue,
+            C16::Magenta,
+            C16::BrightMagenta,
+            C16::BrightWhite
+        ],
+        "1-row capped bar: four steps then the white-hot top step, {row:?}"
     );
     assert_eq!(short.get(121, 4).unwrap().ch, '█');
     assert_eq!(fg_sgr(short.get(121, 4).unwrap().fg), 97, "short digit top");
@@ -1911,7 +1939,7 @@ fn activity_label_names_each_source_and_drops_watts_before_the_label() {
 /// T54: activity is nominal-relative and reads up to 125. Over 100 the text
 /// keeps the real number, the bar is full, and it turns red.
 #[test]
-fn activity_over_100_is_a_full_red_bar_with_the_real_number() {
+fn activity_over_100_is_a_full_bar_with_a_hot_top_step_and_the_real_number() {
     let bar = |pct: f64| {
         let mut model = sample(WatchState::Generating);
         model.activity_pct = Some(pct);
@@ -1946,14 +1974,22 @@ fn activity_over_100_is_a_full_red_bar_with_the_real_number() {
         pinned.iter().map(|cell| cell.ch).collect::<String>(),
         full.iter().map(|cell| cell.ch).collect::<String>()
     );
-    assert!(
-        full.iter().all(|cell| cell.fg != C16::BrightRed),
-        "100 % keeps the flat-out band"
+    let fgs = |cells: &[llama_watch::tty::grid::Cell]| -> Vec<C16> {
+        cells
+            .iter()
+            .filter(|cell| cell.ch != '░')
+            .map(|cell| cell.fg)
+            .collect()
+    };
+    assert_eq!(steps_of(&fgs(&full)), STEPS, "100 % is every step");
+    let mut hot_steps = STEPS.to_vec();
+    hot_steps[4] = C16::BrightWhite;
+    assert_eq!(
+        steps_of(&fgs(&hot)),
+        hot_steps,
+        "over 100 the top step turns white-hot"
     );
-    assert!(
-        hot.iter().all(|cell| cell.fg == C16::BrightRed),
-        "over 100 the bar is red"
-    );
+    assert_eq!(steps_of(&fgs(&pinned)), hot_steps);
 }
 
 fn requests(live_head: bool) -> Vec<Activity> {
@@ -3051,4 +3087,123 @@ fn sparkline_hides_below_twelve_columns_and_the_panel_keeps_its_height() {
         req_rule_row(&plain),
         req_rule_row(&draw(&sample(WatchState::Generating), 240, 67))
     );
+}
+
+/// The tty's five console steps, low to high.
+const STEPS: [C16; 5] = [
+    C16::Blue,
+    C16::BrightBlue,
+    C16::Magenta,
+    C16::BrightMagenta,
+    C16::BrightRed,
+];
+
+/// Colours of a run of cells with repeats collapsed: the steps a bar shows.
+fn steps_of(fgs: &[C16]) -> Vec<C16> {
+    let mut out: Vec<C16> = Vec::new();
+    for fg in fgs {
+        if out.last() != Some(fg) {
+            out.push(*fg);
+        }
+    }
+    out
+}
+
+/// Lit colours of the bar that starts at `col` on `row`, up to the track.
+fn bar_from(grid: &llama_watch::tty::grid::Grid, row: u16, col: u16) -> Vec<C16> {
+    (col..grid.cols())
+        .map(|c| grid.get(c, row).expect("cell"))
+        .take_while(|cell| matches!(cell.ch, '█' | '▓' | '▐' | '▌'))
+        .map(|cell| cell.fg)
+        .collect()
+}
+
+/// Row of the left meter labelled `label` (the label starts at column 2).
+fn meter_row(grid: &llama_watch::tty::grid::Grid, label: &str) -> u16 {
+    (0..grid.rows())
+        .find(|row| {
+            let text = row_string(grid, *row);
+            text.get(2..)
+                .is_some_and(|rest| rest.starts_with(label) && rest[label.len()..].starts_with(' '))
+        })
+        .unwrap_or_else(|| panic!("missing meter {label}"))
+}
+
+/// Top row (and bottom row at 4K) of the CPU meter at `pct`.
+fn cpu_bar(pct: f64, cols: u16, rows: u16) -> (Vec<C16>, Vec<C16>, usize) {
+    let mut model = sample(WatchState::Generating);
+    model.cpu_pct = Some(pct);
+    let grid = draw(&model, cols, rows);
+    let row = meter_row(&grid, "CPU");
+    let track = (27..grid.cols())
+        .take_while(|c| matches!(grid.get(*c, row).expect("cell").ch, '█' | '▐' | '▌' | '░'))
+        .count();
+    (
+        bar_from(&grid, row, 27),
+        bar_from(&grid, row + 1, 27),
+        track,
+    )
+}
+
+/// T63: a level meter is a spectrum. Each lit cell takes the step of its own
+/// position, so a full bar runs every step in order and starts blue.
+#[test]
+fn full_level_meter_shows_every_step_in_order() {
+    for (cols, rows) in [(240u16, 67u16), (480, 135)] {
+        let (top, bottom, track) = cpu_bar(100.0, cols, rows);
+        assert_eq!(top.len(), track, "{cols}x{rows} a full bar has no track");
+        assert_eq!(steps_of(&top), STEPS, "{cols}x{rows} {top:?}");
+        if rows >= 135 {
+            assert_eq!(steps_of(&bottom), STEPS, "{cols}x{rows} {bottom:?}");
+        }
+        // Each step covers about a fifth of the bar.
+        for step in STEPS {
+            let n = top.iter().filter(|fg| **fg == step).count();
+            assert!(
+                n.abs_diff(track / 5) <= 1,
+                "{cols}x{rows} {step:?} covers {n} of {track}"
+            );
+        }
+    }
+}
+
+/// T63: a 30 % bar reaches only the low steps (0-20 % and 20-40 %).
+#[test]
+fn thirty_percent_level_meter_holds_only_the_low_steps() {
+    for (cols, rows) in [(240u16, 67u16), (480, 135)] {
+        let (top, _, _) = cpu_bar(30.0, cols, rows);
+        assert_eq!(
+            steps_of(&top),
+            [C16::Blue, C16::BrightBlue],
+            "{cols}x{rows} {top:?}"
+        );
+        let (low, _, _) = cpu_bar(10.0, cols, rows);
+        assert_eq!(steps_of(&low), [C16::Blue], "{cols}x{rows} {low:?}");
+    }
+}
+
+/// T63: the spectrum applies to every level meter; VRAM and MEM are capacity
+/// and keep one colour for the whole bar.
+#[test]
+fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
+    let mut model = sample(WatchState::Generating);
+    model.cpu_pct = Some(90.0);
+    model.gpu_pct = Some(90.0);
+    model.load_pct = Some(90.0);
+    model.activity_pct = Some(90.0);
+    model.power_w = Some(450.0);
+    model.power_limit_w = Some(500.0);
+    model.vram_used_gb = Some(90.0);
+    model.vram_total_gb = Some(100.0);
+    model.mem_used_gb = Some(90.0);
+    model.mem_total_gb = Some(100.0);
+    let grid = draw(&model, 240, 67);
+    for label in ["CPU", "GPU", "POWER", "LOAD", "ACTIVITY"] {
+        let bar = bar_from(&grid, meter_row(&grid, label), 27);
+        assert_eq!(steps_of(&bar), STEPS, "{label} {bar:?}");
+    }
+    for label in ["VRAM", "MEM"] {
+        let bar = bar_from(&grid, meter_row(&grid, label), 27);
+        assert_eq!(steps_of(&bar), [C16::BrightWhite], "{label} {bar:?}");
+    }
 }

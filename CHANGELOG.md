@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.1 — 2026-09-27
+
+### Added
+
+- **llama-light drives the Corsair STRAFE RGB MK.2** (`1b1c:1b48`) per key,
+  on its vendor lighting interface only (typing is untouched). A closed
+  encoder with four report shapes (software mode, hardware mode, colour
+  stream, 24-bit commit) and no profile, firmware or flash writes; stopping
+  hands the keyboard back to its own lighting. An unplugged keyboard is
+  logged once and looked for every 10 s. udev pins it to
+  `/dev/llama-light/keyboard`, the unit's second `DeviceAllow=`.
+- Keyboard targets: key ranges (`keyboard.keys["F1".."F12"]`), key lists,
+  `keyboard.all`, single keys by name, and `led:N`.
+- An optional frame pipeline for llama-light: `[engine]` (`tick_hz`,
+  `target_hz`, `tween_fps`, `tween_s`) recomputes targets at a slow rate and
+  tweens between them; `[base]` colour under every entry; named
+  `[palette.NAME]` stops.
+- New `[[light]]` options: `ladder`, `gate` and `peak` styles,
+  `edge = "fractional"`, `gradient = "position"`, `attack_s` (asymmetric
+  smoothing), `rate_window_s` (windowed tokens/s) and `brightness = [lo, hi]`.
+- `packaging/light.example.toml` has a complete keyboard layout
+  (`keyboard-c`), made for translucent keycaps where light bleeds between
+  keys: activity on F1–F12, GPU and busiest cores as two bars each two rows
+  tall (keys interleaved along the row stagger, so they grow in half-key
+  steps), each bar one colour chosen by its value, GPU temperature on the
+  navigation keys, and a tokens/s dial on the number pad around "5".
+
+### Changed
+
+- Colours: a deeper, more saturated cold end, and the top of the redline
+  is a bright hot orange-gold instead of white. LCD, tty11 and RGB share it.
+- tty11 level meters are spectra: each cell is coloured by its position.
+
 ## 0.1.0 — 2026-09-26
 
 First public release. For watching when you're bored waiting on your agent.
@@ -40,8 +73,8 @@ security and much of the code; Grok CLI for many of the builds.
   (`0b05:18f3`): `[[light]]` mappings from any snapshot metric to solid,
   ring, bar or pulse styles with palettes or colour stops, mirrored or
   daisy-chained fans, a brightness cap, and live reload of `light.toml`. A
-  two-opcode encoder with no save-to-flash. Corsair keyboard support is
-  detection only for now.
+  two-opcode encoder with no save-to-flash. Corsair keyboard support was
+  detection only in this release.
 - **llama-metrics**, a Prometheus exporter on TCP 19477 (`llamabored_*`
   series) for a CIDR allowlist, with strict HTTP limits; the only process
   that listens.

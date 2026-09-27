@@ -222,7 +222,8 @@ assert_packaging_contract() {
 }
 
 # T57: llama-light, the RGB writer. Colour only, its own uid, only the Aura
-# controller's hidraw pin, no network. Directives only (comments ignored).
+# controller's and (T64) the keyboard lighting interface's hidraw pins, no
+# network. Directives only (comments ignored).
 light_directive_golden() {
   cat <<'EOF'
 [Unit]
@@ -270,6 +271,7 @@ ProcSubset=pid
 ReadOnlyPaths=/sys
 DevicePolicy=closed
 DeviceAllow=/dev/llama-light/aura rw
+DeviceAllow=/dev/llama-light/keyboard rw
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
@@ -280,10 +282,17 @@ EOF
 
 light_rules_golden() {
   cat <<'EOF'
-# /etc/udev/rules.d/94-llama-light-hidraw.rules — the ASUS Aura USB controller (0b05:18f3).
-# Numbered after distro and OpenRGB rules that leave its hidraw node 0666 or tag it uaccess;
-# install.sh overwrites it. The symlink is llama-light.service's only DeviceAllow= entry.
+# /etc/udev/rules.d/94-llama-light-hidraw.rules — the ASUS Aura USB controller (0b05:18f3)
+# and the Corsair STRAFE RGB MK.2 keyboard's lighting interface (1b1c:1b48, USB interface 1).
+# Numbered after distro and OpenRGB rules that leave these hidraw nodes 0666 or tag them uaccess;
+# install.sh overwrites it. The two symlinks are llama-light.service's only DeviceAllow= entries.
 SUBSYSTEM=="hidraw", KERNELS=="0003:0B05:18F3.*", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/aura"
+# Keyboard: udev matches all parent keys on one ancestor, so the HID id (on the HID device) and
+# the interface number (on the USB interface) take two rules. Only interface 1, the vendor
+# lighting interface (usage page 0xFFC2), is taken; llama-light re-checks the usage page before
+# it opens the node. Typing uses the keyboard interface and evdev, not hidraw: unaffected.
+SUBSYSTEM=="hidraw", KERNELS=="0003:1B1C:1B48.*", ENV{LLAMA_LIGHT_KBD}="1"
+SUBSYSTEM=="hidraw", ENV{LLAMA_LIGHT_KBD}=="1", SUBSYSTEMS=="usb", ATTRS{bInterfaceNumber}=="01", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/keyboard"
 EOF
 }
 
@@ -297,6 +306,7 @@ assert_light_unit_golden() {
     'RestrictAddressFamilies=AF_INET'
     'DeviceAllow=char-hidraw rw'
     'DeviceAllow=/dev/kraken-lcd/hid rw'
+    'DeviceAllow=/dev/hidraw0 rw'
     'DeviceAllow=char-usb_device rw'
     'DeviceAllow=/dev/i2c-5 rw'
     'SupplementaryGroups=kraken-lcd'
@@ -328,6 +338,15 @@ assert_light_rules_golden() {
   rm -f -- "$tmp"
   if [[ "$got" == "$want" ]]; then
     echo "stage self-test: llama-light rules accepted an added 0666 line" >&2
+    exit 1
+  fi
+  # T64: the keyboard rule widened to every interface of the keyboard.
+  tmp="$(mktemp)"
+  sed 's/, ATTRS{bInterfaceNumber}=="01"//' -- "$rules" >"$tmp"
+  got="$(rules_text "$tmp")"
+  rm -f -- "$tmp"
+  if [[ "$got" == "$want" ]]; then
+    echo "stage self-test: llama-light rules accepted a keyboard rule on every interface" >&2
     exit 1
   fi
 }

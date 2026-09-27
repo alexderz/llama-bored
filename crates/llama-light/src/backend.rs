@@ -18,4 +18,15 @@ pub trait Backend {
     fn probe(&mut self) -> Result<(), String>;
     /// Show `frame` if it changed.
     fn show(&mut self, frame: &[Rgb]) -> Result<bool, String>;
+    /// Hand the device back to its own lighting and close it. `Ok(true)`
+    /// when something was sent, `Ok(false)` when there is nothing to do
+    /// (the default) or the device is absent.
+    fn release(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Whether the device is present but only a restart of the unit would
+    /// let the process open it.
+    fn wants_restart(&self) -> bool {
+        false
+    }
 }

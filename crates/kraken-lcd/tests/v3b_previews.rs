@@ -107,9 +107,13 @@ impl Replay {
     }
 
     fn write(&self, name: &str) {
+        self.write_as("v3b", name);
+    }
+
+    fn write_as(&self, set: &str, name: &str) {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
         std::fs::create_dir_all(&dir).expect("target dir");
-        let path = dir.join(format!("preview-v3b-{name}.json"));
+        let path = dir.join(format!("preview-{set}-{name}.json"));
         let json = serde_json::to_vec_pretty(&self.view).expect("encode");
         assert!(
             json.len() < 16 * 1024,
@@ -193,4 +197,13 @@ fn write_v3b_preview_views() {
     warm.seed(1_800.0, |s| 4.0 + 2.0 * (s / 9.0).sin());
     warm.seed(12.0, |s| (s * 12.0).min(96.0));
     warm.write("warm-up");
+}
+
+/// T62: the deeper-blues ramp across the cold end and into the blackbody.
+#[test]
+#[ignore = "writes preview views; run on demand in release"]
+fn write_blues_preview_views() {
+    for v in [0.0, 20.0, 45.0, 70.0, 100.0, 118.0, 125.0] {
+        six_value(ConfigVariant::A1, v).write_as("blues", &format!("{}", v as u32));
+    }
 }

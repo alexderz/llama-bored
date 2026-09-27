@@ -9,9 +9,10 @@ const WRITE_FILES: &[&str] = &[
     "crates/kraken-lcd/src/device/hid.rs",
     "crates/kraken-lcd/src/device/guard.rs",
     "crates/kraken-lcd/src/main.rs",
-    // T57: llama-light's one hidraw write (the Aura controller). S15 in
-    // crates/llama-light/tests fences that crate further.
-    "crates/llama-light/src/aura/device.rs",
+    // T57/T64: llama-light's one hidraw open-for-write, shared by the Aura
+    // controller and the keyboard. S15 in crates/llama-light/tests fences
+    // that crate further.
+    "crates/llama-light/src/hidraw.rs",
     // T58: llama-metrics writes HTTP responses to its sockets. S16
     // (crates/llama-metrics/tests) forbids any file write in that crate.
     "crates/llama-metrics/src/http.rs",
@@ -67,6 +68,8 @@ fn src_tree_passes_s1_and_the_s3_scan() {
         // S16 covers the RGB writer too: it must keep no listening socket.
         "crates/llama-light/src/service.rs",
         "crates/llama-light/src/aura/device.rs",
+        "crates/llama-light/src/hidraw.rs",
+        "crates/llama-light/src/keyboard/device.rs",
     ] {
         assert!(
             rels.iter().any(|rel| rel == required),
@@ -549,7 +552,7 @@ fn scan_source(rel: &str, text: &str) -> Vec<String> {
     let writes = write_apis(&code);
     if writes && !WRITE_FILES.contains(&rel) {
         hits.push(format!(
-            "{rel}: write API outside hid.rs, guard.rs, main.rs, llama-light aura/device.rs, and llama-metrics http.rs"
+            "{rel}: write API outside hid.rs, guard.rs, main.rs, llama-light hidraw.rs, and llama-metrics http.rs"
         ));
     }
     if writes && (code.contains("\"/sys") || code.contains("\"/proc")) {

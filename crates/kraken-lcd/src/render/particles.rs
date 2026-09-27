@@ -2,17 +2,17 @@
 //!
 //! Wisps: two discs (the outer at 0.55 α, an inner 55 % disc at 0.7 α),
 //! source-over, colour `#FFE0B8 → #A8A8B4`. Embers: a solid disc plus a
-//! 2.2× halo at ¼ α, Plus, colour `#FFF0B0 → #FF6A1E`.
+//! 2.2× halo at ¼ α, Plus, colour `#FFE6A0 → #FF6A1E`.
 
 use tiny_skia::{BlendMode, Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
 
 use super::Rgb;
-use super::color::{hex, mix};
+use super::color::{HOT_GOLD, hex, mix};
 use crate::anim::Particles;
 
 const WISP_A: Rgb = hex(0xFFE0B8);
 const WISP_B: Rgb = hex(0xA8A8B4);
-const EMBER_A: Rgb = hex(0xFFF0B0);
+const EMBER_A: Rgb = HOT_GOLD;
 const EMBER_B: Rgb = hex(0xFF6A1E);
 
 /// Paint the alive particles. At most 20 × 2 discs.

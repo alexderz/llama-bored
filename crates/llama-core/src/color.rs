@@ -2,8 +2,10 @@
 //! chart) and the RGB writer (llama-light). Moved here from kraken-lcd's
 //! `render/color.rs` so both writers share one ramp.
 //!
-//! 0–100 is the token-dial ramp L1..L6 placed at 0/20/40/60/80/100. 100–125
-//! keeps heating like a black body: red → orange → yellow → white. Both are
+//! 0–100 is the token-dial ramp L1..L6 placed at 0/20/40/60/80/100 (T62:
+//! deep, saturated blues at the cold end). 100–125
+//! keeps heating like a black body: red → orange → bright orange-gold
+//! (T62: no white at the top, it stopped reading as heat). Both are
 //! piecewise-linear in sRGB over the eleven stops, input clamped to 0–125.
 
 /// One sRGB channel triple.
@@ -27,22 +29,27 @@ const fn rgb(hex: u32) -> Rgb {
 
 /// 0–100: L1..L6.
 pub const ACT_STOPS: [(f32, Rgb); 6] = [
-    (0.0, rgb(0x4A55C8)),
-    (20.0, rgb(0x7550D8)),
-    (40.0, rgb(0xA64ACF)),
-    (60.0, rgb(0xD044A8)),
-    (80.0, rgb(0xF4466A)),
-    (100.0, rgb(0xFF3A22)),
+    (0.0, rgb(0x1428D8)),
+    (20.0, rgb(0x3A1EF0)),
+    (40.0, rgb(0x7A1FE8)),
+    (60.0, rgb(0xC21CC8)),
+    (80.0, rgb(0xF21E5A)),
+    (100.0, rgb(0xFF2A14)),
 ];
 
-/// 100–125: blackbody.
+/// 100–125: blackbody. The 100 stop is L6, so the two ramps join without a
+/// step.
 pub const BB_STOPS: [(f32, Rgb); 5] = [
-    (100.0, rgb(0xFF3A22)),
-    (107.0, rgb(0xFF6E1A)),
-    (114.0, rgb(0xFFB02A)),
-    (120.0, rgb(0xFFEA9A)),
-    (125.0, rgb(0xFFFFFF)),
+    (100.0, rgb(0xFF2A14)),
+    (107.0, rgb(0xFF5A12)),
+    (114.0, rgb(0xFF8A1E)),
+    (120.0, rgb(0xFFB030)),
+    (125.0, rgb(0xFFD050)),
 ];
+
+/// `#FFE6A0`: hot pale gold, the hottest touch anywhere (white-hot core,
+/// halo, filament, embers). Never pure white, so 125 still reads as heat.
+pub const HOT_GOLD: Rgb = rgb(0xFFE6A0);
 
 /// `#000000`.
 pub const BLACK: Rgb = rgb(0x000000);

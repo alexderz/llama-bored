@@ -5,7 +5,7 @@
 //! Stop: production relies on the default SIGTERM action. systemd treats
 //! death by SIGTERM as a clean stop, and the unit's `ExecStopPost` runs
 //! `llama-light restore`, which leaves the header on a neutral static
-//! colour (see [`restore`]).
+//! colour and hands the keyboard back to its own lighting (see [`restore`]).
 
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use sd_notify::NotifyState;
 
 use crate::backend::Backend;
 use crate::config::{ConfigSource, LightConfig, Stamp};
-use crate::mapping::{Renderer, fade, neutral_frame};
+use crate::mapping::{Frames, Renderer, fade, keyboard_neutral_frame, neutral_frame};
 use crate::snapshot::SnapshotSource;
 
 /// A snapshot older than this is stale: the last frame is held.
@@ -144,6 +144,8 @@ struct Device {
     backend: Box<dyn Backend>,
     presence: Presence,
     last_scan: Option<u64>,
+    /// When a frame was last written.
+    last_sent: Option<u64>,
 }
 
 impl Device {
@@ -153,7 +155,20 @@ impl Device {
             backend,
             presence: Presence::new(name),
             last_scan: None,
+            last_sent: None,
         }
+    }
+
+    /// Whether a frame may be written now under a cap of `fps` frames per
+    /// second, when the loop runs at `tick_hz`. A cap at or above the loop
+    /// rate never holds a frame back.
+    fn may_send(&self, now: u64, fps: u8, tick_hz: u8) -> bool {
+        if fps >= tick_hz {
+            return true;
+        }
+        let period = 1_000_000_000 / u64::from(fps.max(1));
+        self.last_sent
+            .is_none_or(|last| now.saturating_sub(last) + SEND_SLACK_NS >= period)
     }
 
     fn due(&self, now: u64) -> bool {
@@ -184,7 +199,12 @@ impl Device {
 
     fn show(&mut self, frame: &[Rgb], now: u64, sink: &mut impl Sink) -> bool {
         match self.backend.show(frame) {
-            Ok(sent) => sent,
+            Ok(sent) => {
+                if sent {
+                    self.last_sent = Some(now);
+                }
+                sent
+            }
             Err(reason) => {
                 self.last_scan = Some(now);
                 self.presence.update(false, &reason, sink);
@@ -193,6 +213,9 @@ impl Device {
         }
     }
 }
+
+/// Clock jitter allowed when checking a device's frame cap.
+const SEND_SLACK_NS: u64 = 1_000_000;
 
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -216,8 +239,20 @@ pub struct Light<C, S, F, N, L> {
     rejected: Option<Option<Stamp>>,
     latest: Option<SnapshotV1>,
     snapshot_label: Option<&'static str>,
-    live_frame: Option<Vec<Rgb>>,
+    live_frame: Option<Frames>,
     frames_sent: u64,
+    keyboard_frames_sent: u64,
+    restart: bool,
+}
+
+/// Why [`Light::run`] returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunEnd {
+    /// The tick budget ran out (tests).
+    Ticks,
+    /// A device is present that only a restart of the unit can open.
+    /// `main` exits non-zero so systemd restarts the unit.
+    Restart,
 }
 
 /// Everything [`Light::new`] needs.
@@ -262,7 +297,15 @@ where
             snapshot_label: None,
             live_frame: None,
             frames_sent: 0,
+            keyboard_frames_sent: 0,
+            restart: false,
         }
+    }
+
+    /// Frames written to the keyboard so far.
+    #[must_use]
+    pub fn keyboard_frames_sent(&self) -> u64 {
+        self.keyboard_frames_sent
     }
 
     /// Frames written to the Aura so far.
@@ -287,17 +330,20 @@ where
         &mut self.clock
     }
 
-    /// Run forever, or `max_ticks` ticks.
-    pub fn run(&mut self, max_ticks: Option<u64>) {
+    /// Run forever, `max_ticks` ticks, or until a restart is needed.
+    pub fn run(&mut self, max_ticks: Option<u64>) -> RunEnd {
         self.notify.ready();
         let mut ticks = 0_u64;
         loop {
             if max_ticks.is_some_and(|max| ticks >= max) {
-                return;
+                return RunEnd::Ticks;
             }
             self.tick();
+            if self.restart {
+                return RunEnd::Restart;
+            }
             ticks += 1;
-            let fps = u64::from(self.config().aura.fps.max(1));
+            let fps = u64::from(self.config().engine.tick_hz.max(1));
             self.clock.sleep(Duration::from_nanos(1_000_000_000 / fps));
         }
     }
@@ -314,28 +360,40 @@ where
             self.check_config();
         }
         self.read_snapshot(now);
-        let frame = self.aura_frame(now, dt_s);
+        let frames = self.frames(now, dt_s);
         let aura_enabled = self.config().aura.enabled;
+        let tick_hz = self.config().engine.tick_hz;
+        let aura_fps = self.config().aura.fps;
+        let keyboard_fps = self.config().engine.tween_fps;
         if let Some(device) = self.aura.as_mut()
             && aura_enabled
             && device.ensure_open(now, &mut self.sink)
-            && let Some(frame) = frame
-            && device.show(&frame, now, &mut self.sink)
+            && let Some(frames) = &frames
+            && device.may_send(now, aura_fps, tick_hz)
+            && device.show(&frames.aura, now, &mut self.sink)
         {
             self.frames_sent += 1;
         }
-        let keyboard_enabled = self.config().keyboard_enabled;
+        // The keyboard is independent of the fans: absent, refused or
+        // failing, it never stops the Aura frame above.
+        let keyboard_enabled = self.config().keyboard.enabled;
         if let Some(device) = self.keyboard.as_mut()
             && keyboard_enabled
         {
-            if device.backend.is_open() {
-                // Detection only: look again at the rescan cadence.
-                if device.due(now) {
-                    device.last_scan = Some(now);
-                    device.show(&[], now, &mut self.sink);
+            if device.ensure_open(now, &mut self.sink) {
+                if let Some(frames) = &frames
+                    && device.may_send(now, keyboard_fps, tick_hz)
+                    && device.show(&frames.keyboard, now, &mut self.sink)
+                {
+                    self.keyboard_frames_sent += 1;
                 }
-            } else {
-                device.ensure_open(now, &mut self.sink);
+            } else if device.backend.wants_restart() && !self.restart {
+                self.restart = true;
+                log::emit(
+                    &mut self.sink,
+                    Priority::Warning,
+                    "keyboard: attached after the unit started, so the unit's device list does not include it; exiting so systemd restarts llama-light",
+                );
             }
         }
         self.notify.watchdog();
@@ -351,6 +409,7 @@ where
                 self.stamp = stamp;
                 self.rejected = None;
                 let was_enabled = self.config().aura.enabled;
+                let keyboard_was_enabled = self.config().keyboard.enabled;
                 let neutral = neutral_frame(&self.config().aura);
                 self.renderer = Renderer::new(config);
                 self.live_frame = None;
@@ -362,6 +421,18 @@ where
                 {
                     let now = self.clock.now_ns();
                     device.show(&neutral, now, &mut self.sink);
+                }
+                if keyboard_was_enabled
+                    && !self.config().keyboard.enabled
+                    && let Some(device) = self.keyboard.as_mut()
+                    && device.backend.is_open()
+                    && let Err(reason) = device.backend.release()
+                {
+                    log::emit(
+                        &mut self.sink,
+                        Priority::Warning,
+                        &format!("keyboard: hand-back to its own lighting failed ({reason})"),
+                    );
                 }
             }
             Err(err) => {
@@ -402,39 +473,85 @@ where
         }
     }
 
-    /// The frame to show now, or `None` to send nothing.
-    fn aura_frame(&mut self, now: u64, dt_s: f32) -> Option<Vec<Rgb>> {
+    /// The frames to show now, or `None` to send nothing.
+    fn frames(&mut self, now: u64, dt_s: f32) -> Option<Frames> {
         let age_ns = match &self.latest {
             Some(snapshot) => now.saturating_sub(snapshot.t_mono_ns),
             None => now.saturating_sub(self.started).max(nanos(HOLD_AFTER) + 1),
         };
-        let neutral = neutral_frame(&self.config().aura);
+        let neutral = Frames {
+            aura: neutral_frame(&self.config().aura),
+            keyboard: keyboard_neutral_frame(&self.config().keyboard),
+        };
         match phase(Duration::from_nanos(age_ns)) {
             Phase::Live => {
                 let snapshot = self.latest.as_ref()?;
-                let frame = self.renderer.aura_frame(snapshot, dt_s);
-                self.live_frame = Some(frame.clone());
-                Some(frame)
+                let frames = self.renderer.frames(snapshot, dt_s);
+                self.live_frame = Some(frames.clone());
+                Some(frames)
             }
             Phase::Hold => self.live_frame.clone(),
             Phase::Fade(amount) => {
                 let from = self.live_frame.clone().unwrap_or_else(|| neutral.clone());
-                Some(fade(&from, &neutral, amount))
+                Some(Frames {
+                    aura: fade(&from.aura, &neutral.aura, amount),
+                    keyboard: fade(&from.keyboard, &neutral.keyboard, amount),
+                })
             }
         }
     }
 }
 
 /// `ExecStopPost`: leave header 1 on [`crate::mapping::NEUTRAL`] (after the
-/// brightness cap), in Direct mode, RAM only.
+/// brightness cap), in Direct mode, RAM only; then hand the keyboard back
+/// to its own lighting.
 ///
-/// The protocol has no documented command that re-loads the board's
+/// Aura: the protocol has no documented command that re-loads the board's
 /// stored effect without a power cycle, and the effect commands that do
 /// exist would either overwrite what is stored (with a commit) or guess at
 /// it. So this writes a neutral static frame and never commits: the stored
 /// effect comes back at the next power cycle, as observed on a test board.
-/// An absent controller is one log line and success.
-pub fn restore(config: &LightConfig, aura: &mut dyn Backend, sink: &mut impl Sink) -> u8 {
+///
+/// Keyboard: the legacy protocol has a RAM-only switch back to hardware
+/// lighting (`07 05 01`), so the keyboard shows its own stored lighting
+/// again, and keeps showing it while llama-light is stopped. `keyboard` is
+/// `None` when the config leaves the keyboard off.
+///
+/// An absent device is one log line and success. Exit status 1 if a write
+/// to a present device failed.
+pub fn restore(
+    config: &LightConfig,
+    aura: &mut dyn Backend,
+    keyboard: Option<&mut dyn Backend>,
+    sink: &mut impl Sink,
+) -> u8 {
+    let mut status = restore_aura(config, aura, sink);
+    if let Some(keyboard) = keyboard {
+        match keyboard.release() {
+            Ok(true) => log::emit(
+                sink,
+                Priority::Info,
+                "restore: keyboard handed back to its own (hardware) lighting",
+            ),
+            Ok(false) => log::emit(
+                sink,
+                Priority::Info,
+                "restore: keyboard absent; nothing sent",
+            ),
+            Err(reason) => {
+                log::emit(
+                    sink,
+                    Priority::Err,
+                    &format!("restore: keyboard write failed ({reason})"),
+                );
+                status = 1;
+            }
+        }
+    }
+    status
+}
+
+fn restore_aura(config: &LightConfig, aura: &mut dyn Backend, sink: &mut impl Sink) -> u8 {
     if !config.aura.enabled {
         log::emit(
             sink,

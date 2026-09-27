@@ -1,4 +1,11 @@
-# /etc/udev/rules.d/94-llama-light-hidraw.rules — the ASUS Aura USB controller (0b05:18f3).
-# Numbered after distro and OpenRGB rules that leave its hidraw node 0666 or tag it uaccess;
-# install.sh overwrites it. The symlink is llama-light.service's only DeviceAllow= entry.
+# /etc/udev/rules.d/94-llama-light-hidraw.rules — the ASUS Aura USB controller (0b05:18f3)
+# and the Corsair STRAFE RGB MK.2 keyboard's lighting interface (1b1c:1b48, USB interface 1).
+# Numbered after distro and OpenRGB rules that leave these hidraw nodes 0666 or tag them uaccess;
+# install.sh overwrites it. The two symlinks are llama-light.service's only DeviceAllow= entries.
 SUBSYSTEM=="hidraw", KERNELS=="0003:0B05:18F3.*", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/aura"
+# Keyboard: udev matches all parent keys on one ancestor, so the HID id (on the HID device) and
+# the interface number (on the USB interface) take two rules. Only interface 1, the vendor
+# lighting interface (usage page 0xFFC2), is taken; llama-light re-checks the usage page before
+# it opens the node. Typing uses the keyboard interface and evdev, not hidraw: unaffected.
+SUBSYSTEM=="hidraw", KERNELS=="0003:1B1C:1B48.*", ENV{LLAMA_LIGHT_KBD}="1"
+SUBSYSTEM=="hidraw", ENV{LLAMA_LIGHT_KBD}=="1", SUBSYSTEMS=="usb", ATTRS{bInterfaceNumber}=="01", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/keyboard"

@@ -3,7 +3,7 @@
 //! A value is placed on its entry's range as a percent: 0 % at `range.min`,
 //! 100 % at `range.max`, linearly or logarithmically. Palettes are defined
 //! on that percent axis. The `act` palette is the LCD's ramp (`act_color`):
-//! blue → red over 0–100 %, then blackbody to white at 125 %, so a value
+//! blue → red over 0–100 %, then blackbody to bright orange-gold at 125 %, so a value
 //! past the range max heats up exactly as on the LCD.
 
 use llama_core::color::{Rgb, act_color, hex, ramp};

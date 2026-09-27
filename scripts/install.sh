@@ -584,6 +584,54 @@ resolve_aura_hidraw() {
   fi
 }
 
+# T64: the keyboard's lighting pin from 94-llama-light-hidraw.rules.
+# readlink only; the node is not opened.
+keyboard_pin_target() {
+  if [[ -n "${INSTALL_FAKE_KBD_PIN+x}" ]]; then
+    printf '%s\n' "$INSTALL_FAKE_KBD_PIN"
+    return 0
+  fi
+  readlink -e -- /dev/llama-light/keyboard || true
+}
+
+keyboard_mode_group() {
+  local node=$1
+  if [[ -n "${INSTALL_FAKE_KBD_STAT+x}" ]]; then
+    printf '%s\n' "$INSTALL_FAKE_KBD_STAT"
+    return 0
+  fi
+  stat -c '%a %G' -- "$node"
+}
+
+# /dev/hidrawN of the Corsair STRAFE RGB MK.2's lighting interface (HID
+# 0003:1B1C:1B48 on USB interface 01, as the udev rule picks it), or nothing
+# when the keyboard is not attached. More than one is an error. sysfs reads
+# only; the keyboard's other interfaces (typing) are left alone.
+resolve_keyboard_hidraw() {
+  local sys=$1 dir uevent hid iface
+  local -a found=()
+  [[ -d "$sys/class/hidraw" ]] || return 0
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    uevent="$dir/device/uevent"
+    [[ -f "$uevent" ]] || continue
+    grep -q -x 'HID_ID=0003:00001B1C:00001B48' "$uevent" || continue
+    hid="$(readlink -f -- "$dir/device")" || continue
+    iface="$(dirname -- "$hid")/bInterfaceNumber"
+    [[ -f "$iface" ]] || continue
+    if [[ "$(tr -d '[:space:]' <"$iface")" == "01" ]]; then
+      found+=("$(basename -- "$dir")")
+    fi
+  done < <(find "$sys/class/hidraw" -mindepth 1 -maxdepth 1 -name 'hidraw[0-9]*' -print 2>/dev/null || true)
+  if [[ ${#found[@]} -gt 1 ]]; then
+    echo "install.sh: expected at most one keyboard lighting (1b1c:1b48 interface 01) hidraw node, found ${#found[@]}" >&2
+    return 1
+  fi
+  if [[ ${#found[@]} -eq 1 ]]; then
+    printf '/dev/%s\n' "${found[0]}"
+  fi
+}
+
 resolve_kraken_hidraw() {
   local sys=$1
   local devices="$sys/bus/usb/devices"
@@ -867,6 +915,7 @@ print_rollback() {
     echo "  udevadm trigger --action=change --sysname-match=vcs11"
     echo "  udevadm trigger --action=change --sysname-match=vcsu11"
     echo "  udevadm trigger --action=change --attr-match=idVendor=0b05 --attr-match=idProduct=18f3"
+    echo "  udevadm trigger --action=change --attr-match=idVendor=1b1c --attr-match=idProduct=1b48"
     echo "  udevadm trigger --action=change --subsystem-match=hidraw"
   fi
   echo "  # INSTALLED_SHA stays the previous value (${prev})."
@@ -1403,6 +1452,7 @@ apply_from_staging() {
   local binary_dest watch_binary view_binary view_rule watch_mode watch_dest user_dir font_dest
   local node hidraw_name mode_group pin sha_dest prev interval_src config_bak
   local light_binary light_unit light_rule light_mode light_dest aura_node aura_pin aura_mode
+  local kbd_node kbd_pin kbd_mode
   local metrics_binary metrics_unit metrics_mode metrics_dest
   local -a scan=() trial=()
   ROLLBACK_KIND=()
@@ -1549,6 +1599,9 @@ apply_from_staging() {
   # The Aura controller may be absent; a trigger that matches nothing is fine.
   must host_cmd udevadm trigger --action=change \
     --attr-match=idVendor=0b05 --attr-match=idProduct=18f3 || return 1
+  # T64: the keyboard may be absent too.
+  must host_cmd udevadm trigger --action=change \
+    --attr-match=idVendor=1b1c --attr-match=idProduct=1b48 || return 1
   # A USB parent's change event does not re-run rules on its hidraw child, so
   # re-apply the hidraw rules directly (idempotent; seen on a test machine with the
   # Aura node staying 0666 after install).
@@ -1605,6 +1658,34 @@ apply_from_staging() {
     mark_write "aura hidraw check passed"
   else
     echo "install.sh: no Aura controller (0b05:18f3) attached; llama-light will report it absent" >&2
+  fi
+
+  # T64: the keyboard's lighting interface is llama-light's alone (0660, no
+  # uaccess ACL; typing uses another interface and evdev), and its pin names
+  # it. Not attached: nothing to check; llama-light logs it absent once.
+  kbd_node="$(resolve_keyboard_hidraw "$sys_root")" || fail_install || return 1
+  if [[ -n "$kbd_node" ]]; then
+    must host_cmd setfacl -b -- "$kbd_node" || return 1
+    if ! kbd_mode="$(keyboard_mode_group "$kbd_node")"; then
+      echo "install.sh: stat of $kbd_node failed" >&2
+      fail_install || return 1
+    fi
+    if [[ "$kbd_mode" != "660 llama-light" ]]; then
+      echo "install.sh: keyboard lighting node $kbd_node is '$kbd_mode', expected '660 llama-light'" >&2
+      fail_install || return 1
+    fi
+    if hidraw_has_user_acl "$kbd_node"; then
+      echo "install.sh: $kbd_node still has a named user ACL after setfacl -b" >&2
+      fail_install || return 1
+    fi
+    kbd_pin="$(keyboard_pin_target)"
+    if [[ "$kbd_pin" != "$kbd_node" ]]; then
+      echo "install.sh: /dev/llama-light/keyboard resolves to '${kbd_pin:-nothing}', expected $kbd_node" >&2
+      fail_install || return 1
+    fi
+    mark_write "keyboard hidraw check passed"
+  else
+    echo "install.sh: no Corsair keyboard (1b1c:1b48) attached; llama-light will report it absent" >&2
   fi
 
   # Swap binaries, units and config only after the device check.
@@ -1757,7 +1838,7 @@ install_real() {
   export PATH="$ROOT_PATH"
   hash -r
   unset INSTALL_DRY INSTALL_ALLOW_UNPRIV_COPY INSTALL_FAKE_STAT INSTALL_FAKE_GETFACL INSTALL_FAKE_PIN INSTALL_LOG INSTALL_FAIL_AT INSTALL_FAIL_MARKER
-  unset INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT
+  unset INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
   unset INSTALL_OWNER_MODE INSTALL_OWNER_PATH INSTALL_OWNER_HOME INSTALL_TAMPER_LIVE
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "install.sh: must be run as root (with sudo)" >&2
@@ -3532,7 +3613,7 @@ self_test() {
   write_fixture_provenance "$repo" "$head"
   INSTALL_FAKE_STAT='660 kraken-lcd'
   INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
-  unset INSTALL_FAIL_AT INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT
+  unset INSTALL_FAIL_AT INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
 
   light="$tmp/light-default"
   mkdir -p -- "$light"
@@ -3589,6 +3670,10 @@ self_test() {
     echo "install self-test: the Aura udev trigger did not run" >&2
     exit 1
   }
+  log_has 'udevadm trigger --action=change --attr-match=idVendor=1b1c --attr-match=idProduct=1b48' || {
+    echo "install self-test: the keyboard udev trigger did not run" >&2
+    exit 1
+  }
   light_log="$(cat -- "$INSTALL_LOG")"
   if [[ "$light_log" =~ (enable|start|restart)[^$'\n']*llama-light ]]; then
     echo "install self-test: llama-light was enabled or started without --enable-light" >&2
@@ -3608,6 +3693,7 @@ self_test() {
     && "$light_section" == *"rm -f -- /etc/udev/rules.d/94-llama-light-hidraw.rules"* \
     && "$light_section" == *"rm -f -- /etc/llama-bored/light.toml"* \
     && "$light_section" == *"--attr-match=idVendor=0b05 --attr-match=idProduct=18f3"* \
+    && "$light_section" == *"--attr-match=idVendor=1b1c --attr-match=idProduct=1b48"* \
     && "$light_section" == *"udevadm trigger --action=change --subsystem-match=hidraw"* \
     && "$light_section" != *"disable --now llama-light"* ]] || {
     echo "install self-test: rollback record does not cover the llama-light files" >&2
@@ -3724,6 +3810,84 @@ self_test() {
     rm -rf -- "$light_stage"
   done
   INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
+
+  # T64: an attached keyboard. Only its interface-01 hidraw node (lighting)
+  # is checked; the typing interface's node is not touched. It must end
+  # 0660 llama-light, with no user ACL, and the pin must name it.
+  local kbd_sys kbd_case kbd_dest kbd_err kbd_status kbd_usb
+  kbd_sys="$tmp/sys-kbd"
+  cp -a -- "$sys" "$kbd_sys"
+  kbd_usb="$kbd_sys/devices/pci0000:00/usb1/1-4"
+  mkdir -p "$kbd_usb/1-4:1.0/0003:1B1C:1B48.0003" "$kbd_usb/1-4:1.1/0003:1B1C:1B48.0004"
+  printf '00\n' >"$kbd_usb/1-4:1.0/bInterfaceNumber"
+  printf '01\n' >"$kbd_usb/1-4:1.1/bInterfaceNumber"
+  printf 'DRIVER=hid-generic\nHID_ID=0003:00001B1C:00001B48\n' \
+    >"$kbd_usb/1-4:1.0/0003:1B1C:1B48.0003/uevent"
+  printf 'DRIVER=hid-generic\nHID_ID=0003:00001B1C:00001B48\n' \
+    >"$kbd_usb/1-4:1.1/0003:1B1C:1B48.0004/uevent"
+  mkdir -p "$kbd_sys/class/hidraw/hidraw3" "$kbd_sys/class/hidraw/hidraw4"
+  ln -s -- "$kbd_usb/1-4:1.0/0003:1B1C:1B48.0003" "$kbd_sys/class/hidraw/hidraw3/device"
+  ln -s -- "$kbd_usb/1-4:1.1/0003:1B1C:1B48.0004" "$kbd_sys/class/hidraw/hidraw4/device"
+  assert_eq "$(resolve_keyboard_hidraw "$kbd_sys")" "/dev/hidraw4" "keyboard lighting hidraw from sysfs"
+  assert_eq "$(resolve_keyboard_hidraw "$sys")" "" "no keyboard in sysfs"
+
+  kbd_dest="$tmp/kbd-ok"
+  : >"$INSTALL_LOG"
+  light_stage="$(freeze_staging "$repo" "$kbd_dest")"
+  INSTALL_FAKE_KBD_STAT='660 llama-light' INSTALL_FAKE_KBD_PIN=/dev/hidraw4 \
+    run_expect_ok apply_from_staging "$light_stage" "$kbd_dest" "$kbd_sys" "$head"
+  log_has 'setfacl -b -- /dev/hidraw4' || {
+    echo "install self-test: the keyboard lighting node's ACL was not cleared" >&2
+    exit 1
+  }
+  if log_has 'setfacl -b -- /dev/hidraw3'; then
+    echo "install self-test: the keyboard's typing interface node was touched" >&2
+    exit 1
+  fi
+  rm -rf -- "$light_stage"
+
+  for kbd_case in 'stat:666 root' 'stat:660 root' 'pin:' 'pin:/dev/hidraw3' 'acl:'; do
+    kbd_dest="$tmp/kbd-bad-${kbd_case//[^a-z0-9]/-}"
+    : >"$INSTALL_LOG"
+    light_stage="$(freeze_staging "$repo" "$kbd_dest")"
+    set +e
+    case "$kbd_case" in
+      stat:*)
+        kbd_err="$(INSTALL_FAKE_KBD_STAT="${kbd_case#stat:}" INSTALL_FAKE_KBD_PIN=/dev/hidraw4 \
+          apply_from_staging "$light_stage" "$kbd_dest" "$kbd_sys" "$head" 2>&1 >/dev/null)"
+        ;;
+      pin:*)
+        kbd_err="$(INSTALL_FAKE_KBD_STAT='660 llama-light' INSTALL_FAKE_KBD_PIN="${kbd_case#pin:}" \
+          apply_from_staging "$light_stage" "$kbd_dest" "$kbd_sys" "$head" 2>&1 >/dev/null)"
+        ;;
+      acl:*)
+        kbd_err="$(INSTALL_FAKE_KBD_STAT='660 llama-light' INSTALL_FAKE_KBD_PIN=/dev/hidraw4 \
+          INSTALL_FAKE_GETFACL=$'user::rw-\nuser:someone:rw-\n' \
+          apply_from_staging "$light_stage" "$kbd_dest" "$kbd_sys" "$head" 2>&1 >/dev/null)"
+        ;;
+    esac
+    kbd_status=$?
+    set -e
+    if [[ "$kbd_status" -eq 0 ]]; then
+      echo "install self-test: keyboard case '$kbd_case' was accepted" >&2
+      exit 1
+    fi
+    [[ "$kbd_err" == *"how to roll back"* ]] || {
+      echo "install self-test: keyboard case '$kbd_case' did not print the rollback" >&2
+      printf '%s\n' "$kbd_err" >&2
+      exit 1
+    }
+    if [[ -e "$(dest_path "$kbd_dest" /usr/local/libexec/llama-bored/llama-light)" \
+      || -e "$(dest_path "$kbd_dest" /usr/local/libexec/llama-bored/kraken-lcd)" ]] \
+      || log_has 'systemctl daemon-reload'; then
+      echo "install self-test: keyboard case '$kbd_case' still swapped a binary or reloaded units" >&2
+      exit 1
+    fi
+    assert_no_new "$kbd_dest"
+    rm -rf -- "$light_stage"
+  done
+  INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
+  unset INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
 
   # T58: llama-metrics. Staged and hashed with the rest; its unit and
   # config land verbatim; it is never enabled or started, and no firewall

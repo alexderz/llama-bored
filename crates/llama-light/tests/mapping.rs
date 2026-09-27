@@ -32,12 +32,12 @@ fn the_default_is_act_color_of_activity_on_all_six_leds() {
 }
 
 #[test]
-fn act_is_blue_to_red_then_white_hot() {
+fn act_is_blue_to_red_then_orange_gold_hot() {
     // Same stops as the LCD (kraken-lcd render::color re-exports these).
-    assert_eq!(act_color(0.0), hex(0x4A55C8));
-    assert_eq!(act_color(100.0), hex(0xFF3A22));
-    assert_eq!(act_color(125.0), hex(0xFFFFFF));
-    assert_eq!(Palette::Act.color(60.0), hex(0xD044A8));
+    assert_eq!(act_color(0.0), hex(0x1428D8));
+    assert_eq!(act_color(100.0), hex(0xFF2A14));
+    assert_eq!(act_color(125.0), hex(0xFFD050));
+    assert_eq!(Palette::Act.color(60.0), hex(0xC21CC8));
 }
 
 #[test]

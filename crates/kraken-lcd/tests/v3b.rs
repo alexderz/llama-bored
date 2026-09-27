@@ -45,16 +45,16 @@ fn view(ring: Option<u8>) -> View {
 #[test]
 fn act_color_hits_every_stop_and_interpolates_between() {
     let stops = [
-        (0.0, 0x4A55C8),
-        (20.0, 0x7550D8),
-        (40.0, 0xA64ACF),
-        (60.0, 0xD044A8),
-        (80.0, 0xF4466A),
-        (100.0, 0xFF3A22),
-        (107.0, 0xFF6E1A),
-        (114.0, 0xFFB02A),
-        (120.0, 0xFFEA9A),
-        (125.0, 0xFFFFFF),
+        (0.0, 0x1428D8),
+        (20.0, 0x3A1EF0),
+        (40.0, 0x7A1FE8),
+        (60.0, 0xC21CC8),
+        (80.0, 0xF21E5A),
+        (100.0, 0xFF2A14),
+        (107.0, 0xFF5A12),
+        (114.0, 0xFF8A1E),
+        (120.0, 0xFFB030),
+        (125.0, 0xFFD050),
     ];
     for (p, value) in stops {
         assert_eq!(act_color(p), hex(value), "stop {p}");
@@ -64,26 +64,32 @@ fn act_color_hits_every_stop_and_interpolates_between() {
     assert_eq!(
         act_color(10.0),
         Rgb {
-            r: 96,
-            g: 83,
-            b: 208
+            r: 39,
+            g: 35,
+            b: 228
         }
     );
-    // Halfway 114 → 120: #FFB02A → #FFEA9A.
+    // Halfway 114 → 120: #FF8A1E → #FFB030.
     assert_eq!(
         act_color(117.0),
         Rgb {
             r: 255,
-            g: 205,
-            b: 98
+            g: 157,
+            b: 39
         }
     );
     // Clamped to 0–125; NaN reads as 0.
-    assert_eq!(act_color(-5.0), hex(0x4A55C8));
-    assert_eq!(act_color(400.0), hex(0xFFFFFF));
-    assert_eq!(act_color(f32::NAN), hex(0x4A55C8));
-    // Red at 100 is continuous with L6.
+    assert_eq!(act_color(-5.0), hex(0x1428D8));
+    assert_eq!(act_color(400.0), hex(0xFFD050));
+    assert_eq!(act_color(f32::NAN), hex(0x1428D8));
+    // Red at 100 is continuous with L6: the blackbody ramp starts on it.
     assert_eq!(act_color(100.0), act_color(100.000_01));
+    assert_eq!(ACT_STOPS[5].1, BB_STOPS[0].1, "100 joins the blackbody");
+    // T62: the cold end is deep and saturated, blue-dominant with low green.
+    for p in [0.0, 10.0, 20.0] {
+        let c = act_color(p);
+        assert!(c.b >= 0xD8 && c.g <= 0x30 && c.r <= 0x40, "{p} got {c:?}");
+    }
 }
 
 #[test]
@@ -92,23 +98,71 @@ fn readout_and_head_colours_follow_the_spec() {
     assert_eq!(
         readout_color(0.0),
         Rgb {
-            r: 137,
-            g: 145,
-            b: 219
+            r: 102,
+            g: 115,
+            b: 230
         }
     );
     // Above 100: act_color(max(112, v)).
     assert_eq!(readout_color(104.0), act_color(112.0));
-    assert_eq!(readout_color(125.0), hex(0xFFFFFF));
+    assert_eq!(readout_color(125.0), hex(0xFFD050));
     // The comet head is act_color(v) mixed halfway to white.
     assert_eq!(
         head_color(100.0),
         Rgb {
             r: 255,
-            g: 157,
-            b: 145
+            g: 149,
+            b: 138
         }
     );
+}
+
+#[test]
+fn cold_tips_lighten_at_most_15_percent_toward_white() {
+    use kraken_lcd::render::color::{WHITE, cold_tip_lift, mix};
+    // T62: under 50 a tip mixes at most 15 % toward white; 50 and up keep
+    // today's lift.
+    assert_eq!(cold_tip_lift(0.0, 0.30), 0.15);
+    assert_eq!(cold_tip_lift(49.9, 0.30), 0.15);
+    assert_eq!(cold_tip_lift(49.9, 0.10), 0.10);
+    assert_eq!(cold_tip_lift(50.0, 0.30), 0.30);
+    assert_eq!(cold_tip_lift(90.0, 0.50), 0.50);
+    assert_eq!(head_color(20.0), mix(act_color(20.0), WHITE, 0.15));
+    assert_eq!(head_color(50.0), mix(act_color(50.0), WHITE, 0.5));
+}
+
+#[test]
+fn nothing_is_pure_white_at_125() {
+    use kraken_lcd::render::color::{HOT_GOLD, WHITE, mix};
+    // T62 addendum: the top is a bright hot orange-gold, the hottest touch
+    // is HOT_GOLD, never white.
+    assert_eq!(HOT_GOLD, hex(0xFFE6A0));
+    for v in [118.0, 120.0, 123.0, 125.0] {
+        assert_ne!(act_color(v), WHITE, "act {v}");
+        assert_ne!(readout_color(v), WHITE, "readout {v}");
+        assert_ne!(head_color(v), WHITE, "head {v}");
+        assert!(act_color(v).b < 0x60, "act {v} stays orange-gold");
+    }
+    assert_eq!(head_color(125.0), mix(hex(0xFFD050), HOT_GOLD, 0.5));
+    // Rendered: the pinned ring, and a 125 bar, have no pure-white pixel
+    // on the ring or bar band (text and the 100 gate aside).
+    let mut assets = Assets::load().expect("assets");
+    let frame = render::render(&view(Some(125)), &DisplayCfg::default(), &mut assets);
+    for deg in 0..360 {
+        for radius in [148.0, 151.0, 154.0] {
+            let got = at(&frame, radius, deg as f32);
+            assert_ne!(got, (255, 255, 255), "ring pixel at {deg}° r {radius}");
+        }
+    }
+    let mut dial = [None; 24];
+    dial[23] = Some(125);
+    let mut hot = view(None);
+    hot.dial = dial;
+    let frame = render::render(&hot, &DisplayCfg::default(), &mut assets);
+    for radius in [120.0, 125.0, 130.0, 135.0, 140.5, 143.5] {
+        let got = at(&frame, radius, OLDEST_DEG - 6.0);
+        assert_ne!(got, (255, 255, 255), "bar pixel at r {radius}");
+    }
 }
 
 #[test]
@@ -161,13 +215,13 @@ fn the_arc_covers_its_value_by_position_and_leaves_the_rest_dim() {
 }
 
 #[test]
-fn the_peg_goes_white_hot() {
+fn the_peg_goes_hot_gold() {
     let mut assets = Assets::load().expect("assets");
     let frame = render::render(&view(Some(125)), &DisplayCfg::default(), &mut assets);
     let head = at(&frame, 151.0, ring_angle(123.0));
     assert!(
-        head.0 > 240 && head.1 > 230 && head.2 > 220,
-        "the last 8° are white at 125, got {head:?}"
+        near(head, hex(0xFFE6A0), 8),
+        "the last 8° are hot pale gold at 125, got {head:?}"
     );
     let orange = at(&frame, 151.0, ring_angle(106.0));
     assert!(
@@ -251,7 +305,7 @@ fn bars_use_act_color_and_turn_incandescent_over_100() {
     let body = at(&frame, 129.2, OLDEST_DEG);
     assert!(
         near(body, act_color(60.0), 30),
-        "60 is #D044A8, got {body:?}"
+        "60 is #C21CC8, got {body:?}"
     );
     // Tip at r 133.6, past it is empty.
     assert_eq!(at(&frame, 136.0, OLDEST_DEG), (0, 0, 0));
@@ -260,7 +314,7 @@ fn bars_use_act_color_and_turn_incandescent_over_100() {
     let mut hot = view(None);
     hot.dial = dial;
     let frame = render::render(&hot, &DisplayCfg::default(), &mut assets);
-    // Full length at 125 (tip r 142), ember-dark base, white-hot tip.
+    // Full length at 125 (tip r 142), ember-dark base, orange-gold tip.
     let base = at(&frame, 119.5, OLDEST_DEG - 6.0);
     let tip = at(&frame, 140.5, OLDEST_DEG - 6.0);
     assert!(
@@ -268,8 +322,8 @@ fn bars_use_act_color_and_turn_incandescent_over_100() {
         "coals are dark at the bottom, got {base:?}"
     );
     assert!(
-        tip.0 > 240 && tip.1 > 200 && tip.2 > 150,
-        "the tip is near white at 125, got {tip:?}"
+        tip.0 > 240 && tip.1 > 170 && tip.2 < 120,
+        "the tip is bright orange-gold at 125, got {tip:?}"
     );
     // Bloom: Plus halo just outside the bar's edge.
     let halo = at(&frame, 143.5, OLDEST_DEG - 6.0);

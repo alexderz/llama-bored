@@ -12,7 +12,7 @@ listens on the network opens no device.
 |---|---|---|---|---|
 | `llama-watch` | system unit, user `llama-watch` | `/proc`, hwmon (incl. an opt-in Super-I/O fan chip), NVML, llama-swap on loopback | `/run/llama-watch/snapshot.json` (10 Hz), tty11 | Loopback client only (`IPAddressAllow=localhost`) |
 | `kraken-lcd` | system unit, user `kraken-lcd` | The snapshot; the cooler's own sysfs (guard) | The Kraken LCD (hidraw + usbfs bulk), `/var/lib/kraken-lcd/halted` | **None** (`PrivateNetwork=yes`) |
-| `llama-light` | system unit, user `llama-light` | The snapshot; `light.toml`; the Aura node's sysfs ids | The Aura controller's hidraw node (colour only) | **None** (`PrivateNetwork=yes`) |
+| `llama-light` | system unit, user `llama-light` | The snapshot; `light.toml`; the Aura node's sysfs ids | The Aura controller's and the keyboard lighting interface's hidraw nodes (colour only) | **None** (`PrivateNetwork=yes`) |
 | `llama-metrics` | system unit, user `llama-metrics` | The snapshot; `metrics.toml` | HTTP responses | **Listens** on TCP 19477 for a CIDR allowlist; dials nothing |
 | `llama-view` | any user in group `llama-view` | `/dev/vcsa11` | Its own terminal | None |
 
@@ -29,7 +29,7 @@ The workspace crates:
 | `llama-core` | Snapshot schema v1 and its validator, the name sanitiser, the model-detail type and its line builders, the reset-aware rate helper, logging | `serde`, `serde_json`, `toml` |
 | `llama-watch` | Sources (including the launch-command parser and the fan reader), collector and activity, llama poller, publisher, tty model and renderer | `nvml-wrapper` (dlopen), `ureq` |
 | `kraken-lcd` | Snapshot reader, activity dial and tokens·24h history, presentation, V3b renderer and animation, upload policy, device layer, service | `nusb`, `tiny-skia`, `fontdue`. **No** `ureq` or `nvml-wrapper` (S10) |
-| `llama-light` | Config and `[[light]]` mappings, metric and palette maths, the closed Aura encoder, the pinned hidraw open, the keyboard detector, service with live reload | `rustix`, `toml`. Dependency allowlist (S10/S15) |
+| `llama-light` | Config and `[[light]]` mappings, metric and palette maths, the closed Aura and keyboard encoders, the pinned hidraw opens, the frame engine (tweening), service with live reload | `rustix`, `toml`. Dependency allowlist (S10/S15) |
 | `llama-metrics` | CIDR allowlist, bounded HTTP/1.1 server, text exposition, service | `rustix`, `toml`. Dependency allowlist (S10/S16) |
 | `llama-view` | vcsa reader and terminal painter | `rustix` |
 
@@ -53,6 +53,7 @@ The workspace crates:
                                                                                └──────────────────────────────────► Kraken LCD (hidraw + usbfs EP 0x02)
 
  snapshot.json ──► llama-light ──► [[light]] mappings ──► Aura USB controller (hidraw, direct colour, RAM only)
+                                                         └──► Corsair keyboard lighting interface (hidraw, per-key colour, RAM only)
  snapshot.json ──► llama-metrics ──► GET /metrics on :19477 ──► Prometheus on the allowed LAN
 ```
 
@@ -89,9 +90,9 @@ The workspace crates:
   10 s). *Stream* mode renders and uploads every tick at `stream_fps` (1–12,
   default 10), smoothing the gauge per frame and animating the redline.
 - **LCD (V3b Plasma Blackbody).** A 270° gauge, 0–125 from 7:30 to 4:30,
-  coloured by position, with a 100–125 redline; above 100 the head goes
-  white-hot, and at the peg deterministic smoke and embers rise. Inside it, the
-  activity dial: 24 bars in five tiers (10 × 0.5 s, 2 × 5 s, 3 × 15 s,
+  coloured by position, with a 100–125 redline; above 100 the head goes hot
+  orange-gold, and at the peg deterministic smoke and embers rise. Inside it,
+  the activity dial: 24 bars in five tiers (10 × 0.5 s, 2 × 5 s, 3 × 15 s,
   4 × 1 min, 5 × 5 min = 30 min), each the mean activity of its window, with
   tier ticks and labels as a time scale. A bar below `xff` coverage draws
   nothing, never zero. The centre has the model name (up to two lines, head and
@@ -193,7 +194,7 @@ budget as uploads.
 |---|---|---|
 | `llama-watch` | `/run/llama-watch/`, tty11 (an fd inherited from systemd), the journal | `/proc`, hwmon (the `[fans]` chip only by reading `fanN_input`, `pwmN`, `pwmN_enable`), NVML devices, loopback llama-swap. It **cannot** open the cooler's nodes |
 | `kraken-lcd` | The cooler's LCD, `/var/lib/kraken-lcd/halted`, the journal | The snapshot, the cooler's own sysfs (guard and open checks), its hidraw and usbfs nodes |
-| `llama-light` | The Aura controller's colours, the journal | The snapshot, `light.toml`, the Aura node's sysfs ids and the keyboard's USB ids. No Kraken, no hwmon, no i2c |
+| `llama-light` | The Aura controller's and the keyboard's colours, the journal | The snapshot, `light.toml`, the Aura node's sysfs ids and the keyboard's sysfs ids and usage page. No Kraken, no hwmon, no i2c |
 | `llama-metrics` | Its sockets, the journal | The snapshot and `metrics.toml`. No `/proc` (beyond its own), `/sys` or `/dev` |
 | `llama-view` users | Their own terminal | `/dev/vcsa11` (group `llama-view`, 0640) |
 

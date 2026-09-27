@@ -10,8 +10,9 @@ User=llama-light
 Group=llama-light
 SupplementaryGroups=llama-watch
 ExecStart=/usr/local/libexec/llama-bored/llama-light run --config /etc/llama-bored/light.toml
-# Leaves ARGB header 1 on a neutral static colour, in RAM (no save to flash).
-# The board's stored effect returns at the next power cycle.
+# Leaves ARGB header 1 on a neutral static colour, in RAM (no save to flash);
+# the board's stored effect returns at the next power cycle. Hands the
+# keyboard back to its own (hardware) lighting, also RAM only.
 ExecStopPost=-/usr/local/libexec/llama-bored/llama-light restore --config /etc/llama-bored/light.toml
 Restart=on-failure
 # Exit 2 is an unusable config at start; restarting cannot fix it.
@@ -50,12 +51,18 @@ ProtectProc=invisible
 ProcSubset=pid
 ReadOnlyPaths=/sys
 
-# --- devices: only the Aura controller's hidraw node, through the udev
-# symlink from 94-llama-light-hidraw.rules. No i2c, no usbfs, no Kraken.
-# The keyboard node is added when its protocol lands. After a USB
-# re-enumeration the node can get a new minor; restart the unit to pick it up.
+# --- devices: only the Aura controller's and the keyboard lighting
+# interface's hidraw nodes, through the udev symlinks from
+# 94-llama-light-hidraw.rules. No i2c, no usbfs, no Kraken. systemd resolves
+# each symlink when the unit starts: a missing one (keyboard unplugged) is
+# a warning in the journal, not a failure. A keyboard plugged in later is
+# refused by the kernel until the unit restarts; llama-light notices that
+# once and exits 3, and Restart=on-failure brings it back with the node.
+# After an Aura re-enumeration the node can get a new minor; restart the
+# unit to pick it up.
 DevicePolicy=closed
 DeviceAllow=/dev/llama-light/aura rw
+DeviceAllow=/dev/llama-light/keyboard rw
 
 # --- network: none
 PrivateNetwork=yes

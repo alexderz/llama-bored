@@ -110,7 +110,7 @@ fn slot_centre_deg(index: usize) -> f32 {
     unreachable!("24 bars");
 }
 
-const L6: (u8, u8, u8) = (0xFF, 0x3A, 0x22);
+const L6: (u8, u8, u8) = (0xFF, 0x2A, 0x14);
 const L1: (u8, u8, u8) = (0x4A, 0x55, 0xC8);
 /// Redline track: 3 o'clock is 104 on the 0–125 scale.
 const REDLINE_TRACK: (u8, u8, u8) = (0x3A, 0x12, 0x16);
@@ -261,7 +261,7 @@ fn step_colour_and_shading_follow_the_level() {
     let mid = sample_at(&l6, 135.0, angle);
     assert!(
         near(mid, L6, 48),
-        "L6 at 72% of the bar is #FF3A22, got {mid:?}"
+        "L6 at 72% of the bar is #FF2A14, got {mid:?}"
     );
     let base = sample_at(&l6, 122.0, angle);
     let mid_sum = u16::from(mid.0) + u16::from(mid.1) + u16::from(mid.2);

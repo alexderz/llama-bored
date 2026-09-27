@@ -4,13 +4,16 @@ use std::process::ExitCode;
 use llama_core::log::{self, Priority};
 use llama_light::aura::AuraBackend;
 use llama_light::aura::device::HidrawOpener;
+use llama_light::backend::Backend;
 use llama_light::config::{self, ConfigFile};
-use llama_light::keyboard::KeyboardStub;
-use llama_light::service::{self, HostClock, Light, Parts, SdNotify};
+use llama_light::keyboard::KeyboardBackend;
+use llama_light::keyboard::device::KeyboardOpenerHidraw;
+use llama_light::service::{self, HostClock, Light, Parts, RunEnd, SdNotify};
 use llama_light::snapshot::SnapshotFile;
 
 const USAGE: &str = "usage: llama-light <run|restore|check> --config PATH";
-/// Device and sysfs roots. The unit allows only /dev/llama-light/aura.
+/// Device and sysfs roots. The unit allows only /dev/llama-light/aura and
+/// /dev/llama-light/keyboard.
 const DEV_ROOT: &str = "/dev";
 const SYS_ROOT: &str = "/sys";
 
@@ -43,16 +46,11 @@ fn run(path: PathBuf) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let keyboard: Option<Box<dyn llama_light::backend::Backend>> = if config.keyboard_enabled {
-        log::emit(
-            &mut sink,
-            Priority::Info,
-            "keyboard: detection only; the keyboard protocol is not implemented, nothing is written",
-        );
-        Some(Box::new(KeyboardStub::new(SYS_ROOT)))
-    } else {
-        None
-    };
+    // Always built, so a reload can turn the keyboard on. The opener notes
+    // which node the pin names now, when the unit's device list was made.
+    let keyboard: Option<Box<dyn Backend>> = Some(Box::new(KeyboardBackend::new(
+        KeyboardOpenerHidraw::new(DEV_ROOT, SYS_ROOT),
+    )));
     let mut light = Light::new(Parts {
         clock: HostClock,
         snapshots: SnapshotFile::published(),
@@ -65,25 +63,39 @@ fn run(path: PathBuf) -> ExitCode {
         )))),
         keyboard,
     });
-    light.run(None);
-    ExitCode::SUCCESS
+    match light.run(None) {
+        // Restart=on-failure brings the unit back with the new node allowed.
+        RunEnd::Restart => ExitCode::from(3),
+        RunEnd::Ticks => ExitCode::SUCCESS,
+    }
 }
 
 fn restore(path: PathBuf) -> ExitCode {
     let mut sink = log::Stderr;
-    let config = match config::load(&path) {
-        Ok(config) => config,
+    // An unusable config still hands the keyboard back: it may have been
+    // on under the config that was running.
+    let (config, keyboard_on) = match config::load(&path) {
+        Ok(config) => {
+            let on = config.keyboard.enabled;
+            (config, on)
+        }
         Err(err) => {
             log::emit(
                 &mut sink,
                 Priority::Warning,
                 &format!("restore: config unusable ({err}); using defaults"),
             );
-            config::LightConfig::default()
+            (config::LightConfig::default(), true)
         }
     };
     let mut aura = AuraBackend::new(HidrawOpener::new(DEV_ROOT, SYS_ROOT));
-    ExitCode::from(service::restore(&config, &mut aura, &mut sink))
+    let mut keyboard = KeyboardBackend::new(KeyboardOpenerHidraw::new(DEV_ROOT, SYS_ROOT));
+    let keyboard: Option<&mut dyn Backend> = if keyboard_on {
+        Some(&mut keyboard)
+    } else {
+        None
+    };
+    ExitCode::from(service::restore(&config, &mut aura, keyboard, &mut sink))
 }
 
 /// Validate without touching any device.
@@ -91,13 +103,18 @@ fn check(path: PathBuf) -> ExitCode {
     match config::load(&path) {
         Ok(config) => {
             eprintln!(
-                "{}: ok ({} light entr{}, {} LEDs per frame, {} fps, brightness cap {} %)",
+                "{}: ok ({} light entr{}, {} LEDs per frame, {} fps, brightness cap {} %; keyboard {})",
                 path.display(),
                 config.layers.len(),
                 if config.layers.len() == 1 { "y" } else { "ies" },
                 config.aura.frame_len(),
                 config.aura.fps,
-                config.aura.brightness_max
+                config.aura.brightness_max,
+                if config.keyboard.enabled {
+                    format!("on, brightness cap {} %", config.keyboard.brightness_max)
+                } else {
+                    "off".to_owned()
+                }
             );
             ExitCode::SUCCESS
         }

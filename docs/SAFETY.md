@@ -110,8 +110,17 @@ when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
 - **Bounded output.** Every LED is capped at `brightness_max` (default 80 %),
   which also limits header current, and frames are sent at most `fps` times
   a second, only when they change.
-- **Keyboard: detection only.** The Corsair backend reads USB ids and writes
-  nothing until its protocol lands.
+- **Keyboard: a closed encoder on the lighting interface.** udev pins only
+  the STRAFE RGB MK.2's interface 1 (vendor usage page `0xFFC2`) to
+  `/dev/llama-light/keyboard`; llama-light re-checks the usage page before
+  opening it. Typing uses another interface and evdev, and is untouched. The
+  encoder can emit four report shapes: software mode and hardware mode
+  (`07 05`, a RAM mode switch), a colour stream packet (`7F`) and a 24-bit
+  channel commit (`07 28`). Reset, special-function, firmware, poll-rate,
+  key-routing, hardware-profile and stored-lighting writes, and all reads,
+  are never built, and S15 fails if their bytes appear. On stop,
+  `llama-light restore` sends hardware mode, so the keyboard shows its own
+  lighting again. Unplugged: logged once, retried every 10 s.
 
 ## The network exporter (llama-metrics)
 
@@ -174,7 +183,7 @@ anomalies. Nothing on the device needs cleaning up after uninstall.
 | RR5 | A broken runtime could stop `ExecStopPost` from restoring stock | One native binary on glibc; `restore-stock` uses no optional libraries | **Closed** |
 | RR6 | The build tree and toolchain are writable by the build user, whose build root installs | The installer refuses a dirty tree, an unreleased HEAD, or a hash mismatch, and root never runs git or cargo. This protects against accidents, not against a compromised build account | **Accepted** |
 | RR7 | A class-wide `DeviceAllow=char-hidraw` would let the writer open every hidraw node (keyboards and so on) | Closed by pinning: udev adds `/dev/kraken-lcd/hid` for the cooler's node only, the writer unit's single hidraw grant is `DeviceAllow=/dev/kraken-lcd/hid`, and the installer checks that the symlink resolves to that node. The writer cross-checks the node against the cooler's sysfs path before opening it (S1). Trade-off: after a USB re-enumeration the writer needs a restart | **Closed** |
-| RR7b | The Aura controller's hidraw node may also be world-writable or `uaccess`-tagged by distro or OpenRGB rules | `94-llama-light-hidraw.rules` sorts after them, sets `0660 root:llama-light` and strips `uaccess`; the unit is pinned to `/dev/llama-light/aura`, checked against sysfs and `fstat` | **Closed** |
+| RR7b | The Aura controller's and the keyboard lighting interface's hidraw nodes may also be world-writable or `uaccess`-tagged by distro or OpenRGB rules | `94-llama-light-hidraw.rules` sorts after them, sets `0660 root:llama-light` and strips `uaccess`; the unit is pinned to `/dev/llama-light/aura`, checked against sysfs and `fstat` | **Closed** |
 | RR8 | While HALTED, our last frame can stay on screen and look live | Deliberate: no device I/O beats a fresh screen once cooling looks wrong. CRITICAL log, `systemctl status`, optional desktop alert | **Accepted** |
 | RR-LV1 | Prompts and outputs are readable on tty11 (and through llama-view) by anyone at the console, KVM or remote console, or in the `llama-view` group | `[tty] show_text = false` (or `llama-watch run --no-text`) removes the IN/OUT panels, the watcher stops keeping llama text at all, and the header shows "text off". The install skill asks the operator. Text appears only if `LLAMA_SERVER_SLOTS_DEBUG=1` is on. Tails only, no scrollback, and the VT is cleared on stop | **Operator's choice** (default: shown) |
 | RR-LV2 | With `LLAMA_SERVER_SLOTS_DEBUG=1`, llama-server's `/slots` returns whole prompts to **anyone who can reach llama-swap** | Keep llama-swap bound to loopback, or put a proxy in front that blocks any `slots` path for other clients. llama-watch must reach llama-swap directly | **Operator's responsibility** |

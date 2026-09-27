@@ -63,7 +63,7 @@ fn render_once_writes_a_png_of_the_view_fixture() {
     assert_eq!((width, height), (320, 320));
     assert_eq!(corner, [0, 0, 0, 255], "corner is opaque black");
     // 12 o'clock on the ring is 62.5 on the 0–125 scale. The fixture's 70 %
-    // arc covers it in act_color magenta (#D044A8 → #F4466A), head-lightened.
+    // arc covers it in act_color magenta (#C21CC8 → #F21E5A), head-lightened.
     let (_, _, pixel) = common::rgba_png_pixel(&bytes, 160, 12).expect("ring pixel");
     assert!(
         pixel[0] > 0xC0 && pixel[2] > 0x90 && pixel[1] < 0x90 && pixel[3] == 255,

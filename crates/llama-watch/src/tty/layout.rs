@@ -413,28 +413,33 @@ fn draw_rule(grid: &mut Grid, row: u16, cols: u16) {
 }
 
 fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
+    // The bool is "a level": a spectrum along the bar. VRAM and MEM are
+    // capacity and keep one band colour for the whole bar.
     let meters = [
-        ("CPU", cpu_value(model), model.cpu_pct),
-        ("GPU", pct_value(model.gpu_pct), model.gpu_pct),
+        ("CPU", cpu_value(model), model.cpu_pct, true),
+        ("GPU", pct_value(model.gpu_pct), model.gpu_pct, true),
         (
             "VRAM",
             gb_value(model.vram_used_gb, model.vram_total_gb),
             percent_of(model.vram_used_gb, model.vram_total_gb),
+            false,
         ),
         (
             "MEM",
             gb_value(model.mem_used_gb, model.mem_total_gb),
             percent_of(model.mem_used_gb, model.mem_total_gb),
+            false,
         ),
         (
             "POWER",
             power_value(model),
             percent_of(model.power_w, model.power_limit_w),
+            true,
         ),
-        ("LOAD", pct_value(model.load_pct), model.load_pct),
+        ("LOAD", pct_value(model.load_pct), model.load_pct, true),
     ];
     let starting = model.state == WatchState::Starting;
-    for (i, (label, value, percent)) in meters.into_iter().enumerate() {
+    for (i, (label, value, percent, level)) in meters.into_iter().enumerate() {
         let row = 3 + i as u16 * g.pitch;
         paint_str(grid, 2, row, label, C16::White, C16::Black);
         let shown = if starting { "--".to_string() } else { value };
@@ -449,8 +454,13 @@ fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         } else {
             percent.map(f64::round)
         };
-        let (top, bot) = band(pct.unwrap_or(0.0));
         let frac = pct.and_then(|p| (p > 0.0).then_some(p / 100.0));
+        let ink = if level {
+            level_ink(pct)
+        } else {
+            let (top, bot) = band(pct.unwrap_or(0.0));
+            BarInk::Fixed(top, bot)
+        };
         draw_h_bar(
             grid,
             HBar {
@@ -458,11 +468,8 @@ fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 row,
                 width: g.left_bar_w,
                 frac,
-                top,
-                bot,
+                ink,
                 rows: g.bar_rows,
-                ramp: false,
-                cap: false,
             },
         );
     }
@@ -502,8 +509,8 @@ fn draw_one_meter(
     } else {
         percent.map(f64::round)
     };
-    let (top, bot) = band(pct.unwrap_or(0.0));
-    // Activity reads up to 125: over 100 the bar is full and red.
+    // Activity reads up to 125: over 100 the bar is full and its top step
+    // turns white-hot.
     let frac = pct.and_then(|p| (p > 0.0).then_some((p / 100.0).min(1.0)));
     draw_h_bar(
         grid,
@@ -512,11 +519,8 @@ fn draw_one_meter(
             row,
             width: g.left_bar_w,
             frac,
-            top,
-            bot,
+            ink: level_ink(pct),
             rows: g.bar_rows,
-            ramp: false,
-            cap: false,
         },
     );
 }
@@ -585,8 +589,15 @@ fn percent_of(used: Option<f64>, total: Option<f64>) -> Option<f64> {
     }
 }
 
+/// Spectrum ink for a level meter. Past 100 % the top step is white-hot.
+fn level_ink(pct: Option<f64>) -> BarInk {
+    BarInk::Spectrum {
+        hot: pct.is_some_and(|p| p > 100.0),
+    }
+}
+
 /// LCD ring bands on a percent: quiet, light, busy, flat-out, then red
-/// over 100 (activity past its nominal ceiling).
+/// over 100. Only the capacity meters (VRAM, MEM) still use them.
 fn band(percent: f64) -> (C16, C16) {
     if percent > 100.0 {
         (C16::BrightRed, C16::Red)
@@ -601,57 +612,66 @@ fn band(percent: f64) -> (C16, C16) {
     }
 }
 
+/// The console's five steps of the shared activity ramp (L1..L5), low to
+/// high: indigo, blue, magenta, pink, red.
+const STEPS: [C16; 5] = [
+    C16::Blue,
+    C16::BrightBlue,
+    C16::Magenta,
+    C16::BrightMagenta,
+    C16::BrightRed,
+];
+
+/// How the lit cells of a bar are coloured. The empty track is always 90.
+#[derive(Clone, Copy)]
+enum BarInk {
+    /// One top/bottom pair for every lit cell: progress, capacity, alarms.
+    Fixed(C16, C16),
+    /// Each lit cell takes the step of its own position (its fifth of full
+    /// scale), so a bar starts blue and a full bar shows every step. `hot` is
+    /// a value past full scale: the top step turns white-hot (97 on 91).
+    Spectrum { hot: bool },
+}
+
 struct HBar {
     x: u16,
     row: u16,
     width: u16,
     frac: Option<f64>,
-    top: C16,
-    bot: C16,
+    ink: BarInk,
     rows: u16,
-    ramp: bool,
-    cap: bool,
 }
 
 fn draw_h_bar(grid: &mut Grid, bar: HBar) {
-    let glyphs = bar_glyphs(
-        bar.frac.unwrap_or(0.0),
-        usize::from(bar.width),
-        bar.frac.is_some_and(|frac| frac > 0.0),
-    );
-    for (i, ch) in glyphs.iter().enumerate() {
-        let (fg_top, fg_bot) = if *ch == '░' {
-            (C16::BrightBlack, C16::BrightBlack)
-        } else if bar.ramp && bar.cap {
-            (C16::BrightWhite, C16::BrightRed)
-        } else if bar.ramp {
-            let colour = ramp_colour(i, usize::from(bar.width));
-            (colour, colour)
-        } else {
-            (bar.top, bar.bot)
+    let width = usize::from(bar.width);
+    let lit = lit_halves(bar.frac, width);
+    for i in 0..width {
+        let ch = bar_glyph(i, lit);
+        let (fg_top, fg_bot) = match bar.ink {
+            _ if ch == '░' => (C16::BrightBlack, C16::BrightBlack),
+            BarInk::Fixed(top, bot) => (top, bot),
+            BarInk::Spectrum { hot } => spectrum_colours(i, width, hot),
         };
-        let top_ch = *ch;
         let bot_ch = match ch {
             '█' => '▓',
-            other => *other,
+            other => other,
         };
         let col = bar.x + i as u16;
-        paint(grid, col, bar.row, top_ch, fg_top, C16::Black);
+        paint(grid, col, bar.row, ch, fg_top, C16::Black);
         if bar.rows > 1 {
             paint(grid, col, bar.row + 1, bot_ch, fg_bot, C16::Black);
         }
     }
 }
 
-fn ramp_colour(cell: usize, width: usize) -> C16 {
-    const STEPS: [C16; 5] = [
-        C16::Blue,
-        C16::BrightBlue,
-        C16::Magenta,
-        C16::BrightMagenta,
-        C16::BrightRed,
-    ];
-    STEPS[fifth(cell, width)]
+/// Top and bottom colour of spectrum cell `cell` in a bar `width` cells long.
+fn spectrum_colours(cell: usize, width: usize, hot: bool) -> (C16, C16) {
+    let step = fifth(cell, width);
+    if hot && step == STEPS.len() - 1 {
+        (C16::BrightWhite, C16::BrightRed)
+    } else {
+        (STEPS[step], STEPS[step])
+    }
 }
 
 fn fifth(cell: usize, width: usize) -> usize {
@@ -662,27 +682,28 @@ fn fifth(cell: usize, width: usize) -> usize {
     (0..5).find(|step| cell < edge(step + 1)).unwrap_or(4)
 }
 
-fn bar_glyphs(frac: f64, width: usize, draw_fill: bool) -> Vec<char> {
-    let mut glyphs = vec!['░'; width];
-    if width == 0 || !draw_fill || frac <= 0.0 {
-        return glyphs;
+/// Lit half cells `n = clamp(round(frac × 2W), 2, 2W)`; 0 for no fill.
+fn lit_halves(frac: Option<f64>, width: usize) -> usize {
+    match frac {
+        Some(frac) if frac > 0.0 && width > 0 => {
+            let tw = width * 2;
+            ((frac * tw as f64).round() as usize).clamp(2, tw)
+        }
+        _ => 0,
     }
-    let tw = (width * 2) as i32;
-    let n = (frac * tw as f64).round() as i32;
-    let n = n.clamp(2, tw);
-    for (cell, glyph) in glyphs.iter_mut().enumerate() {
-        let left = (cell * 2) as i32;
-        let right = left + 1;
-        let lit_l = (1..n).contains(&left);
-        let lit_r = (1..n).contains(&right);
-        *glyph = match (lit_l, lit_r) {
-            (true, true) => '█',
-            (false, true) => '▐',
-            (true, false) => '▌',
-            (false, false) => '░',
-        };
+}
+
+/// Glyph of `cell` when halves `1..lit` are lit (half 0 is the rounded start).
+fn bar_glyph(cell: usize, lit: usize) -> char {
+    let left = cell * 2;
+    let lit_l = (1..lit).contains(&left);
+    let lit_r = (1..lit).contains(&(left + 1));
+    match (lit_l, lit_r) {
+        (true, true) => '█',
+        (false, true) => '▐',
+        (true, false) => '▌',
+        (false, false) => '░',
     }
-    glyphs
 }
 
 fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
@@ -769,7 +790,7 @@ fn digit_len(value: Option<f64>) -> usize {
 }
 
 fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64>, rows: u16) {
-    let cap = frac.is_some_and(|frac| frac >= 1.0);
+    let hot = frac.is_some_and(|frac| frac >= 1.0);
     draw_h_bar(
         grid,
         HBar {
@@ -777,11 +798,8 @@ fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64
             row,
             width,
             frac,
-            top: C16::BrightBlack,
-            bot: C16::BrightBlack,
+            ink: BarInk::Spectrum { hot },
             rows,
-            ramp: true,
-            cap,
         },
     );
 }
@@ -901,13 +919,6 @@ fn draw_digits(
 }
 
 fn digit_colours(step: usize) -> (C16, C16) {
-    const STEPS: [C16; 5] = [
-        C16::Blue,
-        C16::BrightBlue,
-        C16::Magenta,
-        C16::BrightMagenta,
-        C16::BrightRed,
-    ];
     if step >= 5 {
         (C16::BrightWhite, C16::BrightRed)
     } else {
@@ -1006,11 +1017,8 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 row,
                 width: bar_w,
                 frac,
-                top: fill,
-                bot: fill,
+                ink: BarInk::Fixed(fill, fill),
                 rows: 1,
-                ramp: false,
-                cap: false,
             },
         );
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
@@ -1133,11 +1141,8 @@ fn paint_slot_spark(
                 row,
                 width: CTX_METER_W,
                 frac: Some(frac),
-                top: ctx_colour(frac),
-                bot: ctx_colour(frac),
+                ink: BarInk::Spectrum { hot: false },
                 rows: 1,
-                ramp: false,
-                cap: false,
             },
         );
     }
@@ -1241,19 +1246,9 @@ fn compact_k(n: u64) -> String {
     }
 }
 
-/// Step palette, one colour for the whole meter. The top step is red.
+/// Step of a context fill, one colour per sparkline column. The top step is red.
 fn ctx_colour(frac: f64) -> C16 {
-    const STEPS: [C16; 5] = [
-        C16::Blue,
-        C16::BrightBlue,
-        C16::Magenta,
-        C16::BrightMagenta,
-        C16::BrightRed,
-    ];
-    if frac >= 1.0 {
-        return C16::BrightRed;
-    }
-    let step = ((frac.max(0.0) * 5.0).floor() as usize).min(4);
+    let step = ((frac.max(0.0) * 5.0).floor() as usize).min(STEPS.len() - 1);
     STEPS[step]
 }
 
@@ -1311,11 +1306,8 @@ fn paint_slot_ctx(grid: &mut Grid, row: u16, after_decoded: u16, cols: u16, slot
                 row,
                 width: col_u16(meter_w),
                 frac: Some(frac),
-                top: ctx_colour(frac),
-                bot: ctx_colour(frac),
+                ink: BarInk::Spectrum { hot: false },
                 rows: 1,
-                ramp: false,
-                cap: false,
             },
         );
         meter_x.saturating_sub(gap + label_w)
@@ -1831,7 +1823,13 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             C16::Black,
         );
         let frac = rate_frac(Some(req.gen_tps), model.gen_ceiling);
-        let cap = !dim && frac.is_some_and(|frac| frac >= 1.0);
+        let ink = if dim {
+            BarInk::Fixed(C16::BrightBlack, C16::BrightBlack)
+        } else {
+            BarInk::Spectrum {
+                hot: frac.is_some_and(|frac| frac >= 1.0),
+            }
+        };
         draw_h_bar(
             grid,
             HBar {
@@ -1839,11 +1837,8 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
                 row,
                 width: plan.bar.w,
                 frac,
-                top: C16::BrightBlack,
-                bot: C16::BrightBlack,
+                ink,
                 rows: 1,
-                ramp: !dim,
-                cap,
             },
         );
         paint_span_right(grid, plan.dur, row, &req.dur, plain, C16::Black);
@@ -2471,11 +2466,12 @@ fn draw_fan_row(grid: &mut Grid, fan: &FanReading, left: u16, width: usize, row:
                 row,
                 width: col_u16(bar_w),
                 frac,
-                top: C16::Red,
-                bot: C16::Red,
+                ink: if stalled {
+                    BarInk::Fixed(C16::Red, C16::Red)
+                } else {
+                    BarInk::Spectrum { hot: false }
+                },
                 rows: 1,
-                ramp: !stalled,
-                cap: false,
             },
         );
         col += col_u16(bar_w) + 1;

@@ -1,8 +1,8 @@
 # /etc/llama-bored/light.toml — llama-light: RGB lighting from the llama-watch snapshot.
 #
 # Colour only. llama-light never changes fan or pump speed, never saves
-# anything to the lighting controller's flash, and reads nothing but
-# /run/llama-watch/snapshot.json.
+# anything to the lighting controller's or the keyboard's flash, and reads
+# nothing but /run/llama-watch/snapshot.json.
 #
 # Check a file without touching any device:
 #   /usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml
@@ -23,7 +23,28 @@ brightness_max = 80       # 0..=100 %. A cap on every LED (limits header current
 fps = 10                  # 1..=20 frames per second; a frame is sent only when it changes
 
 [keyboard]
-enabled = false           # Corsair STRAFE RGB MK.2 (1b1c:1b48): detection only for now
+enabled = false           # Corsair STRAFE RGB MK.2 (1b1c:1b48), per-key colour
+brightness_max = 100      # 0..=100 %. A cap on every key
+# While llama-light runs, the keyboard shows only what [[light]] entries
+# draw (keys no entry covers are off). When llama-light stops, or the
+# keyboard is turned off here, the keyboard goes back to its own lighting.
+# Unplugged: logged once, looked for every 10 s; the fans carry on.
+
+# [engine]                # optional: the frame pipeline (see keyboard-c)
+# tick_hz = 10            # 1..=20 loop rate: metrics sampled, frames made (default aura.fps)
+# target_hz = 2           # LED targets recomputed this often (default: every tick)
+# tween_fps = 10          # 1..=20, <= tick_hz: most keyboard frames per second
+# tween_s = 0.5           # each new target is reached in a straight line over this
+#                         # (default 1 / target_hz; at most one target period)
+#
+# [base]                  # optional: under every entry, so every LED no
+# color = "#1428D8"       # entry lights shows it (default black)
+# brightness = 0.10
+#
+# [palette.NAME]          # optional: a named palette for palette = "NAME".
+# stops = [[0, "#1428D8"], [100, "#FF2A14"], [125, "#FFD050"]]
+#                         # positions are percent of range, 0..=125, ascending;
+#                         # [palette.act] replaces the built-in act.
 
 # ---------------------------------------------------------------------------
 # [[light]] entries. Later entries draw over earlier ones. Keys:
@@ -31,27 +52,75 @@ enabled = false           # Corsair STRAFE RGB MK.2 (1b1c:1b48): detection only 
 #   target      "aura.fans"                 every fan (default)
 #               "aura.chain[2]"             one fan on a daisy chain (fans = "chain")
 #               "aura.chain[0..2]"          fans 0 and 1 as one span ("0..=1" also works)
-#               'keyboard.keys["F1".."F12"]' keys, once the keyboard protocol lands
-#   metric      activity (default) | gpu | cpu | load | tokens_rate | mem
-#               coolant | gpu_temp | cpu_temp (degrees C)
+#               'keyboard.keys["F1".."F12"]' keys F1 to F12 as one span, left to right
+#               'keyboard.keys["W","A","S","D"]' these keys as one span, in this order
+#               "keyboard.all"              every key
+#               ["Insert", "Delete"]        these keys as one span, in this order
+#               "Number Pad +"              one key by name
+#               "led:110"                   one key by index in the known key
+#                                           order (row by row, left to right,
+#                                           led:0..=led:110): for keys a driver
+#                                           lists unnamed; led:97 is "Number Pad
+#                                           Enter", led:110 is "Number Pad ."
+#               Key names are OpenRGB's without "Key: ": "Escape", "F1", "`",
+#               "1", "Q", "Caps Lock", "Left Shift", "Space", "Enter",
+#               "Number Pad 7", "Up Arrow", "Media Mute", ... A range runs
+#               row by row, left to right. [keyboard] enabled = true first.
+#   metric      activity (default) | gpu | cpu | cpu_topk | load | tokens_rate
+#               mem | coolant | gpu_temp | cpu_temp (degrees C). The
+#               snapshot's field names work too: activity_pct, gpu_pct,
+#               cpu_pct, cpu_topk_pct, load_pct, mem_pct, tokens_per_s,
+#               coolant_c, gpu_c, cpu_c.
 #               activity is the LCD's power-weighted activity (0-125);
-#               tokens_rate is decoded tokens/s from the watcher's counter.
+#               tokens_rate is decoded tokens/s from the watcher's counter;
+#               decoded_total is that counter itself (style = "gate" only).
+#   rate_window_s  tokens_rate only: 0..=60 s. Tokens/s is the counter's
+#               change over this sliding window (default 0: between two
+#               snapshots, which flickers as tokens land in bursts; 2.0 is
+#               steady).
 #   range       [min, max] in the metric's units. Defaults: percents [0, 100],
 #               tokens_rate [0, 100], coolant [25, 45], gpu_temp [30, 85],
 #               cpu_temp [30, 90]. Must be finite with min < max.
 #   scale       "linear" (default) | "log" (log needs min > 0)
 #   style       "solid"  whole target one colour
-#               "ring" / "bar"  k of N LEDs lit from LED 0, a coarse gauge;
+#               "ring" / "bar"  k of N LEDs lit from LED 0, a gauge;
 #                        unlit LEDs show whatever an earlier entry drew
 #               "pulse"  whole target breathing; faster as the value rises
+#               "ladder" one rung per LED in the order given; rung k is
+#                        fully lit at thresholds[k]
+#               "gate"   color, on while the raw value was above threshold
+#                        (default 0) in the last hold_s
+#               "peak"   the highest value, held peak_s, then falling
+#                        linearly (the whole range in peak_s)
+#   edge        bar, ladder: "round" (default, whole LEDs) | "fractional"
+#               (the last LED lit by the fraction filled)
+#   gradient    bar, ladder: "value" (default: every lit LED the value's
+#               colour) | "position" (each LED the colour of its own place)
+#   fill_to     bar: percent of range the full bar stands for, 100..=125
+#               (default 100); 125 gives the last LEDs the over-range
+#   thresholds  ladder: one value per LED, ascending, above range min
+#               (default: evenly over the range)
+#   threshold   solid, pulse, peak: below it the entry draws nothing
+#               (with attack_s / smooth_s it fades in and out)
+#   hold_s      gate: 0..=60 s (default 1)
+#   shimmer     gate: { depth = 0.2, hz = 0.7 }, brightness x (1 +- depth)
+#   peak_s      peak: 0..=60 s (default 30)
 #   palette     "act" (default: the LCD ramp) | "thermal" | "mono"
 #   stops       instead of palette: [[position, "#RRGGBB"], ...], ascending.
 #               A number is in metric units; a string "60%" is percent of
 #               range. Positions may run from 0 % to 125 % of the range.
-#   brightness  0..=100 % for this entry (default 100), under brightness_max
-#   smooth_s    0..=60 s exponential smoothing (default 0, off)
+#   brightness  0..=100 % for this entry (default 100), under brightness_max.
+#               A float is a fraction: 0.45 is 45 %. solid: [lo, hi] scales
+#               with the value, lo at range min to hi at range max.
+#   smooth_s    0..=60 s exponential smoothing (default 0, off); with
+#               attack_s it is the fall (release) time
+#   attack_s    0..=60 s smoothing while the value rises (default smooth_s)
 #   idle_color  "#RRGGBB" shown below range min and when the metric is missing
 #               (without it a missing metric shows a dim grey)
+#   color       "#RRGGBB" a fixed colour instead of a metric (with brightness
+#               only: no metric, range, palette, stops or style)
+#
+# When every entry is on the keyboard, the fans keep the default entry.
 # ---------------------------------------------------------------------------
 
 # Uncomment one example below (remove the leading "# " from its lines), or
@@ -120,16 +189,139 @@ enabled = false           # Corsair STRAFE RGB MK.2 (1b1c:1b48): detection only 
 # chain = [ { metric = "gpu" }, { metric = "cpu" }, { metric = "activity" }, { metric = "tokens_rate", range = [1, 200], scale = "log" } ]
 # --- end
 
-# --- example: keyboard-f-row
-# # Future: the F-row as a 12-key coolant gauge. Parsed and checked today;
-# # nothing is written to the keyboard until its protocol lands.
+# --- example: keyboard-c
+# # Variant C1: two-row bars, value-coloured, numpad as a dial centred on "5".
+# #
+# # Built for a translucent plate: no bar is one key tall, no gradient runs
+# # along a bar, and every bar is one solid colour chosen by its value, so
+# # bleed between neighbours only ever mixes a colour with itself.
+# #
+# #   F1-F12                   activity 0-125 (F1-F10 = 0-100, F11-F12 the
+# #                            blackbody over-range). Own bar: gap above the
+# #                            number row.
+# #   ` 1 2 .. Backspace  +    GPU % as ONE bar two rows tall, keys in x
+# #   Tab Q W .. \             order so it grows in half-key steps (28 steps)
+# #   Caps A S .. Enter   +    busiest cores % (cpu_topk) as one bar two rows
+# #   Shift Z X .. Shift       tall, 25 half-key steps
+# #   Ins Home PgUp            GPU temperature: one six-key tile, colour and
+# #   Del End PgDn             brightness slide with the value, very slow
+# #   numpad                   tokens/s as a DIAL centred on "5": the ring
+# #                            8 9 6 3 2 1 4 7 sweeps clockwise from 12
+# #                            o'clock, 0-100 tok/s, ring the rate's colour;
+# #                            "5" breathes in that colour while generating;
+# #                            over 100 tok/s a second lap sweeps the outer
+# #                            frame / * - + Enter . 0 Num Lock
+# #   everything else          dim blue base (bottom row, arrows, media keys)
+# # The fans keep the default (activity on every fan).
+#
 # [keyboard]
 # enabled = true
 #
+# [engine]
+# tick_hz    = 10      # metric sampling
+# target_hz  = 2       # LED targets recomputed every 0.5 s
+# tween_fps  = 10      # software interpolation frames
+# tween_s    = 0.5     # tween length = one target period
+#
+# [base]               # every LED no [[light]] lights
+# color      = "#1428D8"
+# brightness = 0.08
+#
+# [palette.act]        # percent of range; 100-125 is the blackbody tail
+# stops = [[0,"#1428D8"],[20,"#3A1EF0"],[40,"#7A1FE8"],[60,"#C21CC8"],[80,"#F21E5A"],[100,"#FF2A14"],
+#          [107,"#FF5A12"],[114,"#FF8A1E"],[120,"#FFB030"],[125,"#FFD050"]]
+#
+# # --- bar 1: F-row = activity ------------------------------------------------
 # [[light]]
-# target = 'keyboard.keys["F1".."F12"]'
-# metric = "coolant"
-# range = [25, 45]
-# style = "bar"
-# palette = "thermal"
+# target   = 'keyboard.keys["F1".."F12"]'
+# metric   = "activity_pct"
+# range    = [0, 100]
+# fill_to  = 125       # F1-F10 cover 0-100, F11-F12 the blackbody 100-125
+# style    = "bar"
+# edge     = "fractional"
+# palette  = "act"
+# gradient = "value"   # whole bar one colour: the value's
+# brightness = 1.0
+# attack_s = 0.6
+# smooth_s = 1.5
+#
+# # --- bar 2: number row + Q row, interleaved by x = GPU % --------------------
+# [[light]]
+# target   = ["`","Tab","1","Q","2","W","3","E","4","R","5","T","6","Y","7","U",
+#             "8","I","9","O","0","P","-","[","=","]","Backspace","\\ (ANSI)"]
+# metric   = "gpu_pct"
+# range    = [0, 100]
+# style    = "bar"
+# edge     = "fractional"
+# palette  = "act"
+# gradient = "value"
+# brightness = 1.0
+# attack_s = 0.6
+# smooth_s = 1.5
+#
+# # --- bar 3: A row + Z row, interleaved by x = busiest cores % ---------------
+# [[light]]
+# target   = ["Caps Lock","Left Shift","A","Z","S","X","D","C","F","V","G","B",
+#             "H","N","J","M","K",",","L",".",";","/","'","Right Shift","Enter"]
+# metric   = "cpu_topk_pct"
+# range    = [0, 100]
+# style    = "bar"
+# edge     = "fractional"
+# palette  = "act"
+# gradient = "value"
+# brightness = 1.0
+# attack_s = 1.0
+# smooth_s = 2.0
+#
+# # --- nav tile: GPU temperature ----------------------------------------------
+# [[light]]
+# target   = ["Insert","Home","Page Up","Delete","End","Page Down"]
+# metric   = "gpu_c"
+# range    = [30, 90]
+# style    = "solid"
+# palette  = "act"
+# brightness = [0.30, 1.0]      # dims with a cool GPU, full at 90 C
+# attack_s = 10
+# smooth_s = 10
+#
+# # --- numpad dial: tokens/s, clockwise from 12 o'clock around "5" ------------
+# [[light]]
+# target   = ["Number Pad 8","Number Pad 9","Number Pad 6","Number Pad 3",
+#             "Number Pad 2","Number Pad 1","Number Pad 4","Number Pad 7"]
+# metric   = "tokens_per_s"      # rate of decoded_total over rate_window_s
+# rate_window_s = 2.0
+# range    = [0, 100]            # one lap = 100 tok/s, 12.5 per key
+# style    = "ring"
+# edge     = "fractional"        # the key being swept is partly lit
+# palette  = "act"
+# gradient = "value"             # the whole ring is the rate's colour
+# brightness = 1.0
+# attack_s = 1.0
+# smooth_s = 1.0
+#
+# [[light]]                       # outer frame: the second lap, 100-125 tok/s
+# target   = ["Number Pad /","Number Pad *","Number Pad -","Number Pad +",
+#             "Number Pad Enter","Number Pad .","Number Pad 0","Num Lock"]
+# metric   = "tokens_per_s"
+# rate_window_s = 2.0
+# range    = [100, 125]          # below 100 tok/s nothing is drawn (base shows)
+# style    = "ring"
+# edge     = "fractional"
+# stops    = [[100, "#FF2A14"], [107, "#FF5A12"], [114, "#FF8A1E"], [120, "#FFB030"], [125, "#FFD050"]]
+# gradient = "value"
+# brightness = 1.0
+# attack_s = 1.0
+# smooth_s = 1.0
+#
+# [[light]]                       # centre: breathes in the rate's colour while generating
+# target   = "Number Pad 5"
+# metric   = "tokens_per_s"
+# rate_window_s = 2.0
+# range    = [0, 100]
+# style    = "pulse"             # faster as the rate rises
+# threshold = 1.0                # off (base) below 1 tok/s
+# palette  = "act"
+# brightness = 1.0
+# attack_s = 0.5
+# smooth_s = 2.0
 # --- end

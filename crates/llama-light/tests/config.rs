@@ -20,7 +20,7 @@ fn an_empty_file_is_mirrored_fans_showing_activity_on_act() {
     assert_eq!(config.aura.layout, Layout::Mirrored);
     assert_eq!(config.aura.brightness_max, 80);
     assert_eq!(config.aura.fps, 10);
-    assert!(!config.keyboard_enabled);
+    assert!(!config.keyboard.enabled);
     assert_eq!(config.layers.len(), 1);
     let layer = &config.layers[0];
     assert_eq!(layer.target, Target::AuraFans);
@@ -145,7 +145,7 @@ fn targets_must_exist() {
     .expect("keyboard gauge");
     assert_eq!(
         config.layers[0].target,
-        Target::KeyboardKeys { start: 1, end: 12 }
+        Target::KeyboardKeys((1..=12).collect())
     );
 }
 
@@ -270,7 +270,7 @@ fn the_shipped_example_is_valid() {
     let config = parse(&text).expect("light.example.toml");
     assert_eq!(config.aura.layout, Layout::Mirrored);
     assert_eq!(config.aura.leds_per_fan, 6);
-    assert!(!config.keyboard_enabled);
+    assert!(!config.keyboard.enabled);
 }
 
 /// Every commented example block in light.example.toml parses once uncommented.
@@ -312,4 +312,96 @@ fn every_commented_example_in_the_shipped_file_is_valid() {
             panic!("example {name} does not parse: {err}\n{body}");
         }
     }
+}
+
+fn kb_target(target: &str) -> Result<Target, String> {
+    let text = format!("[keyboard]\nenabled = true\n[[light]]\ntarget = '{target}'\n");
+    parse(&text)
+        .map(|c| c.layers[0].target.clone())
+        .map_err(|e| e.0)
+}
+
+fn names(target: &Target) -> Vec<&'static str> {
+    use llama_light::keyboard::keymap::KEYS;
+    match target {
+        Target::KeyboardKeys(keys) => keys.iter().map(|i| KEYS[*i].name).collect(),
+        other => panic!("not a key list: {other:?}"),
+    }
+}
+
+#[test]
+fn keyboard_targets_take_ranges_lists_and_all() {
+    let t = kb_target(r#"keyboard.keys["F1".."F12"]"#).expect("f-row");
+    assert_eq!(
+        names(&t),
+        [
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
+        ]
+    );
+    let t = kb_target(r#"keyboard.keys["F1"..="F4"]"#).expect("inclusive");
+    assert_eq!(names(&t), ["F1", "F2", "F3", "F4"]);
+    let t = kb_target(r#"keyboard.keys["W","A","S","D"]"#).expect("wasd");
+    assert_eq!(names(&t), ["W", "A", "S", "D"]);
+    let t = kb_target(r#"keyboard.keys[ "1" .. "0" , "Escape" ]"#).expect("spaces");
+    assert_eq!(
+        names(&t),
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Escape"]
+    );
+    // Names with punctuation are fine inside quotes.
+    let t = kb_target(r#"keyboard.keys[",", ".", "/", "\ (ANSI)", "[", "]"]"#).expect("punct");
+    assert_eq!(names(&t), [",", ".", "/", "\\ (ANSI)", "[", "]"]);
+    let t = kb_target(r#"keyboard.keys["Number Pad 7"]"#).expect("numpad");
+    assert_eq!(names(&t), ["Number Pad 7"]);
+    assert_eq!(kb_target("keyboard.all").expect("all"), Target::KeyboardAll);
+}
+
+#[test]
+fn keyboard_target_errors_are_clear() {
+    let err = kb_target(r#"keyboard.keys["f1"]"#).expect_err("case");
+    assert!(
+        err.contains("\"f1\" is not a known key; did you mean \"F1\"?"),
+        "{err}"
+    );
+    let err = kb_target(r#"keyboard.keys["Esc"]"#).expect_err("alias");
+    assert!(err.contains("\"Esc\" is not a known key"), "{err}");
+    assert!(err.contains("\"Escape\""), "{err}");
+    let err = kb_target(r#"keyboard.keys[F1]"#).expect_err("unquoted");
+    assert!(err.contains("key names are quoted"), "{err}");
+    let err = kb_target(r#"keyboard.keys["W" "A"]"#).expect_err("no comma");
+    assert!(err.contains("expected , or .."), "{err}");
+    let err = kb_target(r#"keyboard.keys["W","W"]"#).expect_err("twice");
+    assert!(err.contains("\"W\" is listed twice"), "{err}");
+    let err = kb_target(r#"keyboard.keys["F1".."F4","F3"]"#).expect_err("overlap");
+    assert!(err.contains("listed twice"), "{err}");
+    let err = kb_target(r#"keyboard.keys[]"#).expect_err("empty");
+    assert!(err.contains("quoted"), "{err}");
+    let err = kb_target("keyboard.leds").expect_err("unknown");
+    assert!(err.contains("is not a target"), "{err}");
+    let err = error("[[light]]\ntarget = \"keyboard.all\"\n");
+    assert!(err.contains("[keyboard] enabled = true"), "{err}");
+}
+
+#[test]
+fn keyboard_brightness_cap_and_fixed_colour() {
+    let config = parse(
+        "[keyboard]\nenabled = true\nbrightness_max = 40\n[[light]]\ntarget = \"keyboard.all\"\ncolor = \"#102030\"\nbrightness = 20\n",
+    )
+    .expect("parse");
+    assert_eq!(config.keyboard.brightness_max, 40);
+    assert_eq!(config.layers[0].fixed, Some(hex(0x102030)));
+    assert_eq!(config.layers[0].brightness, 20.0);
+    // Every entry is on the keyboard: the fans keep their default entry.
+    assert_eq!(config.layers.len(), 2);
+    assert_eq!(config.layers[1].target, Target::AuraFans);
+    let err = error("[keyboard]\nbrightness_max = 101\n");
+    assert!(err.contains("keyboard.brightness_max = 101"), "{err}");
+    let err = error("[[light]]\ncolor = \"#102030\"\nmetric = \"gpu\"\n");
+    assert!(
+        err.contains("color is a fixed colour; remove metric"),
+        "{err}"
+    );
+    let err = error("[[light]]\ncolor = \"blue\"\n");
+    assert!(err.contains("light[0].color = \"blue\""), "{err}");
+    let err = error("[keyboard]\nenabled = true\nleds = 3\n");
+    assert!(err.contains("unknown field"), "{err}");
 }

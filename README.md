@@ -19,7 +19,7 @@ and pixels, through small closed command sets.
 | `llama-watch` | `llama-watch.service` | The **single reader** of host and llama state. Draws the tty11 dashboard (Alt+F11) and publishes a validated snapshot to `/run/llama-watch/snapshot.json` at 10 Hz |
 | `llama-view` | none | Read-only mirror of tty11 for tmux or SSH (group `llama-view`) |
 | `kraken-lcd` | `kraken-lcd.service` | Draws the snapshot on the NZXT Kraken Z LCD. LCD only, no network |
-| `llama-light` | `llama-light.service` | Sets ASUS Aura RGB colours from the snapshot. Colour only, no network |
+| `llama-light` | `llama-light.service` | Sets ASUS Aura and Corsair keyboard RGB colours from the snapshot. Colour only, no network |
 | `llama-metrics` | `llama-metrics.service` | Prometheus exporter on port 19477 (`llamabored_*`). The only process that listens |
 
 `llama-core` is the shared library: the snapshot schema and its validator, the
@@ -29,7 +29,7 @@ name sanitiser, logging.
 
 **llama-watch and tty11** (10 fps, bundled Hack 12x24 console font)
 
-- Meters for CPU, GPU, VRAM, MEM, POWER and LOAD, and an **ACTIVITY** row that
+- Spectrum meters for CPU, GPU, VRAM, MEM, POWER and LOAD, and an **ACTIVITY** row that
   names its source (`gpu`, `cpu` or `util`).
 - Prompt and generation tok/s, and a token chart in eighth-block bars
   (generation up, prompt down, newest on the left), log-scaled to
@@ -62,13 +62,17 @@ falls back to utilisation.
 - *Change* mode (default: upload only when a drawn value changes, at most once
   per `min_interval_s`) or opt-in *stream* mode (10 fps, animated gauge).
 
-**llama-light** (ASUS Aura USB RGB)
+**llama-light** (ASUS Aura USB RGB, Corsair STRAFE RGB MK.2 keyboard)
 
 - Maps any snapshot metric (activity, gpu, cpu, load, mem, tokens_rate,
   coolant, gpu_temp, cpu_temp) to colour, with `[[light]]` layers: solid,
   ring, bar or pulse styles, palettes or your own colour stops, smoothing,
   brightness caps and an idle colour.
 - Fans on a splitter (mirrored) or a daisy chain (per-fan values).
+- Per-key keyboard gauges: bars two key rows tall, a tokens/s dial on the
+  number pad, with an optional tweened frame pipeline so values glide
+  instead of flicker. The example file has a full layout. On stop the keyboard gets its
+  own lighting back.
 - Live reload: edits to `light.toml` apply within 2 s; a bad file is logged
   and ignored.
 
@@ -91,7 +95,8 @@ currently expect one Kraken Z, because it pins the cooler's hidraw node.
 | NZXT Kraken Z63 / Z73 | `1e71:3008` (same id) | Same LCD protocol, accepted, **untested** |
 | Other NZXT (Kraken 2023/Elite, X-series) | other ids | Not supported; kraken-lcd refuses them |
 | ASUS Aura USB mainboard controller | `0b05:18f3` | **Tested** (llama-light, addressable header 1) |
-| Corsair keyboards | e.g. `1b1c:1b48` | **Planned**: detected and config-checked only, nothing is written |
+| Corsair STRAFE RGB MK.2 | `1b1c:1b48` | **Tested** (llama-light, per key, lighting interface only) |
+| Other Corsair keyboards | other ids | Not supported |
 
 The Z63 and Z73 report the same USB id and `z53` hwmon name as the Z53, so no
 software check can tell them apart. If you try one, read
@@ -117,7 +122,8 @@ main risk:
 - **Closed command sets.** kraken-lcd can build nine LCD commands; pump, fan,
   init, brightness and firmware commands do not exist in the code.
   llama-light can build two Aura opcodes (set direct mode, stream colours) and
-  has no save-to-flash. Tests check both tables.
+  four keyboard report shapes, with no save-to-flash, profile or firmware
+  writes. Tests check all three tables.
 - **Cooling guard and HALTED latch.** Every LCD operation is bracketed by
   read-only checks of the cooler's hwmon (pump mode, pump rpm, USB device,
   bootloader). Any change stops all device I/O and writes a latch that only
@@ -127,7 +133,8 @@ main risk:
   network, each pinned by udev and `DeviceAllow=` to its one device node; one
   exporter that opens no device. Only llama-metrics listens.
 - **Stock restore on stop.** Stopping or crashing kraken-lcd gives the screen
-  back to the stock readout; llama-light leaves a neutral colour in RAM.
+  back to the stock readout; llama-light leaves a neutral colour in RAM and
+  hands the keyboard back to its own lighting.
 
 Details: [docs/SAFETY.md](docs/SAFETY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -181,7 +188,8 @@ configs in `/etc/llama-bored/`, units in `/etc/systemd/system/` and
 `/etc/systemd/user/`, udev rules `71-kraken-lcd`, `72-llama-view`,
 `93-kraken-lcd-hidraw` and `94-llama-light-hidraw` in `/etc/udev/rules.d/`,
 users from `/etc/sysusers.d/llama-bored.conf`. Stable device links:
-`/dev/kraken-lcd/hid` and `/dev/llama-light/aura`.
+`/dev/kraken-lcd/hid`, `/dev/llama-light/aura` and
+`/dev/llama-light/keyboard`.
 
 ## Configuration
 
@@ -225,11 +233,15 @@ fans = "mirrored"         # "mirrored" (splitter) or "chain" (daisy chain)
 brightness_max = 80       # cap on every LED, 0..=100 %
 fps = 10
 
+[keyboard]
+enabled = false           # Corsair STRAFE RGB MK.2, per key
+brightness_max = 100
+
 [[light]]                 # later entries draw over earlier ones
-target = "aura.fans"      # or "aura.chain[2]", "aura.chain[0..2]"
+target = "aura.fans"      # or "aura.chain[2]", 'keyboard.keys["F1".."F12"]', "led:110"
 metric = "activity"       # gpu, cpu, load, mem, tokens_rate, coolant, gpu_temp, cpu_temp
 range = [0, 100]
-style = "solid"           # solid | ring | bar | pulse
+style = "solid"           # solid | ring | bar | pulse | ladder | gate | peak
 palette = "act"           # act | thermal | mono, or stops = [[0, "#4A55C8"], [100, "#FF3A22"]]
 smooth_s = 1.5
 idle_color = "#101830"
@@ -239,7 +251,8 @@ With no `[[light]]` entries every fan shows activity on the LCD's colour ramp.
 **Mirrored vs chained:** on a splitter every fan receives the same data, so
 all fans always show the same thing. Per-fan metrics (`aura.chain[N]`) need
 the fans daisy-chained on one data line (fan N is LEDs `N × leds_per_fan` on).
-The example file has complete examples for both.
+The example file has complete examples for both, and a full keyboard layout
+(`keyboard-c`) with `[engine]` tweening, a `[base]` colour and named palettes.
 
 **`metrics.toml`** (llama-metrics):
 
@@ -290,6 +303,7 @@ After editing `watch.toml` or `config.toml`, restart that service
 | tty11 IN/OUT empty | `LLAMA_SERVER_SLOTS_DEBUG=1` for llama-server, and `[tty] show_text` |
 | tty11 chart shows odd glyphs | The font did not load; set `chart_glyphs = "halves"` |
 | RGB does nothing | `lsusb -d 0b05:18f3`, `ls -l /dev/llama-light/aura`, `llama-light check`. Only one RGB tool (OpenRGB, vendor tools) at a time |
+| Keyboard stays on its own lighting | `lsusb -d 1b1c:1b48`, `ls -l /dev/llama-light/keyboard`, `[keyboard] enabled = true`. Only one RGB tool (ckb-next, OpenRGB) at a time. Plugged in after llama-light started: it restarts itself to pick it up |
 | All fans show one colour with `aura.chain[N]` | The fans are on a splitter. Use `fans = "mirrored"` or daisy-chain them |
 | Prometheus gets no answer | `allow`, `IPAddressAllow=`, and the firewall; `llamabored_exporter_rejected_connections_total` counts refusals |
 | `llamabored_snapshot_stale` is 1 | llama-watch is down or behind |

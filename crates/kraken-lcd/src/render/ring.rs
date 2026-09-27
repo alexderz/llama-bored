@@ -18,7 +18,7 @@ use tiny_skia::{
 };
 
 use super::Rgb;
-use super::color::{BLACK, WHITE, act_color, hex, mix};
+use super::color::{BLACK, HOT_GOLD, WHITE, act_color, cold_tip_lift, hex, mix};
 use super::geometry::LayoutGeometry;
 use super::text::{GlyphCache, Pen, TextStyle, Weight};
 use crate::anim::{RING_MAX, RING_START_DEG, RING_SWEEP_DEG, pulse, ring_angle};
@@ -30,8 +30,8 @@ const PER: f32 = RING_SWEEP_DEG / RING_MAX;
 const BB_TRACK: Rgb = hex(0x3A1216);
 /// The 100 gate.
 const GATE: Rgb = hex(0xF4F4F2);
-/// White-core halo.
-const HALO: Rgb = hex(0xFFF3D0);
+/// Hot-core halo: hot pale gold, not white.
+const HALO: Rgb = HOT_GOLD;
 
 /// Paint the track, the value arc, the glow and the break lines.
 ///
@@ -88,10 +88,13 @@ pub fn readout_color(v: f32) -> Rgb {
     }
 }
 
-/// Head colour: `mix(act_color(v), white, 0.5)`.
+/// Head colour: `mix(act_color(v), white, 0.5)`, capped at 15 % under 50 so
+/// the cold comet head stays saturated (T62). Above 100 it mixes toward
+/// [`HOT_GOLD`] instead of white.
 #[must_use]
 pub fn head_color(v: f32) -> Rgb {
-    mix(act_color(v), WHITE, 0.5)
+    let toward = if v > 100.0 { HOT_GOLD } else { WHITE };
+    mix(act_color(v), toward, cold_tip_lift(v, 0.5))
 }
 
 /// Degrees the leading cap's centre sits short of the value angle.
@@ -209,7 +212,7 @@ fn draw_value(pixmap: &mut Pixmap, v: f32, r: f32, w: f32, t: f32) {
     }
     dot(pixmap, r, end, w * 0.5, tip, 1.0, BlendMode::SourceOver);
 
-    // White-hot core at the peg.
+    // Hot core at the peg, in hot pale gold.
     if v >= 120.0 {
         let k = ((v - 120.0) / 5.0).clamp(0.0, 1.0);
         let halo = ((0.30 + 0.20 * (std::f32::consts::TAU * 1.1 * t).sin()) * k).max(0.0);
@@ -230,14 +233,14 @@ fn draw_value(pixmap: &mut Pixmap, v: f32, r: f32, w: f32, t: f32) {
             stroke_solid(
                 pixmap,
                 &path,
-                WHITE,
+                HOT_GOLD,
                 0.85 * k,
                 w,
                 LineCap::Round,
                 BlendMode::SourceOver,
             );
         }
-        dot(pixmap, r, end, w * 0.5, WHITE, k, BlendMode::SourceOver);
+        dot(pixmap, r, end, w * 0.5, HOT_GOLD, k, BlendMode::SourceOver);
     }
 }
 

@@ -21,7 +21,7 @@ use tiny_skia::{
     Transform,
 };
 
-use super::color::{BLACK, WHITE, act_color, hex, mix};
+use super::color::{BLACK, HOT_GOLD, WHITE, act_color, cold_tip_lift, hex, mix};
 use super::geometry::LayoutGeometry;
 use super::ring::arc_path;
 use super::text::{GlyphCache, Pen, TextStyle, Weight};
@@ -33,7 +33,7 @@ const CENTRE: f32 = 160.0;
 /// Coal base of an incandescent bar.
 const HOT_BASE: Rgb = hex(0x6E1000);
 /// L6, the red at 100.
-const RED: Rgb = hex(0xFF3A22);
+const RED: Rgb = hex(0xFF2A14);
 /// Tier-boundary ticks.
 const SCALE_TICK: Rgb = hex(0x55555C);
 /// Time-scale labels.
@@ -108,13 +108,13 @@ impl Bar {
         }
     }
 
-    /// Tip colour, pushed toward white or black by the flicker when hot.
+    /// Tip colour, pushed toward hot gold or black by the flicker when hot.
     fn tip_color(&self) -> Rgb {
         let tip = act_color(self.mean);
         if self.heat <= 0.0 {
             tip
         } else if self.noise > 0.0 {
-            mix(tip, WHITE, 0.15 * self.heat * self.noise)
+            mix(tip, HOT_GOLD, 0.15 * self.heat * self.noise)
         } else {
             mix(tip, BLACK, 0.10 * self.heat * -self.noise)
         }
@@ -132,7 +132,7 @@ fn draw_bar(pixmap: &mut Pixmap, geom: &LayoutGeometry, bar: &Bar) {
         vec![
             (base, mix(color, BLACK, 0.55)),
             (base + 0.72 * bar.length, color),
-            (bar.tip, mix(color, WHITE, 0.30)),
+            (bar.tip, mix(color, WHITE, cold_tip_lift(bar.mean, 0.30))),
         ]
     } else {
         let at = |x: f32| base + x * bar.length;
@@ -186,7 +186,7 @@ fn draw_bloom(pixmap: &mut Pixmap, geom: &LayoutGeometry, bar: &Bar) {
 }
 
 /// A 1.2 px line along the mid-angle from 45 % of the length to 0.8 px short
-/// of the tip, `mix(tip, white, 0.6)` at `0.8·(h − 0.6)/0.4·f`, Plus.
+/// of the tip, `mix(tip, HOT_GOLD, 0.6)` at `0.8·(h − 0.6)/0.4·f`, Plus.
 fn draw_filament(pixmap: &mut Pixmap, geom: &LayoutGeometry, bar: &Bar) {
     let (a0, a1) = bar_angles(geom, bar.index);
     let mid = (a0 + a1) * 0.5;
@@ -202,7 +202,7 @@ fn draw_filament(pixmap: &mut Pixmap, geom: &LayoutGeometry, bar: &Bar) {
     stroke(
         pixmap,
         &path,
-        mix(bar.tip_color(), WHITE, 0.6),
+        mix(bar.tip_color(), HOT_GOLD, 0.6),
         alpha,
         1.2,
         LineCap::Round,

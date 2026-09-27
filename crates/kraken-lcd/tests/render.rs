@@ -77,7 +77,7 @@ fn nothing_is_drawn_outside_the_disc() {
 fn a_none_ring_draws_only_the_bare_track() {
     let mut assets = Assets::load().expect("assets");
     let frame = render::render(&view(None, None), &DisplayCfg::default(), &mut assets);
-    // 12 o'clock is 62.5: act_color #D544A1 at 20 %.
+    // 12 o'clock is 62.5: act_color #C81CBA at 20 %.
     assert!(
         near(sample_ring(&frame, 0.0), (43, 14, 32), 10),
         "12 o'clock got {:?}",

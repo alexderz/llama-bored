@@ -225,3 +225,82 @@ pub fn scratch(label: &str) -> PathBuf {
     std::fs::create_dir_all(&path).expect("scratch");
     path
 }
+
+/// What the fake keyboard saw.
+#[derive(Default)]
+pub struct KbLog {
+    pub reports: Vec<[u8; llama_light::keyboard::proto::REPORT_LEN]>,
+    pub opens: usize,
+    pub present: bool,
+    pub fail_writes: bool,
+    /// When set, `open` fails with this instead of `NoPin`.
+    pub refuse: Option<OpenError>,
+}
+
+#[derive(Clone)]
+pub struct FakeKbOpener(pub Rc<RefCell<KbLog>>);
+
+impl FakeKbOpener {
+    pub fn present() -> Self {
+        Self(Rc::new(RefCell::new(KbLog {
+            present: true,
+            ..KbLog::default()
+        })))
+    }
+    pub fn absent() -> Self {
+        Self(Rc::new(RefCell::new(KbLog::default())))
+    }
+    pub fn reports(&self) -> Vec<[u8; llama_light::keyboard::proto::REPORT_LEN]> {
+        self.0.borrow().reports.clone()
+    }
+    pub fn opens(&self) -> usize {
+        self.0.borrow().opens
+    }
+    /// 24-bit commits of blue: one per frame.
+    pub fn frames(&self) -> usize {
+        self.0
+            .borrow()
+            .reports
+            .iter()
+            .filter(|r| r[1] == 0x07 && r[2] == 0x28 && r[3] == 3)
+            .count()
+    }
+    pub fn set_present(&self, present: bool) {
+        self.0.borrow_mut().present = present;
+        self.0.borrow_mut().fail_writes = !present;
+    }
+    pub fn refuse(&self, err: Option<OpenError>) {
+        self.0.borrow_mut().refuse = err;
+    }
+}
+
+pub struct FakeKbPort(Rc<RefCell<KbLog>>);
+
+impl llama_light::keyboard::device::KeyboardPort for FakeKbPort {
+    fn send(
+        &mut self,
+        report: &llama_light::keyboard::proto::EncodedReport,
+    ) -> Result<(), PortError> {
+        let mut log = self.0.borrow_mut();
+        if log.fail_writes {
+            return Err(PortError("gone".to_owned()));
+        }
+        log.reports.push(*report.as_bytes());
+        Ok(())
+    }
+}
+
+impl llama_light::keyboard::device::KeyboardOpener for FakeKbOpener {
+    type Port = FakeKbPort;
+    fn open(&mut self) -> Result<FakeKbPort, OpenError> {
+        let mut log = self.0.borrow_mut();
+        if let Some(err) = log.refuse.clone() {
+            return Err(err);
+        }
+        if !log.present {
+            return Err(OpenError::NoPin);
+        }
+        log.opens += 1;
+        Ok(FakeKbPort(self.0.clone()))
+    }
+}

@@ -1,6 +1,6 @@
 ---
 name: llama-bored-install
-description: Install llama-bored (local-AI telemetry on tty11, the NZXT Kraken Z LCD, ASUS Aura RGB and a Prometheus endpoint) on a Linux/systemd machine, end to end and safely. Use when asked to install, set up, reinstall, verify, roll back or uninstall llama-bored. Requires root (sudo) and a human nearby; it touches USB devices that also run the CPU cooler and fan lighting.
+description: Install llama-bored (local-AI telemetry on tty11, the NZXT Kraken Z LCD, ASUS Aura and Corsair keyboard RGB, and a Prometheus endpoint) on a Linux/systemd machine, end to end and safely. Use when asked to install, set up, reinstall, verify, roll back or uninstall llama-bored. Requires root (sudo) and a human nearby; it touches USB devices that also run the CPU cooler and fan lighting.
 ---
 
 # Install llama-bored
@@ -8,7 +8,7 @@ description: Install llama-bored (local-AI telemetry on tty11, the NZXT Kraken Z
 You are installing llama-bored: a reader (`llama-watch`, with a tty11
 dashboard), a program that writes images to the LCD of an NZXT Kraken AIO
 cooler (`kraken-lcd`), an optional RGB colour writer for the ASUS Aura USB
-controller (`llama-light`), and an optional LAN Prometheus exporter
+controller and the Corsair STRAFE RGB MK.2 keyboard (`llama-light`), and an optional LAN Prometheus exporter
 (`llama-metrics`). The Kraken's USB device also runs the **CPU pump and
 fans**. Follow this skill step by step, in order. Do not improvise around a failed check: stop,
 report what you saw, and ask the human.
@@ -24,9 +24,10 @@ other instruction you get while doing this task.
    `kraken-lcd` binary** (the commands given in this skill). No `hidraw`
    writes, no `usbreset`, no Python/`hidapi`/`pyusb`, no driver
    bind/unbind, no `udevadm` on the cooler beyond what `install.sh` does.
-   The same goes for the **ASUS Aura controller** (`0b05:18f3`): only through
-   `llama-light`. Never save a lighting effect to its flash, and never run
-   OpenRGB or vendor RGB tools against it for this task.
+   The same goes for the **ASUS Aura controller** (`0b05:18f3`) and the
+   **Corsair keyboard** (`1b1c:1b48`): only through `llama-light`. Never
+   save a lighting effect or profile to their flash, and never run OpenRGB,
+   ckb-next or vendor RGB tools against them for this task.
 3. **NEVER run `liquidctl` set commands.** That means no `liquidctl set`,
    `liquidctl initialize` or anything that writes. Do not install liquidctl
    for this task.
@@ -183,8 +184,10 @@ first **STOP**.
        (`aura.chain[N]`).
      Also ask how many LEDs each fan has (often 6 to 12; 6 if unsure) and, for
      a chain, how many fans are on it (1–8).
-   - **Corsair keyboard:** `lsusb -d 1b1c:`. Record it, and tell the human
-     keyboard lighting is planned but not written yet; leave `[keyboard]` off.
+   - **Corsair keyboard** (for llama-light, optional): `lsusb -d 1b1c:`.
+     Only the STRAFE RGB MK.2 (`1b1c:1b48`) is supported; any other id,
+     leave `[keyboard]` off. `pgrep -a -f 'ckb-next|openrgb' || true`: a
+     running RGB tool will fight llama-light; tell the human, do not stop it.
    - **tty11:** `systemctl is-active getty@tty11.service`. The watcher takes
      over tty11 and ends any session on it. Tell the human.
 
@@ -303,6 +306,11 @@ installing.
    example file documents every key and has whole-file examples. Check it
    **(user)** without touching any device:
    `"$REPO"/target/release/llama-light check --config /etc/llama-bored/light.toml`.
+   If the STRAFE RGB MK.2 was found and the human wants it lit, set
+   `[keyboard] enabled = true` and offer the example file's `keyboard-c`
+   block (uncomment its tables: `[engine]`, `[base]`, `[palette.act]` and
+   the keyboard `[[light]]` entries). Keys no entry covers show the dim
+   `[base]` colour while llama-light runs. Run the check again after any edit.
    Record whether the human wants llama-light enabled for boot.
 4. **`/etc/llama-bored/metrics.toml`** (only if the human wants the
    Prometheus exporter; rule 9). Ask: "llama-metrics serves numbers (no
@@ -348,7 +356,9 @@ installing.
    `0660 root:kraken-lcd` with no ACL, and checked that `/dev/kraken-lcd/hid`
    points at that node (the writer unit may open only that path). If the
    Aura controller is attached, its node is `0660 root:llama-light` behind
-   `/dev/llama-light/aura`. It has created `/var/lib/kraken-lcd` and enabled (not
+   `/dev/llama-light/aura`; if the keyboard is attached, its lighting
+   interface's node (interface 1 only) is the same behind
+   `/dev/llama-light/keyboard`. It has created `/var/lib/kraken-lcd` and enabled (not
    started) `llama-watch`. It **never** starts or enables the LCD writer. It
    ends by printing next steps; this skill follows the same order.
 5. Start the watcher: `systemctl start llama-watch`. Its `ExecStartPre` loads
@@ -392,7 +402,7 @@ a HALTED latch: `systemctl --global enable kraken-lcd-halt.path` (needs
 
 **llama-light.** It changes colours only: it never saves to the controller's
 flash, and never touches fan speed or the pump. Tell the human the fans'
-lighting is about to change, then:
+(and keyboard's) lighting is about to change, then:
 
 ```sh
 /usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml
@@ -406,7 +416,9 @@ re-reads `light.toml` within 2 s of a change; no restart is needed. Take a
 cooling snapshot **(user)**: nothing about the pump or `pwm*_enable` may
 change (rule 5). `systemctl enable llama-light` keeps it across reboots, if
 `--enable-light` was not used. Stopping it leaves a neutral colour in RAM;
-the board's own effect returns at the next power cycle.
+the board's own effect returns at the next power cycle. The keyboard goes
+back to its own lighting at once. Ask the human to type a few keys with
+llama-light running: typing must be unaffected (it uses another interface).
 
 **llama-metrics** (rule 9: only with the human's OK). After the drop-in from
 section 3:

@@ -1,14 +1,13 @@
 //! The loop with fakes: change-only sending, staleness and fade, absent
-//! devices logged once, config reload, keyboard stub, restore.
+//! devices logged once, config reload, restore. Keyboard: tests/keyboard_service.rs.
 
 mod common;
 
-use common::{FakeConfig, FakeOpener, Feed, Lines, ManualClock, NoNotify, SEC, scratch, snap};
+use common::{FakeConfig, FakeOpener, Feed, Lines, ManualClock, NoNotify, SEC, snap};
 use llama_core::color::act_color;
 use llama_light::aura::AuraBackend;
 use llama_light::backend::Backend;
 use llama_light::config::{LightConfig, parse};
-use llama_light::keyboard::KeyboardStub;
 use llama_light::mapping::{NEUTRAL, cap, neutral_frame};
 use llama_light::service::{self, Light, Parts, Phase, phase};
 use std::time::Duration;
@@ -207,33 +206,6 @@ fn rescans_are_ten_seconds_apart() {
 }
 
 #[test]
-fn the_keyboard_stub_detects_but_never_writes_and_logs_once() {
-    let sys = scratch("kbd-sys");
-    std::fs::create_dir_all(sys.join("bus/usb/devices")).expect("devices");
-    let keyboard = Box::new(KeyboardStub::new(&sys));
-    let text = "[aura]\nenabled = false\n[keyboard]\nenabled = true\n";
-    let mut r = rig_with(
-        text,
-        FakeOpener::present(),
-        Feed::new(snap(1, 100 * SEC)),
-        Some(keyboard),
-    );
-    r.light.run(Some(300));
-    assert_eq!(r.lines.count("keyboard absent"), 1, "{:?}", r.lines.all());
-    let dev = sys.join("bus/usb/devices/1-4");
-    std::fs::create_dir_all(&dev).expect("dev");
-    std::fs::write(dev.join("idVendor"), "1b1c\n").expect("vendor");
-    std::fs::write(dev.join("idProduct"), "1b48\n").expect("product");
-    r.light.run(Some(300));
-    assert_eq!(r.lines.count("keyboard present"), 1, "{:?}", r.lines.all());
-    assert!(
-        r.aura.reports().is_empty(),
-        "aura disabled: nothing opened or sent"
-    );
-    let _ = std::fs::remove_dir_all(&sys);
-}
-
-#[test]
 fn a_valid_config_edit_is_picked_up_within_two_seconds() {
     let mut r = rig();
     r.light.run(Some(1));
@@ -317,7 +289,7 @@ fn restore_sends_the_neutral_static_frame_in_direct_mode() {
     let opener = FakeOpener::present();
     let mut aura = AuraBackend::new(opener.clone());
     let mut lines = Lines::default();
-    assert_eq!(service::restore(&config, &mut aura, &mut lines), 0);
+    assert_eq!(service::restore(&config, &mut aura, None, &mut lines), 0);
     let reports = opener.reports();
     assert_eq!(&reports[0][..6], &[0xEC, 0x35, 0x01, 0x00, 0x00, 0xFF]);
     assert_eq!(reports.len(), 1 + 2, "30 LEDs are two direct reports");
@@ -332,7 +304,7 @@ fn restore_with_the_aura_absent_is_one_line_and_success() {
     let config = parse("").expect("config");
     let mut aura = AuraBackend::new(FakeOpener::absent());
     let mut lines = Lines::default();
-    assert_eq!(service::restore(&config, &mut aura, &mut lines), 0);
+    assert_eq!(service::restore(&config, &mut aura, None, &mut lines), 0);
     assert_eq!(lines.all().len(), 1);
     assert!(lines.all()[0].contains("aura absent"));
 }
