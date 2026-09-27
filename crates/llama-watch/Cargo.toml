@@ -1,0 +1,21 @@
+[package]
+name = "llama-watch"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+llama-core = { path = "../llama-core" }
+nvml-wrapper = { workspace = true }
+rustix = { workspace = true }
+sd-notify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+ureq = { workspace = true }
+
+[lints]
+workspace = true

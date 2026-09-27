@@ -1,0 +1,2 @@
+# /etc/udev/rules.d/71-kraken-lcd.rules — usbfs node (bulk EP 0x02 on iface 0)
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1e71", ATTR{idProduct}=="3008", GROUP="kraken-lcd", MODE="0660"

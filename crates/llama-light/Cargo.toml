@@ -1,0 +1,25 @@
+[package]
+name = "llama-light"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "llama-light"
+path = "src/main.rs"
+
+[dependencies]
+llama-core = { path = "../llama-core" }
+rustix = { workspace = true, features = ["fs", "time"] }
+sd-notify = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

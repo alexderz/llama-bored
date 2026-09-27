@@ -1,0 +1,4 @@
+# /etc/udev/rules.d/94-llama-light-hidraw.rules — the ASUS Aura USB controller (0b05:18f3).
+# Numbered after distro and OpenRGB rules that leave its hidraw node 0666 or tag it uaccess;
+# install.sh overwrites it. The symlink is llama-light.service's only DeviceAllow= entry.
+SUBSYSTEM=="hidraw", KERNELS=="0003:0B05:18F3.*", GROUP="llama-light", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="llama-light/aura"

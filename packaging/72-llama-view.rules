@@ -1,0 +1,1 @@
+KERNEL=="vcsa11|vcs11|vcsu11", GROUP="llama-view", MODE="0640"

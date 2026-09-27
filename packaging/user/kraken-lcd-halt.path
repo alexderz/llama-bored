@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for a Kraken LCD cooling-guard halt latch
+
+[Path]
+PathExists=/var/lib/kraken-lcd/halted
+Unit=kraken-lcd-halt-notify.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,135 @@
+# /etc/llama-bored/light.toml — llama-light: RGB lighting from the llama-watch snapshot.
+#
+# Colour only. llama-light never changes fan or pump speed, never saves
+# anything to the lighting controller's flash, and reads nothing but
+# /run/llama-watch/snapshot.json.
+#
+# Check a file without touching any device:
+#   /usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml
+# The running service re-reads this file within 2 s of a change. A file
+# that fails the check is logged once and ignored; the running config stays.
+#
+# With no [[light]] entries (as shipped), every fan shows `activity` on the
+# LCD's colour ramp: blue -> red for 0-100 %, then white-hot up to 125 %.
+
+[aura]
+enabled = true            # ASUS Aura USB controller (0b05:18f3), addressable header 1
+leds_per_fan = 6          # 1..=20. many 120 mm ARGB fans have 6; LED 0 is lower-left, clockwise
+fans = "mirrored"         # "mirrored" (splitter: every fan shows the same LEDs) | "chain"
+# chain_len = 4           # fans = "chain" only: fans on the daisy chain, 1..=8
+metric = "activity"       # default entry's metric when there are no [[light]] entries
+style = "solid"           # default entry's style: solid | ring | bar | pulse
+brightness_max = 80       # 0..=100 %. A cap on every LED (limits header current)
+fps = 10                  # 1..=20 frames per second; a frame is sent only when it changes
+
+[keyboard]
+enabled = false           # Corsair STRAFE RGB MK.2 (1b1c:1b48): detection only for now
+
+# ---------------------------------------------------------------------------
+# [[light]] entries. Later entries draw over earlier ones. Keys:
+#
+#   target      "aura.fans"                 every fan (default)
+#               "aura.chain[2]"             one fan on a daisy chain (fans = "chain")
+#               "aura.chain[0..2]"          fans 0 and 1 as one span ("0..=1" also works)
+#               'keyboard.keys["F1".."F12"]' keys, once the keyboard protocol lands
+#   metric      activity (default) | gpu | cpu | load | tokens_rate | mem
+#               coolant | gpu_temp | cpu_temp (degrees C)
+#               activity is the LCD's power-weighted activity (0-125);
+#               tokens_rate is decoded tokens/s from the watcher's counter.
+#   range       [min, max] in the metric's units. Defaults: percents [0, 100],
+#               tokens_rate [0, 100], coolant [25, 45], gpu_temp [30, 85],
+#               cpu_temp [30, 90]. Must be finite with min < max.
+#   scale       "linear" (default) | "log" (log needs min > 0)
+#   style       "solid"  whole target one colour
+#               "ring" / "bar"  k of N LEDs lit from LED 0, a coarse gauge;
+#                        unlit LEDs show whatever an earlier entry drew
+#               "pulse"  whole target breathing; faster as the value rises
+#   palette     "act" (default: the LCD ramp) | "thermal" | "mono"
+#   stops       instead of palette: [[position, "#RRGGBB"], ...], ascending.
+#               A number is in metric units; a string "60%" is percent of
+#               range. Positions may run from 0 % to 125 % of the range.
+#   brightness  0..=100 % for this entry (default 100), under brightness_max
+#   smooth_s    0..=60 s exponential smoothing (default 0, off)
+#   idle_color  "#RRGGBB" shown below range min and when the metric is missing
+#               (without it a missing metric shows a dim grey)
+# ---------------------------------------------------------------------------
+
+# Uncomment one example below (remove the leading "# " from its lines), or
+# write your own. Each example is a whole file on its own.
+
+# --- example: mirrored-fans
+# # Every fan (on the splitter) shows activity, smoothed a little, with a
+# # custom ramp and a dim blue when idle.
+# [aura]
+# fans = "mirrored"
+#
+# [[light]]
+# target = "aura.fans"
+# metric = "activity"
+# range = [0, 100]
+# stops = [[0, "#4A55C8"], ["60%", "#D044A8"], [100, "#FF3A22"], [125, "#FFFFFF"]]
+# smooth_s = 1.5
+# idle_color = "#101830"
+# --- end
+
+# --- example: mirrored-gauge
+# # A dim activity colour on every LED, with GPU load as a ring gauge on top.
+# [[light]]
+# metric = "activity"
+# brightness = 30
+#
+# [[light]]
+# metric = "gpu"
+# style = "ring"
+# palette = "thermal"
+# --- end
+
+# --- example: daisy-chained
+# # Needs the fans daisy-chained (or a hub with one data line): fan 0 is the
+# # first on the chain. Rear = GPU, front 1 = CPU, front 2 = activity,
+# # top = tokens/s on a log scale.
+# [aura]
+# fans = "chain"
+# chain_len = 4
+#
+# [[light]]
+# target = "aura.chain[0]"
+# metric = "gpu"
+#
+# [[light]]
+# target = "aura.chain[1]"
+# metric = "cpu"
+# style = "ring"
+#
+# [[light]]
+# target = "aura.chain[2]"
+# metric = "activity"
+#
+# [[light]]
+# target = "aura.chain[3]"
+# metric = "tokens_rate"
+# range = [1, 200]
+# scale = "log"
+# style = "pulse"
+# idle_color = "#000010"
+# --- end
+
+# --- example: chain-shorthand
+# # The same chain, one entry per fan, written inline.
+# [aura]
+# chain = [ { metric = "gpu" }, { metric = "cpu" }, { metric = "activity" }, { metric = "tokens_rate", range = [1, 200], scale = "log" } ]
+# --- end
+
+# --- example: keyboard-f-row
+# # Future: the F-row as a 12-key coolant gauge. Parsed and checked today;
+# # nothing is written to the keyboard until its protocol lands.
+# [keyboard]
+# enabled = true
+#
+# [[light]]
+# target = 'keyboard.keys["F1".."F12"]'
+# metric = "coolant"
+# range = [25, 45]
+# style = "bar"
+# palette = "thermal"
+# --- end

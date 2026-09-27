@@ -1,0 +1,1 @@
+[{"id":0,"id_task":4,"is_processing":true,"n_prompt_tokens":10,"n_prompt_tokens_processed":3,"next_token":[{"has_next_token":true,"n_decoded":2}],"prompt":"hello","generated":"world","grammar":"ignored"}]

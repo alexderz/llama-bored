@@ -1,0 +1,63 @@
+# HELP llamabored_exporter_build_info llama-metrics build; always 1.
+# TYPE llamabored_exporter_build_info gauge
+llamabored_exporter_build_info{version="0.1.0",wire_schema="1"} 1
+# HELP llamabored_exporter_rejected_connections_total Connections closed before a request was read, by reason.
+# TYPE llamabored_exporter_rejected_connections_total counter
+llamabored_exporter_rejected_connections_total{reason="busy"} 1
+llamabored_exporter_rejected_connections_total{reason="denied"} 3
+# HELP llamabored_snapshot_up 1 when the snapshot file was read and validated.
+# TYPE llamabored_snapshot_up gauge
+llamabored_snapshot_up 1
+# HELP llamabored_snapshot_stale 1 when the snapshot is missing, invalid, or older than stale_after_s; value series are then omitted.
+# TYPE llamabored_snapshot_stale gauge
+llamabored_snapshot_stale 0
+# HELP llamabored_snapshot_seq Snapshot sequence number within the watcher run.
+# TYPE llamabored_snapshot_seq gauge
+llamabored_snapshot_seq 4242
+# HELP llamabored_snapshot_age_seconds Seconds since the watcher sampled the snapshot.
+# TYPE llamabored_snapshot_age_seconds gauge
+llamabored_snapshot_age_seconds 0.250
+# HELP llamabored_activity_pct Power-weighted activity percent, 0..125; 100 is nominal sustained load.
+# TYPE llamabored_activity_pct gauge
+llamabored_activity_pct 112.25
+# HELP llamabored_load_pct Composite load percent, max(gpu, cpu top-k).
+# TYPE llamabored_load_pct gauge
+llamabored_load_pct 64.5
+# HELP llamabored_cpu_pct Mean CPU percent.
+# TYPE llamabored_cpu_pct gauge
+llamabored_cpu_pct 23.5
+# HELP llamabored_cpu_topk_pct Mean of the busiest CPUs, percent.
+# TYPE llamabored_cpu_topk_pct gauge
+llamabored_cpu_topk_pct 64.5
+# HELP llamabored_gpu_pct GPU utilisation percent.
+# TYPE llamabored_gpu_pct gauge
+llamabored_gpu_pct 97
+# HELP llamabored_mem_pct Memory percent.
+# TYPE llamabored_mem_pct gauge
+llamabored_mem_pct 41.75
+# HELP llamabored_coolant_celsius Coolant temperature, degrees Celsius.
+# TYPE llamabored_coolant_celsius gauge
+llamabored_coolant_celsius 31.5
+# HELP llamabored_cpu_celsius CPU temperature, degrees Celsius.
+# TYPE llamabored_cpu_celsius gauge
+llamabored_cpu_celsius 58
+# HELP llamabored_gpu_celsius GPU temperature, degrees Celsius.
+# TYPE llamabored_gpu_celsius gauge
+llamabored_gpu_celsius 71.5
+# HELP llamabored_tokens_decoded_total Tokens decoded since the watcher started.
+# TYPE llamabored_tokens_decoded_total counter
+llamabored_tokens_decoded_total 1234567
+# HELP llamabored_ai_state llama-swap state; the current state is 1.
+# TYPE llamabored_ai_state gauge
+llamabored_ai_state{state="down"} 0
+llamabored_ai_state{state="idle"} 0
+llamabored_ai_state{state="loaded"} 1
+# HELP llamabored_model_loaded A model llama-swap has loaded, with its tuning detail.
+# TYPE llamabored_model_loaded gauge
+llamabored_model_loaded{name="Bonsai 8B",full_name="Bonsai 8B",quant="PTQ1_0",kv="q8_0/q4_0",ctx="131072",moe="all"} 1
+llamabored_model_loaded{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",quant="UD-Q4_K_M",kv="q8_0",ctx="262144",moe="16"} 1
+llamabored_model_loaded{name="tiny",full_name="tiny",quant="",kv="",ctx="",moe=""} 1
+# HELP llamabored_model_ctx_size_tokens Configured context size of a loaded model, tokens.
+# TYPE llamabored_model_ctx_size_tokens gauge
+llamabored_model_ctx_size_tokens{name="Bonsai 8B",full_name="Bonsai 8B"} 131072
+llamabored_model_ctx_size_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 262144

@@ -1,0 +1,19 @@
+# HELP llamabored_exporter_build_info llama-metrics build; always 1.
+# TYPE llamabored_exporter_build_info gauge
+llamabored_exporter_build_info{version="0.1.0",wire_schema="1"} 1
+# HELP llamabored_exporter_rejected_connections_total Connections closed before a request was read, by reason.
+# TYPE llamabored_exporter_rejected_connections_total counter
+llamabored_exporter_rejected_connections_total{reason="busy"} 1
+llamabored_exporter_rejected_connections_total{reason="denied"} 3
+# HELP llamabored_snapshot_up 1 when the snapshot file was read and validated.
+# TYPE llamabored_snapshot_up gauge
+llamabored_snapshot_up 1
+# HELP llamabored_snapshot_stale 1 when the snapshot is missing, invalid, or older than stale_after_s; value series are then omitted.
+# TYPE llamabored_snapshot_stale gauge
+llamabored_snapshot_stale 1
+# HELP llamabored_snapshot_seq Snapshot sequence number within the watcher run.
+# TYPE llamabored_snapshot_seq gauge
+llamabored_snapshot_seq 4242
+# HELP llamabored_snapshot_age_seconds Seconds since the watcher sampled the snapshot.
+# TYPE llamabored_snapshot_age_seconds gauge
+llamabored_snapshot_age_seconds 5.000

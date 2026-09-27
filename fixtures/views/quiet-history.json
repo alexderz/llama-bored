@@ -1,0 +1,13 @@
+{
+  "ring_pct": 3,
+  "ring_band": "Quiet",
+  "blocks": ["Light", "FlatOut", "Busy"],
+  "coolant_c": 34,
+  "cpu_c": 46,
+  "gpu_c": 38,
+  "cpu_pct": 3,
+  "mem_pct": 11,
+  "ai": "Loaded",
+  "models": ["Qwen3.6 35B-A3B"],
+  "model_count": 1
+}

@@ -1,0 +1,95 @@
+[collector]
+tick_s = 0.1                        # 0.05..=1.0
+cpu_window_s = 1.0                  # tick_s..=5.0
+cpu_top_k = 8                       # 1..=nproc
+
+[llama]
+# Set enabled = false on a host without llama-swap. The watcher then never
+# dials the URL; the LCD shows "no model" and the tty shows NO LLAMA.
+enabled = true
+# llama-swap's own listen address (its default is :8080). The host must be a
+# loopback IP literal. If a reverse proxy already owns 8080, move llama-swap to
+# another port and point this at llama-swap directly: a proxy in front of it
+# may block /slots and /api/metrics.
+url = "http://127.0.0.1:8080"
+running_interval_s = 0.5            # 0.1..=60; must exceed its timeout
+running_timeout_s = 0.25
+metrics_interval_s = 0.25           # 0.1..=60
+metrics_timeout_s = 0.2
+slots_interval_s = 1.0              # 0.5..=10.0 (never faster than 2 Hz)
+slots_timeout_s = 0.5
+slots_max_bytes = 4194304           # ≤ 16 MiB
+activity_interval_s = 2.0           # 0.1..=60
+activity_timeout_s = 0.25
+input_tail_chars = 8192             # 256..=32768
+output_tail_chars = 24576           # 256..=32768
+
+[models]
+max_name_chars = 12
+[models.aliases]
+# llama-swap model id = short display name (at most 32 entries). Example:
+# "my-model-id" = "My Model 7B"
+
+# snapshot dir/file are compile-time constants in llama-core (not configurable)
+
+[load]
+# Activity is the busier device: max(gpu, cpu), each
+# (watts - idle) / (nominal_frac * limit - idle), clamped to 0..=125 %.
+# 100 % is sustained heavy load; spikes read above it on the LCD redline.
+# The GPU limit is NVML's enforced limit; the CPU uses AMD socket energy (the
+# zenergy hwmon driver). A device with no watts drops out; with neither, activity
+# is max(GPU util, CPU mean). The tty ACTIVITY bar shows gpu, cpu or util.
+cpu_limit_w = 230                   # finite and > 0; your CPU's full-load socket watts
+# idle = "auto" learns each floor: the lowest 10 s mean draw since start,
+# ignoring the first 30 s after start or after a source reappears. The watts
+# below hold until the first mean; the learned floor may sit above them (a Zen
+# package idles near 40 W). It never rises, so load is not learned as idle,
+# and it stays under (nominal_frac - 0.1) * limit. A box that is busy from
+# boot learns a wrong floor: set idle = "fixed" and the watts below instead.
+idle = "auto"                       # "auto" or "fixed" (use the watts below as they are)
+gpu_idle_w = 30                     # finite and >= 0
+cpu_idle_w = 25                     # finite, >= 0 and < nominal_frac * cpu_limit_w
+smooth_s = 0.3                      # 0..=5; 0 disables the EMA
+nominal_frac = 0.8                  # 0.5..=1.0; share of each limit that reads 100 %
+
+[tty]
+fps = 10                            # 1..=20
+full_redraw_s = 5                   # >= 1
+# Tok/s at the top of the tty rate scales (tick labels, chart band, RECENT
+# speed bars, ACTIVITY gen digits). log-scaled; pick the fastest model's
+# decode and prefill rates.
+gen_ceiling_tps = 250               # decode; finite, (0, 100000]
+prompt_ceiling_tps = 1500           # prefill; finite, (0, 100000]
+chart_bucket_s = 2                  # 1..=60; one tty chart column
+ctx_history_h = 6                   # 1..=24; hours of per-slot context in the SLOTS sparklines
+chart_glyphs = "eighths"            # "eighths" needs llama-hack-12x24 on tty11; "halves" renders with eurlatgr (code default)
+# false hides the IN/OUT prompt and output panels (their rows go to the chart
+# and RECENT) and the watcher stops keeping llama text at all. The header
+# then shows "text off". `llama-watch run --config PATH --no-text` forces
+# false whatever this says.
+show_text = true
+# "clean" strips chat-template control tokens (<|im_start|>, [INST], <think>,
+# ...) from the IN panel and marks each turn with a "-- user --" style label.
+# "raw" shows the prompt tail as llama-server holds it. Both are sanitised.
+prompt_view = "clean"
+# Burn-in guard (off by default; 0 = off, 0..=60 minutes). The kernel counts
+# both from the last KEYPRESS on the console, not from screen output, so the
+# monitor blanks while the dashboard is still updating; any key or a VT switch
+# wakes it. blank_min blanks the console (on KMS/DRM that is DPMS standby).
+# sleep_min adds a deeper VESA powerdown and must be above blank_min. The
+# kernel counts powerdown from the blank, so the watcher sends
+# sleep_min - blank_min. The powerdown also needs the console powersave mode,
+# which llama-watch.service sets with a root setterm pre-step.
+#blank_min = 10
+#sleep_min = 15
+
+# Read-only fan panel on tty11 (off by default). The watcher reads
+# fanN_input, pwmN and pwmN_enable from the hwmon whose `name` matches
+# `hwmon`, and never writes them. Match by name, not by hwmonN: the number
+# changes across reboots. List the names with: cat /sys/class/hwmon/*/name
+# Channels are 1..=16, at most 8; labels (optional) are <= 10 characters.
+#[fans]
+#enabled = true
+#hwmon = "nct6798"
+#channels = [2, 3, 5, 6]
+#labels = ["front1", "front2", "rear", "top"]

@@ -1,0 +1,26 @@
+{
+  "ring_pct": 70,
+  "ring_band": "FlatOut",
+  "blocks": [
+    "FlatOut",
+    "Busy",
+    "Light"
+  ],
+  "coolant_c": 40,
+  "cpu_c": 79,
+  "gpu_c": 80,
+  "cpu_pct": 41,
+  "mem_pct": 11,
+  "ai": "Loaded",
+  "models": [
+    "Qwen 35B"
+  ],
+  "model_count": 1,
+  "detail": {
+    "ctx": 262144,
+    "ncmoe": 16,
+    "quant": "UD-Q4_K_M",
+    "kv_k": "q8_0",
+    "kv_v": "q8_0"
+  }
+}

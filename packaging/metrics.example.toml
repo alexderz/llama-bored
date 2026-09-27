@@ -1,0 +1,35 @@
+# /etc/llama-bored/metrics.toml: llama-metrics, the Prometheus exporter.
+#
+# LAN-exposed by design. It serves GET /metrics (text format 0.0.4) to the
+# networks below and to nobody else. It is "just metrics": numbers from the
+# llama-watch snapshot plus model display names and tuning tokens. It
+# contains no prompt or output text; the snapshot carries none.
+#
+# The exporter reads one file, /run/llama-watch/snapshot.json (a compile-time
+# constant, not a key here). It opens no device and dials nothing.
+#
+# Scrape config for Prometheus on another LAN host:
+#   - job_name: llamabored
+#     static_configs: [{ targets: ["<this-host>:19477"] }]
+
+# IP:PORT to bind. 19477 is outside the Prometheus exporter port registry
+# (9100-9999 is fully allocated there). "[::]:19477" is dual-stack; IPv4
+# peers then match the IPv4 networks in `allow`.
+listen = "0.0.0.0:19477"
+
+# CIDR allowlist, checked for every connection before a byte is read. Host
+# bits must be zero and /0 is refused. 1..=32 entries.
+# The shipped value is an example: every 192.168.x.x host plus loopback.
+# Narrow it to your LAN, or to the Prometheus host alone, for example
+# ["192.168.1.0/24", "127.0.0.1/32"] or ["192.168.1.20/32"]. A 10.0.0.0/8
+# or 172.16.0.0/12 network works the same way.
+# Keep this equal to IPAddressAllow= in llama-metrics.service (and the port
+# above equal to SocketBindAllow=): the unit is the kernel's copy of the rule.
+allow = ["192.168.0.0/16", "127.0.0.1/32"]
+
+# Connections served at once, 1..=64. More are answered 503 and closed.
+max_conns = 16
+
+# A snapshot older than this (seconds, 1..=300) is stale: the value series
+# are dropped and llamabored_snapshot_stale is 1.
+stale_after_s = 5

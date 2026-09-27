@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify the session that Kraken LCD halted
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -u critical "Kraken LCD HALTED: cooling guard tripped"

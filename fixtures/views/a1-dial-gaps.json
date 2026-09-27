@@ -1,0 +1,21 @@
+{
+  "ring_pct": 40,
+  "ring_band": "Busy",
+  "blocks": ["Busy", "Light", "Quiet"],
+  "coolant_c": 36,
+  "cpu_c": 62,
+  "gpu_c": 55,
+  "cpu_pct": 22,
+  "mem_pct": 18,
+  "ai": "Loaded",
+  "models": ["Qwen3.6 35B-A3B"],
+  "model_count": 1,
+  "variant": "a1",
+  "dial": [
+    100, 100, null, null, 90, null, 70, null, 50, null,
+    100, null,
+    70, null, 30,
+    0, null, 90, null,
+    50, null, 70, 0, 10
+  ]
+}

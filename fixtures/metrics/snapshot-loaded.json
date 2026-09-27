@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "run_id": 7340233211,
+  "seq": 4242,
+  "t_mono_ns": 1000000000000,
+  "t_wall_ms": 1790000000000,
+  "host": {
+    "load_pct": 64.5,
+    "activity_pct": 112.25,
+    "cpu_pct": 23.5,
+    "cpu_topk_pct": 64.5,
+    "gpu_pct": 97,
+    "mem_pct": 41.75,
+    "coolant_c": 31.5,
+    "cpu_c": 58,
+    "gpu_c": 71.5
+  },
+  "ai": {
+    "state": "loaded",
+    "models": [
+      {
+        "name": "Qwen3-Coder…",
+        "state": "ready",
+        "full_name": "Qwen3-Coder-30B \"fast\" \\ build",
+        "detail": {
+          "ctx": 262144,
+          "ncmoe": 16,
+          "kv_k": "q8_0",
+          "kv_v": "q8_0",
+          "quant": "UD-Q4_K_M",
+          "fa": true
+        }
+      },
+      {
+        "name": "Bonsai 8B",
+        "state": "starting",
+        "detail": {
+          "ctx": 131072,
+          "ncmoe": 65535,
+          "kv_k": "q8_0",
+          "kv_v": "q4_0",
+          "quant": "PTQ1_0"
+        }
+      },
+      {
+        "name": "tiny",
+        "state": "other"
+      }
+    ]
+  },
+  "tokens": {
+    "decoded_total": 1234567
+  }
+}

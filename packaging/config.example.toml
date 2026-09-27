@@ -1,0 +1,35 @@
+[writer]
+tick_s = 0.5                       # 0.1..=2.0
+
+[snapshot]
+# path is a compile-time constant in llama-core: /run/llama-watch/snapshot.json (not configurable)
+stale_after_s = 1.0                # 0.3..=10.0
+watch_down_stock_after_s = 30      # 5..=600
+watch_down_restore_min_s = 600     # 60..=3600; at most one watch-down ShowLiquid per this period
+
+[dial]
+# each bars >= 1; widths finite and <= 300 s; displayed window <= 1800 s
+tiers = [[0.5, 10], [5, 2], [15, 3], [60, 4], [300, 5]]
+ceiling_tps = 150.0                # 10..=10000; unused since the activity dial (kept for old files)
+xff = 0.5                          # 0.0..=1.0
+max_gap_s = 2.0                    # 0.5..=10.0
+
+[upload]
+min_interval_s = 60                 # floor 10; change mode only. Stream mode ignores this gap.
+fail_limit = 3                      # 1..=10
+mode = "change"                     # change | stream. Installed units stay on change until switched.
+stream_fps = 10                     # 1..=12. One rendered frame per tick when mode = "stream".
+
+[bands]
+enter = [15, 40, 70]                # Light, Busy, FlatOut
+margin = 5
+fill_min_coverage = 0.5
+
+[hysteresis]                        # [step, margin]
+ring = [5, 2]
+percent = [1, 1]
+temp = [1, 1]
+
+[display]
+variant = "a1"                     # a1 | a3   (rotate_deg unchanged)
+rotate_deg = 0                      # 0 | 90 | 180 | 270, on top of the device orientation

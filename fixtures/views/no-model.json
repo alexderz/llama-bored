@@ -1,0 +1,13 @@
+{
+  "ring_pct": 3,
+  "ring_band": "Quiet",
+  "blocks": ["Quiet", "Light", "Busy"],
+  "coolant_c": 34,
+  "cpu_c": 46,
+  "gpu_c": 38,
+  "cpu_pct": 3,
+  "mem_pct": 11,
+  "ai": "Idle",
+  "models": [],
+  "model_count": 0
+}

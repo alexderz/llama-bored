@@ -1,0 +1,66 @@
+[Unit]
+Description=Llama Light - RGB lighting from the llama-watch snapshot (colour only, never cooling)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=llama-light
+Group=llama-light
+SupplementaryGroups=llama-watch
+ExecStart=/usr/local/libexec/llama-bored/llama-light run --config /etc/llama-bored/light.toml
+# Leaves ARGB header 1 on a neutral static colour, in RAM (no save to flash).
+# The board's stored effect returns at the next power cycle.
+ExecStopPost=-/usr/local/libexec/llama-bored/llama-light restore --config /etc/llama-bored/light.toml
+Restart=on-failure
+# Exit 2 is an unusable config at start; restarting cannot fix it.
+RestartPreventExitStatus=2
+RestartSec=10
+WatchdogSec=10
+TimeoutStopSec=10
+UMask=0077
+
+# --- privilege
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# --- filesystem: reads the snapshot, its config and sysfs; writes nothing
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadOnlyPaths=/sys
+
+# --- devices: only the Aura controller's hidraw node, through the udev
+# symlink from 94-llama-light-hidraw.rules. No i2c, no usbfs, no Kraken.
+# The keyboard node is added when its protocol lands. After a USB
+# re-enumeration the node can get a new minor; restart the unit to pick it up.
+DevicePolicy=closed
+DeviceAllow=/dev/llama-light/aura rw
+
+# --- network: none
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

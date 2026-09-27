@@ -1,0 +1,13 @@
+{
+  "ring_pct": null,
+  "ring_band": null,
+  "blocks": ["Quiet", "Quiet", "Quiet"],
+  "coolant_c": null,
+  "cpu_c": null,
+  "gpu_c": null,
+  "cpu_pct": null,
+  "mem_pct": null,
+  "ai": "Loaded",
+  "models": ["Qwen3.6 35B-A3B"],
+  "model_count": 1
+}

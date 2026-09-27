@@ -1,0 +1,63 @@
+[Unit]
+Description=Llama Watch - single reader of host + llama state; tty11 dashboard; publishes snapshot
+Conflicts=getty@tty11.service
+After=getty@tty11.service systemd-user-sessions.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=llama-watch
+Group=llama-watch
+ExecStartPre=-+/usr/bin/setfont -C /dev/tty11 /usr/local/share/llama-bored/llama-hack-12x24.psfu
+ExecStartPre=-+/usr/bin/sh -c 'exec /usr/bin/setterm --term linux --powersave powerdown </dev/tty11 >/dev/tty11'
+ExecStart=/usr/local/libexec/llama-bored/llama-watch run --config /etc/llama-bored/watch.toml
+Restart=on-failure
+RestartSec=5
+WatchdogSec=10
+UMask=0027
+RuntimeDirectory=llama-watch
+RuntimeDirectoryMode=0750
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty11
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ReadOnlyPaths=/sys
+DevicePolicy=closed
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/tty11 rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "run_id": 1,
+  "seq": 9,
+  "t_mono_ns": 1000000000000,
+  "t_wall_ms": 1790000000000,
+  "host": {
+    "load_pct": null,
+    "cpu_pct": 5,
+    "cpu_topk_pct": null,
+    "gpu_pct": null,
+    "mem_pct": 20,
+    "coolant_c": null,
+    "cpu_c": null,
+    "gpu_c": null
+  },
+  "ai": { "state": "down", "models": [] },
+  "tokens": { "decoded_total": null }
+}

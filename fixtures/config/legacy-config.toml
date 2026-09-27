@@ -1,0 +1,27 @@
+[collector]
+tick_s = 2.0                        # 1.0..10.0
+llama_swap_url = "http://127.0.0.1:8080"   # host must be loopback
+http_timeout_s = 1.0                # must be < tick_s
+cpu_top_k = 8                       # 1..=nproc
+
+[upload]
+min_interval_s = 60                 # floor 10
+fail_limit = 3                      # 1..=10
+
+[bands]
+enter = [15, 40, 70]                # Light, Busy, FlatOut
+margin = 5
+fill_min_coverage = 0.5
+
+[hysteresis]                        # [step, margin]
+ring = [5, 2]
+percent = [1, 1]
+temp = [1, 1]
+
+[display]
+rotate_deg = 0                      # 0 | 90 | 180 | 270, on top of the device orientation
+
+[models]
+max_name_chars = 12
+[models.aliases]
+"qwen3.6-35b-a3b" = "Qwen 35B"

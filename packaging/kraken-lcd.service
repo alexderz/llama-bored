@@ -1,0 +1,73 @@
+[Unit]
+Description=Kraken LCD - live telemetry on the NZXT Kraken Z LCD (LCD-only, never cooling)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=kraken-lcd
+Group=kraken-lcd
+SupplementaryGroups=llama-watch
+ExecStart=/usr/local/libexec/llama-bored/kraken-lcd run --config /etc/llama-bored/config.toml
+ExecStopPost=-/usr/local/libexec/llama-bored/kraken-lcd restore-stock --config /etc/llama-bored/config.toml
+Restart=on-failure
+# Exit 2 is Fence or Fatal and must not restart. RestartSec tracks
+# upload.min_interval_s (shipped default 60). install.sh rewrites this
+# line from the config so a restart cannot skip the in-process upload gap.
+RestartPreventExitStatus=2
+RestartSec=60
+WatchdogSec=30
+TimeoutStopSec=15
+UMask=0077
+StateDirectory=kraken-lcd
+StateDirectoryMode=0755
+
+# --- privilege
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# --- filesystem (sysfs/hwmon read-only is a SAFETY control)
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadOnlyPaths=/sys
+
+# --- devices: only the Kraken (usbfs + hidraw)
+# T44 / RR7: hidraw is pinned to the one node behind the udev symlink from
+# 93-kraken-lcd-hidraw.rules. systemd stat()s the path, following the
+# symlink, and allows that major:minor when the unit starts. A path that is
+# absent then is skipped: no hidraw node is allowed, the open fails, and the
+# writer detaches ("device unavailable") and retries with backoff, never
+# crash-looping. After a USB re-enumeration the node can get a new minor that
+# the running unit does not allow; restart the unit to pick it up.
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+DeviceAllow=/dev/kraken-lcd/hid rw
+
+# --- network: none (PrivateNetwork)
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

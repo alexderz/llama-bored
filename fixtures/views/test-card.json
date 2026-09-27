@@ -1,0 +1,21 @@
+{
+  "ring_pct": 70,
+  "ring_band": "FlatOut",
+  "blocks": ["FlatOut", "Busy", "Light"],
+  "coolant_c": null,
+  "cpu_c": null,
+  "gpu_c": null,
+  "cpu_pct": null,
+  "mem_pct": null,
+  "ai": "Loaded",
+  "models": ["TEST IMAGE"],
+  "model_count": 1,
+  "variant": "a1",
+  "dial": [
+    90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
+    90, 90,
+    90, 90, 90,
+    90, 90, 90, 90,
+    90, 50, 30, 0, 10
+  ]
+}

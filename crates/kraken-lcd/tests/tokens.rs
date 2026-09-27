@@ -1,0 +1,174 @@
+//! Tokens · 24 h: the 40-point integer cascade and its counter feed.
+
+use kraken_lcd::tokens::{Bucket, SLOTS, TIERS, TokenChart, TokenFeed};
+use llama_core::sample::TokenReading;
+
+fn reading(run_id: u64, seq: u64, t_ms: u64, total: Option<u64>) -> TokenReading {
+    TokenReading {
+        run_id,
+        seq,
+        t_mono_ns: t_ms * 1_000_000,
+        decoded_total: total,
+    }
+}
+
+#[test]
+fn tiers_cover_exactly_24_hours_in_40_points() {
+    let points: usize = TIERS.iter().map(|(_, cap)| cap).sum();
+    assert_eq!(points, SLOTS);
+    let span: u64 = TIERS
+        .iter()
+        .map(|(ms, cap)| u64::from(*ms) * *cap as u64)
+        .sum();
+    // 10×30 s + 11×5 min + 10×30 min + 9×2 h = 5 min + 55 min + 5 h + 18 h.
+    assert_eq!(span, 24 * 3_600_000);
+    // Carries merge whole buckets: 10 × 30 s = 5 min, 6 × 5 min = 30 min,
+    // 4 × 30 min = 2 h.
+    for pair in TIERS.windows(2) {
+        assert_eq!(pair[1].0 % pair[0].0, 0, "{pair:?}");
+    }
+}
+
+#[test]
+fn rollover_sums_are_exact_and_nothing_is_rebinned() {
+    let mut chart = TokenChart::default();
+    let mut added = Bucket::default();
+    // Two days at 10 Hz with an uneven token stream, in 100 ms steps.
+    let mut state = 12_345_u64;
+    for _ in 0..(2 * 24 * 3600 * 10) {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let tok = (state >> 59) & 0x1F;
+        chart.add(tok, 100);
+        added.tok += tok;
+        let held = chart.held();
+        let dropped = chart.dropped();
+        assert_eq!(
+            held.tok + dropped.tok,
+            added.tok,
+            "every token is held or fell off the 24 h end"
+        );
+    }
+    let held = chart.held();
+    let dropped = chart.dropped();
+    assert_eq!(
+        u64::from(held.ms) + u64::from(dropped.ms),
+        2 * 24 * 3600 * 1000,
+        "every millisecond is accounted for"
+    );
+    // The held span is 24 h plus at most the carries and the live bucket.
+    assert!(u64::from(held.ms) >= 24 * 3_600_000, "{}", held.ms);
+    assert!(
+        u64::from(held.ms) <= 24 * 3_600_000 + 30_000 + 300_000 + 1_800_000 + 7_200_000,
+        "{}",
+        held.ms
+    );
+}
+
+#[test]
+fn a_constant_rate_reads_the_same_on_every_point() {
+    let mut chart = TokenChart::default();
+    // 42 tok/s for 30 h, fed as 4.2 tokens per 100 ms (21 per 500 ms).
+    for _ in 0..(30 * 3600 * 2) {
+        chart.add(21, 500);
+    }
+    let points = chart.points();
+    assert_eq!(points.len(), SLOTS);
+    for (i, rate) in points.iter().enumerate() {
+        assert!((rate - 42.0).abs() < 1e-3, "point {i} reads {rate}");
+    }
+}
+
+#[test]
+fn points_are_newest_first_and_the_live_bucket_waits_for_3_s() {
+    let mut chart = TokenChart::default();
+    // 5 min at 10 tok/s, then 5 min at 100 tok/s.
+    for _ in 0..300 {
+        chart.add(10, 1_000);
+    }
+    for _ in 0..300 {
+        chart.add(100, 1_000);
+    }
+    let points = chart.points();
+    assert!((points[0] - 100.0).abs() < 1e-3, "{points:?}");
+    assert!((points.last().copied().unwrap_or(0.0) - 10.0).abs() < 1e-3);
+    chart.add(50, 2_000);
+    assert_eq!(
+        chart.points(),
+        points,
+        "2 s in the live bucket is not plotted"
+    );
+    chart.add(50, 1_000);
+    let with_live = chart.points();
+    assert!((with_live[0] - 100.0 / 3.0).abs() < 1e-3, "{with_live:?}");
+    assert_eq!(with_live.len(), points.len() + 1);
+}
+
+#[test]
+fn memory_is_bounded_after_days_of_samples() {
+    let mut chart = TokenChart::default();
+    for _ in 0..(5 * 24 * 3600) {
+        chart.add(7, 1_000);
+    }
+    // 40 buckets, 4 carries and the live one.
+    assert!(chart.stored() <= 40 + 4 + 1, "{}", chart.stored());
+    assert!(chart.points().len() <= SLOTS);
+    // The held milliseconds do not grow without bound.
+    assert!(u64::from(chart.held().ms) < 36 * 3_600_000);
+}
+
+#[test]
+fn a_counter_reset_or_model_swap_is_a_gap_not_a_negative() {
+    let mut feed = TokenFeed::new(2.0);
+    assert_eq!(feed.accept(reading(1, 1, 1_000, Some(500))).interval, None);
+    let step = feed.accept(reading(1, 2, 1_100, Some(510)));
+    assert!(step.fresh);
+    assert_eq!(step.interval, Some((10, 100)));
+    // The counter goes down: a restart or a swapped model.
+    let reset = feed.accept(reading(1, 3, 1_200, Some(3)));
+    assert!(reset.fresh);
+    assert_eq!(reset.interval, None, "a decrease adds nothing");
+    // The next interval counts from the new baseline.
+    assert_eq!(
+        feed.accept(reading(1, 4, 1_300, Some(8))).interval,
+        Some((5, 100))
+    );
+    // A missing counter is a gap on both sides.
+    assert_eq!(feed.accept(reading(1, 5, 1_400, None)).interval, None);
+    assert_eq!(feed.accept(reading(1, 6, 1_500, Some(20))).interval, None);
+    // A new watcher run is a gap even when the counter is higher.
+    assert_eq!(feed.accept(reading(2, 1, 1_600, Some(900))).interval, None);
+    // A stall beyond max_gap_s is a gap.
+    assert_eq!(feed.accept(reading(2, 2, 4_000, Some(950))).interval, None);
+    // A re-read is not fresh and does not move the baseline.
+    let reread = feed.accept(reading(2, 2, 4_000, Some(950)));
+    assert!(!reread.fresh);
+    assert_eq!(
+        feed.accept(reading(2, 3, 4_100, Some(960))).interval,
+        Some((10, 100))
+    );
+
+    // Through the chart: the reset leaves no negative anywhere.
+    let mut chart = TokenChart::default();
+    let mut feed = TokenFeed::new(2.0);
+    let mut total = 1_000_u64;
+    for seq in 0..600 {
+        if seq == 300 {
+            total = 0;
+        }
+        total += 5;
+        if let Some((tok, ms)) = feed
+            .accept(reading(1, seq, 10_000 + seq * 100, Some(total)))
+            .interval
+        {
+            chart.add(tok, ms);
+        }
+    }
+    let points = chart.points();
+    assert!(!points.is_empty());
+    assert!(
+        points.iter().all(|rate| (*rate - 50.0).abs() < 1e-3),
+        "5 tokens per 100 ms is 50 tok/s either side of the reset: {points:?}"
+    );
+}

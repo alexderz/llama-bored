@@ -1,0 +1,66 @@
+# llama-metrics: Prometheus exporter for the llama-watch snapshot.
+# LAN-exposed by design; it reads only /run/llama-watch/snapshot.json and
+# opens no device. Installed, never enabled by install.sh.
+#
+# Keep IPAddressAllow= equal to `allow` in /etc/llama-bored/metrics.toml and
+# SocketBindAllow= equal to the port of `listen`. The config is checked in
+# process; these lines are the kernel's copy of the same rule. Change both
+# together (a drop-in with `IPAddressAllow=` first resets the list).
+# The shipped 192.168.0.0/16 is an example LAN; set your own network (or the
+# Prometheus host's /32) in both places, e.g. with a drop-in:
+#   [Service]
+#   IPAddressAllow=
+#   IPAddressAllow=192.168.1.0/24 127.0.0.1/32
+[Unit]
+Description=Llama Metrics - Prometheus exporter for the llama-watch snapshot (read-only, LAN)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=llama-metrics
+Group=llama-metrics
+SupplementaryGroups=llama-watch
+ExecStart=/usr/local/libexec/llama-bored/llama-metrics run --config /etc/llama-bored/metrics.toml
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+WatchdogSec=10
+TimeoutStopSec=5
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=192.168.0.0/16 127.0.0.1/32
+IPAddressDeny=any
+SocketBindAllow=tcp:19477
+SocketBindDeny=any
+
+[Install]
+WantedBy=multi-user.target

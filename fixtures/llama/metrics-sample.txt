@@ -1,0 +1,8 @@
+# extra series are ignored
+llamacpp:prompt_tokens_total 3
+llamacpp:n_decode_total 100
+llamacpp:n_decode_total NaN
+llamacpp:n_decode_total_extra 9
+not_llamacpp:n_decode_total 8
+llamacpp:requests_processing NaN
+llamacpp:requests_processing 0

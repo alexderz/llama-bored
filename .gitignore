@@ -1,0 +1,9 @@
+target/
+__pycache__/
+*.pyc
+.venv/
+venv/
+artifacts/
+*.png
+!docs/**/*.png
+!crates/**/tests/golden/**/*.png

@@ -1,0 +1,21 @@
+{
+  "ring_pct": null,
+  "ring_band": null,
+  "blocks": ["Filling", "Filling", "Filling"],
+  "coolant_c": null,
+  "cpu_c": null,
+  "gpu_c": null,
+  "cpu_pct": null,
+  "mem_pct": null,
+  "ai": "NoData",
+  "models": [],
+  "model_count": 0,
+  "variant": "a1",
+  "dial": [
+    null, null, null, null, null, null, null, null, null, null,
+    null, null,
+    null, 70, 70,
+    70, 70, 70, 70,
+    90, 90, 90, 90, 90
+  ]
+}
