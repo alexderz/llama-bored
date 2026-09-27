@@ -101,10 +101,11 @@ when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
   controller's RAM. On stop, `ExecStopPost` runs `llama-light restore`, which
   sends one neutral static frame, again without a commit; the board's own
   stored effect returns at the next power cycle.
-- **One pinned node.** udev (`94-llama-light-hidraw.rules`) gives the
+- **Pinned nodes.** udev (`94-llama-light-hidraw.rules`) gives the
   controller's hidraw node to group `llama-light`, mode 0660, strips
-  `uaccess`, and adds `/dev/llama-light/aura`, the unit's only
-  `DeviceAllow=`. Before opening, llama-light checks in sysfs that the node is
+  `uaccess`, and adds `/dev/llama-light/aura`. It does the same for the
+  keyboard's lighting interface as `/dev/llama-light/keyboard` (below). These
+  two links are the unit's only `DeviceAllow=` entries. Before opening, llama-light checks in sysfs that the node is
   HID `0003:0B05:18F3`; after opening (write-only) it checks with `fstat`
   that it opened that character device.
 - **Bounded output.** Every LED is capped at `brightness_max` (default 80 %),
@@ -133,9 +134,11 @@ when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
   networks with host bits set are refused. The shipped example admits
   `192.168.0.0/16` and loopback; narrow it to your LAN.
 - **Nothing sensitive to reach.** It reads only the snapshot (which carries no
-  llama text) and its config. It has `PrivateDevices=yes`, no `/proc` beyond
-  its own, no `/sys`, no hidraw or USB, no outbound connections and no file
-  writes (S16), and runs as its own user.
+  llama text) and its config, and runs as its own user. The unit gives it
+  `PrivateDevices=yes`, no `/proc` beyond its own and no `/sys`
+  (`InaccessiblePaths=/sys`). That it makes no outbound connections, opens no
+  hidraw or USB node and writes no files is enforced in code by fence S16;
+  the unit's `IPAddressAllow=` admits the allowed range in both directions.
 - **Strict HTTP.** `GET /metrics` only; request-line, head-size and
   header-count caps; one deadline for the whole head; a fixed worker pool
   (`max_conns`) with `503` beyond it. No body is read.
@@ -183,7 +186,8 @@ anomalies. Nothing on the device needs cleaning up after uninstall.
 | RR5 | A broken runtime could stop `ExecStopPost` from restoring stock | One native binary on glibc; `restore-stock` uses no optional libraries | **Closed** |
 | RR6 | The build tree and toolchain are writable by the build user, whose build root installs | The installer refuses a dirty tree, an unreleased HEAD, or a hash mismatch, and root never runs git or cargo. This protects against accidents, not against a compromised build account | **Accepted** |
 | RR7 | A class-wide `DeviceAllow=char-hidraw` would let the writer open every hidraw node (keyboards and so on) | Closed by pinning: udev adds `/dev/kraken-lcd/hid` for the cooler's node only, the writer unit's single hidraw grant is `DeviceAllow=/dev/kraken-lcd/hid`, and the installer checks that the symlink resolves to that node. The writer cross-checks the node against the cooler's sysfs path before opening it (S1). Trade-off: after a USB re-enumeration the writer needs a restart | **Closed** |
-| RR7b | The Aura controller's and the keyboard lighting interface's hidraw nodes may also be world-writable or `uaccess`-tagged by distro or OpenRGB rules | `94-llama-light-hidraw.rules` sorts after them, sets `0660 root:llama-light` and strips `uaccess`; the unit is pinned to `/dev/llama-light/aura`, checked against sysfs and `fstat` | **Closed** |
+| RR7b | The Aura controller's and the keyboard lighting interface's hidraw nodes may also be world-writable or `uaccess`-tagged by distro or OpenRGB rules | `94-llama-light-hidraw.rules` sorts after them, sets `0660 root:llama-light` and strips `uaccess`; the unit is pinned to `/dev/llama-light/aura` and `/dev/llama-light/keyboard`. Both are checked against sysfs before the open and `fstat` after it; the keyboard's usage page is checked too | **Closed** |
+| RR7c | The writer unit's usbfs grant, `DeviceAllow=char-usb_device rw`, covers every USB device node, not only the cooler's | `71-kraken-lcd.rules` gives only the cooler's usbfs node to group `kraken-lcd`, mode 0660; other USB nodes keep root ownership and their distro modes. The writer opens only the bus and device number it resolves from the cooler's sysfs directory | **Accepted** |
 | RR8 | While HALTED, our last frame can stay on screen and look live | Deliberate: no device I/O beats a fresh screen once cooling looks wrong. CRITICAL log, `systemctl status`, optional desktop alert | **Accepted** |
 | RR-LV1 | Prompts and outputs are readable on tty11 (and through llama-view) by anyone at the console, KVM or remote console, or in the `llama-view` group | `[tty] show_text = false` (or `llama-watch run --no-text`) removes the IN/OUT panels, the watcher stops keeping llama text at all, and the header shows "text off". The install skill asks the operator. Text appears only if `LLAMA_SERVER_SLOTS_DEBUG=1` is on. Tails only, no scrollback, and the VT is cleared on stop | **Operator's choice** (default: shown) |
 | RR-LV2 | With `LLAMA_SERVER_SLOTS_DEBUG=1`, llama-server's `/slots` returns whole prompts to **anyone who can reach llama-swap** | Keep llama-swap bound to loopback, or put a proxy in front that blocks any `slots` path for other clients. llama-watch must reach llama-swap directly | **Operator's responsibility** |

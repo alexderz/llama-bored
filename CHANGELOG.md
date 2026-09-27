@@ -11,6 +11,18 @@ All notable changes to llama-bored. Versions follow
 - `docs/RELEASING.md`: how versions, the changelog and releases work.
 - README demo GIFs of the Kraken LCD, tty11 and the keyboard (`docs/media/`).
 
+### Fixed
+
+- README, `docs/SAFETY.md` and `docs/ARCHITECTURE.md` describe device access
+  exactly: kraken-lcd's usbfs grant is class-wide and narrowed by udev (new
+  risk row RR7c), llama-light is pinned to two nodes (Aura and keyboard), and
+  the unit hardening is listed per unit.
+
+### Security
+
+- `llama-metrics.service` adds `InaccessiblePaths=/sys`, so the exporter
+  cannot read sysfs even through a bug; it never needed it.
+
 ## 0.1.1 — 2026-09-27
 
 ### Added

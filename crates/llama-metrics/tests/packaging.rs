@@ -79,6 +79,7 @@ fn unit_is_sandboxed_and_device_free() {
         ("SupplementaryGroups", "llama-watch"),
         ("DevicePolicy", "closed"),
         ("PrivateDevices", "yes"),
+        ("InaccessiblePaths", "/sys"),
         ("ProtectSystem", "strict"),
         ("ProtectHome", "yes"),
         ("ProcSubset", "pid"),

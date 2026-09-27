@@ -188,6 +188,7 @@ budget as uploads.
 | **B5** writers ↔ network | Nothing | `kraken-lcd` and `llama-light`: `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX` (sd_notify only), `IPAddressDeny=any`, and no network crates |
 | **B6** watcher → llama-light | The snapshot | The same validator as B3. A hostile snapshot can at worst pick wrong colours. Every LED is capped at `brightness_max`, and the frame rate at `fps` |
 | **B7** llama-light → Aura controller | 65-byte HID output reports | A closed encoder with two opcodes (`0x35` direct mode on channel 1, `0x40` colours on direct channel 0) and no save/commit. Write-only open of the one node behind `/dev/llama-light/aura`, checked against sysfs before and `fstat` after. See [SAFETY.md](SAFETY.md) |
+| **B7b** llama-light → keyboard lighting interface | 64-byte HID output reports | A closed encoder with four report shapes (software and hardware mode, a colour stream packet, a 24-bit commit) and no profile, firmware or stored-lighting writes, and no reads. Write-only open of the one node behind `/dev/llama-light/keyboard` (USB interface 1, usage page `0xFFC2`), checked against sysfs before and `fstat` after. Typing is on another interface and untouched. See [SAFETY.md](SAFETY.md) |
 | **B8** LAN → llama-metrics | HTTP requests | In-process CIDR allowlist checked before a byte is read, and the same list in the unit's `IPAddressAllow=`; `SocketBindAllow=` pins the port. `GET /metrics` only; caps on request line, head size and header count, one deadline for the head (slowloris gets `408`), `max_conns` workers then `503`. No request body is read. The response holds numbers, model names and allowlisted tokens only |
 
 | Actor | May write | May read |
@@ -202,29 +203,47 @@ budget as uploads.
 `kraken-lcd`, mode 0660, and strips `uaccess` ACLs from the hidraw node. It
 also adds a stable symlink, `/dev/kraken-lcd/hid`. The writer unit's only
 hidraw grant is `DeviceAllow=/dev/kraken-lcd/hid`, so it cannot open any
-other hidraw device (keyboards and so on), whatever their file modes. systemd
+other hidraw device (keyboards and so on), whatever their file modes. Its
+usbfs grant, `DeviceAllow=char-usb_device rw`, is class-wide: there the
+kernel's cgroup check allows every USB device node, and what narrows it to
+the cooler is the udev group and mode (other USB nodes stay root-owned with
+their distro modes) and the writer opening only the bus and device number it
+reads from the cooler's sysfs directory (SAFETY.md RR7c). systemd
 resolves that path when the unit starts. After a USB re-enumeration the node can
 get a new number, and the writer then needs a restart to reach it. The writer
 claims **only USB interface 0** (bulk) and never detaches a driver, changes the
 configuration or resets the device. The `nzxt-kraken3` hwmon driver stays bound
 to the HID interface.
 
-The Aura controller gets the same treatment: `94-llama-light-hidraw.rules`
-gives its hidraw node to group `llama-light`, mode 0660, strips `uaccess`, and
-adds `/dev/llama-light/aura`, the llama-light unit's only `DeviceAllow=`.
+The Aura controller and the keyboard's lighting interface get the same
+treatment: `94-llama-light-hidraw.rules` gives their hidraw nodes to group
+`llama-light`, mode 0660, strips `uaccess`, and adds `/dev/llama-light/aura`
+and `/dev/llama-light/keyboard`, the llama-light unit's only two
+`DeviceAllow=` entries.
 
 **Units.** All four system units use `NoNewPrivileges`, an empty capability set,
-`ProtectSystem=strict`, `ProtectKernelTunables`, `ReadOnlyPaths=/sys`,
-`DevicePolicy=closed` with explicit `DeviceAllow`, a `@system-service` syscall
-filter, `MemoryDenyWriteExecute`, and a systemd watchdog (watcher 10 s, writer
-30 s). `kraken-lcd` and `llama-light` add `PrivateNetwork=yes` and `ProcSubset=pid`;
-`kraken-lcd` runs `restore-stock` and `llama-light` runs `restore` (a neutral
-colour, never saved) in `ExecStopPost`. `llama-metrics` adds
-`PrivateDevices=yes`, `ProcSubset=pid`, `IPAddressAllow=` (its allowlist),
-`IPAddressDeny=any` and `SocketBindAllow=tcp:19477`. `scripts/stage.sh` pins
-the full directive set of the writer, watcher and exporter units, and checks
-that the exporter's `IPAddressAllow=` equals `allow` in
-`packaging/metrics.example.toml`. The writer does not depend on the watcher:
+`ProtectSystem=strict`, `ProtectKernelTunables`, `DevicePolicy=closed`, a
+`@system-service` syscall filter, `MemoryDenyWriteExecute`, and a systemd
+watchdog (LCD writer 30 s, the others 10 s). Per unit:
+
+- `llama-watch`: `ReadOnlyPaths=/sys`; `DeviceAllow=` for `/dev/nvidiactl`,
+  `/dev/nvidia0` and `/dev/tty11`; `IPAddressAllow=localhost`. Two
+  `ExecStartPre=-+` steps run as root, outside the sandbox (the `+` prefix),
+  before the service starts, and their failure is ignored (the `-`): `setfont`
+  loads the bundled font on tty11 and `setterm` sets its power-down mode.
+- `kraken-lcd`: `ReadOnlyPaths=/sys`, `ProcSubset=pid`, `PrivateNetwork=yes`;
+  `DeviceAllow=char-usb_device` and `DeviceAllow=/dev/kraken-lcd/hid`;
+  `restore-stock` in `ExecStopPost`.
+- `llama-light`: `ReadOnlyPaths=/sys`, `ProcSubset=pid`, `PrivateNetwork=yes`;
+  `DeviceAllow=/dev/llama-light/aura` and `/dev/llama-light/keyboard`;
+  `restore` (a neutral colour, never saved) in `ExecStopPost`.
+- `llama-metrics`: `InaccessiblePaths=/sys`, `PrivateDevices=yes` and no
+  `DeviceAllow=`, `ProcSubset=pid`, `IPAddressAllow=` (its allowlist),
+  `IPAddressDeny=any` and `SocketBindAllow=tcp:19477`.
+
+`scripts/stage.sh` pins the full directive set of the writer, watcher and
+exporter units, and checks that the exporter's `IPAddressAllow=` equals
+`allow` in `packaging/metrics.example.toml`. The writer does not depend on the watcher:
 it must run, and show "no data", when the watcher is absent.
 
 ## Safety fences

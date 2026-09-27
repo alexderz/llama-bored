@@ -149,8 +149,12 @@ main risk:
   root can clear.
 - **Nothing writes sysfs.** The FANS panel only reads.
 - **Split privileges.** One reader with no device access; writers with no
-  network, each pinned by udev and `DeviceAllow=` to its one device node; one
-  exporter that opens no device. Only llama-metrics listens.
+  network and only their own device nodes. kraken-lcd's hidraw grant is
+  pinned by udev and `DeviceAllow=` to the cooler's node; its usbfs grant is
+  class-wide in the unit, and udev gives only the cooler's usbfs node to its
+  group. llama-light is pinned the same way to two hidraw nodes, the Aura
+  controller and the keyboard's lighting interface. One exporter that opens
+  no device. Only llama-metrics listens.
 - **Stock restore on stop.** Stopping or crashing kraken-lcd gives the screen
   back to the stock readout; llama-light leaves a neutral colour in RAM and
   hands the keyboard back to its own lighting.
