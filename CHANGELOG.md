@@ -9,7 +9,7 @@ All notable changes to llama-bored. Versions follow
 ### Added
 
 - `docs/RELEASING.md`: how versions, the changelog and releases work.
-- README demo GIFs of the Kraken LCD and tty11 (`docs/media/`).
+- README demo GIFs of the Kraken LCD, tty11 and the keyboard (`docs/media/`).
 
 ## 0.1.1 — 2026-09-27
 

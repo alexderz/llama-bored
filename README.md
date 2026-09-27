@@ -85,8 +85,13 @@ falls back to utilisation.
 - Fans on a splitter (mirrored) or a daisy chain (per-fan values).
 - Per-key keyboard gauges: bars two key rows tall, a tokens/s dial on the
   number pad, with an optional tweened frame pipeline so values glide
-  instead of flicker. The example file has a full layout. On stop the keyboard gets its
-  own lighting back.
+  instead of flicker. The example file has a full layout. On stop the
+  keyboard gets its own lighting back.
+
+  <img src="docs/media/keyboard.gif" alt="The keyboard layout during the same 12 seconds: activity on the F-row, GPU and busiest cores as two-row bars, GPU temperature on the navigation keys, tokens/s as a dial on the number pad">
+
+  <sub>The keyboard layout during the same 12 seconds, computed by llama-light
+  from the recorded snapshots and drawn with simulated keycap bleed.</sub>
 - Live reload: edits to `light.toml` apply within 2 s; a bad file is logged
   and ignored.
 
