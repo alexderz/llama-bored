@@ -6,6 +6,14 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- Continuous integration: GitHub Actions run `scripts/check.sh` on every
+  push and pull request, a weekly advisory audit, and a release workflow
+  that checks a `vX.Y.Z` tag against the crate versions and the changelog
+  and publishes the release notes. Actions are pinned by commit; Dependabot
+  keeps them current.
+
 ## 0.1.2 — 2026-09-27
 
 ### Added

@@ -1,0 +1,8 @@
+# Only the pinned GitHub Actions. Rust dependencies are pinned and
+# allowlisted on purpose (scripts/s10-deps.sh); they change by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -23,18 +23,27 @@ llama-bored follows [Semantic Versioning](https://semver.org/) and keeps a
 - A release renames `## Unreleased` to `## X.Y.Z — YYYY-MM-DD` and opens a
   new, empty `## Unreleased` above it.
 
+## Changes
+
+`main` is protected: every change lands through a pull request, and the
+`check.sh` CI job must pass first. CI runs `scripts/check.sh` on each push
+and pull request; a weekly job runs `cargo audit` and `cargo deny check
+advisories` so new advisories show up without a code change.
+
 ## Cutting a release
 
-1. `main` is green: `scripts/check.sh` exits 0 on a clean tree.
+1. `main` is green: CI passes, and `scripts/check.sh` exits 0 on a clean
+   tree locally.
 2. Bump the version (above), move `Unreleased` to the new version, and
    update the README, `docs/` and `skills/install/SKILL.md` where the
    release changes what they describe.
-3. Commit `llama-bored X.Y.Z: <one-line summary>` and run `scripts/check.sh`
-   again on the committed tree.
-4. Tag it annotated: `git tag -a vX.Y.Z -m "llama-bored X.Y.Z"`, then
-   `git push origin main vX.Y.Z`.
-5. Publish the GitHub release with that changelog section as its notes:
-   `gh release create vX.Y.Z --title "llama-bored X.Y.Z" --notes-file <section>`.
+3. Commit `llama-bored X.Y.Z: <one-line summary>` on a branch, open a pull
+   request, and merge it when CI passes.
+4. Tag the merged commit on `main`, annotated:
+   `git tag -a vX.Y.Z -m "llama-bored X.Y.Z"`, then `git push origin vX.Y.Z`.
+5. The release workflow checks that the tag matches every crate version
+   and that `CHANGELOG.md` has a `## X.Y.Z` section, then publishes the
+   GitHub release with that section as its notes.
 
 Never move a pushed tag, rewrite pushed history or force-push `main`. A
 mistake in a release is fixed by the next patch release.
