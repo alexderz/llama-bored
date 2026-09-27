@@ -1,5 +1,5 @@
 ---
-name: llama-bored-install
+name: install
 description: Install llama-bored (local-AI telemetry on tty11, the NZXT Kraken Z LCD, ASUS Aura and Corsair keyboard RGB, and a Prometheus endpoint) on a Linux/systemd machine, end to end and safely. Use when asked to install, set up, reinstall, verify, roll back or uninstall llama-bored. Requires root (sudo) and a human nearby; it touches USB devices that also run the CPU cooler and fan lighting.
 ---
 
@@ -112,7 +112,7 @@ first **STOP**.
    ```sh
    D=$(for d in /sys/bus/usb/devices/*; do [ "$(cat "$d/idVendor" 2>/dev/null)" = 1e71 ] && [ "$(cat "$d/idProduct")" = 3008 ] && basename "$d"; done)
    ls -l "/sys/bus/usb/devices/$D:1.0/driver" 2>&1   # must say: No such file or directory
-   pgrep -a -f 'liquidctl|coolercontrol|openrgb|krakenz' || true
+   pgrep -a -f '[l]iquidctl|[c]oolercontrol|[o]penrgb|[k]rakenz' || true
    systemctl list-units --all --no-pager | grep -iE 'liquidctl|coolercontrol|openrgb' || true
    ```
    If interface 0 has a driver, or any of those tools is running: **STOP** and
@@ -134,6 +134,7 @@ first **STOP**.
    The repo's `rust-toolchain.toml` selects the pinned version on first use.
    `check.sh` also needs `cargo install --locked cargo-deny cargo-audit`
    (user), plus `git`, a C linker (`cc`), `nm` and `ldd` (binutils/glibc).
+   `install.sh` also needs `setfacl` and `getfacl` (acl).
    On an immutable distro, do not layer packages without asking; use the
    user's toolbox or Homebrew if that is what they use.
 
@@ -169,7 +170,7 @@ first **STOP**.
    - **ASUS Aura USB controller** (for llama-light, optional):
      `lsusb -d 0b05:18f3`. One device → yes. Then, read-only:
      `ls -l /sys/class/hidraw/*/device 2>/dev/null | grep -i 0B05:18F3` and
-     `pgrep -a -f 'openrgb|armoury|aura' || true`. If an RGB tool is running,
+     `pgrep -a -f '[o]penrgb|[a]rmoury|[a]ura' || true`. If an RGB tool is running,
      llama-light and it will fight over the colours: tell the human, do not
      stop it yourself. Other ASUS lighting ids are not supported.
    - **How the fans are wired to the ARGB header.** Ask the human; software
@@ -186,7 +187,7 @@ first **STOP**.
      a chain, how many fans are on it (1–8).
    - **Corsair keyboard** (for llama-light, optional): `lsusb -d 1b1c:`.
      Only the STRAFE RGB MK.2 (`1b1c:1b48`) is supported; any other id,
-     leave `[keyboard]` off. `pgrep -a -f 'ckb-next|openrgb' || true`: a
+     leave `[keyboard]` off. `pgrep -a -f '[c]kb-next|[o]penrgb' || true`: a
      running RGB tool will fight llama-light; tell the human, do not stop it.
    - **tty11:** `systemctl is-active getty@tty11.service`. The watcher takes
      over tty11 and ends any session on it. Tell the human.
@@ -197,7 +198,7 @@ you continue.
 ## 2. Build and verify (user)
 
 ```sh
-git clone <REPO_URL> "$REPO"     # the repository this skill came from; skip if a clean clone exists
+git clone https://github.com/alexderz/llama-bored "$REPO"     # skip if a clean clone exists
 cd "$REPO"
 git switch main
 git status --porcelain                      # must print nothing
@@ -302,7 +303,8 @@ installing.
    On **mirrored** fans use `target = "aura.fans"` (the default) and layer
    entries instead (a dim `activity` base with a `ring` gauge on top, say);
    `aura.chain[...]` is refused there. Metrics: `activity`, `gpu`, `cpu`,
-   `load`, `mem`, `tokens_rate`, `coolant`, `gpu_temp`, `cpu_temp`. The
+   `cpu_topk` (the busiest cores), `load`, `mem`, `tokens_rate`, `coolant`,
+   `gpu_temp`, `cpu_temp`. The
    example file documents every key and has whole-file examples. Check it
    **(user)** without touching any device:
    `"$REPO"/target/release/llama-light check --config /etc/llama-bored/light.toml`.
@@ -363,7 +365,8 @@ installing.
    ends by printing next steps; this skill follows the same order.
 5. Start the watcher: `systemctl start llama-watch`. Its `ExecStartPre` loads
    the Hack console font on tty11. Check `systemctl status llama-watch`
-   (active) and ask the human to glance at Alt+F11.
+   (active) and ask the human to glance at tty11 (Ctrl+Alt+F11 from a
+   graphical session, Alt+F11 from another console).
 6. Cooling snapshot again **(user)** and compare with the baseline. Installing
    runs `udevadm trigger` on the cooler, which is expected to be
    cooling-neutral. Any anomaly → rule 5.
@@ -441,8 +444,9 @@ config: `targets: ["<this-host>:19477"]`, job name `llamabored`.
 ## 6. Verify
 
 1. `systemctl status llama-watch kraken-lcd --no-pager`: both `active
-   (running)`. No `HALTED` or `CRITICAL` in
-   `journalctl -u kraken-lcd -b --no-pager`.
+   (running)`. `journalctl -u kraken-lcd -b -p crit --no-pager` prints no
+   entries: in particular no `cooling guard halted`, `cooling guard latch is
+   present` or `CRITICAL time=` line.
 2. **The snapshot is updating** (10 Hz):
    ```sh
    grep -o '"seq":[0-9]*' /run/llama-watch/snapshot.json; sleep 1; grep -o '"seq":[0-9]*' /run/llama-watch/snapshot.json
@@ -458,7 +462,7 @@ config: `targets: ["<this-host>:19477"]`, job name `llamabored`.
    containing a unique word such as `zebra-4417`; then
    `journalctl -u llama-watch -u kraken-lcd --since -10min | grep -c zebra-4417`
    must print `0`.
-5. **tty11 content.** Ask the human to check Alt+F11: the ACTIVITY row names
+5. **tty11 content.** Ask the human to check tty11 (Ctrl+Alt+F11): the ACTIVITY row names
    its source (`gpu`, `cpu`, or `util` when no power sensor is readable); if
    `[fans]` is on, the FANS panel shows the chosen channels; with
    `show_text = false` the header says "text off". Confirm the fan panel did
@@ -515,7 +519,7 @@ config: `targets: ["<this-host>:19477"]`, job name `llamabored`.
 | Watcher fails to start | `journalctl -u llama-watch -b`. Usually a `watch.toml` value out of range; fix it and restart |
 | Writer logs "no NZXT Kraken Z LCD" | Re-run preflight step 2 |
 | LCD shows "no data" | The watcher is down or stale; check it first |
-| llama-light: "no Aura controller" | Expected without `0b05:18f3`; leave it disabled |
-| llama-light exits with status 2 | `light.toml` failed its check at start; run `llama-light check` and fix the key it names |
+| llama-light logs `aura absent (...)` (or `keyboard absent (...)`) | Expected without `0b05:18f3` (or `1b1c:1b48`); leave that part disabled. Otherwise the text in brackets says why |
+| llama-light exits with status 2 | `light.toml` failed its check at start; run `/usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml` and fix the key it names |
 | Fans all show one colour with per-fan entries | The fans are on a splitter: `fans = "mirrored"` |
 | Prometheus cannot scrape | `allow` in `metrics.toml`, the `IPAddressAllow=` drop-in, and the firewall must all admit the scraper |

@@ -37,8 +37,11 @@ crashing it changes nothing there.
 
 ## The cooling guard
 
-Every device operation (upload, open-time checks, restore to stock, and the
-one-shot `show-image`) is wrapped by a read-only guard.
+Every device operation (upload, open-time checks, restore to stock, the
+one-shot `show-image`, and the development-only `--query-buckets` and
+`bench-upload` commands) is wrapped by a read-only guard. Like `show-image`,
+the development commands refuse root and a claimed interface 0, and do
+nothing while the latch below is present.
 
 **Baseline**, taken just before the operation:
 
@@ -65,10 +68,14 @@ later:
 
 Any failed check moves the writer to **HALTED**:
 
-1. It logs CRITICAL with both snapshots.
+1. It logs at priority `crit` with both snapshots (`CRITICAL time=…
+   reason=…`) and `cooling guard halted; collect only`. A start with the
+   latch present logs `cooling guard latch is present; collect only`.
+   `journalctl -u kraken-lcd -p crit` shows both.
 2. It **stops all device I/O immediately**: no retries, and not even a "show
    stock" command.
-3. It writes the latch file `/var/lib/kraken-lcd/halted` (fsynced).
+3. It writes the latch file `/var/lib/kraken-lcd/halted` (fsynced, owned by
+   `kraken-lcd`).
 4. It keeps running and feeding the systemd watchdog, so systemd does not
    restart it into another attempt.
 
@@ -76,11 +83,13 @@ The latch **persists** across crashes, restarts and reboots. While it exists,
 `run` does no device I/O, and `restore-stock` (including the one in
 `ExecStopPost`) exits without touching the device.
 
-**Clearing it is a human decision.** After you have checked the cooler:
+**Clearing it is a human decision.** The latch is cleared by an explicit
+root command; `clear-halt` refuses to run as any other user and asks you to
+type `YES`. After you have checked the cooler:
 
 ```sh
 cat /var/lib/kraken-lcd/halted                                  # time and both snapshots
-sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt      # root only; asks to confirm
+sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt      # refuses non-root; asks to confirm
 sudo systemctl restart kraken-lcd
 ```
 

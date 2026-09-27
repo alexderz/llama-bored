@@ -929,7 +929,7 @@ install.sh: files are installed. llama-watch is enabled for boot but not
 started. kraken-lcd is neither started nor enabled. This script never runs
 the steps below; run them yourself, as root, one at a time.
 
-  # 1. llama-watch is enabled; start it (tty11 dashboard, Alt+F11 to look):
+  # 1. llama-watch is enabled; start it (tty11 dashboard, Ctrl+Alt+F11 to look):
   systemctl start llama-watch
 
   # 2. Create the state dir if needed (systemd would on the first start):

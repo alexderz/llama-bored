@@ -12,6 +12,10 @@ to look at while it does.
 It never touches the pump or fans. Everything it draws on hardware is colour
 and pixels, through small closed command sets.
 
+It needs Linux with systemd and, for now, an NZXT Kraken Z: the installer
+requires exactly one (`1e71:3008`). NVIDIA, llama-swap, ASUS Aura and the
+Corsair keyboard are optional.
+
 <p align="center">
   <img src="docs/media/kraken-lcd.gif" width="560" alt="The Kraken LCD while a new model loads and starts generating: the activity gauge swings from idle into the redline">
 </p>
@@ -21,7 +25,7 @@ and pixels, through small closed command sets.
 </p>
 
 <sub>Both recorded from the same 12 seconds on a real box: one model unloads,
-Qwen3-Coder loads onto the GPU, and generation ramps to about 80 tok/s. The
+Qwen3-Coder loads onto the GPU, and generation ramps to about 160 tok/s. The
 LCD frames are rendered by kraken-lcd from recorded snapshots and set into a
 drawn pump-head scene; the tty11 frames come from the console's own screen
 buffer.</sub>
@@ -30,7 +34,7 @@ buffer.</sub>
 
 | Binary | Unit | What it does |
 |---|---|---|
-| `llama-watch` | `llama-watch.service` | The **single reader** of host and llama state. Draws the tty11 dashboard (Alt+F11) and publishes a validated snapshot to `/run/llama-watch/snapshot.json` at 10 Hz |
+| `llama-watch` | `llama-watch.service` | The **single reader** of host and llama state. Draws the tty11 dashboard (Ctrl+Alt+F11 from a graphical session, Alt+F11 from another console) and publishes a validated snapshot to `/run/llama-watch/snapshot.json` at 10 Hz |
 | `llama-view` | none | Read-only mirror of tty11 for tmux or SSH (group `llama-view`) |
 | `kraken-lcd` | `kraken-lcd.service` | Draws the snapshot on the NZXT Kraken Z LCD. LCD only, no network |
 | `llama-light` | `llama-light.service` | Sets ASUS Aura and Corsair keyboard RGB colours from the snapshot. Colour only, no network |
@@ -78,8 +82,8 @@ falls back to utilisation.
 
 **llama-light** (ASUS Aura USB RGB, Corsair STRAFE RGB MK.2 keyboard)
 
-- Maps any snapshot metric (activity, gpu, cpu, load, mem, tokens_rate,
-  coolant, gpu_temp, cpu_temp) to colour, with `[[light]]` layers: solid,
+- Maps any snapshot metric (activity, gpu, cpu, cpu_topk (the busiest
+  cores), load, mem, tokens_rate, coolant, gpu_temp, cpu_temp) to colour, with `[[light]]` layers: solid,
   ring, bar or pulse styles, palettes or your own colour stops, smoothing,
   brightness caps and an idle colour.
 - Fans on a splitter (mirrored) or a daisy chain (per-fan values).
@@ -127,6 +131,10 @@ software check can tell them apart. If you try one, read
   hwmon driver (mainline since 6.9) bound to it.
 - **Rust** via rustup (`rust-toolchain.toml` pins the version), plus
   `cargo-deny` and `cargo-audit` for `scripts/check.sh`.
+- For the build and install scripts: `git`, a C compiler as the linker
+  (`cc`), `nm` (binutils), `ldd` (glibc), `sha256sum` (coreutils),
+  `setfacl`/`getfacl` (acl), and udev and `systemd-sysusers`. `python3` is
+  optional (the font rebuild check is skipped without it).
 - Optional: an **NVIDIA** GPU and driver (NVML); **llama-swap** on loopback
   (`llama-server --metrics` for token rates, `LLAMA_SERVER_SLOTS_DEBUG=1` for
   live text); **zenergy** (AMD socket power); **k10temp** or **coretemp**; a
@@ -145,8 +153,8 @@ main risk:
   writes. Tests check all three tables.
 - **Cooling guard and HALTED latch.** Every LCD operation is bracketed by
   read-only checks of the cooler's hwmon (pump mode, pump rpm, USB device,
-  bootloader). Any change stops all device I/O and writes a latch that only
-  root can clear.
+  bootloader). Any change stops all device I/O and writes a latch file that
+  stays until an explicit root command clears it.
 - **Nothing writes sysfs.** The FANS panel only reads.
 - **Split privileges.** One reader with no device access; writers with no
   network and only their own device nodes. kraken-lcd's hidraw grant is
@@ -190,7 +198,7 @@ and **never starts kraken-lcd**. llama-light is enabled only with
 `--enable-light`; llama-metrics is never enabled. Then, as root:
 
 ```sh
-systemctl start llama-watch                           # tty11: Alt+F11
+systemctl start llama-watch                           # tty11: Ctrl+Alt+F11
 d=$(mktemp -d) && chmod 0755 "$d" && install -m 0644 fixtures/views/test-card.json "$d/"
 runuser -u kraken-lcd -- /usr/local/libexec/llama-bored/kraken-lcd show-image --view "$d/test-card.json"
 ```
@@ -219,8 +227,13 @@ users from `/etc/sysusers.d/llama-bored.conf`. Stable device links:
 Four files in `/etc/llama-bored/`, one per service. The installer copies each
 example from `packaging/` only if the file does not exist, and never
 overwrites your edits. Every key has a default and a range (see the comments
-in the examples). Check a file without starting anything with
-`llama-light check --config …` or `llama-metrics check --config …`.
+in the examples), except `listen` and `allow` in `metrics.toml`, which are
+required. Check a file without starting anything:
+
+```sh
+/usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml
+/usr/local/libexec/llama-bored/llama-metrics check --config /etc/llama-bored/metrics.toml
+```
 
 **`watch.toml`** (llama-watch):
 
@@ -262,7 +275,7 @@ brightness_max = 100
 
 [[light]]                 # later entries draw over earlier ones
 target = "aura.fans"      # or "aura.chain[2]", 'keyboard.keys["F1".."F12"]', "led:110"
-metric = "activity"       # gpu, cpu, load, mem, tokens_rate, coolant, gpu_temp, cpu_temp
+metric = "activity"       # gpu, cpu, cpu_topk, load, mem, tokens_rate, coolant, gpu_temp, cpu_temp
 range = [0, 100]
 style = "solid"           # solid | ring | bar | pulse | ladder | gate | peak
 palette = "act"           # act | thermal | mono, or stops = [[0, "#4A55C8"], [100, "#FF3A22"]]
@@ -281,8 +294,8 @@ The example file has complete examples for both, and a full keyboard layout
 
 | Key | Meaning |
 |---|---|
-| `listen` | `"0.0.0.0:19477"`; `"[::]:19477"` for dual-stack |
-| `allow` | CIDR allowlist, checked before a byte is read. Ships as `["192.168.0.0/16", "127.0.0.1/32"]`: **narrow it to your LAN** |
+| `listen` | Required. `"0.0.0.0:19477"`; `"[::]:19477"` for dual-stack |
+| `allow` | Required. CIDR allowlist, checked before a byte is read. Ships as `["192.168.0.0/16", "127.0.0.1/32"]`: **narrow it to your LAN** |
 | `max_conns`, `stale_after_s` | Concurrent connections (16); snapshot age that counts as stale (5 s) |
 
 Keep `allow` equal to `IPAddressAllow=` in `llama-metrics.service`, and the
@@ -319,13 +332,13 @@ After editing `watch.toml` or `config.toml`, restart that service
 | `install.sh`: "a previous install failed" | Run the rollback in `ROLLBACK_PENDING`, then retry |
 | LCD says **no data** | llama-watch is stopped or failing: `journalctl -u llama-watch` |
 | LCD says **AI down** | llama-swap is not answering at `[llama] url` |
-| LCD frozen, journal says **HALTED** | The cooling guard tripped. Check the cooler, read `/var/lib/kraken-lcd/halted`, then `sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt` and restart kraken-lcd |
+| LCD frozen, `journalctl -u kraken-lcd -p crit` shows `cooling guard halted` or `cooling guard latch is present` | The cooling guard tripped. Check the cooler, read `/var/lib/kraken-lcd/halted`, then `sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt` and restart kraken-lcd |
 | `show-image`: interface 0 is bound | kraken-lcd is running. Stop it first |
 | LCD or RGB stops after a replug or resume | The hidraw node got a new number; restart `kraken-lcd` or `llama-light` |
 | Gauge never passes ~50, or pegs at idle | Tune `[load] cpu_limit_w` and the idle watts; the ACTIVITY row shows the source |
 | tty11 IN/OUT empty | `LLAMA_SERVER_SLOTS_DEBUG=1` for llama-server, and `[tty] show_text` |
 | tty11 chart shows odd glyphs | The font did not load; set `chart_glyphs = "halves"` |
-| RGB does nothing | `lsusb -d 0b05:18f3`, `ls -l /dev/llama-light/aura`, `llama-light check`. Only one RGB tool (OpenRGB, vendor tools) at a time |
+| RGB does nothing | `lsusb -d 0b05:18f3`, `ls -l /dev/llama-light/aura`, `journalctl -u llama-light` (`aura absent (...)` names why), `/usr/local/libexec/llama-bored/llama-light check --config /etc/llama-bored/light.toml`. Only one RGB tool (OpenRGB, vendor tools) at a time |
 | Keyboard stays on its own lighting | `lsusb -d 1b1c:1b48`, `ls -l /dev/llama-light/keyboard`, `[keyboard] enabled = true`. Only one RGB tool (ckb-next, OpenRGB) at a time. Plugged in after llama-light started: it restarts itself to pick it up |
 | All fans show one colour with `aura.chain[N]` | The fans are on a splitter. Use `fans = "mirrored"` or daisy-chain them |
 | Prometheus gets no answer | `allow`, `IPAddressAllow=`, and the firewall; `llamabored_exporter_rejected_connections_total` counts refusals |
@@ -349,6 +362,7 @@ sudo rm -f /usr/local/bin/llama-view /etc/sysusers.d/llama-bored.conf \
   /etc/systemd/system/{kraken-lcd,llama-watch,llama-light,llama-metrics}.service \
   /etc/systemd/user/kraken-lcd-halt.path /etc/systemd/user/kraken-lcd-halt-notify.service \
   /etc/udev/rules.d/{71-kraken-lcd,72-llama-view,93-kraken-lcd-hidraw,94-llama-light-hidraw}.rules
+sudo rm -rf /etc/systemd/system/llama-metrics.service.d   # the IPAddressAllow= drop-in, if you made one
 sudo systemctl daemon-reload && sudo udevadm control --reload
 sudo udevadm trigger --action=change --subsystem-match=hidraw
 sudo udevadm trigger --action=change --attr-match=idVendor=1e71 --attr-match=idProduct=3008

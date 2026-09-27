@@ -10,11 +10,19 @@ All notable changes to llama-bored. Versions follow
 
 - `docs/RELEASING.md`: how versions, the changelog and releases work.
 - README demo GIFs of the Kraken LCD, tty11 and the keyboard (`docs/media/`).
+- README says up front what llama-bored needs: Linux with systemd and one
+  NZXT Kraken Z (`1e71:3008`); NVIDIA, llama-swap, Aura and the keyboard are
+  optional. Requirements list the tools the build and install scripts use
+  (`cc`, `nm`, `ldd`, `sha256sum`, `setfacl`/`getfacl`).
+- The `cpu_topk` light metric (the busiest cores) is documented in the
+  README and the install skill.
 
 ### Changed
 
 - Comments in the shipped units, udev rules and scripts no longer cite
   internal ticket numbers; risk ids name their row in `docs/SAFETY.md`.
+- The install skill's frontmatter name is `install`, matching its folder,
+  and it clones from `https://github.com/alexderz/llama-bored`.
 
 ### Fixed
 
@@ -22,6 +30,19 @@ All notable changes to llama-bored. Versions follow
   exactly: kraken-lcd's usbfs grant is class-wide and narrowed by udev (new
   risk row RR7c), llama-light is pinned to two nodes (Aura and keyboard), and
   the unit hardening is listed per unit.
+- The install skill's `pgrep -f` checks no longer match their own shell
+  when run through `bash -c`.
+- README and the skill name the log lines to look for: `cooling guard
+  halted` / `cooling guard latch is present` (`journalctl -u kraken-lcd -p
+  crit`) and llama-light's `aura absent (...)`. `check` commands are shown
+  with their full path and `--config`.
+- README: the demo generates at about 160 tok/s, not 80; tty11 is
+  Ctrl+Alt+F11 from a graphical session; `listen` and `allow` in
+  `metrics.toml` are required; the full uninstall also removes the
+  `llama-metrics.service.d` drop-in directory.
+- `docs/SAFETY.md`: the HALTED latch file is owned by kraken-lcd and
+  cleared by an explicit root command; the development-only
+  `--query-buckets` and `bench-upload` commands are guarded too.
 
 ### Security
 
