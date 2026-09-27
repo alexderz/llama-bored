@@ -1,5 +1,15 @@
 # Changelog
 
+All notable changes to llama-bored. Versions follow
+[Semantic Versioning](https://semver.org/); the process is in
+[docs/RELEASING.md](docs/RELEASING.md).
+
+## Unreleased
+
+### Added
+
+- `docs/RELEASING.md`: how versions, the changelog and releases work.
+
 ## 0.1.1 — 2026-09-27
 
 ### Added
