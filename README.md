@@ -83,8 +83,8 @@ falls back to utilisation.
 **llama-light** (ASUS Aura USB RGB, Corsair STRAFE RGB MK.2 keyboard)
 
 - Maps any snapshot metric (activity, gpu, cpu, cpu_topk (the busiest
-  cores), load, mem, tokens_rate, coolant, gpu_temp, cpu_temp) to colour, with `[[light]]` layers: solid,
-  ring, bar or pulse styles, palettes or your own colour stops, smoothing,
+  cores), load, mem, tokens_rate, coolant, gpu_temp, cpu_temp) to colour,
+  with `[[light]]` layers: solid, ring, bar or pulse styles, palettes or your own colour stops, smoothing,
   brightness caps and an idle colour.
 - Fans on a splitter (mirrored) or a daisy chain (per-fan values).
 - Per-key keyboard gauges: bars two key rows tall, a tokens/s dial on the

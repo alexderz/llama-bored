@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.1.2 — 2026-09-27
+
 ### Added
 
 - `docs/RELEASING.md`: how versions, the changelog and releases work.
