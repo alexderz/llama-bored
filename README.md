@@ -12,6 +12,20 @@ to look at while it does.
 It never touches the pump or fans. Everything it draws on hardware is colour
 and pixels, through small closed command sets.
 
+<p align="center">
+  <img src="docs/media/kraken-lcd.gif" width="560" alt="The Kraken LCD while a new model loads and starts generating: the activity gauge swings from idle into the redline">
+</p>
+
+<p align="center">
+  <img src="docs/media/tty11.gif" alt="The tty11 dashboard during the same 12 seconds">
+</p>
+
+<sub>Both recorded from the same 12 seconds on a real box: one model unloads,
+Qwen3-Coder loads onto the GPU, and generation ramps to about 80 tok/s. The
+LCD frames are rendered by kraken-lcd from recorded snapshots and set into a
+drawn pump-head scene; the tty11 frames come from the console's own screen
+buffer.</sub>
+
 ## Components
 
 | Binary | Unit | What it does |
