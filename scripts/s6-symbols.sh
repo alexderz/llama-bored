@@ -51,12 +51,12 @@ cargo build --release --locked
 
 symbols="$(nm -C target/release/kraken-lcd)"
 # An empty or fully stripped table must fail. `main` is linked even when
-# fat LTO drops the uncalled LCD paths; T14's `run` is what pulls those in.
+# fat LTO drops the uncalled LCD paths; `run` is what pulls those in.
 if ! grep -q 'kraken_lcd::main' <<<"$symbols"; then
   echo "S6: required symbol kraken_lcd::main is absent" >&2
   exit 1
 fi
-# T14 wires `run` to KrakenLcd. Fat LTO would drop `device/` if that call
+# `run` drives the device through KrakenLcd. Fat LTO would drop `device/` if that call
 # were missing, so a real HID transact symbol is required, not drop glue.
 if ! grep -E -q 'kraken_lcd::device::hid::.*transact' <<<"$symbols"; then
   echo "S6: required hid::transact symbol is absent; run does not wire the sink" >&2

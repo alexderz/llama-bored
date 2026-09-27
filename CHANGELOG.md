@@ -11,6 +11,11 @@ All notable changes to llama-bored. Versions follow
 - `docs/RELEASING.md`: how versions, the changelog and releases work.
 - README demo GIFs of the Kraken LCD, tty11 and the keyboard (`docs/media/`).
 
+### Changed
+
+- Comments in the shipped units, udev rules and scripts no longer cite
+  internal ticket numbers; risk ids name their row in `docs/SAFETY.md`.
+
 ### Fixed
 
 - README, `docs/SAFETY.md` and `docs/ARCHITECTURE.md` describe device access

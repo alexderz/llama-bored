@@ -139,8 +139,8 @@ read_kernel_log() {
   fi
 }
 
-# Abort rules (T43)
-# -----------------
+# Abort rules
+# -----------
 # The Kraken firmware runs its own pump curve: pwm1 moves with coolant
 # temperature (115 -> 102 as it cools) while pwm*_enable stays put. A pwm
 # value change is therefore logged as `NOTE pwm1 115->102`, not an abort.

@@ -1,4 +1,4 @@
-# /etc/udev/rules.d/93-kraken-lcd-hidraw.rules — R1. Numbered to sort after distro rules
+# /etc/udev/rules.d/93-kraken-lcd-hidraw.rules — SAFETY.md RR2. Numbered to sort after distro rules
 # (such as 92-viia.rules) that add uaccess to hidraw nodes; install.sh overwrites it.
-# T44 / RR7: the stable name is the writer unit's only hidraw DeviceAllow= entry.
+# SAFETY.md RR7: the stable name is the writer unit's only hidraw DeviceAllow= entry.
 SUBSYSTEM=="hidraw", KERNELS=="0003:1E71:3008.*", GROUP="kraken-lcd", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="kraken-lcd/hid"

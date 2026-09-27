@@ -6,7 +6,7 @@
 # review as the repo owner ($SUDO_USER). Root's PATH is only
 # /usr/sbin:/usr/bin:/sbin:/bin.
 # Bytes are copied into a 0700 staging directory, and only those copies are
-# installed. The provenance gate (RR6) is an automatic anchor: a clean tree,
+# installed. The provenance gate (SAFETY.md RR6) is an automatic anchor: a clean tree,
 # a HEAD contained in the release branch (main), and hashes that match the staged
 # copies. There is no typed-SHA prompt.
 # After the files are in place, llama-watch is enabled for boot.
@@ -532,7 +532,7 @@ hidraw_has_user_acl() {
   grep -E -q '(^|:)user:[^:]+:' <<<"$text"
 }
 
-# T44 / RR7: where the udev symlink from 93-kraken-lcd-hidraw.rules points.
+# SAFETY.md RR7: where the udev symlink from 93-kraken-lcd-hidraw.rules points.
 # Prints nothing when it is absent. readlink only; the node is not opened.
 hidraw_pin_target() {
   if [[ -n "${INSTALL_FAKE_PIN+x}" ]]; then
@@ -542,7 +542,7 @@ hidraw_pin_target() {
   readlink -e -- /dev/kraken-lcd/hid || true
 }
 
-# T57: the Aura controller's pin from 94-llama-light-hidraw.rules.
+# The Aura controller's pin from 94-llama-light-hidraw.rules.
 # readlink only; the node is not opened.
 aura_pin_target() {
   if [[ -n "${INSTALL_FAKE_AURA_PIN+x}" ]]; then
@@ -584,7 +584,7 @@ resolve_aura_hidraw() {
   fi
 }
 
-# T64: the keyboard's lighting pin from 94-llama-light-hidraw.rules.
+# The keyboard's lighting pin from 94-llama-light-hidraw.rules.
 # readlink only; the node is not opened.
 keyboard_pin_target() {
   if [[ -n "${INSTALL_FAKE_KBD_PIN+x}" ]]; then
@@ -781,7 +781,7 @@ rollback_note_rules() {
 
 # "Created llama-watch" means both the binary and the unit were absent
 # before this run, and this run created at least one of them. An existing
-# INSTALLED_SHA (from an earlier T15-era install) does not change that.
+# INSTALLED_SHA (from an older LCD-writer-only install) does not change that.
 # shellcheck disable=SC2329 # called from commit_new_file
 rollback_note_watch() {
   local base
@@ -1517,7 +1517,7 @@ apply_from_staging() {
   watch_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-watch)"
   view_binary="$(dest_path "$dest_root" /usr/local/bin/llama-view)"
   view_rule="$(dest_path "$dest_root" /etc/udev/rules.d/72-llama-view.rules)"
-  # tty11 console font, loaded by the watcher unit's ExecStartPre (T42).
+  # tty11 console font, loaded by the watcher unit's ExecStartPre.
   font_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-12x24.psfu)"
   watch_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-watch.service)"
   light_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-light)"
@@ -1599,7 +1599,7 @@ apply_from_staging() {
   # The Aura controller may be absent; a trigger that matches nothing is fine.
   must host_cmd udevadm trigger --action=change \
     --attr-match=idVendor=0b05 --attr-match=idProduct=18f3 || return 1
-  # T64: the keyboard may be absent too.
+  # The keyboard may be absent too.
   must host_cmd udevadm trigger --action=change \
     --attr-match=idVendor=1b1c --attr-match=idProduct=1b48 || return 1
   # A USB parent's change event does not re-run rules on its hidraw child, so
@@ -1624,7 +1624,7 @@ apply_from_staging() {
     echo "install.sh: $node still has a named user ACL after setfacl -b" >&2
     fail_install || return 1
   fi
-  # The writer unit's only hidraw DeviceAllow= is this symlink (RR7).
+  # The writer unit's only hidraw DeviceAllow= is this symlink (SAFETY.md RR7).
   pin="$(hidraw_pin_target)"
   if [[ "$pin" != "$node" ]]; then
     echo "install.sh: /dev/kraken-lcd/hid resolves to '${pin:-nothing}', expected $node" >&2
@@ -1632,7 +1632,7 @@ apply_from_staging() {
   fi
   mark_write "hidraw check passed"
 
-  # T57: the Aura controller's node is llama-light's alone (0660, no
+  # The Aura controller's node is llama-light's alone (0660, no
   # uaccess ACL), and its pin names it. Not attached: nothing to check;
   # llama-light logs it absent once and looks again every 10 s.
   aura_node="$(resolve_aura_hidraw "$sys_root")" || fail_install || return 1
@@ -1660,7 +1660,7 @@ apply_from_staging() {
     echo "install.sh: no Aura controller (0b05:18f3) attached; llama-light will report it absent" >&2
   fi
 
-  # T64: the keyboard's lighting interface is llama-light's alone (0660, no
+  # The keyboard's lighting interface is llama-light's alone (0660, no
   # uaccess ACL; typing uses another interface and evdev), and its pin names
   # it. Not attached: nothing to check; llama-light logs it absent once.
   kbd_node="$(resolve_keyboard_hidraw "$sys_root")" || fail_install || return 1
@@ -2639,7 +2639,7 @@ self_test() {
   assert_no_new "$acl"
   rm -rf -- "$acl_stage"
 
-  # T44 / RR7: the udev pin must name the node sysfs gives, and must exist.
+  # SAFETY.md RR7: the udev pin must name the node sysfs gives, and must exist.
   local pin_case pin_dest pin_stage pin_err
   for pin_case in /dev/hidraw3 ''; do
     pin_dest="$tmp/bad-pin-${pin_case##*/}"
@@ -2722,7 +2722,7 @@ self_test() {
   assert_eq "$(cat -- "$target")" "keep" "symlink target overwritten"
   rm -rf -- "$link_stage" "$staging" 2>/dev/null || true
 
-  # T27: both binaries, watch.toml, the config backup, legacy refusal, enable/restart.
+  # Both binaries, watch.toml, the config backup, legacy refusal, enable/restart.
   local both both_stage both_hashes legacy legacy_stage legacy_err legacy_status
   local models_only models_stage models_err models_status fresh_watch fresh_stage
   local bak sentinel
@@ -3331,36 +3331,36 @@ self_test() {
     exit 1
   fi
 
-  # (f) INSTALLED_SHA from T15, and no llama-watch binary or unit yet.
-  local roll_f roll_f_stage roll_f_out t15
-  t15="dddddddddddddddddddddddddddddddddddddddd"
+  # (f) INSTALLED_SHA from an older LCD-writer-only install, and no llama-watch binary or unit yet.
+  local roll_f roll_f_stage roll_f_out old_sha
+  old_sha="dddddddddddddddddddddddddddddddddddddddd"
   roll_f="$tmp/roll-f"
   mkdir -p "$(dest_path "$roll_f" /usr/local/libexec/llama-bored)"
   printf 'old-writer\n' >"$(dest_path "$roll_f" /usr/local/libexec/llama-bored/kraken-lcd)"
-  printf '%s\n' "$t15" >"$(dest_path "$roll_f" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  printf '%s\n' "$old_sha" >"$(dest_path "$roll_f" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
   snapshot_tree "$roll_f" "$tmp/snap-f"
   : >"$INSTALL_LOG"
   roll_f_stage="$(freeze_staging "$repo" "$roll_f")"
   roll_f_out="$(apply_from_staging "$roll_f_stage" "$roll_f" "$sys" "$head")"
-  [[ "$roll_f_out" == *"previous INSTALLED_SHA (${t15})"* ]] || {
-    echo "install self-test: T15 rollback did not name the previous INSTALLED_SHA" >&2
+  [[ "$roll_f_out" == *"previous INSTALLED_SHA (${old_sha})"* ]] || {
+    echo "install self-test: writer-only rollback did not name the previous INSTALLED_SHA" >&2
     exit 1
   }
   assert_disable_present "$roll_f_out" 1
   assert_rollback_order "$roll_f_out"
   assert_eq "$(cat -- "$(dest_path "$roll_f" /usr/local/libexec/llama-bored/INSTALLED_SHA)")" \
-    "$head" "T15 install did not record the new INSTALLED_SHA"
+    "$head" "writer-only upgrade did not record the new INSTALLED_SHA"
   execute_printed_rollback "$roll_f_out" "$roll_f"
-  assert_same_tree "$roll_f" "$tmp/snap-f" "T15-sha rollback"
+  assert_same_tree "$roll_f" "$tmp/snap-f" "writer-only rollback"
   assert_eq "$(cat -- "$(dest_path "$roll_f" /usr/local/libexec/llama-bored/kraken-lcd)")" \
-    "old-writer" "T15 rollback did not restore the writer"
+    "old-writer" "writer-only rollback did not restore the writer"
   assert_no_new "$roll_f"
   rm -rf -- "$roll_f_stage"
 
-  # (g) Legacy migration: T15 INSTALLED_SHA, legacy config, the operator's .new and
+  # (g) Legacy migration: an older INSTALLED_SHA, legacy config, the operator's .new and
   # watch.toml, and no llama-watch yet.
-  local roll_g roll_g_stage roll_g_out t15g
-  t15g="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  local roll_g roll_g_stage roll_g_out old_sha_g
+  old_sha_g="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   roll_g="$tmp/roll-g"
   mkdir -p "$(dest_path "$roll_g" /etc/llama-bored)" \
     "$(dest_path "$roll_g" /usr/local/libexec/llama-bored)"
@@ -3369,7 +3369,7 @@ self_test() {
   cp -- "$ROOT/packaging/config.example.toml" \
     "$(dest_path "$roll_g" /etc/llama-bored/config.toml.new)"
   printf 'operator watch\n' >"$(dest_path "$roll_g" /etc/llama-bored/watch.toml)"
-  printf '%s\n' "$t15g" >"$(dest_path "$roll_g" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  printf '%s\n' "$old_sha_g" >"$(dest_path "$roll_g" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
   snapshot_tree "$roll_g" "$tmp/snap-g"
   : >"$INSTALL_LOG"
   roll_g_stage="$(freeze_staging "$repo" "$roll_g")"
@@ -3601,7 +3601,7 @@ self_test() {
   fi
   assert_same_tree "$anchor_ahead" "$tmp/snap-anchor-ahead" "unlanded HEAD wrote install files"
 
-  # T57: llama-light. Installed and hashed with the rest; enabled only with
+  # llama-light. Installed and hashed with the rest; enabled only with
   # --enable-light (LIGHT_ENABLE=1); never started; its udev rule, unit and
   # config are in the rollback record; the Aura node is checked when present.
   local light light_stage light_out light_section light_log
@@ -3811,7 +3811,7 @@ self_test() {
   done
   INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
 
-  # T64: an attached keyboard. Only its interface-01 hidraw node (lighting)
+  # An attached keyboard. Only its interface-01 hidraw node (lighting)
   # is checked; the typing interface's node is not touched. It must end
   # 0660 llama-light, with no user ACL, and the pin must name it.
   local kbd_sys kbd_case kbd_dest kbd_err kbd_status kbd_usb
@@ -3889,7 +3889,7 @@ self_test() {
   INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
   unset INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
 
-  # T58: llama-metrics. Staged and hashed with the rest; its unit and
+  # llama-metrics. Staged and hashed with the rest; its unit and
   # config land verbatim; it is never enabled or started, and no firewall
   # command runs; the rollback removes what this run created and disables
   # the unit first (the operator may have enabled it since).

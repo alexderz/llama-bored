@@ -53,7 +53,7 @@ ProcSubset=pid
 ReadOnlyPaths=/sys
 
 # --- devices: only the Kraken (usbfs + hidraw)
-# T44 / RR7: hidraw is pinned to the one node behind the udev symlink from
+# SAFETY.md RR7: hidraw is pinned to the one node behind the udev symlink from
 # 93-kraken-lcd-hidraw.rules. systemd stat()s the path, following the
 # symlink, and allows that major:minor when the unit starts. A path that is
 # absent then is skipped: no hidraw node is allowed, the open fails, and the

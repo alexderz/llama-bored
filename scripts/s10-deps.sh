@@ -17,7 +17,7 @@ forbidden=(
   llama-watch
 )
 
-# T57 / S15: llama-light (the RGB writer) has its own pin,
+# S15: llama-light (the RGB writer) has its own pin,
 # scripts/s15-light-allow.txt, and a longer denylist: no network, no USB
 # stack (it writes one hidraw node through std), no i2c, and not the LCD
 # writer crate.
@@ -31,7 +31,7 @@ light_forbidden=(
   kraken-lcd
 )
 
-# T58 / S16: llama-metrics (the LAN exporter) has its own pin,
+# S16: llama-metrics (the LAN exporter) has its own pin,
 # scripts/s16-metrics-allow.txt, and a longer denylist: no HTTP client or
 # server framework, no TLS, no async runtime, no device crates, and neither
 # the watcher, the LCD writer, nor the RGB writer.

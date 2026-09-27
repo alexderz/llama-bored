@@ -118,12 +118,12 @@ assert_packaging_contract() {
     exit 1
   fi
   rm -f -- "$expected"
-  # T42: tty11 loads llama-hack-12x24 before the watcher starts. `+` runs
+  # tty11 loads llama-hack-12x24 before the watcher starts. `+` runs
   # setfont outside the sandbox (it needs /dev/tty11 and KDFONTOP); `-` keeps
   # a missing font or a setfont failure from stopping the watcher, which then
   # draws with whatever font tty11 has (tty.chart_glyphs = "halves" is safe).
   local font_pre='ExecStartPre=-+/usr/bin/setfont -C /dev/tty11 /usr/local/share/llama-bored/llama-hack-12x24.psfu'
-  # T61: the root pre-step sets the console powersave mode (TIOCLINUX, via
+  # The second root pre-step sets the console powersave mode (TIOCLINUX, via
   # setterm on stdin = /dev/tty11) so `[tty] sleep_min` can power the monitor
   # down. The watcher itself never calls TIOCLINUX (S13). `-` keeps a setterm
   # failure from stopping the watcher.
@@ -138,13 +138,13 @@ assert_packaging_contract() {
     echo "stage self-test: missing packaging/fonts/llama-hack-12x24.psfu" >&2
     exit 1
   fi
-  # T22 Phase B has not run, so the tty fallback must not ship. This
-  # assertion flips if that check fails: SupplementaryGroups=llama-tty,
-  # packaging/72-llama-watch-tty.rules, and sysusers `g llama-tty -`.
-  # Do not add those files unless Phase B fails. DeviceAllow=/dev/tty11 rw
-  # is the primary unit, not that fallback.
+  # The watcher reaches tty11 through the fd systemd hands it (TTYPath=)
+  # and DeviceAllow=/dev/tty11 rw. A group-based fallback
+  # (SupplementaryGroups=llama-tty, packaging/72-llama-watch-tty.rules and
+  # sysusers `g llama-tty -`) is only a plan for the case where that path
+  # fails; it must not ship unless it is needed. Flip this assertion then.
   if grep -F -q 'llama-tty' "$watch" || grep -F -q 'SupplementaryGroups=' "$watch"; then
-    echo "stage self-test: tty fallback shipped before T22 Phase B" >&2
+    echo "stage self-test: the unused tty group fallback was shipped" >&2
     exit 1
   fi
 
@@ -167,7 +167,7 @@ assert_packaging_contract() {
       exit 1
     fi
   done
-  # T44 / RR7: the class-wide hidraw grant is gone; only the udev pin is allowed.
+  # SAFETY.md RR7: no class-wide hidraw grant; only the udev pin is allowed.
   local -a forbidden=(
     'DeviceAllow=char-hidraw rw'
     'DeviceAllow=/dev/nvidiactl rw'
@@ -221,8 +221,8 @@ assert_packaging_contract() {
   assert_metrics_contract "$root"
 }
 
-# T57: llama-light, the RGB writer. Colour only, its own uid, only the Aura
-# controller's and (T64) the keyboard lighting interface's hidraw pins, no
+# llama-light, the RGB writer. Colour only, its own uid, only the Aura
+# controller's and the keyboard lighting interface's hidraw pins, no
 # network. Directives only (comments ignored).
 light_directive_golden() {
   cat <<'EOF'
@@ -340,7 +340,7 @@ assert_light_rules_golden() {
     echo "stage self-test: llama-light rules accepted an added 0666 line" >&2
     exit 1
   fi
-  # T64: the keyboard rule widened to every interface of the keyboard.
+  # The keyboard rule widened to every interface of the keyboard.
   tmp="$(mktemp)"
   sed 's/, ATTRS{bInterfaceNumber}=="01"//' -- "$rules" >"$tmp"
   got="$(rules_text "$tmp")"
@@ -381,7 +381,7 @@ assert_light_contract() {
   assert_light_rules_golden "$rules"
 }
 
-# T58: llama-metrics, the LAN Prometheus exporter. Its own uid, the snapshot
+# llama-metrics, the LAN Prometheus exporter. Its own uid, the snapshot
 # group only, no devices, IP allowlist and bind port pinned in the kernel.
 # Directives only (comments ignored).
 metrics_directive_golden() {
@@ -595,9 +595,9 @@ EOF
 
 hidraw_rules_golden() {
   cat <<'EOF'
-# /etc/udev/rules.d/93-kraken-lcd-hidraw.rules — R1. Numbered to sort after distro rules
+# /etc/udev/rules.d/93-kraken-lcd-hidraw.rules — SAFETY.md RR2. Numbered to sort after distro rules
 # (such as 92-viia.rules) that add uaccess to hidraw nodes; install.sh overwrites it.
-# T44 / RR7: the stable name is the writer unit's only hidraw DeviceAllow= entry.
+# SAFETY.md RR7: the stable name is the writer unit's only hidraw DeviceAllow= entry.
 SUBSYSTEM=="hidraw", KERNELS=="0003:1E71:3008.*", GROUP="kraken-lcd", MODE="0660", TAG-="uaccess", TAG-="udev-acl", SYMLINK+="kraken-lcd/hid"
 EOF
 }

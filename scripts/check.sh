@@ -13,7 +13,7 @@ scripts/s10-deps.sh --self-test
 cargo audit
 scripts/s6-symbols.sh
 
-# T42: the committed tty11 font is a byte-for-byte rebuild from Hack. The
+# The committed tty11 font is a byte-for-byte rebuild from Hack. The
 # script skips with a note when Pillow or the reference TTF is absent.
 # tests/tty_font.rs (cargo test above) checks its glyph coverage.
 if command -v python3 >/dev/null 2>&1; then
