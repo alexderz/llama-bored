@@ -1,4 +1,4 @@
-# Round-3 churn series, derived from docs/evidence/round3-load-sample-2026-09-22.tsv
+# Round-3 churn series, derived from a load capture (not in this repo)
 # (reference host, 2026-09-22, 2 s ticks over 60 s, box under GPU load).
 # The capture records aggregate CPU % only (no per-core split). Each cpu0..cpu31
 # column is that aggregate spread evenly across 32 logical CPUs, so the plain

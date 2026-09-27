@@ -1,4 +1,4 @@
-# Idle churn series, derived from docs/evidence/idle-load-sample-2026-09-23.tsv
+# Idle churn series, derived from an idle load capture (not in this repo)
 # (reference host, 2026-09-23, 2 s ticks over 120 s, llama-swap up, no requests). 60 rows.
 # The capture has aggregate cpu_pct and cpu_top8_pct, not per-core rows.
 # cpu0..cpu7 are cpu_top8_pct. cpu8..cpu31 are the remainder

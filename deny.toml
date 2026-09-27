@@ -4,7 +4,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 [advisories]
 yanked = "deny"
 ignore = [
-    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is a transitive dependency of LLD-pinned fontdue 0.9.4; no safe upgrade exists; unmaintained (informational, no vuln); ttf-parser only parses our bundled fonts; revisit if fontdue moves off ttf-parser or a vulnerability is filed — tracked in docs/lld.md Open" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is a transitive dependency of fontdue 0.9.4 (pinned on purpose for the LCD renderer); no safe upgrade exists; unmaintained (informational, no vuln); ttf-parser only parses our bundled fonts; revisit if fontdue moves off ttf-parser or a vulnerability is filed" },
 ]
 
 [licenses]
