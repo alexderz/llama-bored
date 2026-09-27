@@ -1,0 +1,49 @@
+# A pushed vX.Y.Z tag must match every crate version and have a
+# "## X.Y.Z" CHANGELOG section; that section becomes the release notes.
+# See docs/RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches versions and changelog
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag $TAG is not vX.Y.Z"; exit 1; }
+          for f in crates/*/Cargo.toml; do
+            got=$(sed -n 's/^version = "\(.*\)"/\1/p' "$f" | head -1)
+            [[ "$got" == "$ver" ]] || { echo "$f is $got, tag is $ver"; exit 1; }
+          done
+          awk -v v="$ver" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          [[ -s notes.md ]] || { echo "CHANGELOG.md has no '## $ver' section"; exit 1; }
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "llama-bored ${TAG#v}" --notes-file notes.md --verify-tag
+          fi
