@@ -1,12 +1,122 @@
-//! llama-server launch command to a [`ModelDetail`].
+//! Launch command to a [`Backend`] and a [`ModelDetail`].
 //!
 //! The command is untrusted text from llama-swap `/running`. It is read once,
 //! inside the `/running` deserialiser, and dropped. Only numbers and tokens
 //! that pass [`llama_core::detail::is_token`] leave this module. The model
 //! path is reduced to a GGUF quant tag by a strict matcher; a file name that
 //! carries no tag gives no quant, and no path segment is ever kept.
+//!
+//! The server is told by its entry point (T72): a `llama-server` binary under
+//! any path, `sglang.launch_server` / `sglang serve`, `vllm serve` /
+//! `vllm.entrypoints`, else any OpenAI-compatible server. SGLang and vLLM
+//! flags are read only after the entry point, so a `podman run ...` wrapper
+//! in front cannot lend its own flags.
 
+use llama_core::backend::Backend;
 use llama_core::detail::{MAX_TOKEN_CHARS, ModelDetail, NCMOE_ALL, is_token};
+
+/// KV type shown for SGLang and vLLM when no `--kv-cache-dtype` is given.
+const KV_AUTO: &str = "auto";
+
+/// What one launch command says about its server.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Launch {
+    /// Server kind from the entry point.
+    pub backend: Backend,
+    /// Tuning detail. `None` for a server whose flags are not read.
+    pub detail: Option<ModelDetail>,
+    /// `--max-running-requests` (SGLang) or `--max-num-seqs` (vLLM).
+    pub max_running: Option<u16>,
+}
+
+/// Detect the server, then read its flags.
+#[must_use]
+pub fn parse_launch(cmd: &str) -> Launch {
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    match detect(&args) {
+        (Backend::LlamaCpp, _) => Launch {
+            backend: Backend::LlamaCpp,
+            detail: Some(parse(cmd)),
+            max_running: None,
+        },
+        (Backend::OpenAi, _) => Launch {
+            backend: Backend::OpenAi,
+            detail: None,
+            max_running: None,
+        },
+        (backend, start) => server_flags(backend, &args[start..]),
+    }
+}
+
+/// The server kind and the index of the first argument after its entry point.
+fn detect(args: &[&str]) -> (Backend, usize) {
+    for (index, arg) in args.iter().enumerate() {
+        let base = arg.rsplit('/').next().unwrap_or(arg);
+        let next = args.get(index + 1).copied();
+        if base.starts_with("llama-server") {
+            return (Backend::LlamaCpp, index + 1);
+        }
+        if *arg == "sglang.launch_server" {
+            return (Backend::SgLang, index + 1);
+        }
+        if base == "sglang" && next == Some("serve") {
+            return (Backend::SgLang, index + 2);
+        }
+        if base == "vllm" && next == Some("serve") {
+            return (Backend::Vllm, index + 2);
+        }
+        if arg.starts_with("vllm.entrypoints") {
+            return (Backend::Vllm, index + 1);
+        }
+    }
+    (Backend::OpenAi, args.len())
+}
+
+/// SGLang or vLLM flags. KV is `auto` unless a dtype is given.
+fn server_flags(backend: Backend, args: &[&str]) -> Launch {
+    let (ctx_flag, running_flag) = if backend == Backend::Vllm {
+        ("--max-model-len", "--max-num-seqs")
+    } else {
+        ("--context-length", "--max-running-requests")
+    };
+    let mut detail = ModelDetail::default();
+    let mut kv = None;
+    let mut max_running = None;
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (arg, None),
+        };
+        let wanted = flag == ctx_flag
+            || flag == running_flag
+            || flag == "--kv-cache-dtype"
+            || flag == "--quantization";
+        if !wanted {
+            continue;
+        }
+        let Some(value) = inline.or_else(|| args.next()) else {
+            break;
+        };
+        if flag == ctx_flag {
+            detail.ctx = value.parse::<u32>().ok().filter(|ctx| *ctx > 0);
+        } else if flag == running_flag {
+            max_running = value.parse::<u16>().ok().filter(|n| *n > 0);
+        } else if flag == "--kv-cache-dtype" {
+            kv = kv_token(value);
+        } else {
+            detail.quant = is_token(value).then(|| value.to_owned());
+        }
+    }
+    let kv = kv.unwrap_or_else(|| KV_AUTO.to_owned());
+    detail.kv_k = Some(kv.clone());
+    detail.kv_v = Some(kv);
+    Launch {
+        backend,
+        detail: Some(detail),
+        max_running,
+    }
+}
 
 /// Parse the flags this display cares about. Later flags win, as in llama.cpp.
 #[must_use]
@@ -213,6 +323,93 @@ mod tests {
         assert_eq!(detail.ctx, None);
         assert_eq!(detail.quant, None);
         assert_eq!(parse("x -ctk AAAAAAAAAAAAAAAAAAAAAAAA").kv_k, None);
+    }
+
+    /// A podman-wrapped SGLang launch, names made generic.
+    const SGLANG_PODMAN: &str = "podman run --name flash --rm --network llama --shm-size 64g --device nvidia.com/gpu=all -v /models/x:/models/x:ro --entrypoint /opt/entrypoint.sh -e HF_HUB_OFFLINE=1 ghcr.io/example/sglang-exl3@sha256:abc python3 -m sglang.launch_server --model-path /models/x --quantization exl3 --trust-remote-code --host 0.0.0.0 --port 30100 --served-model-name flash --kv-cache-dtype fp8_e4m3 --context-length 204800 --mem-fraction-static 0.88 --max-running-requests 4 --max-total-tokens 210000";
+
+    #[test]
+    fn backend_from_the_entry_point() {
+        let kind = |cmd: &str| parse_launch(cmd).backend;
+        assert_eq!(kind(BONSAI), Backend::LlamaCpp);
+        assert_eq!(
+            kind("/opt/ik_llama/bin/llama-server -m /m/x-Q4_K_M.gguf"),
+            Backend::LlamaCpp
+        );
+        assert_eq!(kind("llama-server --port 1"), Backend::LlamaCpp);
+        assert_eq!(
+            kind("/opt/bin/llama-server-cuda --port 1"),
+            Backend::LlamaCpp
+        );
+        assert_eq!(kind(SGLANG_PODMAN), Backend::SgLang);
+        assert_eq!(kind("sglang serve --model-path /m/x"), Backend::SgLang);
+        assert_eq!(kind("/venv/bin/vllm serve /m/x --port 1"), Backend::Vllm);
+        assert_eq!(
+            kind("python -m vllm.entrypoints.openai.api_server --model /m/x"),
+            Backend::Vllm
+        );
+        assert_eq!(
+            kind("python3 main.py --config /tabby/config.yml"),
+            Backend::OpenAi
+        );
+        assert_eq!(kind("sglang-exl3 --port 1"), Backend::OpenAi);
+        assert_eq!(kind(""), Backend::OpenAi);
+        assert_eq!(parse_launch("python3 main.py").detail, None);
+    }
+
+    #[test]
+    fn sglang_flags_after_a_podman_wrapper() {
+        let launch = parse_launch(SGLANG_PODMAN);
+        assert_eq!(launch.max_running, Some(4));
+        let detail = launch.detail.expect("sglang detail");
+        assert_eq!(
+            detail,
+            ModelDetail {
+                ctx: Some(204_800),
+                ncmoe: None,
+                kv_k: Some("fp8_e4m3".to_owned()),
+                kv_v: Some("fp8_e4m3".to_owned()),
+                quant: Some("exl3".to_owned()),
+                fa: None,
+            }
+        );
+        let debug = format!("{detail:?}");
+        assert!(!debug.contains("/models"), "{debug}");
+        assert!(!debug.contains("30100"), "{debug}");
+        // A wrapper flag before the entry point is not read as a server flag.
+        let wrapped = parse_launch(
+            "podman run --context-length 7 img python3 -m sglang.launch_server --model-path /m",
+        );
+        assert_eq!(wrapped.detail.expect("detail").ctx, None);
+    }
+
+    #[test]
+    fn vllm_flags_and_defaults() {
+        let launch = parse_launch(
+            "vllm serve /m/x --max-model-len=32768 --quantization awq --max-num-seqs 8 --context-length 5",
+        );
+        assert_eq!(launch.backend, Backend::Vllm);
+        assert_eq!(launch.max_running, Some(8));
+        let detail = launch.detail.expect("detail");
+        assert_eq!(detail.ctx, Some(32_768));
+        assert_eq!(detail.quant.as_deref(), Some("awq"));
+        assert_eq!(detail.kv_k.as_deref(), Some("auto"));
+        assert_eq!(detail.kv_v.as_deref(), Some("auto"));
+        let bad = parse_launch(
+            "vllm serve /m --max-model-len -1 --quantization ../x --max-num-seqs 0 --kv-cache-dtype a/b",
+        );
+        let detail = bad.detail.expect("detail");
+        assert_eq!(detail.ctx, None);
+        assert_eq!(detail.quant, None);
+        assert_eq!(detail.kv_k.as_deref(), Some("auto"));
+        assert_eq!(bad.max_running, None);
+        assert_eq!(
+            parse_launch("vllm serve /m --max-model-len")
+                .detail
+                .expect("d")
+                .ctx,
+            None
+        );
     }
 
     #[test]

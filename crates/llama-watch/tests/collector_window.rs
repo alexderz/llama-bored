@@ -304,6 +304,7 @@ fn injected_llama_view_is_used_and_running_is_not_called() {
     let loaded = LlamaView {
         ai: AiState::Loaded,
         models: vec![ModelInfo {
+            backend: None,
             name: "Qwen\t三五B".to_owned(),
             state: "ready".to_owned(),
             full_name: None,
@@ -316,6 +317,7 @@ fn injected_llama_view_is_used_and_running_is_not_called() {
     assert_eq!(
         sampled.snapshot.models,
         vec![ModelInfo {
+            backend: None,
             name: "Qwen B".to_owned(),
             state: "ready".to_owned(),
             full_name: None,
@@ -357,6 +359,7 @@ fn watcher_never_produces_no_data() {
     let view = LlamaView {
         ai: AiState::NoData,
         models: vec![ModelInfo {
+            backend: None,
             name: "should-drop".to_owned(),
             state: "ready".to_owned(),
             full_name: None,

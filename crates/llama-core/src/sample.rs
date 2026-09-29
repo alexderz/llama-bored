@@ -60,6 +60,8 @@ pub struct ModelInfo {
     pub full_name: Option<String>,
     /// Tuning detail from the launch command. `None` from an older watcher.
     pub detail: Option<crate::detail::ModelDetail>,
+    /// Server kind and its live gauges (T72). `None` from an older watcher.
+    pub backend: Option<crate::backend::BackendInfo>,
 }
 
 /// llama-swap reachability for one tick.

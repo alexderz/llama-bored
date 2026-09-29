@@ -549,12 +549,14 @@ fn models_are_the_snapshot_names_and_ai_maps_from_state() {
     current.ai = AiState::Loaded;
     current.models = vec![
         ModelInfo {
+            backend: None,
             name: "Qwen 35B".to_owned(),
             state: "ready".to_owned(),
             full_name: None,
             detail: None,
         },
         ModelInfo {
+            backend: None,
             name: "Other…".to_owned(),
             state: "starting".to_owned(),
             full_name: None,
@@ -576,6 +578,7 @@ fn model_count_saturates_at_u8_max() {
     current.ai = AiState::Loaded;
     current.models = (0..256)
         .map(|index| ModelInfo {
+            backend: None,
             name: format!("m{index}"),
             state: "ready".to_owned(),
             full_name: None,
@@ -1381,12 +1384,14 @@ fn full_name_and_first_model_detail_reach_the_view() {
     current.ai = AiState::Loaded;
     current.models = vec![
         ModelInfo {
+            backend: None,
             name: "Ternary Bon…".to_owned(),
             state: "ready".to_owned(),
             full_name: Some("Ternary Bonsai 2 27B".to_owned()),
             detail: Some(detail.clone()),
         },
         ModelInfo {
+            backend: None,
             name: "Qwen 35B".to_owned(),
             state: "ready".to_owned(),
             full_name: None,

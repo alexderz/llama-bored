@@ -31,12 +31,20 @@ fn valid() -> WireSnapshot {
             state: AiWire::Loaded,
             models: vec![
                 ModelWire {
+                    backend: None,
+                    running: None,
+                    queued: None,
+                    kv_fill: None,
                     name: "Qwen 35B".to_owned(),
                     state: ModelState::Ready,
                     full_name: None,
                     detail: None,
                 },
                 ModelWire {
+                    backend: None,
+                    running: None,
+                    queued: None,
+                    kv_fill: None,
                     name: "DeepSeek".to_owned(),
                     state: ModelState::Starting,
                     full_name: None,
@@ -87,6 +95,10 @@ fn sanitize_wire_names_pass_validate() {
         }
         let mut snap = valid();
         snap.ai.models = vec![ModelWire {
+            backend: None,
+            running: None,
+            queued: None,
+            kv_fill: None,
             name: name.clone(),
             state: ModelState::Ready,
             full_name: None,
@@ -347,6 +359,10 @@ fn model_count_and_loaded_state() {
     let mut snap = valid();
     snap.ai.models = (0..8)
         .map(|index| ModelWire {
+            backend: None,
+            running: None,
+            queued: None,
+            kv_fill: None,
             name: format!("m{index}"),
             state: ModelState::Other,
             full_name: None,
@@ -356,6 +372,10 @@ fn model_count_and_loaded_state() {
     assert_eq!(validate(&snap), Ok(()));
 
     snap.ai.models.push(ModelWire {
+        backend: None,
+        running: None,
+        queued: None,
+        kv_fill: None,
         name: "m8".to_owned(),
         state: ModelState::Stopping,
         full_name: None,
@@ -374,6 +394,10 @@ fn model_count_and_loaded_state() {
 fn name_length_and_canonical_form() {
     let mut snap = valid();
     snap.ai.models = vec![ModelWire {
+        backend: None,
+        running: None,
+        queued: None,
+        kv_fill: None,
         name: "123456789012".to_owned(),
         state: ModelState::Ready,
         full_name: None,
@@ -504,4 +528,68 @@ fn model_detail_is_allowlisted() {
         r#","detail":{"cmd":"/models/prism/llama-server"}"#,
     );
     assert!(matches!(parse_validated(&unknown), Err(WireError::Parse)));
+}
+
+#[test]
+fn backend_gauges_are_additive_on_schema_v1() {
+    // An older watcher's model has no backend fields and still validates.
+    let old = parse_validated(base_json().as_bytes()).expect("pre-T72 snapshot");
+    assert_eq!(old.ai.models[0].backend, None);
+    assert_eq!(old.ai.models[0].running, None);
+    assert_eq!(old.ai.models[0].kv_fill, None);
+
+    let mut snap = valid();
+    snap.ai.models[0].backend = Some(wire::Backend::SgLang);
+    snap.ai.models[0].running = Some(1);
+    snap.ai.models[0].queued = Some(0);
+    snap.ai.models[0].kv_fill = Some(0.37);
+    snap.ai.models[1].backend = Some(wire::Backend::LlamaCpp);
+    let bytes = to_json(&snap).expect("encode");
+    let text = std::str::from_utf8(&bytes).expect("utf-8");
+    assert!(
+        text.contains(r#""backend":"sglang","running":1,"queued":0,"kv_fill":0.37"#),
+        "{text}"
+    );
+    assert!(text.contains(r#""backend":"llamacpp""#), "{text}");
+    assert_eq!(parse_validated(&bytes).expect("round trip"), snap);
+
+    for word in ["vllm", "openai", "llamacpp", "sglang"] {
+        let json = insert_after(
+            &base_json(),
+            r#""state":"ready""#,
+            &format!(r#","backend":"{word}""#),
+        );
+        assert!(parse_validated(&json).is_ok(), "{word}");
+    }
+    let json = insert_after(&base_json(), r#""state":"ready""#, r#","backend":"tabby""#);
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
+    let json = insert_after(&base_json(), r#""state":"ready""#, r#","running":-1"#);
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
+}
+
+#[test]
+fn backend_gauges_are_bounded() {
+    let mut snap = valid();
+    snap.ai.models[0].running = Some(wire::MAX_REQS);
+    snap.ai.models[0].queued = Some(wire::MAX_REQS);
+    snap.ai.models[0].kv_fill = Some(1.0);
+    assert_eq!(validate(&snap), Ok(()));
+    snap.ai.models[0].kv_fill = Some(0.0);
+    assert_eq!(validate(&snap), Ok(()));
+
+    let mut snap = valid();
+    snap.ai.models[0].running = Some(wire::MAX_REQS + 1);
+    assert_eq!(validate(&snap), Err(WireError::Gauge));
+    let mut snap = valid();
+    snap.ai.models[0].queued = Some(u16::MAX);
+    assert_eq!(validate(&snap), Err(WireError::Gauge));
+    for fill in [1.01, -0.01, f32::NAN, f32::INFINITY] {
+        let mut snap = valid();
+        snap.ai.models[0].kv_fill = Some(fill);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "{fill}");
+    }
+    let json = insert_after(&base_json(), r#""state":"ready""#, r#","kv_fill":1.5"#);
+    assert_eq!(parse_validated(&json), Err(WireError::Gauge));
+    let json = insert_after(&base_json(), r#""state":"ready""#, r#","running":70000"#);
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
 }

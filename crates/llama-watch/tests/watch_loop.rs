@@ -1234,6 +1234,7 @@ fn view_named(name: &str) -> LlamaView {
     LlamaView {
         ai: AiState::Loaded,
         models: vec![ModelInfo {
+            backend: None,
             name: name.to_owned(),
             state: "ready".to_owned(),
             full_name: None,

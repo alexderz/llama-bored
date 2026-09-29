@@ -181,6 +181,7 @@ fn wire_fields_come_from_the_snapshot_and_the_llama_view() {
         Some(12.5),
         AiState::Loaded,
         vec![ModelInfo {
+            backend: None,
             name: "hello\nworld".to_owned(),
             state: "starting".to_owned(),
             full_name: None,
@@ -190,6 +191,7 @@ fn wire_fields_come_from_the_snapshot_and_the_llama_view() {
     let llama = view(
         AiState::Loaded,
         vec![ModelInfo {
+            backend: None,
             name: "hello\nworld".to_owned(),
             state: "starting".to_owned(),
             full_name: None,
@@ -304,6 +306,7 @@ fn twelve_models_and_mem_pct_101_still_publish() {
     let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
     let models: Vec<_> = (0..12)
         .map(|index| ModelInfo {
+            backend: None,
             name: format!("m{index}"),
             state: "ready".to_owned(),
             full_name: None,
@@ -453,12 +456,14 @@ fn full_name_and_detail_reach_the_wire_and_bad_ones_do_not() {
     };
     let models = vec![
         ModelInfo {
+            backend: None,
             name: "Ternary Bon…".to_owned(),
             state: "ready".to_owned(),
             full_name: Some("Ternary Bonsai 2 27B".to_owned()),
             detail: Some(detail.clone()),
         },
         ModelInfo {
+            backend: None,
             name: "Qwen 35B".to_owned(),
             state: "ready".to_owned(),
             full_name: Some("Qwen 35B".to_owned()),
@@ -484,4 +489,70 @@ fn full_name_and_detail_reach_the_wire_and_bad_ones_do_not() {
     // Same as the canonical name: omitted. Not allowlisted: dropped.
     assert_eq!(parsed.ai.models[1].full_name, None);
     assert_eq!(parsed.ai.models[1].detail, None);
+}
+
+#[test]
+fn backend_and_its_gauges_reach_the_wire() {
+    use llama_core::backend::{Backend, BackendInfo};
+
+    let dir = scratch("backend");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_millis(1);
+    let model = |name: &str, backend: Option<BackendInfo>| ModelInfo {
+        name: name.to_owned(),
+        state: "ready".to_owned(),
+        full_name: None,
+        detail: None,
+        backend,
+    };
+    let gauges = BackendInfo {
+        kind: Backend::SgLang,
+        max_running: Some(4),
+        running: Some(1),
+        queued: Some(0),
+        kv_permille: Some(370),
+        hit_permille: Some(800),
+    };
+    let models = vec![
+        model("flash", Some(gauges)),
+        // llama.cpp has /slots: its gauges stay off the wire.
+        model(
+            "qwen",
+            Some(BackendInfo {
+                kind: Backend::LlamaCpp,
+                ..gauges
+            }),
+        ),
+        model(
+            "tabby",
+            Some(BackendInfo {
+                kind: Backend::OpenAi,
+                ..BackendInfo::default()
+            }),
+        ),
+        model("old", None),
+    ];
+    let snap = snapshot(wall, Some(1.0), AiState::Loaded, models.clone());
+    let llama = view(AiState::Loaded, models, None);
+    publisher.publish(&snap, &llama).expect("publish");
+    let bytes = std::fs::read(dir.join("snapshot.json")).expect("read");
+    let parsed = wire::parse_validated(&bytes).expect("parse");
+    let m = &parsed.ai.models;
+    assert_eq!(m[0].backend, Some(Backend::SgLang));
+    assert_eq!((m[0].running, m[0].queued), (Some(1), Some(0)));
+    assert_eq!(m[0].kv_fill, Some(0.37));
+    assert_eq!(m[1].backend, Some(Backend::LlamaCpp));
+    assert_eq!(
+        (m[1].running, m[1].queued, m[1].kv_fill),
+        (None, None, None)
+    );
+    assert_eq!(m[2].backend, Some(Backend::OpenAi));
+    assert_eq!(
+        (m[2].running, m[2].queued, m[2].kv_fill),
+        (None, None, None)
+    );
+    assert_eq!(m[3].backend, None);
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(!text.contains("hit"), "hit rate stays off the wire: {text}");
+    assert!(!text.contains("max_running"), "{text}");
 }

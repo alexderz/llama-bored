@@ -91,6 +91,10 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
         ai: Ai {
             state: AiWire::Loaded,
             models: vec![ModelWire {
+                backend: None,
+                running: None,
+                queued: None,
+                kv_fill: None,
                 name: "Qwen 35B".to_owned(),
                 state: ModelState::Ready,
                 full_name: None,

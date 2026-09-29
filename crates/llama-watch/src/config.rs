@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use llama_core::backend::Backend;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -199,6 +200,12 @@ pub enum InvalidWatchConfig {
         /// Offending count.
         count: usize,
     },
+    /// `[llama.backends]` has more than 32 entries.
+    #[error("llama.backends has {count} entries, above the cap of 32")]
+    BackendCount {
+        /// Offending count.
+        count: usize,
+    },
     /// An alias display name is longer than 64 characters.
     #[error("models.aliases value is {chars} characters, above the cap of 64")]
     AliasValue {
@@ -336,6 +343,11 @@ pub struct Llama {
     /// Characters kept from the output side of slot text.
     #[serde(default = "defaults::output_tail_chars")]
     pub output_tail_chars: u32,
+    /// `[llama.backends]`: model id to `llamacpp`, `sglang`, `vllm` or
+    /// `openai`, over what the launch command says (T72). Unknown words fail
+    /// the parse; ids that are not loaded are fine.
+    #[serde(default = "defaults::backends")]
+    pub backends: BTreeMap<String, Backend>,
 }
 
 /// `[models]`.
@@ -657,6 +669,9 @@ mod defaults {
     pub(super) fn aliases() -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+    pub(super) fn backends() -> BTreeMap<String, super::Backend> {
+        BTreeMap::new()
+    }
     pub(super) fn fps() -> u32 {
         10
     }
@@ -724,6 +739,7 @@ impl Default for Llama {
             activity_timeout_s: defaults::activity_timeout_s(),
             input_tail_chars: defaults::input_tail_chars(),
             output_tail_chars: defaults::output_tail_chars(),
+            backends: defaults::backends(),
         }
     }
 }
@@ -891,6 +907,11 @@ impl Config {
         let output_tail_chars = self.llama.output_tail_chars;
         if !(256..=32768).contains(&output_tail_chars) {
             return Err(InvalidWatchConfig::OutputTail { output_tail_chars });
+        }
+        if self.llama.backends.len() > MAX_ALIASES {
+            return Err(InvalidWatchConfig::BackendCount {
+                count: self.llama.backends.len(),
+            });
         }
         if self.models.aliases.len() > MAX_ALIASES {
             return Err(InvalidWatchConfig::AliasCount {

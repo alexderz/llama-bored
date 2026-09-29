@@ -106,6 +106,19 @@ falls back to utilisation.
   decoded-token counter, and snapshot age and staleness. Numbers and model
   names only; never prompt or output text.
 
+**Backends behind llama-swap.** llama-bored tells each model's server apart
+by its launch command (or `[llama.backends]` in `watch.toml`):
+
+| Backend | What you get |
+|---|---|
+| llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill, IN/OUT text, the tuning line |
+| SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; no IN/OUT text |
+| vLLM | The same from `vllm:*` metrics; tuning line from its flags; no IN/OUT text |
+| Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
+
+A llama.cpp server started through a wrapper script, without `llama-server`
+in its command, needs `"model-id" = "llamacpp"` under `[llama.backends]`.
+
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
 controller are optional; missing sources show "—". The installer does
 currently expect one Kraken Z, because it pins the cooler's hidraw node.
@@ -240,6 +253,7 @@ required. Check a file without starting anything:
 | Key | Meaning |
 |---|---|
 | `[llama] enabled`, `url` | Poll llama-swap at a **loopback** URL (default `http://127.0.0.1:8080`). Point it at llama-swap itself, not a proxy in front of it |
+| `[llama.backends]` | `"model-id" = "llamacpp"`, `"sglang"`, `"vllm"` or `"openai"`: overrides the backend detected from the launch command |
 | `[models.aliases]` | `"long-model-id" = "Short Name"` |
 | `[load] cpu_limit_w`, `nominal_frac` | CPU full-load socket watts; `nominal_frac` (0.8) of each limit reads 100 |
 | `[load] idle`, `gpu_idle_w`, `cpu_idle_w` | `"auto"` learns idle floors; `"fixed"` uses the watts as given |

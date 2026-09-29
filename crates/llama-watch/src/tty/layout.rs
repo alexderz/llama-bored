@@ -74,8 +74,9 @@ pub struct Activity {
     pub input_tok: u64,
     pub cached_tok: u64,
     pub output_tok: u64,
-    pub prompt_tps: f64,
-    pub gen_tps: f64,
+    /// `None` when llama-swap reported no rate (a backend without timings).
+    pub prompt_tps: Option<f64>,
+    pub gen_tps: Option<f64>,
     pub dur: String,
     pub err: bool,
 }
@@ -90,6 +91,8 @@ pub struct TtyModel {
     /// Tuning detail of the first model (`262k · kv q8_0 · PTQ1_0`). Empty
     /// draws nothing.
     pub model_detail: String,
+    /// The first model has sat in llama-swap `stopping` for over a minute.
+    pub model_stuck: bool,
     pub slots_line: String,
     pub swap_line: String,
     pub cool_c: Option<i32>,
@@ -118,6 +121,11 @@ pub struct TtyModel {
     pub gen_ceiling: f64,
     pub prompt_ceiling: f64,
     pub slots: Vec<Slot>,
+    /// One SLOTS line per ready model without `/slots` (T72), such as
+    /// `sglang  running 1 · queued 0 · KV 37 %`. Drawn under the slot rows.
+    pub backend_lines: Vec<String>,
+    /// Drawn in IN and OUT while they are empty. Empty draws nothing.
+    pub text_note: String,
     pub requests: Vec<Activity>,
     pub in_title: String,
     pub out_title: String,
@@ -249,7 +257,7 @@ impl Geom {
 fn slot_body_rows(model: &TtyModel) -> u16 {
     match model.state {
         WatchState::AiDown | WatchState::Starting | WatchState::NoLlama => 1,
-        _ => u16::try_from(model.slots.len()).unwrap_or(u16::MAX),
+        _ => u16::try_from(model.slots.len() + model.backend_lines.len()).unwrap_or(u16::MAX),
     }
 }
 
@@ -342,6 +350,9 @@ const MODEL_NAME_CAP: usize = llama_core::detail::MAX_FULL_NAME_CHARS;
 /// Longest detail string in the header.
 const MODEL_DETAIL_CAP: usize = 48;
 
+/// Header tag for a model stuck in llama-swap `stopping`.
+const STUCK_TAG: &str = "stopping (stuck?)";
+
 /// `model <full name>  <detail>`, the detail in grey.
 fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel) -> u16 {
     let label = "model";
@@ -359,6 +370,11 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel) -> u16 {
         drawn,
     );
     let mut end = vx.saturating_add(drawn);
+    if model.model_stuck {
+        let sx = end.saturating_add(2);
+        paint_str(grid, col_u16(sx), 0, STUCK_TAG, C16::Yellow, C16::Black);
+        end = sx.saturating_add(STUCK_TAG.chars().count());
+    }
     if !model.model_detail.is_empty() {
         let dx = end.saturating_add(2);
         let shown = paint_detail(grid, dx, 0, &model.model_detail, MODEL_DETAIL_CAP);
@@ -976,7 +992,9 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         WatchState::Generating | WatchState::Ready => {}
     }
     let spark = spark_plan(model, g);
-    if let Some(plan) = &spark {
+    if let Some(plan) = &spark
+        && !model.slots.is_empty()
+    {
         draw_spark_header(grid, model, g, plan);
     }
     // The count sits in a 13-column field ending 3 columns before `decoded`,
@@ -1038,6 +1056,19 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
             Some(plan) => paint_slot_spark(grid, row, after_decoded, plan, slot, model),
             None => paint_slot_ctx(grid, row, after_decoded, g.cols, slot),
         }
+    }
+    let first = u16::try_from(model.slots.len()).unwrap_or(u16::MAX);
+    let cap = usize::from(g.cols.saturating_sub(2).saturating_sub(g.right));
+    for (i, line) in model.backend_lines.iter().enumerate() {
+        let Ok(offset) = u16::try_from(i) else {
+            break;
+        };
+        let row = g
+            .slot_label
+            .saturating_add(1)
+            .saturating_add(first)
+            .saturating_add(offset);
+        paint_detail(grid, usize::from(g.right), usize::from(row), line, cap);
     }
 }
 
@@ -1810,7 +1841,8 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             grid,
             plan.prompt_tps,
             row,
-            &commas(req.prompt_tps.round() as u64),
+            &req.prompt_tps
+                .map_or_else(|| "--".to_owned(), |tps| commas(tps.round() as u64)),
             plain,
             C16::Black,
         );
@@ -1818,11 +1850,11 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             grid,
             plan.gen_tps,
             row,
-            &one_decimal(req.gen_tps),
+            &req.gen_tps.map_or_else(|| "--".to_owned(), one_decimal),
             hot,
             C16::Black,
         );
-        let frac = rate_frac(Some(req.gen_tps), model.gen_ceiling);
+        let frac = rate_frac(req.gen_tps, model.gen_ceiling);
         let ink = if dim {
             BarInk::Fixed(C16::BrightBlack, C16::BrightBlack)
         } else {
@@ -2318,6 +2350,20 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
         true,
         right,
     );
+    if !model.text_note.is_empty() && model.in_lines.is_empty() && model.out_lines.is_empty() {
+        for (start, rows) in [(in_start, in_rows), (out_start, out_rows)] {
+            let mid = start.saturating_add(rows.saturating_sub(1) / 2);
+            center_in(
+                grid,
+                2,
+                right,
+                mid,
+                &model.text_note,
+                C16::BrightBlack,
+                C16::Black,
+            );
+        }
+    }
     if model.state == WatchState::Starting {
         let note = "llama-watch starting - first reads in ~1 s; llama text appears after the first /slots poll";
         let mid = in_start

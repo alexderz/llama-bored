@@ -23,6 +23,17 @@ activity_interval_s = 2.0           # 0.1..=60
 activity_timeout_s = 0.25
 input_tail_chars = 8192             # 256..=32768
 output_tail_chars = 24576           # 256..=32768
+# Each model's server is read from its llama-swap cmd: llama-server (any path
+# or fork) is "llamacpp"; sglang.launch_server / sglang serve is "sglang";
+# vllm serve / vllm.entrypoints is "vllm"; anything else is "openai" (TabbyAPI,
+# ExLlamaV3 or another OpenAI-compatible server). Only llama.cpp has /slots
+# (SLOTS, IN/OUT text). SGLang (start it with --enable-metrics) and vLLM give
+# tok/s, running/queued requests and KV fill from /metrics; without /metrics,
+# and for "openai", tokens are counted from llama-swap's activity log at the
+# end of each request. Override a wrong guess by llama-swap model id (at most
+# 32 entries; ids that are not loaded are fine):
+#[llama.backends]
+#"my-sglang-model" = "sglang"
 
 [models]
 max_name_chars = 12

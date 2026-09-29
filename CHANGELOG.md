@@ -8,6 +8,15 @@ All notable changes to llama-bored. Versions follow
 
 ### Added
 
+- Backends beyond llama.cpp: SGLang, vLLM and any other OpenAI-compatible
+  server behind llama-swap, told apart by the launch command or
+  `[llama.backends]`. SGLang and vLLM metrics give tok/s, running and
+  queued requests, KV fill and cache hit rate; others fall back to token
+  counts from llama-swap's request log. The tuning line reads SGLang and
+  vLLM flags. The snapshot gains optional `backend`, `running`, `queued`
+  and `kv_fill` per model, and `llamabored_model_loaded` a `backend` label.
+- tty11 flags a model that stays `stopping` for over a minute.
+
 - Continuous integration: GitHub Actions run `scripts/check.sh` on every
   push and pull request, a weekly advisory audit, and a release workflow
   that checks a `vX.Y.Z` tag against the crate versions and the changelog

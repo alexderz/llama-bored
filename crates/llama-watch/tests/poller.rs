@@ -414,7 +414,7 @@ fn metrics_body(decode: u64, processing: f64) -> Vec<u8> {
 
 fn running_model(id: &str, name: &str, state: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "running": [{"model": id, "name": name, "state": state, "cmd": "not-stored"}]
+        "running": [{"model": id, "name": name, "state": state, "cmd": "llama-server not-stored"}]
     }))
     .expect("json")
 }
@@ -1037,4 +1037,221 @@ fn oversize_slots(cap: usize) -> Vec<u8> {
     assert_ne!(body.len(), cap + 1);
     serde_json::from_slice::<serde_json::Value>(&body).expect("oversize body is json");
     body
+}
+
+/// An SGLang launch behind a podman wrapper, names made generic.
+const SGLANG_CMD: &str = "podman run --rm --name flash img python3 -m sglang.launch_server --model-path /models/x --quantization exl3 --kv-cache-dtype fp8_e4m3 --context-length 204800 --max-running-requests 4";
+
+fn running_cmd(id: &str, cmd: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "running": [{"model": id, "state": "ready", "cmd": cmd}]
+    }))
+    .expect("json")
+}
+
+fn sglang_metrics(generated: u64, running: u32, queued: u32, usage: f64) -> Vec<u8> {
+    format!(
+        "# TYPE sglang:generation_tokens_total counter\n\
+sglang:generation_tokens_total{{model_name=\"flash\"}} {generated}.0\n\
+sglang:prompt_tokens_total{{model_name=\"flash\"}} 900.0\n\
+sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n\
+sglang:num_queue_reqs{{model_name=\"flash\"}} {queued}.0\n\
+sglang:token_usage{{model_name=\"flash\"}} {usage}\n\
+sglang:cache_hit_rate{{model_name=\"flash\"}} 0.5\n"
+    )
+    .into_bytes()
+}
+
+fn activity_page(rows: &[(i64, &str, i64)]) -> Vec<u8> {
+    let data: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, model, output)| {
+            serde_json::json!({
+                "id": id,
+                "timestamp": format!("2026-09-29T10:00:{id:02}Z"),
+                "model": model,
+                "tokens": {
+                    "input_tokens": 10,
+                    "output_tokens": output,
+                    "cache_tokens": 0,
+                    "prompt_per_second": -1,
+                    "tokens_per_second": -1
+                },
+                "duration_ms": 1000,
+                "resp_status_code": 200
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "data": data })).expect("json")
+}
+
+#[test]
+fn sglang_reads_its_own_metrics_and_never_slots() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(1000, 1, 2, 0.37));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+            && view.models[0]
+                .backend
+                .is_some_and(|info| info.running.is_some())
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kind, llama_core::backend::Backend::SgLang);
+    assert_eq!(info.running, Some(1));
+    assert_eq!(info.queued, Some(2));
+    assert_eq!(info.kv_permille, Some(370));
+    assert_eq!(info.hit_permille, Some(500));
+    assert_eq!(info.max_running, Some(4));
+    let detail = view.models[0].detail.as_ref().expect("detail");
+    assert_eq!(detail.ctx, Some(204_800));
+    assert_eq!(detail.quant.as_deref(), Some("exl3"));
+
+    server.update(|world| {
+        world
+            .metrics
+            .insert("flash".to_owned(), sglang_metrics(1034, 0, 0, 0.1));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(34)
+    });
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(
+        hits.iter().any(|path| path == "/upstream/flash/metrics"),
+        "{hits:?}"
+    );
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+    let lines = log.lines().join("\n");
+    assert!(!lines.contains("metrics:"), "{lines}");
+}
+
+#[test]
+fn sglang_without_metrics_counts_activity_once_and_logs_once() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world.metrics_status = 404;
+    world.activity = activity_page(&[(7, "flash", 500), (6, "flash", 400)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    // The first activity read is only the baseline: history is not back-filled.
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    assert_eq!(view.models[0].backend.expect("backend").running, None);
+    server.update(|world| {
+        world.activity = activity_page(&[
+            (9, "flash", 25),
+            (8, "other", 1000),
+            (7, "flash", 500),
+            (6, "flash", 400),
+        ]);
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(25)
+    });
+    // The same rows read again add nothing.
+    thread::sleep(Duration::from_millis(900));
+    let (view, _) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
+    assert_eq!(view.decoded_total, Some(25));
+    let lines = log.lines();
+    let notes: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("no /metrics"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{lines:?}");
+    assert!(
+        notes[0].contains("flash: no /metrics from sglang; using llama-swap activity"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("metrics: ")),
+        "no metrics failure flag: {lines:?}"
+    );
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+
+    // /metrics comes back: a new baseline, not a jump.
+    server.update(|world| {
+        world.metrics_status = 200;
+        world
+            .metrics
+            .insert("flash".to_owned(), sglang_metrics(5000, 0, 0, 0.0));
+    });
+    thread::sleep(Duration::from_millis(600));
+    server.update(|world| {
+        world
+            .metrics
+            .insert("flash".to_owned(), sglang_metrics(5010, 0, 0, 0.0));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(35)
+    });
+}
+
+#[test]
+fn openai_server_gets_no_metrics_or_slots_and_counts_activity() {
+    let mut world = World::running(running_cmd("tabby", "python3 main.py --port 5000"));
+    world.activity = activity_page(&[(1, "tabby", 3)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    assert_eq!(
+        view.models[0].backend.expect("backend").kind,
+        llama_core::backend::Backend::OpenAi
+    );
+    assert_eq!(view.models[0].detail, None);
+    server.update(|world| {
+        world.activity = activity_page(&[(2, "tabby", 40), (1, "tabby", 3)]);
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(40)
+    });
+    let hits = server.hits();
+    assert!(
+        hits.iter().all(|path| !path.contains("/upstream/")),
+        "{hits:?}"
+    );
+    assert!(log.lines().iter().all(|line| !line.contains("metrics")));
+}
+
+#[test]
+fn config_override_beats_the_launch_command() {
+    let mut world = World::running(running_cmd("flash", "llama-server -m /m/x-Q4_K_M.gguf"));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(10, 1, 0, 0.2));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(
+        server.port,
+        12,
+        4_194_304,
+        0.15,
+        "[llama.backends]\n\"flash\" = \"sglang\"\n",
+    );
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.running == Some(1))
+    });
+    assert_eq!(
+        view.models[0].backend.expect("backend").kind,
+        llama_core::backend::Backend::SgLang
+    );
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
 }
