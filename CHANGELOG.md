@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.2.1 — 2026-09-29
+
 ### Added
 
 - llama-metrics exports everything the dashboards show: GPU and CPU power
