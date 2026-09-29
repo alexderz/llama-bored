@@ -104,6 +104,8 @@ pub struct LlamaView {
     pub models: Vec<ModelInfo>,
     /// Running decoded-token total, when every ready model was measured.
     pub decoded_total: Option<u64>,
+    /// Running prompt-token total, on the same rule as `decoded_total` (#11).
+    pub prompt_total: Option<u64>,
 }
 
 /// One collector tick. Every `None` means that source failed or is stale.
@@ -176,6 +178,7 @@ mod tests {
             ai: AiState::NoData,
             models: Vec::new(),
             decoded_total: None,
+            prompt_total: None,
         };
         assert_eq!(view.ai, AiState::NoData);
         assert!(view.models.is_empty());

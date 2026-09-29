@@ -143,6 +143,7 @@ fn idle_view() -> LlamaView {
         ai: AiState::Idle,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     }
 }
 

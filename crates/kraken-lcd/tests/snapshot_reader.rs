@@ -87,6 +87,13 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
             coolant_c: Some(99.0),
             cpu_c: Some(70.0),
             gpu_c: Some(60.0),
+            gpu_w: None,
+            gpu_limit_w: None,
+            cpu_w: None,
+            vram_used_bytes: None,
+            vram_total_bytes: None,
+            mem_used_bytes: None,
+            mem_total_bytes: None,
         },
         ai: Ai {
             state: AiWire::Loaded,
@@ -99,11 +106,17 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
                 state: ModelState::Ready,
                 full_name: None,
                 detail: None,
+                cache_hit: None,
+                slots_busy: None,
+                slots_total: None,
             }],
         },
         tokens: Tokens {
             decoded_total: Some(1_000 + seq),
+            prompt_total: None,
         },
+        fans: Vec::new(),
+        sources: None,
     }
 }
 

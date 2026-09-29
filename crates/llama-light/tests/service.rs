@@ -161,6 +161,49 @@ fn a_snapshot_from_the_future_is_not_accepted() {
 }
 
 #[test]
+fn a_rejected_snapshot_logs_once_per_reason_until_a_good_read() {
+    let mut r = rig();
+    let a = "snapshot rejected: snapshot schema is not 1";
+    let b = "snapshot rejected: snapshot field gpu_pct is out of range";
+    r.feed.set(Err(a));
+    r.light.run(Some(5));
+    assert_eq!(r.lines.count(a), 1, "{:?}", r.lines.all());
+    assert!(r.lines.all().contains(&format!("<4>{a}")));
+    r.feed.set(Err(b));
+    r.light.run(Some(5));
+    assert_eq!(r.lines.count(b), 1);
+    // A good read resets it: the same failure later is logged again.
+    publish(&r, 2, 40.0);
+    r.light.run(Some(1));
+    r.feed.set(Err(b));
+    r.light.run(Some(5));
+    assert_eq!(r.lines.count(b), 2, "{:?}", r.lines.all());
+    assert_eq!(r.lines.count(a), 1);
+}
+
+#[test]
+fn the_file_reader_names_the_validator_reason() {
+    use llama_light::snapshot::{SnapshotFile, SnapshotSource};
+    let dir = common::scratch("reject-reason");
+    let path = dir.join("snapshot.json");
+    let mut good = snap(1, 5);
+    good.host.gpu_pct = Some(10.0);
+    let text = String::from_utf8(llama_core::wire::to_json(&good).unwrap()).unwrap();
+    std::fs::write(&path, text.replace("\"schema\":1", "\"schema\":2")).unwrap();
+    let err = SnapshotFile::at(&path).read().expect_err("schema 2");
+    assert_eq!(err, "snapshot rejected: snapshot schema is not 1");
+    std::fs::write(&path, text.replace("\"gpu_pct\":10.0", "\"gpu_pct\":170.0")).unwrap();
+    let err = SnapshotFile::at(&path).read().expect_err("out of range");
+    assert_eq!(
+        err,
+        "snapshot rejected: snapshot field gpu_pct is out of range"
+    );
+    // An unknown field from a newer watcher is ignored (#12).
+    std::fs::write(&path, text.replacen('{', "{\"future\":1,", 1)).unwrap();
+    assert!(SnapshotFile::at(&path).read().is_ok());
+}
+
+#[test]
 fn an_absent_aura_is_logged_once_and_rescanned_every_ten_seconds() {
     let aura = FakeOpener::absent();
     let mut r = rig_with(CONFIG, aura.clone(), Feed::new(snap(1, 100 * SEC)), None);

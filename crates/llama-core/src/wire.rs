@@ -3,6 +3,19 @@
 //! The writer accepts bytes only through [`parse_validated`]: the size cap,
 //! then the parse, then [`validate`]. [`from_bytes`] parses without those
 //! rules and is crate-private.
+//!
+//! # Compatibility
+//!
+//! A reader ignores fields it does not know, within the same [`SCHEMA`]
+//! number. A newer watcher may add an optional field to schema 1, and an
+//! older kraken-lcd, llama-light or llama-metrics still accepts the file and
+//! simply does not see it (#12; before 0.2 every unknown field was a reject,
+//! which took old readers down on an upgrade). Known fields keep every check:
+//! the exact `schema`, [`MAX_BYTES`] before the parse, types, ranges, and
+//! the name and token allowlists in [`validate`]. An unknown field's value is
+//! dropped at the parse, so it reaches no display and no export. A change
+//! that an older reader must not misread (a renamed field, a new meaning, a
+//! tighter range the old reader would not enforce) needs a new schema number.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,6 +42,23 @@ pub const SNAPSHOT_DIR: &str = "/run/llama-watch";
 /// Path of the published snapshot. Not configurable.
 pub const SNAPSHOT_PATH: &str = "/run/llama-watch/snapshot.json";
 
+/// Top of every watts field (GPU, GPU limit, CPU socket).
+pub const MAX_WATTS: f32 = 5000.0;
+/// Top of every byte-count field (VRAM, system memory): 1 PiB.
+pub const MAX_MEM_BYTES: u64 = 1 << 50;
+/// Most slots a model may report.
+pub const MAX_SLOTS: u16 = 1024;
+/// Most fans a snapshot may carry (`[fans] channels` allows 8).
+pub const MAX_FANS: usize = 8;
+/// Highest fan channel number (`[fans] channels` are 1..=16).
+pub const MAX_FAN_CHANNEL: u8 = 16;
+/// Longest fan label, in characters (`[fans] labels`).
+pub const MAX_FAN_LABEL_CHARS: usize = 10;
+/// Top of a fan's rpm.
+pub const MAX_FAN_RPM: u32 = 100_000;
+/// Top of a source's last poll latency, seconds.
+pub const MAX_LATENCY_S: f32 = 600.0;
+
 /// Canonical model-name width, including the trailing `…`.
 ///
 /// [`MAX_NAME_CHARS`] is only a cheap length pre-check. A name that
@@ -36,7 +66,7 @@ pub const SNAPSHOT_PATH: &str = "/run/llama-watch/snapshot.json";
 pub const CANONICAL_NAME_CHARS: usize = 12;
 
 /// Why a buffer was not accepted as a v1 snapshot.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum WireError {
     /// `bytes.len()` is greater than [`MAX_BYTES`].
     #[error("snapshot length {len} exceeds the maximum")]
@@ -72,6 +102,10 @@ pub enum WireError {
     /// A full name is not canonical, or a detail token is not allowlisted.
     #[error("snapshot model detail is not canonical")]
     Detail,
+    /// More than [`MAX_FANS`] fans, a repeated or out-of-range channel, a
+    /// label that is not short printable ASCII, or an rpm or pwm out of range.
+    #[error("snapshot fan is out of range")]
+    Fan,
     /// The snapshot could not be encoded. Not signalled by an empty buffer.
     #[error("snapshot could not be encoded")]
     Encode,
@@ -82,7 +116,6 @@ pub type SnapshotV1 = WireSnapshot;
 
 /// One published sample.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireSnapshot {
     /// Must be [`SCHEMA`].
     pub schema: u8,
@@ -100,12 +133,17 @@ pub struct WireSnapshot {
     pub ai: Ai,
     /// Decoded-token counter.
     pub tokens: Tokens,
+    /// Fan speeds when `[fans]` is on (#11). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fans: Vec<FanWire>,
+    /// Source health, the tty health line (#11). Omitted by an older watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Sources>,
 }
 
 /// Host numbers. Percents are 0..=100, except `activity_pct`, which is
 /// 0..=[`ACTIVITY_MAX_PCT`]. Temperatures are −20..=150 °C.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Host {
     /// Composite load percent: `max(gpu, cpu_topk)`.
     #[serde(with = "finite_f32")]
@@ -135,11 +173,32 @@ pub struct Host {
     /// GPU temperature, °C.
     #[serde(with = "finite_f32")]
     pub gpu_c: Option<f32>,
+    /// GPU power draw, watts, 0..=[`MAX_WATTS`] (#11). Every field below is
+    /// optional on schema v1 and omitted when unknown.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_w: Option<f32>,
+    /// GPU enforced power limit, watts.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_limit_w: Option<f32>,
+    /// CPU socket power, watts.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub cpu_w: Option<f32>,
+    /// VRAM in use, bytes, at most [`MAX_MEM_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_used_bytes: Option<u64>,
+    /// VRAM total, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_total_bytes: Option<u64>,
+    /// System memory in use (`MemTotal - MemAvailable`), bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used_bytes: Option<u64>,
+    /// System memory total, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
 }
 
 /// llama-swap state and the models to draw.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ai {
     /// Reachability.
     pub state: AiWire,
@@ -161,7 +220,6 @@ pub enum AiWire {
 
 /// One display name and its upstream state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelWire {
     /// Canonical display name. See [`validate`].
     pub name: String,
@@ -186,6 +244,15 @@ pub struct ModelWire {
     /// KV cache fill 0..=1, from a backend without `/slots`.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub kv_fill: Option<f32>,
+    /// Prefix cache hit ratio 0..=1, from a backend without `/slots` (#11).
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<f32>,
+    /// llama.cpp slots busy now, at most [`Self::slots_total`] (#11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots_busy: Option<u16>,
+    /// llama.cpp slots the server has, at most [`MAX_SLOTS`] (#11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots_total: Option<u16>,
 }
 
 /// Upstream model lifecycle.
@@ -202,12 +269,97 @@ pub enum ModelState {
     Other,
 }
 
-/// Box decoded-token counter since watcher start.
+/// Box token counters since watcher start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Tokens {
     /// `None` when the counter was not measured. No numeric range.
     pub decoded_total: Option<u64>,
+    /// Prompt tokens processed, like `decoded_total` (#11). Omitted when
+    /// not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_total: Option<u64>,
+}
+
+/// One configured fan (#11). Read-only numbers from the watcher's hwmon.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FanWire {
+    /// Channel `N`, 1..=[`MAX_FAN_CHANNEL`], unique in the snapshot.
+    pub channel: u8,
+    /// The `[fans] labels` entry, or `fanN`: 1..=[`MAX_FAN_LABEL_CHARS`]
+    /// printable ASCII characters.
+    pub label: String,
+    /// `fanN_input`, rpm, at most [`MAX_FAN_RPM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+    /// `pwmN` as 0..=1.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub pwm: Option<f32>,
+}
+
+/// One source on the tty health line (#11).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceWire {
+    /// `true` when the source answered (tty OK or idle), `false` when down.
+    pub up: bool,
+    /// Last poll duration, seconds, 0..=[`MAX_LATENCY_S`]. Omitted when the
+    /// tty shows none.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub latency_s: Option<f32>,
+}
+
+/// Source health by fixed name. A source the watcher did not poll this tick
+/// (llama-swap off or down, or still starting) is absent. A fixed set of
+/// named fields, so a source added later is an unknown field to an older
+/// reader, not an error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Sources {
+    /// llama-swap reachability and its `/running` latency.
+    #[serde(
+        rename = "llama-swap",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub llama_swap: Option<SourceWire>,
+    /// `/running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<SourceWire>,
+    /// `/upstream/<model>/slots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<SourceWire>,
+    /// `/upstream/<model>/metrics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<SourceWire>,
+    /// `/api/metrics/activity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SourceWire>,
+    /// The GPU (NVML; `nvml` on the tty health line). Named `gpu` here and
+    /// in the export, as the S11 and S16 fences keep that word out of the
+    /// core and the exporter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<SourceWire>,
+    /// hwmon (coolant, CPU temperature).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwmon: Option<SourceWire>,
+    /// `/proc` (CPU, memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc: Option<SourceWire>,
+}
+
+impl Sources {
+    /// Every source, by its wire and label name, in health-line order.
+    #[must_use]
+    pub fn entries(&self) -> [(&'static str, Option<SourceWire>); 8] {
+        [
+            ("llama-swap", self.llama_swap),
+            ("running", self.running),
+            ("slots", self.slots),
+            ("metrics", self.metrics),
+            ("activity", self.activity),
+            ("gpu", self.gpu),
+            ("hwmon", self.hwmon),
+            ("proc", self.proc),
+        ]
+    }
 }
 
 /// Serialise `snapshot` as compact JSON.
@@ -258,6 +410,30 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
     check_temp("coolant_c", snapshot.host.coolant_c)?;
     check_temp("cpu_c", snapshot.host.cpu_c)?;
     check_temp("gpu_c", snapshot.host.gpu_c)?;
+    check_range("gpu_w", snapshot.host.gpu_w, 0.0, MAX_WATTS)?;
+    check_range("gpu_limit_w", snapshot.host.gpu_limit_w, 0.0, MAX_WATTS)?;
+    check_range("cpu_w", snapshot.host.cpu_w, 0.0, MAX_WATTS)?;
+    for (field, bytes) in [
+        ("vram_used_bytes", snapshot.host.vram_used_bytes),
+        ("vram_total_bytes", snapshot.host.vram_total_bytes),
+        ("mem_used_bytes", snapshot.host.mem_used_bytes),
+        ("mem_total_bytes", snapshot.host.mem_total_bytes),
+    ] {
+        if bytes.is_some_and(|b| b > MAX_MEM_BYTES) {
+            return Err(WireError::OutOfRange { field });
+        }
+    }
+    validate_fans(&snapshot.fans)?;
+    if let Some(sources) = &snapshot.sources {
+        for (_, source) in sources.entries() {
+            check_range(
+                "latency_s",
+                source.and_then(|s| s.latency_s),
+                0.0,
+                MAX_LATENCY_S,
+            )?;
+        }
+    }
     if snapshot.ai.models.len() > MAX_MODELS {
         return Err(WireError::TooManyModels);
     }
@@ -274,13 +450,43 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         {
             return Err(WireError::Detail);
         }
+        let not_ratio = |value: Option<f32>| {
+            value.is_some_and(|ratio| !ratio.is_finite() || !(0.0..=1.0).contains(&ratio))
+        };
         if model.running.is_some_and(|n| n > MAX_REQS)
             || model.queued.is_some_and(|n| n > MAX_REQS)
+            || not_ratio(model.kv_fill)
+            || not_ratio(model.cache_hit)
+            || model.slots_total.is_some_and(|n| n > MAX_SLOTS)
             || model
-                .kv_fill
-                .is_some_and(|fill| !fill.is_finite() || !(0.0..=1.0).contains(&fill))
+                .slots_busy
+                .is_some_and(|busy| model.slots_total.is_none_or(|total| busy > total))
         {
             return Err(WireError::Gauge);
+        }
+    }
+    Ok(())
+}
+
+fn validate_fans(fans: &[FanWire]) -> Result<(), WireError> {
+    if fans.len() > MAX_FANS {
+        return Err(WireError::Fan);
+    }
+    for (i, fan) in fans.iter().enumerate() {
+        if !(1..=MAX_FAN_CHANNEL).contains(&fan.channel)
+            || fans[..i].iter().any(|other| other.channel == fan.channel)
+            || fan.label.is_empty()
+            || fan.label.chars().count() > MAX_FAN_LABEL_CHARS
+            || !fan
+                .label
+                .chars()
+                .all(|c| ('\u{20}'..='\u{7e}').contains(&c))
+            || fan.rpm.is_some_and(|rpm| rpm > MAX_FAN_RPM)
+            || fan
+                .pwm
+                .is_some_and(|pwm| !pwm.is_finite() || !(0.0..=1.0).contains(&pwm))
+        {
+            return Err(WireError::Fan);
         }
     }
     Ok(())
@@ -377,6 +583,13 @@ mod tests {
                 coolant_c: None,
                 cpu_c: None,
                 gpu_c: None,
+                gpu_w: None,
+                gpu_limit_w: None,
+                cpu_w: None,
+                vram_used_bytes: None,
+                vram_total_bytes: None,
+                mem_used_bytes: None,
+                mem_total_bytes: None,
             },
             ai: Ai {
                 state: AiWire::Down,
@@ -384,7 +597,10 @@ mod tests {
             },
             tokens: Tokens {
                 decoded_total: None,
+                prompt_total: None,
             },
+            fans: Vec::new(),
+            sources: None,
         }
     }
 

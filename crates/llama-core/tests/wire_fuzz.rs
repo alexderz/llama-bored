@@ -26,6 +26,13 @@ fn sample() -> WireSnapshot {
             coolant_c: Some(6.0),
             cpu_c: Some(7.0),
             gpu_c: Some(8.0),
+            gpu_w: None,
+            gpu_limit_w: None,
+            cpu_w: None,
+            vram_used_bytes: None,
+            vram_total_bytes: None,
+            mem_used_bytes: None,
+            mem_total_bytes: None,
         },
         ai: Ai {
             state: AiWire::Loaded,
@@ -45,11 +52,17 @@ fn sample() -> WireSnapshot {
                     quant: Some("UD-Q4_K_M".to_owned()),
                     fa: Some(true),
                 }),
+                cache_hit: None,
+                slots_busy: None,
+                slots_total: None,
             }],
         },
         tokens: Tokens {
             decoded_total: Some(10),
+            prompt_total: None,
         },
+        fans: Vec::new(),
+        sources: None,
     }
 }
 

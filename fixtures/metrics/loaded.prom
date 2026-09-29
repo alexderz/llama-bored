@@ -44,9 +44,33 @@ llamabored_cpu_celsius 58
 # HELP llamabored_gpu_celsius GPU temperature, degrees Celsius.
 # TYPE llamabored_gpu_celsius gauge
 llamabored_gpu_celsius 71.5
+# HELP llamabored_gpu_power_watts GPU power draw, watts.
+# TYPE llamabored_gpu_power_watts gauge
+llamabored_gpu_power_watts 312.5
+# HELP llamabored_gpu_power_limit_watts GPU enforced power limit, watts.
+# TYPE llamabored_gpu_power_limit_watts gauge
+llamabored_gpu_power_limit_watts 600
+# HELP llamabored_cpu_power_watts CPU socket power, watts.
+# TYPE llamabored_cpu_power_watts gauge
+llamabored_cpu_power_watts 88.25
+# HELP llamabored_gpu_memory_used_bytes GPU memory in use, bytes.
+# TYPE llamabored_gpu_memory_used_bytes gauge
+llamabored_gpu_memory_used_bytes 21474836480
+# HELP llamabored_gpu_memory_total_bytes GPU memory total, bytes.
+# TYPE llamabored_gpu_memory_total_bytes gauge
+llamabored_gpu_memory_total_bytes 34359738368
+# HELP llamabored_memory_used_bytes System memory in use (MemTotal - MemAvailable), bytes.
+# TYPE llamabored_memory_used_bytes gauge
+llamabored_memory_used_bytes 57982058496
+# HELP llamabored_memory_total_bytes System memory total, bytes.
+# TYPE llamabored_memory_total_bytes gauge
+llamabored_memory_total_bytes 137438953472
 # HELP llamabored_tokens_decoded_total Tokens decoded since the watcher started.
 # TYPE llamabored_tokens_decoded_total counter
 llamabored_tokens_decoded_total 1234567
+# HELP llamabored_tokens_prompt_total Prompt tokens processed since the watcher started.
+# TYPE llamabored_tokens_prompt_total counter
+llamabored_tokens_prompt_total 7654321
 # HELP llamabored_ai_state llama-swap state; the current state is 1.
 # TYPE llamabored_ai_state gauge
 llamabored_ai_state{state="down"} 0
@@ -57,7 +81,60 @@ llamabored_ai_state{state="loaded"} 1
 llamabored_model_loaded{name="Bonsai 8B",full_name="Bonsai 8B",quant="PTQ1_0",kv="q8_0/q4_0",ctx="131072",moe="all",backend="sglang"} 1
 llamabored_model_loaded{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",quant="UD-Q4_K_M",kv="q8_0",ctx="262144",moe="16",backend="llamacpp"} 1
 llamabored_model_loaded{name="tiny",full_name="tiny",quant="",kv="",ctx="",moe="",backend="llamacpp"} 1
+# HELP llamabored_model_state Lifecycle of a loaded model; the current state is 1.
+# TYPE llamabored_model_state gauge
+llamabored_model_state{name="Bonsai 8B",full_name="Bonsai 8B",state="ready"} 0
+llamabored_model_state{name="Bonsai 8B",full_name="Bonsai 8B",state="starting"} 1
+llamabored_model_state{name="Bonsai 8B",full_name="Bonsai 8B",state="stopping"} 0
+llamabored_model_state{name="Bonsai 8B",full_name="Bonsai 8B",state="other"} 0
+llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="ready"} 1
+llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="starting"} 0
+llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="stopping"} 0
+llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="other"} 0
+llamabored_model_state{name="tiny",full_name="tiny",state="ready"} 0
+llamabored_model_state{name="tiny",full_name="tiny",state="starting"} 0
+llamabored_model_state{name="tiny",full_name="tiny",state="stopping"} 0
+llamabored_model_state{name="tiny",full_name="tiny",state="other"} 1
 # HELP llamabored_model_ctx_size_tokens Configured context size of a loaded model, tokens.
 # TYPE llamabored_model_ctx_size_tokens gauge
 llamabored_model_ctx_size_tokens{name="Bonsai 8B",full_name="Bonsai 8B"} 131072
 llamabored_model_ctx_size_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 262144
+# HELP llamabored_model_requests_running Requests a loaded model is running now (SGLang, vLLM and other backends without slots).
+# TYPE llamabored_model_requests_running gauge
+llamabored_model_requests_running{name="Bonsai 8B",full_name="Bonsai 8B"} 0
+# HELP llamabored_model_requests_queued Requests waiting for a loaded model (SGLang, vLLM and other backends without slots).
+# TYPE llamabored_model_requests_queued gauge
+llamabored_model_requests_queued{name="Bonsai 8B",full_name="Bonsai 8B"} 1
+# HELP llamabored_model_kv_cache_usage_ratio KV cache fill of a loaded model, 0 to 1 (SGLang, vLLM and other backends without slots).
+# TYPE llamabored_model_kv_cache_usage_ratio gauge
+llamabored_model_kv_cache_usage_ratio{name="Bonsai 8B",full_name="Bonsai 8B"} 0.25
+# HELP llamabored_model_cache_hit_ratio Prefix cache hit ratio of a loaded model, 0 to 1 (SGLang, vLLM).
+# TYPE llamabored_model_cache_hit_ratio gauge
+llamabored_model_cache_hit_ratio{name="Bonsai 8B",full_name="Bonsai 8B"} 0.75
+# HELP llamabored_slots_busy llama.cpp slots of a loaded model that are processing.
+# TYPE llamabored_slots_busy gauge
+llamabored_slots_busy{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 1
+# HELP llamabored_slots_total llama.cpp slots of a loaded model.
+# TYPE llamabored_slots_total gauge
+llamabored_slots_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 4
+# HELP llamabored_fan_rpm Fan speed, rpm, per configured [fans] channel.
+# TYPE llamabored_fan_rpm gauge
+llamabored_fan_rpm{channel="3",label="rad \"top\""} 1450
+# HELP llamabored_fan_pwm_ratio Fan PWM duty, 0 to 1, per configured [fans] channel (read only).
+# TYPE llamabored_fan_pwm_ratio gauge
+llamabored_fan_pwm_ratio{channel="1",label="fan1"} 0.25
+llamabored_fan_pwm_ratio{channel="3",label="rad \"top\""} 0.5
+# HELP llamabored_source_up 1 when a watcher source answered on its last poll, 0 when it failed; absent when not polled.
+# TYPE llamabored_source_up gauge
+llamabored_source_up{source="llama-swap"} 1
+llamabored_source_up{source="running"} 1
+llamabored_source_up{source="metrics"} 0
+llamabored_source_up{source="activity"} 1
+llamabored_source_up{source="gpu"} 1
+llamabored_source_up{source="hwmon"} 0
+llamabored_source_up{source="proc"} 1
+# HELP llamabored_source_latency_seconds Duration of a watcher source's last poll, seconds.
+# TYPE llamabored_source_latency_seconds gauge
+llamabored_source_latency_seconds{source="llama-swap"} 0.003
+llamabored_source_latency_seconds{source="running"} 0.003
+llamabored_source_latency_seconds{source="metrics"} 0.125

@@ -196,6 +196,7 @@ fn view(ai: AiState) -> LlamaView {
         ai,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     }
 }
 

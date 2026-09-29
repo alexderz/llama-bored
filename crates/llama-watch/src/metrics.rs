@@ -32,7 +32,7 @@ struct Names {
 const LLAMACPP: Names = Names {
     decode: &["llamacpp:n_decode_total"],
     running: &["llamacpp:requests_processing"],
-    prompt: &[],
+    prompt: &["llamacpp:prompt_tokens_total"],
     queued: &[],
     kv: &[],
     hit: &[],
@@ -76,7 +76,8 @@ pub struct MetricsSample {
     pub n_decode_total: Option<u64>,
     /// Requests in flight (`llamacpp:requests_processing`, running requests).
     pub requests_processing: Option<f64>,
-    /// Prompt-token counter. SGLang and vLLM only.
+    /// Prompt-token counter (`llamacpp:prompt_tokens_total`,
+    /// `*:prompt_tokens_total`).
     pub prompt_total: Option<u64>,
     /// Requests waiting. SGLang and vLLM only.
     pub queued: Option<f64>,
@@ -325,9 +326,12 @@ llamacpp:requests_processing{lane=\"a b\"} 2
         assert_eq!(sample.n_decode_total, Some(42));
         assert_eq!(sample.requests_processing, Some(2.0));
 
+        assert_eq!(sample.prompt_total, Some(999));
+
         let missing = parse_metrics("llamacpp:prompt_tokens_total 3\n");
         assert_eq!(missing.n_decode_total, None);
         assert_eq!(missing.requests_processing, None);
+        assert_eq!(missing.prompt_total, Some(3));
 
         let fractional = parse_metrics("llamacpp:n_decode_total 10.9\n");
         assert_eq!(fractional.n_decode_total, Some(10));

@@ -13,7 +13,14 @@
     "mem_pct": 41.75,
     "coolant_c": 31.5,
     "cpu_c": 58,
-    "gpu_c": 71.5
+    "gpu_c": 71.5,
+    "gpu_w": 312.5,
+    "gpu_limit_w": 600,
+    "cpu_w": 88.25,
+    "vram_used_bytes": 21474836480,
+    "vram_total_bytes": 34359738368,
+    "mem_used_bytes": 57982058496,
+    "mem_total_bytes": 137438953472
   },
   "ai": {
     "state": "loaded",
@@ -29,7 +36,9 @@
           "kv_v": "q8_0",
           "quant": "UD-Q4_K_M",
           "fa": true
-        }
+        },
+        "slots_busy": 1,
+        "slots_total": 4
       },
       {
         "name": "Bonsai 8B",
@@ -38,6 +47,7 @@
         "running": 0,
         "queued": 1,
         "kv_fill": 0.25,
+        "cache_hit": 0.75,
         "detail": {
           "ctx": 131072,
           "ncmoe": 65535,
@@ -53,6 +63,20 @@
     ]
   },
   "tokens": {
-    "decoded_total": 1234567
+    "decoded_total": 1234567,
+    "prompt_total": 7654321
+  },
+  "fans": [
+    { "channel": 3, "label": "rad \"top\"", "rpm": 1450, "pwm": 0.5 },
+    { "channel": 1, "label": "fan1", "pwm": 0.25 }
+  ],
+  "sources": {
+    "llama-swap": { "up": true, "latency_s": 0.003 },
+    "running": { "up": true, "latency_s": 0.003 },
+    "metrics": { "up": false, "latency_s": 0.125 },
+    "activity": { "up": true },
+    "gpu": { "up": true },
+    "hwmon": { "up": false },
+    "proc": { "up": true }
   }
 }

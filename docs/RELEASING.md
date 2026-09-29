@@ -13,7 +13,13 @@ llama-bored follows [Semantic Versioning](https://semver.org/) and keeps a
 - All crates share one version. Bump every `crates/*/Cargo.toml` and
   refresh `Cargo.lock` (`cargo update --offline --workspace`).
 - The snapshot has its own `schema` number. Only an incompatible change to
-  the snapshot bumps it.
+  the snapshot bumps it. Within one schema number, new fields are optional
+  and readers ignore fields they do not know (known fields stay strictly
+  validated, and the size cap stays), so a newer llama-watch never blinds
+  an older kraken-lcd, llama-light or llama-metrics.
+- After an upgrade, restart every running unit so all of them run the new
+  binaries: `systemctl try-restart llama-watch kraken-lcd llama-light
+  llama-metrics` (install.sh prints this; it never restarts units itself).
 
 ## Changelog
 

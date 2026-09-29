@@ -16,6 +16,13 @@ fn host_ok() -> Host {
         coolant_c: Some(34.0),
         cpu_c: Some(70.0),
         gpu_c: Some(60.0),
+        gpu_w: None,
+        gpu_limit_w: None,
+        cpu_w: None,
+        vram_used_bytes: None,
+        vram_total_bytes: None,
+        mem_used_bytes: None,
+        mem_total_bytes: None,
     }
 }
 
@@ -39,6 +46,9 @@ fn valid() -> WireSnapshot {
                     state: ModelState::Ready,
                     full_name: None,
                     detail: None,
+                    cache_hit: None,
+                    slots_busy: None,
+                    slots_total: None,
                 },
                 ModelWire {
                     backend: None,
@@ -49,12 +59,18 @@ fn valid() -> WireSnapshot {
                     state: ModelState::Starting,
                     full_name: None,
                     detail: None,
+                    cache_hit: None,
+                    slots_busy: None,
+                    slots_total: None,
                 },
             ],
         },
         tokens: Tokens {
             decoded_total: Some(1_234_567),
+            prompt_total: None,
         },
+        fans: Vec::new(),
+        sources: None,
     }
 }
 
@@ -103,6 +119,9 @@ fn sanitize_wire_names_pass_validate() {
             state: ModelState::Ready,
             full_name: None,
             detail: None,
+            cache_hit: None,
+            slots_busy: None,
+            slots_total: None,
         }];
         assert_eq!(validate(&snap), Ok(()), "raw={raw:?} name={name:?}");
         assert!(
@@ -153,6 +172,13 @@ fn valid_snapshot_round_trips() {
         coolant_c: None,
         cpu_c: None,
         gpu_c: None,
+        gpu_w: None,
+        gpu_limit_w: None,
+        cpu_w: None,
+        vram_used_bytes: None,
+        vram_total_bytes: None,
+        mem_used_bytes: None,
+        mem_total_bytes: None,
     };
     empty.tokens.decoded_total = None;
     let bytes = to_json(&empty).expect("encode");
@@ -168,18 +194,29 @@ fn valid_snapshot_round_trips() {
     assert_eq!(validate(&empty), Ok(()));
 }
 
+/// Compatibility rule (#12): within one `schema` number a reader ignores
+/// fields it does not know, so a newer watcher's additive field does not take
+/// an older reader down. This replaces the pre-0.2 rule that rejected every
+/// unknown field. It is safe because a reader only ever sees typed, known
+/// fields, and those keep every check: the schema number, the size cap, and
+/// the range and allowlist rules below. An unknown field's value is dropped
+/// at the parse and can reach no display or export.
 #[test]
-fn unknown_field_at_each_level_is_rejected() {
+fn unknown_fields_are_ignored_within_schema_v1() {
     let base = base_json();
     let parsed = parse_validated(base.as_bytes()).expect("base json");
     assert_eq!(parsed.schema, wire::SCHEMA);
     let cases = [
         ("root", insert_after(&base, "{", r#""nope":1,"#)),
+        (
+            "root object",
+            insert_after(&base, "{", r#""future":{"a":[1,2,{"b":"x"}]},"#),
+        ),
         ("host", insert_after(&base, r#""host":{"#, r#""nope":1,"#)),
         ("ai", insert_after(&base, r#""ai":{"#, r#""nope":1,"#)),
         (
             "model",
-            insert_after(&base, r#""models":[{"#, r#""nope":1,"#),
+            insert_after(&base, r#""models":[{"#, r#""nope":"text","#),
         ),
         (
             "tokens",
@@ -187,11 +224,45 @@ fn unknown_field_at_each_level_is_rejected() {
         ),
     ];
     for (level, bytes) in cases {
-        assert!(
-            matches!(parse_validated(&bytes), Err(WireError::Parse)),
-            "{level}"
-        );
+        let snap = parse_validated(&bytes).unwrap_or_else(|err| panic!("{level}: {err}"));
+        assert_eq!(snap, parsed, "{level}: the unknown field changes nothing");
     }
+
+    // Known fields stay strict next to an unknown one.
+    let extra_and_bad = insert_after(
+        &base.replace(r#""gpu_pct":1.0"#, r#""gpu_pct":101.0"#),
+        r#""host":{"#,
+        r#""nope":1,"#,
+    );
+    assert_eq!(
+        parse_validated(&extra_and_bad),
+        Err(WireError::OutOfRange { field: "gpu_pct" })
+    );
+    let bad_type = insert_after(&base, r#""host":{"#, r#""nope":1,"#);
+    let bad_type = String::from_utf8(bad_type)
+        .expect("utf8")
+        .replace(r#""cpu_c":1.0"#, r#""cpu_c":"hot""#);
+    assert!(matches!(
+        parse_validated(bad_type.as_bytes()),
+        Err(WireError::Parse)
+    ));
+    // A wrong schema number is still refused, unknown fields or not.
+    let v2 = insert_after(
+        &base.replace(r#""schema":1"#, r#""schema":2"#),
+        "{",
+        r#""nope":1,"#,
+    );
+    assert_eq!(parse_validated(&v2), Err(WireError::Schema));
+    // And the size cap still comes first.
+    let mut big = insert_after(&base, "{", r#""nope":1,"#);
+    big.resize(wire::MAX_BYTES + 1, b' ');
+    assert_eq!(
+        parse_validated(&big),
+        Err(WireError::TooLong {
+            len: wire::MAX_BYTES + 1
+        })
+    );
+
     let upper = base.replace("\"loaded\"", "\"Loaded\"");
     assert!(matches!(
         parse_validated(upper.as_bytes()),
@@ -367,6 +438,9 @@ fn model_count_and_loaded_state() {
             state: ModelState::Other,
             full_name: None,
             detail: None,
+            cache_hit: None,
+            slots_busy: None,
+            slots_total: None,
         })
         .collect();
     assert_eq!(validate(&snap), Ok(()));
@@ -380,6 +454,9 @@ fn model_count_and_loaded_state() {
         state: ModelState::Stopping,
         full_name: None,
         detail: None,
+        cache_hit: None,
+        slots_busy: None,
+        slots_total: None,
     });
     assert_eq!(validate(&snap), Err(WireError::TooManyModels));
 
@@ -402,6 +479,9 @@ fn name_length_and_canonical_form() {
         state: ModelState::Ready,
         full_name: None,
         detail: None,
+        cache_hit: None,
+        slots_busy: None,
+        slots_total: None,
     }];
     assert_eq!(validate(&snap), Ok(()));
 
@@ -522,12 +602,20 @@ fn model_detail_is_allowlisted() {
         snap.ai.models[0].full_name = Some(name.to_owned());
         assert_eq!(validate(&snap), Err(WireError::Detail), "{name:?}");
     }
+    // An unknown detail key is ignored under the #12 rule: the path is
+    // dropped at the parse, so no reader can draw or export it.
     let unknown = insert_after(
         &base_json(),
         r#""state":"ready""#,
         r#","detail":{"cmd":"/models/prism/llama-server"}"#,
     );
-    assert!(matches!(parse_validated(&unknown), Err(WireError::Parse)));
+    let parsed = parse_validated(&unknown).expect("unknown detail key is ignored");
+    assert_eq!(
+        parsed.ai.models[0].detail,
+        Some(wire::ModelDetail::default())
+    );
+    let debug = format!("{parsed:?}");
+    assert!(!debug.contains("/models"), "{debug}");
 }
 
 #[test]
@@ -592,4 +680,207 @@ fn backend_gauges_are_bounded() {
     assert_eq!(parse_validated(&json), Err(WireError::Gauge));
     let json = insert_after(&base_json(), r#""state":"ready""#, r#","running":70000"#);
     assert_eq!(parse_validated(&json), Err(WireError::Parse));
+}
+
+/// Every #11 field set, at its top value where there is one.
+fn full() -> WireSnapshot {
+    let mut snap = valid();
+    snap.host.gpu_w = Some(wire::MAX_WATTS);
+    snap.host.gpu_limit_w = Some(600.0);
+    snap.host.cpu_w = Some(0.0);
+    snap.host.vram_used_bytes = Some(wire::MAX_MEM_BYTES);
+    snap.host.vram_total_bytes = Some(34_190_917_632);
+    snap.host.mem_used_bytes = Some(0);
+    snap.host.mem_total_bytes = Some(134_217_728_000);
+    snap.tokens.prompt_total = Some(u64::MAX);
+    snap.ai.models[0].cache_hit = Some(1.0);
+    snap.ai.models[0].slots_busy = Some(wire::MAX_SLOTS);
+    snap.ai.models[0].slots_total = Some(wire::MAX_SLOTS);
+    snap.ai.models[1].slots_busy = Some(0);
+    snap.ai.models[1].slots_total = Some(4);
+    snap.fans = (1..=8)
+        .map(|channel| wire::FanWire {
+            channel: channel * 2,
+            label: "CPU fan ~9".to_owned(),
+            rpm: Some(wire::MAX_FAN_RPM),
+            pwm: Some(1.0),
+        })
+        .collect();
+    let up = |latency: f32| {
+        Some(wire::SourceWire {
+            up: true,
+            latency_s: Some(latency),
+        })
+    };
+    snap.sources = Some(wire::Sources {
+        llama_swap: up(wire::MAX_LATENCY_S),
+        running: up(0.0),
+        slots: Some(wire::SourceWire {
+            up: false,
+            latency_s: None,
+        }),
+        metrics: up(0.004),
+        activity: up(0.01),
+        gpu: up(0.0),
+        hwmon: up(0.0),
+        proc: up(0.0),
+    });
+    snap
+}
+
+#[test]
+fn metrics_fields_are_additive_on_schema_v1() {
+    // An older watcher's snapshot has none of them and still validates.
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#11 snapshot");
+    assert_eq!(old.host.gpu_w, None);
+    assert_eq!(old.tokens.prompt_total, None);
+    assert_eq!(old.ai.models[0].slots_total, None);
+    assert!(old.fans.is_empty());
+    assert_eq!(old.sources, None);
+
+    // Nothing known writes the old shape: no new keys at all.
+    let text = String::from_utf8(to_json(&valid()).expect("encode")).expect("utf8");
+    for key in [
+        "gpu_w",
+        "cpu_w",
+        "_bytes",
+        "prompt_total",
+        "cache_hit",
+        "slots_",
+        "fans",
+        "sources",
+    ] {
+        assert!(!text.contains(key), "{key}: {text}");
+    }
+
+    let snap = full();
+    let bytes = to_json(&snap).expect("encode");
+    assert_eq!(parse_validated(&bytes).expect("round trip"), snap);
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(text.contains(r#""llama-swap":{"up":true"#), "{text}");
+}
+
+#[test]
+fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
+    let mut snap = full();
+    let model = ModelWire {
+        name: "Qwen3-Coder…".to_owned(),
+        state: ModelState::Ready,
+        full_name: Some("x".repeat(wire::MAX_FULL_NAME_CHARS)),
+        detail: Some(wire::ModelDetail {
+            ctx: Some(u32::MAX),
+            ncmoe: Some(u16::MAX),
+            kv_k: Some("a".repeat(16)),
+            kv_v: Some("b".repeat(16)),
+            quant: Some("c".repeat(16)),
+            fa: Some(true),
+        }),
+        backend: Some(wire::Backend::LlamaCpp),
+        running: Some(wire::MAX_REQS),
+        queued: Some(wire::MAX_REQS),
+        kv_fill: Some(0.123_456_7),
+        cache_hit: Some(0.123_456_7),
+        slots_busy: Some(wire::MAX_SLOTS),
+        slots_total: Some(wire::MAX_SLOTS),
+    };
+    snap.ai.models = vec![model; wire::MAX_MODELS];
+    snap.host.load_pct = Some(12.345_678);
+    let bytes = to_json(&snap).expect("encode");
+    assert!(
+        bytes.len() < wire::MAX_BYTES / 2,
+        "worst case is {} bytes",
+        bytes.len()
+    );
+    assert!(parse_validated(&bytes).is_ok());
+}
+
+type Mutate = fn(&mut WireSnapshot);
+
+#[test]
+fn metrics_fields_are_bounded() {
+    assert_eq!(validate(&full()), Ok(()));
+    let host_cases: [(&str, Mutate); 9] = [
+        ("gpu_w", |s| s.host.gpu_w = Some(-0.1)),
+        ("gpu_w", |s| s.host.gpu_w = Some(wire::MAX_WATTS + 1.0)),
+        ("gpu_w", |s| s.host.gpu_w = Some(f32::NAN)),
+        ("gpu_limit_w", |s| s.host.gpu_limit_w = Some(f32::INFINITY)),
+        ("cpu_w", |s| s.host.cpu_w = Some(-5.0)),
+        ("vram_used_bytes", |s| {
+            s.host.vram_used_bytes = Some(wire::MAX_MEM_BYTES + 1)
+        }),
+        ("vram_total_bytes", |s| {
+            s.host.vram_total_bytes = Some(u64::MAX)
+        }),
+        ("mem_used_bytes", |s| s.host.mem_used_bytes = Some(u64::MAX)),
+        ("mem_total_bytes", |s| {
+            s.host.mem_total_bytes = Some(u64::MAX)
+        }),
+    ];
+    for (field, bad) in host_cases {
+        let mut snap = full();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::OutOfRange { field }));
+    }
+
+    let gauge_cases: [Mutate; 6] = [
+        |s| s.ai.models[0].cache_hit = Some(1.01),
+        |s| s.ai.models[0].cache_hit = Some(f32::NAN),
+        |s| s.ai.models[1].slots_busy = Some(5),
+        |s| s.ai.models[1].slots_total = None,
+        |s| s.ai.models[0].slots_total = Some(wire::MAX_SLOTS + 1),
+        |s| {
+            s.ai.models[0].slots_busy = None;
+            s.ai.models[0].slots_total = Some(wire::MAX_SLOTS + 1);
+        },
+    ];
+    for (i, bad) in gauge_cases.into_iter().enumerate() {
+        let mut snap = full();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+
+    let fan_cases: [Mutate; 10] = [
+        |s| s.fans.push(s.fans[0].clone()),
+        |s| s.fans[1].channel = s.fans[0].channel,
+        |s| s.fans[0].channel = 0,
+        |s| s.fans[0].channel = wire::MAX_FAN_CHANNEL + 1,
+        |s| s.fans[0].label = String::new(),
+        |s| s.fans[0].label = "x".repeat(wire::MAX_FAN_LABEL_CHARS + 1),
+        |s| s.fans[0].label = "fan\n1".to_owned(),
+        |s| s.fans[0].label = "fän".to_owned(),
+        |s| s.fans[0].rpm = Some(wire::MAX_FAN_RPM + 1),
+        |s| s.fans[0].pwm = Some(1.5),
+    ];
+    for (i, bad) in fan_cases.into_iter().enumerate() {
+        let mut snap = full();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Fan), "case {i}");
+    }
+
+    for latency in [-0.001, wire::MAX_LATENCY_S + 1.0, f32::NAN] {
+        let mut snap = full();
+        if let Some(sources) = snap.sources.as_mut() {
+            sources.metrics = Some(wire::SourceWire {
+                up: true,
+                latency_s: Some(latency),
+            });
+        }
+        assert_eq!(
+            validate(&snap),
+            Err(WireError::OutOfRange { field: "latency_s" }),
+            "{latency}"
+        );
+    }
+
+    // Types stay strict on the wire: a negative count or a string is a parse error.
+    for extra in [r#""vram_used_bytes":-1,"#, r#""gpu_w":"hot","#] {
+        let json = insert_after(&base_json(), r#""host":{"#, extra);
+        assert_eq!(parse_validated(&json), Err(WireError::Parse), "{extra}");
+    }
+    let json = insert_after(&base_json(), "{", r#""sources":{"proc":{"up":"yes"}},"#);
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
+    // A source this reader does not know is ignored (#12).
+    let json = insert_after(&base_json(), "{", r#""sources":{"tpu":{"up":true}},"#);
+    let snap = parse_validated(&json).expect("unknown source is ignored");
+    assert_eq!(snap.sources, Some(wire::Sources::default()));
 }

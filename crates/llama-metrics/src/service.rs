@@ -2,11 +2,11 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use llama_core::log::{self, Priority};
+use llama_core::log::{self, Priority, Sink};
 use sd_notify::NotifyState;
 
 use crate::config::Config;
@@ -49,11 +49,21 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 /// Monotonic nanoseconds. Production is [`snapshot::mono_now_ns`].
 pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 
+/// Where [`SnapshotMetrics`] logs. Production is stderr.
+pub type LogSink = Box<dyn Sink + Send>;
+
+/// The last rejection reason that was logged, and the sink.
+struct RejectLog {
+    last: Option<String>,
+    sink: LogSink,
+}
+
 /// Renders `/metrics` from a fresh read of the snapshot on every scrape.
 pub struct SnapshotMetrics {
     file: SnapshotFile,
     stale_after: Duration,
     clock: Clock,
+    log: Mutex<RejectLog>,
 }
 
 impl SnapshotMetrics {
@@ -63,6 +73,47 @@ impl SnapshotMetrics {
             file,
             stale_after,
             clock,
+            log: Mutex::new(RejectLog {
+                last: None,
+                sink: Box::new(log::Stderr),
+            }),
+        }
+    }
+
+    /// Log to `sink` instead of stderr. Tests capture the lines.
+    #[must_use]
+    pub fn with_log(self, sink: LogSink) -> Self {
+        Self {
+            log: Mutex::new(RejectLog { last: None, sink }),
+            ..self
+        }
+    }
+
+    /// `snapshot rejected: <reason>` once per distinct reason, at warning;
+    /// a good read resets it, so a later failure logs again (#12).
+    fn note(&self, read: &Result<llama_core::wire::WireSnapshot, snapshot::ReadError>) {
+        let Ok(mut state) = self.log.lock() else {
+            return;
+        };
+        let state = &mut *state;
+        match read {
+            Ok(_) => {
+                if state.last.take().is_some() {
+                    state
+                        .sink
+                        .write_line(&log::format_line(Priority::Info, "snapshot accepted"));
+                }
+            }
+            Err(err) => {
+                let reason = err.reason();
+                if state.last.as_deref() != Some(reason.as_str()) {
+                    state.sink.write_line(&log::format_line(
+                        Priority::Warning,
+                        &format!("snapshot rejected: {reason}"),
+                    ));
+                    state.last = Some(reason);
+                }
+            }
         }
     }
 }
@@ -70,6 +121,7 @@ impl SnapshotMetrics {
 impl Body for SnapshotMetrics {
     fn metrics(&self, rejected: Rejected) -> String {
         let read = self.file.read();
+        self.note(&read);
         expo::render(&Scrape {
             read: &read,
             now_ns: (self.clock)(),

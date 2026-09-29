@@ -483,7 +483,8 @@ pub enum ChartGlyphs {
 /// `[fans]`: read-only fan speeds from one Super-I/O hwmon, for the tty.
 ///
 /// Off by default. The watcher only reads `fanN_input`, `pwmN` and
-/// `pwmN_enable`; it never writes them. The snapshot does not carry fans.
+/// `pwmN_enable`; it never writes them. The snapshot carries rpm and pwm
+/// as numbers for llama-metrics (#11).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fans {

@@ -347,6 +347,7 @@ fn collector_carries_fans_beside_the_snapshot_only_when_enabled() {
         ai: AiState::Idle,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     };
     let on = valid(
         "[fans]\nenabled = true\nhwmon = \"nct6798\"\nchannels = [2, 3, 5, 6]\n\

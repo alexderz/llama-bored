@@ -182,6 +182,7 @@ fn missing_snapshot_is_down_and_stale() {
     for err in [
         ReadError::Missing,
         ReadError::Invalid,
+        ReadError::Rejected(wire::WireError::Schema),
         ReadError::TooLarge,
         ReadError::NotRegular,
     ] {
@@ -220,14 +221,22 @@ fn file_reader_refuses_symlinks_oversize_and_bad_json() {
 
     let bad = dir.join("bad.json");
     std::fs::write(&bad, b"{\"schema\":1}").unwrap();
-    assert_eq!(SnapshotFile::at(&bad).read(), Err(ReadError::Invalid));
+    assert_eq!(
+        SnapshotFile::at(&bad).read(),
+        Err(ReadError::Rejected(wire::WireError::Parse))
+    );
 
     // A validated-parser rule, not only JSON: out-of-range percent.
     let text = std::fs::read_to_string(&good)
         .unwrap()
         .replace("\"gpu_pct\": 97", "\"gpu_pct\": 170");
     std::fs::write(&bad, text).unwrap();
-    assert_eq!(SnapshotFile::at(&bad).read(), Err(ReadError::Invalid));
+    assert_eq!(
+        SnapshotFile::at(&bad).read(),
+        Err(ReadError::Rejected(wire::WireError::OutOfRange {
+            field: "gpu_pct"
+        }))
+    );
 }
 
 #[test]
@@ -248,6 +257,72 @@ fn body_reads_the_file_on_every_scrape() {
     let text = metrics.metrics(Rejected::default());
     assert!(text.contains("llamabored_snapshot_up 1\n"));
     assert!(text.contains("llamabored_snapshot_stale 0\n"));
+}
+
+/// Log lines captured from the exporter.
+#[derive(Clone, Default)]
+struct Lines(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl llama_core::log::Sink for Lines {
+    fn write_line(&mut self, line: &str) {
+        self.0.lock().unwrap().push(line.to_owned());
+    }
+}
+
+impl Lines {
+    fn all(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[test]
+fn a_rejected_snapshot_logs_once_per_reason_until_a_good_read() {
+    let dir = common::scratch("reject-log");
+    let path = dir.join("snapshot.json");
+    let lines = Lines::default();
+    let metrics = SnapshotMetrics::new(
+        SnapshotFile::at(&path),
+        STALE,
+        Box::new(|| T0 + 1_000_000_000),
+    )
+    .with_log(Box::new(lines.clone()));
+    let good = std::fs::read_to_string(common::fixture("snapshot-loaded.json")).unwrap();
+    let scrape = |times: usize| {
+        for _ in 0..times {
+            let _ = metrics.metrics(Rejected::default());
+        }
+    };
+
+    std::fs::write(&path, good.replace("\"schema\": 1", "\"schema\": 2")).unwrap();
+    scrape(3);
+    assert_eq!(
+        lines.all(),
+        ["<4>snapshot rejected: snapshot schema is not 1"]
+    );
+
+    // A different reason logs again, once.
+    std::fs::write(&path, good.replace("\"gpu_pct\": 97", "\"gpu_pct\": 170")).unwrap();
+    scrape(3);
+    assert_eq!(lines.all().len(), 2, "{:?}", lines.all());
+    assert_eq!(
+        lines.all()[1],
+        "<4>snapshot rejected: snapshot field gpu_pct is out of range"
+    );
+
+    // A good read resets it: the same failure later is logged again.
+    std::fs::write(&path, &good).unwrap();
+    scrape(2);
+    std::fs::write(&path, good.replace("\"gpu_pct\": 97", "\"gpu_pct\": 170")).unwrap();
+    scrape(2);
+    let all = lines.all();
+    assert_eq!(all.len(), 4, "{all:?}");
+    assert_eq!(all[2], "<6>snapshot accepted");
+    assert_eq!(all[3], all[1]);
+
+    std::fs::remove_file(&path).unwrap();
+    scrape(2);
+    assert_eq!(lines.all()[4], "<4>snapshot rejected: missing");
+    assert_eq!(lines.all().len(), 5);
 }
 
 #[test]
@@ -360,6 +435,13 @@ fn no_prompt_or_output_text_is_exported() {
         "host.coolant_c",
         "host.cpu_c",
         "host.gpu_c",
+        "host.gpu_w",
+        "host.gpu_limit_w",
+        "host.cpu_w",
+        "host.vram_used_bytes",
+        "host.vram_total_bytes",
+        "host.mem_used_bytes",
+        "host.mem_total_bytes",
         "ai",
         "ai.state",
         "ai.models",
@@ -377,8 +459,35 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.running",
         "ai.models.queued",
         "ai.models.kv_fill",
+        "ai.models.cache_hit",
+        "ai.models.slots_busy",
+        "ai.models.slots_total",
         "tokens",
         "tokens.decoded_total",
+        "tokens.prompt_total",
+        "fans",
+        "fans.channel",
+        "fans.label",
+        "fans.rpm",
+        "fans.pwm",
+        "sources",
+        "sources.llama-swap",
+        "sources.llama-swap.up",
+        "sources.llama-swap.latency_s",
+        "sources.running",
+        "sources.running.up",
+        "sources.running.latency_s",
+        "sources.metrics",
+        "sources.metrics.up",
+        "sources.metrics.latency_s",
+        "sources.activity",
+        "sources.activity.up",
+        "sources.gpu",
+        "sources.gpu.up",
+        "sources.hwmon",
+        "sources.hwmon.up",
+        "sources.proc",
+        "sources.proc.up",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -387,7 +496,11 @@ fn no_prompt_or_output_text_is_exported() {
         keys, pinned,
         "the snapshot wire changed; review llama-metrics for text before updating this pin"
     );
-    for key in &keys {
+    // A token count is not text: `prompt_total` is a u64 counter (#11),
+    // typed on the wire, so it is the one key allowed to say "prompt".
+    const COUNTS: [&str; 2] = ["tokens.prompt_total", "llamabored_tokens_prompt_total"];
+    assert!(json["tokens"]["prompt_total"].is_u64());
+    for key in keys.iter().filter(|key| !COUNTS.contains(&key.as_str())) {
         for word in ["prompt", "output", "input", "text", "content", "message"] {
             assert!(!key.contains(word), "wire key {key} looks like text");
         }
@@ -403,6 +516,16 @@ fn no_prompt_or_output_text_is_exported() {
             .map(str::to_owned)
             .collect();
     allowed.insert(env!("CARGO_PKG_VERSION").to_owned());
+    for state in ["ready", "starting", "stopping", "other"] {
+        allowed.insert(state.to_owned());
+    }
+    for fan in &snap.fans {
+        allowed.insert(fan.channel.to_string());
+        allowed.insert(fan.label.clone());
+    }
+    for (source, _) in wire::Sources::default().entries() {
+        allowed.insert(source.to_owned());
+    }
     allowed.insert(wire::SCHEMA.to_string());
     for model in &snap.ai.models {
         allowed.insert(model.name.clone());
@@ -436,10 +559,16 @@ fn no_prompt_or_output_text_is_exported() {
         "ctx",
         "moe",
         "backend",
+        "channel",
+        "label",
+        "source",
     ]
     .into_iter()
     .collect();
     for (name, labels, _) in samples(&text) {
+        if COUNTS.contains(&name.as_str()) {
+            continue;
+        }
         for word in ["prompt", "output", "input", "text", "content", "message"] {
             assert!(!name.contains(word), "{name} looks like a text metric");
         }
@@ -453,6 +582,142 @@ fn no_prompt_or_output_text_is_exported() {
     }
     for line in text.lines().filter(|l| l.starts_with("# HELP ")) {
         assert!(line.len() < 200, "HELP text is long: {line}");
+    }
+}
+
+/// Snapshot leaves that are exported, and the series that carries each one
+/// (a value or a label value).
+const EXPORTED: &[(&str, &str)] = &[
+    ("seq", "llamabored_snapshot_seq"),
+    ("t_mono_ns", "llamabored_snapshot_age_seconds"),
+    ("host.load_pct", "llamabored_load_pct"),
+    ("host.activity_pct", "llamabored_activity_pct"),
+    ("host.cpu_pct", "llamabored_cpu_pct"),
+    ("host.cpu_topk_pct", "llamabored_cpu_topk_pct"),
+    ("host.gpu_pct", "llamabored_gpu_pct"),
+    ("host.mem_pct", "llamabored_mem_pct"),
+    ("host.coolant_c", "llamabored_coolant_celsius"),
+    ("host.cpu_c", "llamabored_cpu_celsius"),
+    ("host.gpu_c", "llamabored_gpu_celsius"),
+    ("host.gpu_w", "llamabored_gpu_power_watts"),
+    ("host.gpu_limit_w", "llamabored_gpu_power_limit_watts"),
+    ("host.cpu_w", "llamabored_cpu_power_watts"),
+    ("host.vram_used_bytes", "llamabored_gpu_memory_used_bytes"),
+    ("host.vram_total_bytes", "llamabored_gpu_memory_total_bytes"),
+    ("host.mem_used_bytes", "llamabored_memory_used_bytes"),
+    ("host.mem_total_bytes", "llamabored_memory_total_bytes"),
+    ("ai.state", "llamabored_ai_state"),
+    ("ai.models.name", "llamabored_model_loaded"),
+    ("ai.models.full_name", "llamabored_model_loaded"),
+    ("ai.models.state", "llamabored_model_state"),
+    ("ai.models.backend", "llamabored_model_loaded"),
+    ("ai.models.detail.ctx", "llamabored_model_ctx_size_tokens"),
+    ("ai.models.detail.ncmoe", "llamabored_model_loaded"),
+    ("ai.models.detail.kv_k", "llamabored_model_loaded"),
+    ("ai.models.detail.kv_v", "llamabored_model_loaded"),
+    ("ai.models.detail.quant", "llamabored_model_loaded"),
+    ("ai.models.running", "llamabored_model_requests_running"),
+    ("ai.models.queued", "llamabored_model_requests_queued"),
+    ("ai.models.kv_fill", "llamabored_model_kv_cache_usage_ratio"),
+    ("ai.models.cache_hit", "llamabored_model_cache_hit_ratio"),
+    ("ai.models.slots_busy", "llamabored_slots_busy"),
+    ("ai.models.slots_total", "llamabored_slots_total"),
+    ("tokens.decoded_total", "llamabored_tokens_decoded_total"),
+    ("tokens.prompt_total", "llamabored_tokens_prompt_total"),
+    ("fans.channel", "llamabored_fan_rpm"),
+    ("fans.label", "llamabored_fan_rpm"),
+    ("fans.rpm", "llamabored_fan_rpm"),
+    ("fans.pwm", "llamabored_fan_pwm_ratio"),
+    ("sources.*.up", "llamabored_source_up"),
+    ("sources.*.latency_s", "llamabored_source_latency_seconds"),
+];
+
+/// Snapshot leaves that are deliberately not exported, with the reason.
+const NOT_EXPORTED: &[(&str, &str)] = &[
+    (
+        "schema",
+        "validated equal to wire::SCHEMA; build_info's wire_schema carries it",
+    ),
+    (
+        "run_id",
+        "random per watcher start; a label would be unbounded, a value meaningless",
+    ),
+    ("t_wall_ms", "wall clock for logs; age comes from t_mono_ns"),
+    (
+        "ai.models.detail.fa",
+        "flash attention flag; carried on the wire but drawn by no dashboard",
+    ),
+];
+
+fn collect_leaves(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                // Source names are a fixed set; one pattern covers them.
+                let key = if prefix == "sources" {
+                    "*"
+                } else {
+                    key.as_str()
+                };
+                let path = if prefix.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_leaves(child, &path, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_leaves(item, prefix, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_owned());
+        }
+    }
+}
+
+/// #11: every snapshot field reaches Prometheus, unless NOT_EXPORTED says
+/// why not. A new wire field fails here until it is exported or listed.
+#[test]
+fn every_snapshot_field_is_exported_or_listed() {
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(common::fixture("snapshot-loaded.json")).unwrap())
+            .unwrap();
+    let snap = load("snapshot-loaded.json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&wire::to_json(&snap).expect("encode")).expect("json");
+    // The fixture holds only fields the wire knows (none silently ignored),
+    // and it sets every one of them.
+    let mut raw_leaves = BTreeSet::new();
+    collect_leaves(&raw, "", &mut raw_leaves);
+    let mut leaves = BTreeSet::new();
+    collect_leaves(&json, "", &mut leaves);
+    assert_eq!(raw_leaves, leaves, "fixture has keys the wire ignores");
+
+    let exported: BTreeSet<&str> = EXPORTED.iter().map(|(path, _)| *path).collect();
+    let skipped: BTreeSet<&str> = NOT_EXPORTED.iter().map(|(path, _)| *path).collect();
+    assert!(exported.is_disjoint(&skipped));
+    for leaf in &leaves {
+        assert!(
+            exported.contains(leaf.as_str()) || skipped.contains(leaf.as_str()),
+            "snapshot field {leaf} has no exported series; export it or add it to NOT_EXPORTED with a reason"
+        );
+    }
+    for path in exported.iter().chain(&skipped) {
+        assert!(
+            leaves.contains(*path),
+            "{path} is listed but not in snapshot-loaded.json; set it there"
+        );
+    }
+    let text = render(&Ok(snap), T0);
+    let names: BTreeSet<String> = samples(&text).into_iter().map(|(n, _, _)| n).collect();
+    for (path, metric) in EXPORTED {
+        assert!(names.contains(*metric), "{path}: {metric} is not rendered");
+    }
+    for (_, reason) in NOT_EXPORTED {
+        assert!(!reason.is_empty());
     }
 }
 

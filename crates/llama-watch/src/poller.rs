@@ -312,6 +312,9 @@ struct State<L> {
     /// SGLang/vLLM prompt-token counter, for prompt tok/s without `/slots`.
     prompt_counter: DecodedCounter,
     prompt_rate: GenRate,
+    /// Box prompt-token total for the snapshot (#11): every metered model's
+    /// prompt counter, or its activity rows' `input_tokens` in fallback.
+    prompt_box: DecodedCounter,
     running_up: bool,
     unmetered: bool,
     latencies: PollLatencies,
@@ -347,6 +350,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         activity_seen: None,
         prompt_counter: DecodedCounter::default(),
         prompt_rate: GenRate::default(),
+        prompt_box: DecodedCounter::default(),
         running_up: false,
         unmetered: false,
         latencies: PollLatencies::default(),
@@ -514,6 +518,7 @@ impl<L: Sink> State<L> {
                 Ok(sample) => sample.n_decode_total,
                 Err(_) => None,
             };
+            let prompt = read.as_ref().ok().and_then(|sample| sample.prompt_total);
             if let Ok(sample) = &read
                 && !model.backend.has_slots()
             {
@@ -544,6 +549,12 @@ impl<L: Sink> State<L> {
                     };
                     self.use_activity(model, reason);
                 }
+            }
+            // A fallback model's prompt tokens come from activity rows.
+            if let Some(prompt) = prompt
+                && !self.fallback.contains(&model.id)
+            {
+                self.prompt_box.observe(&model.id, prompt, None, now);
             }
         }
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
@@ -685,12 +696,15 @@ impl<L: Sink> State<L> {
         let fallback: Vec<String> = self.fallback.iter().cloned().collect();
         for id in &fallback {
             let key = activity::model_key(id);
-            let tokens = rows
-                .iter()
-                .filter(|row| row.id > seen && row.model == key)
+            let new_rows = || rows.iter().filter(|row| row.id > seen && row.model == key);
+            let tokens = new_rows()
                 .filter_map(|row| row.output_tokens)
                 .fold(0u64, u64::saturating_add);
             self.counter.add(id, tokens, now, window);
+            let prompt = new_rows()
+                .filter_map(|row| row.input_tokens)
+                .fold(0u64, u64::saturating_add);
+            self.prompt_box.add(id, prompt, now, window);
         }
         self.activity_seen = Some(newest.map_or(seen, |newest| newest.max(seen)));
     }
@@ -711,6 +725,12 @@ impl<L: Sink> State<L> {
             None
         } else {
             self.counter
+                .total_if_fresh(self.running_up, &ready_ids, now)
+        };
+        let prompt_total = if self.unmetered {
+            None
+        } else {
+            self.prompt_box
                 .total_if_fresh(self.running_up, &ready_ids, now)
         };
         let gen_tps = if let Some(total) = decoded {
@@ -738,6 +758,7 @@ impl<L: Sink> State<L> {
             ai: self.ai,
             models: self.models_with_gauges(now),
             decoded_total: decoded,
+            prompt_total,
         };
         let detail = LlamaDetail {
             slots: self.slots.slots(),

@@ -502,6 +502,7 @@ fn ready_metrics_ignore_extra_lines_and_track_resets() {
     let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
         view.ai == AiState::Loaded && view.decoded_total == Some(0)
     });
+    assert_eq!(view.prompt_total, Some(0), "first read is the baseline");
     assert_eq!(view.models[0].name, "Qwen 35B");
     assert_eq!(view.models[0].state, "ready");
     assert_eq!(detail.prompt_tps, Some(0.0));
@@ -566,6 +567,43 @@ fn ready_metrics_ignore_extra_lines_and_track_resets() {
             .any(|path| path == "/upstream/other-model/metrics"),
         "{hits:?}"
     );
+}
+
+/// #11: llama.cpp's `llamacpp:prompt_tokens_total` feeds the snapshot's
+/// prompt total, on the decode counter's rules; without it there is none.
+#[test]
+fn llamacpp_prompt_counter_is_the_prompt_total() {
+    let mut world = World::running(fixture("running-ready.json"));
+    world
+        .metrics
+        .insert("qwen3.6-35b-a3b".to_owned(), fixture("metrics-sample.txt"));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.prompt_total == Some(0)
+    });
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.6-35b-a3b".to_owned(),
+            b"llamacpp:prompt_tokens_total 103\nllamacpp:n_decode_total 110\n".to_vec(),
+        );
+    });
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.prompt_total == Some(100)
+    });
+    assert_eq!(view.decoded_total, Some(10));
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.6-35b-a3b".to_owned(),
+            b"llamacpp:n_decode_total 120\n".to_vec(),
+        );
+    });
+    let (view, _) = wait_msg(&rx, Duration::from_secs(3), |view, _| {
+        view.decoded_total == Some(20) && view.prompt_total.is_none()
+    });
+    assert_eq!(view.prompt_total, None, "unmeasured is absent, not zero");
 }
 
 #[test]
@@ -833,6 +871,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 ai: AiState::Loaded,
                 models: Vec::new(),
                 decoded_total: Some(n),
+                prompt_total: None,
             },
             LlamaDetail {
                 slots: Vec::new(),
@@ -1184,13 +1223,16 @@ fn sglang_without_metrics_counts_activity_once_and_logs_once() {
             (6, "flash", 400),
         ]);
     });
-    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
         view.decoded_total == Some(25)
     });
+    // #11: the fallback's prompt tokens are the new rows' input_tokens.
+    assert_eq!(view.prompt_total, Some(10));
     // The same rows read again add nothing.
     thread::sleep(Duration::from_millis(900));
     let (view, _) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
     assert_eq!(view.decoded_total, Some(25));
+    assert_eq!(view.prompt_total, Some(10));
     let lines = log.lines();
     let notes: Vec<&String> = lines
         .iter()
