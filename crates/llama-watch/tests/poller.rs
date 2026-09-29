@@ -1131,6 +1131,37 @@ fn sglang_reads_its_own_metrics_and_never_slots() {
     assert!(!lines.contains("metrics:"), "{lines}");
 }
 
+/// SGLang's real `/metrics` is ~70 KiB of latency histograms; the gauges
+/// sit after them. A document past llama.cpp's 64 KiB cap still counts.
+#[test]
+fn sglang_reads_a_large_metrics_document() {
+    let mut body = String::new();
+    for i in 0..4000 {
+        body.push_str(&format!(
+            "sglang:e2e_request_latency_seconds_bucket{{model_name=\"flash\",le=\"{i}.0\"}} {i}.0\n"
+        ));
+    }
+    assert!(body.len() > 128 * 1024, "{}", body.len());
+    let mut bytes = body.into_bytes();
+    bytes.extend(sglang_metrics(1000, 1, 0, 0.25));
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world.metrics.insert("flash".to_owned(), bytes);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models[0]
+            .backend
+            .is_some_and(|info| info.running.is_some())
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.running, Some(1));
+    assert_eq!(info.kv_permille, Some(250));
+    let lines = log.lines().join("\n");
+    assert!(!lines.contains("no /metrics"), "{lines}");
+}
+
 #[test]
 fn sglang_without_metrics_counts_activity_once_and_logs_once() {
     let mut world = World::running(running_cmd("flash", SGLANG_CMD));
@@ -1167,7 +1198,8 @@ fn sglang_without_metrics_counts_activity_once_and_logs_once() {
         .collect();
     assert_eq!(notes.len(), 1, "{lines:?}");
     assert!(
-        notes[0].contains("flash: no /metrics from sglang; using llama-swap activity"),
+        notes[0].contains("flash: no /metrics from sglang (")
+            && notes[0].contains("); using llama-swap activity"),
         "{lines:?}"
     );
     assert!(
