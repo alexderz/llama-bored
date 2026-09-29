@@ -47,7 +47,11 @@ use crate::slots::{SlotBook, SlotView};
 use crate::sources::llamaswap;
 
 const RUNNING_CAP: usize = 64 * 1024;
-const METRICS_CAP: usize = 64 * 1024;
+/// llama-server's `/metrics` is a few KiB.
+const LLAMACPP_METRICS_CAP: usize = 64 * 1024;
+/// SGLang and vLLM export latency histograms per label set; SGLang's is
+/// about 70 KiB with one model loaded and grows with its labels.
+const SERVER_METRICS_CAP: usize = 1024 * 1024;
 const ACTIVITY_CAP: usize = 256 * 1024;
 const MODEL_PLACEHOLDER: &str = "model";
 /// Backend gauges older than this (or two metrics periods) are not shown.
@@ -496,10 +500,15 @@ impl<L: Sink> State<L> {
         let mut failure: Option<&'static str> = None;
         for model in &ready {
             let url = upstream(&self.limits.url, &model.id, "metrics");
-            let read = get_exact(&self.agent, &url, self.limits.metrics_timeout, METRICS_CAP)
-                .map_err(TapError::label)
-                .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
-                .map(|text| parse_metrics_for(model.backend, &text));
+            let read = get_exact(
+                &self.agent,
+                &url,
+                self.limits.metrics_timeout,
+                metrics_cap(model.backend),
+            )
+            .map_err(TapError::label)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
+            .map(|text| parse_metrics_for(model.backend, &text));
             let now = Instant::now();
             let decoded = match &read {
                 Ok(sample) => sample.n_decode_total,
@@ -528,7 +537,13 @@ impl<L: Sink> State<L> {
                         });
                     }
                 }
-                _ => self.use_activity(model),
+                (_, read) => {
+                    let reason = match read {
+                        Ok(_) => "no token counter",
+                        Err(label) => label,
+                    };
+                    self.use_activity(model, reason);
+                }
             }
         }
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
@@ -537,14 +552,14 @@ impl<L: Sink> State<L> {
 
     /// A non-llama.cpp model with no decode counter: count it from activity
     /// rows. Logged once per model per run; never a `metrics` failure.
-    fn use_activity(&mut self, model: &ReadyModel) {
+    fn use_activity(&mut self, model: &ReadyModel, reason: &str) {
         self.fallback.insert(model.id.clone());
         if self.no_metrics_logged.insert(model.id.clone()) {
             log::emit(
                 &mut self.log,
                 Priority::Info,
                 &format!(
-                    "{}: no /metrics from {}; using llama-swap activity",
+                    "{}: no /metrics from {} ({reason}); using llama-swap activity",
                     model.id,
                     model.backend.as_str()
                 ),
@@ -827,6 +842,14 @@ impl TapError {
             Self::Oversize => "oversized body",
             Self::Failed => "request failed",
         }
+    }
+}
+
+fn metrics_cap(backend: Backend) -> usize {
+    if backend.has_slots() {
+        LLAMACPP_METRICS_CAP
+    } else {
+        SERVER_METRICS_CAP
     }
 }
 

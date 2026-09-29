@@ -6,6 +6,12 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- SGLang and vLLM `/metrics` may be up to 1 MiB: SGLang's is about 70 KiB of
+  latency histograms, over the 64 KiB llama.cpp limit, so its gauges were
+  dropped. The fallback log line now names the reason.
+
 ### Added
 
 - Backends beyond llama.cpp: SGLang, vLLM and any other OpenAI-compatible
