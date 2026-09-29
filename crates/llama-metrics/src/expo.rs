@@ -124,6 +124,8 @@ pub struct ModelLabels {
     pub kv: String,
     pub ctx: String,
     pub moe: String,
+    /// One of four fixed words (T72); an older watcher's model is `llamacpp`.
+    pub backend: &'static str,
 }
 
 impl ModelLabels {
@@ -153,10 +155,11 @@ impl ModelLabels {
                 Some(NCMOE_ALL) => "all".to_owned(),
                 Some(n) => n.to_string(),
             },
+            backend: model.backend.unwrap_or_default().as_str(),
         }
     }
 
-    fn pairs(&self) -> [(&str, &str); 6] {
+    fn pairs(&self) -> [(&str, &str); 7] {
         [
             ("name", &self.name),
             ("full_name", &self.full_name),
@@ -164,6 +167,7 @@ impl ModelLabels {
             ("kv", &self.kv),
             ("ctx", &self.ctx),
             ("moe", &self.moe),
+            ("backend", self.backend),
         ]
     }
 }

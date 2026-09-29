@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use llama_core::backend::Backend;
 use llama_core::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 use llama_core::names::{sanitize, sanitize_wire};
 use serde::{Deserialize, Deserializer};
@@ -31,6 +32,10 @@ pub struct RunningModel {
     pub full_name: String,
     /// Tuning detail from the launch command. `None` when there is no command.
     pub detail: Option<ModelDetail>,
+    /// Server kind from the launch command. llama.cpp when there is no command.
+    pub backend: Backend,
+    /// Request cap from an SGLang or vLLM launch command.
+    pub max_running: Option<u16>,
 }
 
 /// Whether llama-swap is unreachable, up with nothing loaded, or serving models.
@@ -171,7 +176,9 @@ fn parse_running(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Read
             name: display_name(entry, aliases, sanitize_wire),
             state: entry.state.clone().unwrap_or_default(),
             full_name: display_name(entry, aliases, |raw| sanitize(raw, MAX_FULL_NAME_CHARS)),
-            detail: entry.detail.clone(),
+            detail: entry.launch.detail.clone(),
+            backend: entry.launch.backend,
+            max_running: entry.launch.max_running,
         })
         .collect();
     Ok(Reading {
@@ -216,9 +223,9 @@ struct RunningResponse {
     running: Vec<RunningEntry>,
 }
 
-/// Only `model`, `name`, `state`, and the detail parsed from the launch
+/// Only `model`, `name`, `state`, and the detail and backend parsed from the launch
 /// command. Other members, including the upstream proxy URL, are skipped.
-/// The command is borrowed by [`detail_from_command`] and never kept, so it
+/// The command is borrowed by [`launch_from_command`] and never kept, so it
 /// cannot reach a log or the screen.
 #[derive(Debug, Deserialize)]
 struct RunningEntry {
@@ -228,17 +235,21 @@ struct RunningEntry {
     name: Option<String>,
     #[serde(default)]
     state: Option<String>,
-    #[serde(default, rename = "cmd", deserialize_with = "detail_from_command")]
-    detail: Option<ModelDetail>,
+    #[serde(default, rename = "cmd", deserialize_with = "launch_from_command")]
+    launch: super::cmdline::Launch,
 }
 
-/// Parse the command in place. A non-string command gives no detail.
-fn detail_from_command<'de, D>(deserializer: D) -> Result<Option<ModelDetail>, D::Error>
+/// Parse the command in place. A non-string command gives no detail and
+/// counts as llama.cpp, as before T72.
+fn launch_from_command<'de, D>(deserializer: D) -> Result<super::cmdline::Launch, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value.as_str().map(super::cmdline::parse))
+    Ok(value
+        .as_str()
+        .map(super::cmdline::parse_launch)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]

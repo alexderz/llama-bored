@@ -54,9 +54,9 @@ llamabored_ai_state{state="idle"} 0
 llamabored_ai_state{state="loaded"} 1
 # HELP llamabored_model_loaded A model llama-swap has loaded, with its tuning detail.
 # TYPE llamabored_model_loaded gauge
-llamabored_model_loaded{name="Bonsai 8B",full_name="Bonsai 8B",quant="PTQ1_0",kv="q8_0/q4_0",ctx="131072",moe="all"} 1
-llamabored_model_loaded{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",quant="UD-Q4_K_M",kv="q8_0",ctx="262144",moe="16"} 1
-llamabored_model_loaded{name="tiny",full_name="tiny",quant="",kv="",ctx="",moe=""} 1
+llamabored_model_loaded{name="Bonsai 8B",full_name="Bonsai 8B",quant="PTQ1_0",kv="q8_0/q4_0",ctx="131072",moe="all",backend="sglang"} 1
+llamabored_model_loaded{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",quant="UD-Q4_K_M",kv="q8_0",ctx="262144",moe="16",backend="llamacpp"} 1
+llamabored_model_loaded{name="tiny",full_name="tiny",quant="",kv="",ctx="",moe="",backend="llamacpp"} 1
 # HELP llamabored_model_ctx_size_tokens Configured context size of a loaded model, tokens.
 # TYPE llamabored_model_ctx_size_tokens gauge
 llamabored_model_ctx_size_tokens{name="Bonsai 8B",full_name="Bonsai 8B"} 131072

@@ -264,6 +264,8 @@ fn fresh_snapshot(
                 state: model_state(model.state).to_owned(),
                 full_name: model.full_name.clone(),
                 detail: model.detail.clone(),
+                // The LCD draws no backend gauges.
+                backend: None,
             })
             .collect(),
         tokens: Some(TokenReading {

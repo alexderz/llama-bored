@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::backend::{Backend, MAX_REQS};
 pub use crate::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 
 /// Wire schema version this crate reads and writes.
@@ -64,6 +65,10 @@ pub enum WireError {
     /// A model name is empty, too long, or not canonical.
     #[error("snapshot model name is not canonical")]
     Name,
+    /// A model's `running` or `queued` is above [`MAX_REQS`], or its
+    /// `kv_fill` is non-finite or outside 0..=1.
+    #[error("snapshot model gauge is out of range")]
+    Gauge,
     /// A full name is not canonical, or a detail token is not allowlisted.
     #[error("snapshot model detail is not canonical")]
     Detail,
@@ -155,7 +160,7 @@ pub enum AiWire {
 }
 
 /// One display name and its upstream state.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelWire {
     /// Canonical display name. See [`validate`].
@@ -169,6 +174,18 @@ pub struct ModelWire {
     /// Tuning detail from the launch command. Omitted by an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ModelDetail>,
+    /// Server kind (T72). Omitted by an older watcher; absent reads as llama.cpp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<Backend>,
+    /// Requests running, from a backend without `/slots`. At most [`MAX_REQS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<u16>,
+    /// Requests waiting, from a backend without `/slots`. At most [`MAX_REQS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<u16>,
+    /// KV cache fill 0..=1, from a backend without `/slots`.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub kv_fill: Option<f32>,
 }
 
 /// Upstream model lifecycle.
@@ -256,6 +273,14 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
             && !crate::detail::is_valid(detail)
         {
             return Err(WireError::Detail);
+        }
+        if model.running.is_some_and(|n| n > MAX_REQS)
+            || model.queued.is_some_and(|n| n > MAX_REQS)
+            || model
+                .kv_fill
+                .is_some_and(|fill| !fill.is_finite() || !(0.0..=1.0).contains(&fill))
+        {
+            return Err(WireError::Gauge);
         }
     }
     Ok(())

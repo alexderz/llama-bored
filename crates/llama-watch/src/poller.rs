@@ -18,15 +18,23 @@
 //! Samples leave in a one-deep slot. A new sample replaces an unread one, so
 //! a stalled consumer holds exactly the newest publish and nothing older.
 //!
+//! Each ready model has a [`Backend`] (T72), from its launch command or
+//! `[llama.backends]`. Only llama.cpp gets `/slots`. SGLang and vLLM get the
+//! same `/metrics` GET with their own names; a model with no usable
+//! `/metrics` (and any OpenAI-compatible server) falls back to llama-swap's
+//! activity rows: each finished request adds its `output_tokens` to the
+//! decoded counter once, so the counter still moves, at request end.
+//!
 //! The thread never touches the console or the snapshot file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use llama_core::backend::{self, Backend, BackendInfo};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::names::sanitize;
 use llama_core::sample::{AiState, LlamaView, ModelInfo};
@@ -34,7 +42,7 @@ use llama_core::wire::CANONICAL_NAME_CHARS;
 
 use crate::activity::{self, ActivityRow};
 use crate::config::{PromptView, ValidWatchConfig};
-use crate::metrics::{DecodedCounter, GenRate, parse_metrics};
+use crate::metrics::{DecodedCounter, GenRate, MetricsSample, parse_metrics_for};
 use crate::slots::{SlotBook, SlotView};
 use crate::sources::llamaswap;
 
@@ -42,6 +50,8 @@ const RUNNING_CAP: usize = 64 * 1024;
 const METRICS_CAP: usize = 64 * 1024;
 const ACTIVITY_CAP: usize = 256 * 1024;
 const MODEL_PLACEHOLDER: &str = "model";
+/// Backend gauges older than this (or two metrics periods) are not shown.
+const FRESH_GAUGES: Duration = Duration::from_secs(1);
 
 /// How long the last attempt at each tap took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -199,6 +209,8 @@ struct Limits {
     prompt_view: PromptView,
     max_name_chars: usize,
     aliases: HashMap<String, String>,
+    /// `[llama.backends]`: model id to backend, over the launch command.
+    backends: HashMap<String, Backend>,
 }
 
 impl Limits {
@@ -225,6 +237,12 @@ impl Limits {
                 .iter()
                 .map(|(model, name)| (model.clone(), name.clone()))
                 .collect(),
+            backends: config
+                .llama
+                .backends
+                .iter()
+                .map(|(model, kind)| (model.clone(), *kind))
+                .collect(),
         }
     }
 }
@@ -233,6 +251,29 @@ impl Limits {
 struct ReadyModel {
     id: String,
     name: String,
+    backend: Backend,
+}
+
+/// Live gauges from one backend `/metrics` read.
+#[derive(Clone, Copy)]
+struct Gauges {
+    running: Option<u16>,
+    queued: Option<u16>,
+    kv_permille: Option<u16>,
+    hit_permille: Option<u16>,
+    at: Instant,
+}
+
+impl Gauges {
+    fn of(sample: &MetricsSample, at: Instant) -> Self {
+        Self {
+            running: sample.requests_processing.and_then(backend::reqs),
+            queued: sample.queued.and_then(backend::reqs),
+            kv_permille: sample.kv_fill.and_then(backend::permille),
+            hit_permille: sample.cache_hit.and_then(backend::permille),
+            at,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,7 +294,20 @@ struct State<L> {
     activity: Vec<ActivityRow>,
     ai: AiState,
     models: Vec<ModelInfo>,
+    /// Raw id of each entry of `models`, in the same order.
+    model_ids: Vec<String>,
     ready: Vec<ReadyModel>,
+    /// Gauges per model id from the last backend `/metrics` read.
+    gauges: HashMap<String, Gauges>,
+    /// Ready model ids counted from activity rows instead of `/metrics`.
+    fallback: HashSet<String>,
+    /// Model ids whose missing `/metrics` was logged this run.
+    no_metrics_logged: HashSet<String>,
+    /// Newest activity row id already seen. `None` before the first read.
+    activity_seen: Option<i64>,
+    /// SGLang/vLLM prompt-token counter, for prompt tok/s without `/slots`.
+    prompt_counter: DecodedCounter,
+    prompt_rate: GenRate,
     running_up: bool,
     unmetered: bool,
     latencies: PollLatencies,
@@ -281,7 +335,14 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         activity: Vec::new(),
         ai: AiState::Down,
         models: Vec::new(),
+        model_ids: Vec::new(),
         ready: Vec::new(),
+        gauges: HashMap::new(),
+        fallback: HashSet::new(),
+        no_metrics_logged: HashSet::new(),
+        activity_seen: None,
+        prompt_counter: DecodedCounter::default(),
+        prompt_rate: GenRate::default(),
         running_up: false,
         unmetered: false,
         latencies: PollLatencies::default(),
@@ -355,20 +416,26 @@ impl<L: Sink> State<L> {
         self.note_reach(down);
         self.ai = ai;
         self.running_up = down.is_none();
-        self.models = if self.running_up {
-            reading
-                .models
-                .iter()
-                .map(|info| ModelInfo {
-                    name: snapshot_name(&info.name, self.limits.max_name_chars),
-                    state: info.state.clone(),
-                    full_name: full_name(&info.full_name, self.limits.max_name_chars),
-                    detail: info.detail.clone(),
-                })
-                .collect()
+        let models: &[llamaswap::RunningModel] = if self.running_up {
+            &reading.models
         } else {
-            Vec::new()
+            &[]
         };
+        self.models = models
+            .iter()
+            .map(|info| ModelInfo {
+                name: snapshot_name(&info.name, self.limits.max_name_chars),
+                state: info.state.clone(),
+                full_name: full_name(&info.full_name, self.limits.max_name_chars),
+                detail: info.detail.clone(),
+                backend: Some(BackendInfo {
+                    kind: self.backend_of(info),
+                    max_running: info.max_running,
+                    ..BackendInfo::default()
+                }),
+            })
+            .collect();
+        self.model_ids = models.iter().map(|info| info.id.clone()).collect();
 
         self.ready.clear();
         self.unmetered = false;
@@ -379,9 +446,21 @@ impl<L: Sink> State<L> {
                 }
                 let name = snapshot_name(&info.name, self.limits.max_name_chars);
                 match upstream_id(&info.id) {
-                    Some(id) => self.ready.push(ReadyModel { id, name }),
+                    Some(id) => self.ready.push(ReadyModel {
+                        id,
+                        name,
+                        backend: self.backend_of(info),
+                    }),
                     None => self.unmetered = true,
                 }
+            }
+        }
+        let ready: HashSet<&str> = self.ready.iter().map(|model| model.id.as_str()).collect();
+        self.fallback.retain(|id| ready.contains(id.as_str()));
+        self.gauges.retain(|id, _| ready.contains(id.as_str()));
+        for model in &self.ready {
+            if !model.backend.has_metrics() {
+                self.fallback.insert(model.id.clone());
             }
         }
         if !self.running_up || self.ready.is_empty() {
@@ -393,46 +472,84 @@ impl<L: Sink> State<L> {
         self.latencies.running = Some(started.elapsed());
     }
 
+    /// `[llama.backends]` first, then the launch command.
+    fn backend_of(&self, info: &llamaswap::RunningModel) -> Backend {
+        self.limits
+            .backends
+            .get(&info.id)
+            .copied()
+            .unwrap_or(info.backend)
+    }
+
     fn poll_metrics(&mut self) {
-        if self.ready.is_empty() {
+        let ready: Vec<ReadyModel> = self
+            .ready
+            .iter()
+            .filter(|model| model.backend.has_metrics())
+            .cloned()
+            .collect();
+        if ready.is_empty() {
             self.latencies.metrics = None;
             return;
         }
         let started = Instant::now();
-        let ready = self.ready.clone();
         let mut failure: Option<&'static str> = None;
         for model in &ready {
             let url = upstream(&self.limits.url, &model.id, "metrics");
-            match get_exact(&self.agent, &url, self.limits.metrics_timeout, METRICS_CAP) {
-                Ok(bytes) => match std::str::from_utf8(&bytes) {
-                    Ok(text) => {
-                        let sample = parse_metrics(text);
-                        if let Some(value) = sample.n_decode_total {
-                            self.counter.observe(
-                                &model.id,
-                                value,
-                                sample.requests_processing,
-                                Instant::now(),
-                            );
-                        } else if failure.is_none() {
-                            failure = Some("malformed");
-                        }
-                    }
-                    Err(_) => {
-                        if failure.is_none() {
-                            failure = Some("malformed");
-                        }
-                    }
-                },
-                Err(err) => {
+            let read = get_exact(&self.agent, &url, self.limits.metrics_timeout, METRICS_CAP)
+                .map_err(TapError::label)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
+                .map(|text| parse_metrics_for(model.backend, &text));
+            let now = Instant::now();
+            let decoded = match &read {
+                Ok(sample) => sample.n_decode_total,
+                Err(_) => None,
+            };
+            if let Ok(sample) = &read
+                && !model.backend.has_slots()
+            {
+                self.gauges
+                    .insert(model.id.clone(), Gauges::of(sample, now));
+                if let Some(prompt) = sample.prompt_total {
+                    self.prompt_counter.observe(&model.id, prompt, None, now);
+                }
+            }
+            match (decoded, read) {
+                (Some(value), Ok(sample)) => {
+                    self.fallback.remove(&model.id);
+                    self.counter
+                        .observe(&model.id, value, sample.requests_processing, now);
+                }
+                (_, read) if model.backend == Backend::LlamaCpp => {
                     if failure.is_none() {
-                        failure = Some(err.label());
+                        failure = Some(match read {
+                            Ok(_) => "malformed",
+                            Err(label) => label,
+                        });
                     }
                 }
+                _ => self.use_activity(model),
             }
         }
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
         self.latencies.metrics = Some(started.elapsed());
+    }
+
+    /// A non-llama.cpp model with no decode counter: count it from activity
+    /// rows. Logged once per model per run; never a `metrics` failure.
+    fn use_activity(&mut self, model: &ReadyModel) {
+        self.fallback.insert(model.id.clone());
+        if self.no_metrics_logged.insert(model.id.clone()) {
+            log::emit(
+                &mut self.log,
+                Priority::Info,
+                &format!(
+                    "{}: no /metrics from {}; using llama-swap activity",
+                    model.id,
+                    model.backend.as_str()
+                ),
+            );
+        }
     }
 
     fn poll_slots(&mut self) {
@@ -441,9 +558,11 @@ impl<L: Sink> State<L> {
             .ready
             .iter()
             .filter(|model| {
-                self.counter
-                    .requests_processing(&model.id, now)
-                    .is_some_and(|value| value > 0.0)
+                model.backend.has_slots()
+                    && self
+                        .counter
+                        .requests_processing(&model.id, now)
+                        .is_some_and(|value| value > 0.0)
             })
             .cloned()
             .collect();
@@ -513,6 +632,7 @@ impl<L: Sink> State<L> {
         ) {
             Ok(bytes) => match activity::parse_activity_rows(&bytes, self.activity_rows()) {
                 Some(rows) => {
+                    self.count_activity(&rows);
                     self.activity = rows;
                     None
                 }
@@ -527,6 +647,37 @@ impl<L: Sink> State<L> {
             "activity",
         );
         self.latencies.activity = Some(started.elapsed());
+    }
+
+    /// Add each new row's `output_tokens` to its fallback model, once.
+    ///
+    /// Rows are deduped by id. The first read only sets the baseline, so
+    /// history from before the watcher started is not back-filled. A newest
+    /// id below the baseline means llama-swap restarted: every row counts.
+    /// Each fallback model is then fresh until the next activity read is due.
+    fn count_activity(&mut self, rows: &[ActivityRow]) {
+        let newest = rows.iter().map(|row| row.id).max();
+        let Some(seen) = self.activity_seen else {
+            self.activity_seen = Some(newest.unwrap_or(-1));
+            return;
+        };
+        let seen = match newest {
+            Some(newest) if newest < seen => -1,
+            _ => seen,
+        };
+        let now = Instant::now();
+        let window = self.limits.activity_interval + self.limits.activity_timeout;
+        let fallback: Vec<String> = self.fallback.iter().cloned().collect();
+        for id in &fallback {
+            let key = activity::model_key(id);
+            let tokens = rows
+                .iter()
+                .filter(|row| row.id > seen && row.model == key)
+                .filter_map(|row| row.output_tokens)
+                .fold(0u64, u64::saturating_add);
+            self.counter.add(id, tokens, now, window);
+        }
+        self.activity_seen = Some(newest.map_or(seen, |newest| newest.max(seen)));
     }
 
     /// RECENT rows worth keeping: eight with the text panels, more without.
@@ -558,16 +709,19 @@ impl<L: Sink> State<L> {
                 .requests_processing(&model.id, now)
                 .is_some_and(|value| value > 0.0)
         });
+        // Prompt tok/s from SGLang/vLLM's prompt counter, for when no
+        // `/slots` gave one.
+        let prompt_rate = self.prompt_rate.observe(now, self.prompt_counter.total());
         let prompt_tps = if !self.running_up {
             None
         } else if !busy {
             Some(0.0)
         } else {
-            self.slots.prompt_tps()
+            self.slots.prompt_tps().or(prompt_rate)
         };
         let view = LlamaView {
             ai: self.ai,
-            models: self.models.clone(),
+            models: self.models_with_gauges(now),
             decoded_total: decoded,
         };
         let detail = LlamaDetail {
@@ -582,6 +736,29 @@ impl<L: Sink> State<L> {
         }
         self.tx.put((view, detail));
         Ok(())
+    }
+
+    /// [`Self::models`] with each backend's fresh gauges filled in.
+    fn models_with_gauges(&self, now: Instant) -> Vec<ModelInfo> {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        let mut models = self.models.clone();
+        for (model, id) in models.iter_mut().zip(&self.model_ids) {
+            let Some(info) = model.backend.as_mut() else {
+                continue;
+            };
+            let Some(gauges) = self
+                .gauges
+                .get(id)
+                .filter(|gauges| now.saturating_duration_since(gauges.at) <= fresh)
+            else {
+                continue;
+            };
+            info.running = gauges.running;
+            info.queued = gauges.queued;
+            info.kv_permille = gauges.kv_permille;
+            info.hit_permille = gauges.hit_permille;
+        }
+        models
     }
 
     fn note_reach(&mut self, down: Option<&'static str>) {

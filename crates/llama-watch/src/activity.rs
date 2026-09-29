@@ -57,12 +57,7 @@ pub fn parse_activity_rows(body: &[u8], max_rows: usize) -> Option<Vec<ActivityR
 
 impl From<ActivityJson> for ActivityRow {
     fn from(row: ActivityJson) -> Self {
-        let model = sanitize(row.model.as_deref().unwrap_or(""), MODEL_CHARS);
-        let model = if model.is_empty() {
-            "model".to_owned()
-        } else {
-            model
-        };
+        let model = model_key(row.model.as_deref().unwrap_or(""));
         let tokens = row.tokens.unwrap_or_default();
         Self {
             id: row.id,
@@ -87,6 +82,18 @@ impl From<ActivityJson> for ActivityRow {
 }
 
 const MODEL_CHARS: usize = 32;
+
+/// A model id as [`ActivityRow::model`] holds it, for matching rows to a
+/// llama-swap model.
+#[must_use]
+pub fn model_key(id: &str) -> String {
+    let model = sanitize(id, MODEL_CHARS);
+    if model.is_empty() {
+        "model".to_owned()
+    } else {
+        model
+    }
+}
 
 fn nonneg_u64(value: Option<f64>) -> Option<u64> {
     let value = value?;

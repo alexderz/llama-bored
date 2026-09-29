@@ -140,6 +140,7 @@ fn snapshot(t: Instant, v: f32, tokens: TokenReading) -> Snapshot {
         gpu_c: Some(41.0 + v * 0.34),
         ai: AiState::Loaded,
         models: vec![ModelInfo {
+            backend: None,
             name: "Nemotron 3 S…".to_owned(),
             state: "ready".to_owned(),
             full_name: Some("Nemotron 3 Super 120B-A12B".to_owned()),

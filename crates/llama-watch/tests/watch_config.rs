@@ -35,6 +35,9 @@ fn packaged_example_parses_and_validates() {
     // T52: fans ship as a commented example; the code default stays off.
     assert!(text.contains("#[fans]"), "{text}");
     assert!(text.contains("#hwmon = \"nct6798\""), "{text}");
+    // T72: backend overrides ship as a commented example.
+    assert!(text.contains("#[llama.backends]"), "{text}");
+    assert!(text.contains("#\"my-sglang-model\" = \"sglang\""), "{text}");
     assert!(text.contains("#channels = [2, 3, 5, 6]"), "{text}");
 
     let cfg: ValidWatchConfig = Config::load_validated(&path, 8).expect("example validates");
@@ -56,6 +59,7 @@ fn packaged_example_parses_and_validates() {
     assert_eq!(cfg.llama.output_tail_chars, 24576);
     assert_eq!(cfg.models.max_name_chars, 12);
     assert!(cfg.models.aliases.is_empty(), "{:?}", cfg.models.aliases);
+    assert!(cfg.llama.backends.is_empty(), "{:?}", cfg.llama.backends);
     assert_eq!(cfg.tty.fps, 10);
     assert_eq!(cfg.tty.full_redraw_s, 5);
     assert_eq!(cfg.tty.gen_ceiling_tps, 250.0);
@@ -268,6 +272,7 @@ enum Rule {
     CtxHistory,
     AliasCount,
     AliasValue,
+    BackendCount,
     MaxNameChars,
     Fps,
     FullRedraw,
@@ -299,6 +304,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::CtxHistory { .. }) => Rule::CtxHistory,
         Err(InvalidWatchConfig::AliasCount { .. }) => Rule::AliasCount,
         Err(InvalidWatchConfig::AliasValue { .. }) => Rule::AliasValue,
+        Err(InvalidWatchConfig::BackendCount { .. }) => Rule::BackendCount,
         Err(InvalidWatchConfig::MaxNameChars { .. }) => Rule::MaxNameChars,
         Err(InvalidWatchConfig::Fps { .. }) => Rule::Fps,
         Err(InvalidWatchConfig::FullRedraw { .. }) => Rule::FullRedraw,
@@ -769,6 +775,26 @@ fn cases() -> &'static [Case] {
                     .collect();
             },
             expect: Rule::AliasCount,
+        },
+        Case {
+            name: "32 backend overrides accepted",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.llama.backends = (0..32)
+                    .map(|i| (format!("m{i}"), llama_core::backend::Backend::SgLang))
+                    .collect();
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "33 backend overrides rejected",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.llama.backends = (0..33)
+                    .map(|i| (format!("m{i}"), llama_core::backend::Backend::Vllm))
+                    .collect();
+            },
+            expect: Rule::BackendCount,
         },
         Case {
             name: "alias value of 64 chars accepted",
@@ -1439,4 +1465,33 @@ fn console_blank_defaults_off_and_parses() {
     assert!(cfg.validate(32).is_ok());
     assert!(Config::from_toml("[tty]\nblank_min = -1\n").is_err());
     assert!(Config::from_toml("[tty]\npowerdown_min = 15\n").is_err());
+}
+
+#[test]
+fn backend_overrides_parse_known_words_only() {
+    use llama_core::backend::Backend;
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("t72-backends");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let good = dir.join("good.toml");
+    std::fs::write(
+        &good,
+        "[llama.backends]\n\"flash\" = \"sglang\"\n\"big\" = \"vllm\"\n\"tabby\" = \"openai\"\n\"q\" = \"llamacpp\"\n\"not-loaded\" = \"sglang\"\n",
+    )
+    .expect("write");
+    let cfg = Config::load_validated(&good, 8).expect("valid overrides");
+    assert_eq!(cfg.llama.backends.get("flash"), Some(&Backend::SgLang));
+    assert_eq!(cfg.llama.backends.get("big"), Some(&Backend::Vllm));
+    assert_eq!(cfg.llama.backends.get("tabby"), Some(&Backend::OpenAi));
+    assert_eq!(cfg.llama.backends.get("q"), Some(&Backend::LlamaCpp));
+    for bad in ["\"tabbyapi\"", "\"SGLang\"", "1", "\"\""] {
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, format!("[llama.backends]\n\"m\" = {bad}\n")).expect("write");
+        assert!(
+            matches!(
+                Config::load_validated(&path, 8),
+                Err(ConfigError::Parse { .. })
+            ),
+            "{bad} must not parse"
+        );
+    }
 }

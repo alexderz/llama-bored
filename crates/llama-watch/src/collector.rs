@@ -573,6 +573,7 @@ where
                         state: model.state.clone(),
                         full_name: model.full_name.clone(),
                         detail: model.detail.clone(),
+                        backend: model.backend,
                     })
                     .collect();
                 (AiState::Loaded, models)

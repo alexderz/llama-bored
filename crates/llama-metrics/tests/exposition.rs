@@ -288,7 +288,11 @@ fn model_labels_round_trip_through_the_parser() {
         .find(|l| l[0].1 == "Qwen3-Coder\u{2026}")
         .expect("qwen");
     let keys: Vec<&str> = qwen.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(keys, ["name", "full_name", "quant", "kv", "ctx", "moe"]);
+    assert_eq!(
+        keys,
+        ["name", "full_name", "quant", "kv", "ctx", "moe", "backend"]
+    );
+    assert_eq!(qwen[6].1, "llamacpp", "no backend on the wire is llama.cpp");
     assert_eq!(qwen[1].1, "Qwen3-Coder-30B \"fast\" \\ build");
     assert_eq!(qwen[2].1, "UD-Q4_K_M");
     assert_eq!(qwen[3].1, "q8_0");
@@ -304,8 +308,9 @@ fn model_labels_round_trip_through_the_parser() {
     );
     assert_eq!(bonsai[3].1, "q8_0/q4_0");
     assert_eq!(bonsai[5].1, "all");
+    assert_eq!(bonsai[6].1, "sglang");
     let tiny = models.iter().find(|l| l[0].1 == "tiny").expect("tiny");
-    assert!(tiny[2..].iter().all(|(_, v)| v.is_empty()), "{tiny:?}");
+    assert!(tiny[2..6].iter().all(|(_, v)| v.is_empty()), "{tiny:?}");
 }
 
 #[test]
@@ -368,6 +373,10 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.detail.kv_v",
         "ai.models.detail.quant",
         "ai.models.detail.fa",
+        "ai.models.backend",
+        "ai.models.running",
+        "ai.models.queued",
+        "ai.models.kv_fill",
         "tokens",
         "tokens.decoded_total",
     ]
@@ -390,6 +399,7 @@ fn no_prompt_or_output_text_is_exported() {
     let mut allowed: BTreeSet<String> =
         ["", "down", "idle", "loaded", "busy", "denied", "all", "f16"]
             .into_iter()
+            .chain(["llamacpp", "sglang", "vllm", "openai"])
             .map(str::to_owned)
             .collect();
     allowed.insert(env!("CARGO_PKG_VERSION").to_owned());
@@ -425,6 +435,7 @@ fn no_prompt_or_output_text_is_exported() {
         "kv",
         "ctx",
         "moe",
+        "backend",
     ]
     .into_iter()
     .collect();

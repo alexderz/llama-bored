@@ -4,6 +4,7 @@
 //! tick steps return. `STOPPING=1` is sent when [`Stop::requested`] becomes
 //! true, which is how a test stands in for SIGINT or SIGTERM.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,8 +27,9 @@ use crate::tty::grid::Cell;
 use crate::tty::layout::{self, Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState};
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{ConsoleBlank, Term};
+use llama_core::backend::Backend;
 use llama_core::log::{self, Priority, Sink};
-use llama_core::sample::{AiState, LlamaView, Snapshot, SourceId};
+use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
 
 /// Injected clock. Production sleeps; tests advance a fake instant.
 pub trait Clock {
@@ -397,6 +399,8 @@ struct TickState {
     chart: TokenChart,
     /// Per-slot context history for the SLOTS sparklines (T53).
     ctx_history: CtxBook,
+    /// When each model (by name) entered llama-swap `stopping`.
+    stopping_since: HashMap<String, Instant>,
 }
 
 impl TickState {
@@ -423,6 +427,7 @@ impl TickState {
             published_at: None,
             chart: TokenChart::new(chart_bucket_s),
             ctx_history: CtxBook::new(ctx_history_h),
+            stopping_since: HashMap::new(),
         }
     }
 }
@@ -488,6 +493,7 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
     state
         .ctx_history
         .record(mono, &running, &state.detail.slots);
+    note_stopping(&mut state.stopping_since, &sample.snapshot.models, mono);
     let model = tty_model(&sample, state, mono, wall, ctx);
     note_draw(input, state, &model, mono);
 }
@@ -805,6 +811,7 @@ fn tty_model(
     ctx: &FrameCtx,
 ) -> TtyModel {
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
+    let no_slots = first_without_slots(sample, watch);
     // With text off the poller keeps none, and nothing here reads the slot
     // tails either, so no llama text can reach the frame (RR-LV1).
     let text = if ctx.show_text {
@@ -827,7 +834,12 @@ fn tty_model(
         host: ctx.host.clone(),
         model_name: model_name(sample, watch),
         model_detail: model_detail(sample, watch),
-        slots_line: slots_line(&tick.detail, watch),
+        model_stuck: model_stuck(sample, watch, &tick.stopping_since, mono),
+        slots_line: if no_slots && tick.detail.slots.is_empty() {
+            "--".to_owned()
+        } else {
+            slots_line(&tick.detail, watch)
+        },
         swap_line: swap_line(watch),
         cool_c: temp_i(sample.snapshot.coolant_c),
         cpu_c: temp_i(sample.snapshot.cpu_c),
@@ -856,6 +868,12 @@ fn tty_model(
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
         slots: layout_slots(&tick.detail.slots, &tick.ctx_history),
+        backend_lines: backend_lines(sample, watch),
+        text_note: if ctx.show_text && no_slots && tick.detail.slots.is_empty() {
+            NO_SLOTS_TEXT.to_owned()
+        } else {
+            String::new()
+        },
         requests: layout_requests(&tick.detail.activity, watch),
         in_title: text.in_title,
         out_title: text.out_title,
@@ -937,7 +955,12 @@ fn watch_state(
         AiState::Down | AiState::NoData => WatchState::AiDown,
         AiState::Idle => WatchState::Ready,
         AiState::Loaded => {
-            if detail.slots.iter().any(|slot| slot.is_processing) {
+            let backend_busy = sample.snapshot.models.iter().any(|model| {
+                model
+                    .backend
+                    .is_some_and(|info| info.running.is_some_and(|n| n > 0))
+            });
+            if backend_busy || detail.slots.iter().any(|slot| slot.is_processing) {
                 WatchState::Generating
             } else {
                 WatchState::Ready
@@ -965,18 +988,116 @@ fn model_name(sample: &WatchSample, state: WatchState) -> String {
     }
 }
 
-/// Detail line of the first model, the same string the LCD fits.
+/// Detail line of the first model, the same string the LCD fits. A
+/// backend other than llama.cpp leads it: `sglang · 200k · kv fp8_e4m3`.
 fn model_detail(sample: &WatchSample, state: WatchState) -> String {
     match state {
-        WatchState::Generating | WatchState::Ready => sample
+        WatchState::Generating | WatchState::Ready => {
+            let Some(model) = sample.snapshot.models.first() else {
+                return String::new();
+            };
+            let line = model
+                .detail
+                .as_ref()
+                .map(llama_core::detail::line)
+                .unwrap_or_default();
+            match model.backend.map(|info| info.kind) {
+                Some(kind) if kind != Backend::LlamaCpp => {
+                    if line.is_empty() {
+                        kind.as_str().to_owned()
+                    } else {
+                        format!("{}{}{line}", kind.as_str(), llama_core::detail::SEPARATOR)
+                    }
+                }
+                _ => line,
+            }
+        }
+        WatchState::Starting | WatchState::AiDown | WatchState::NoLlama => String::new(),
+    }
+}
+
+/// IN and OUT while the header model has no `/slots` to take text from.
+const NO_SLOTS_TEXT: &str = "text needs llama.cpp /slots";
+/// How long a model may sit in `stopping` before the header calls it stuck.
+const STUCK_STOPPING: Duration = Duration::from_secs(60);
+
+/// True when the header (first) model is served by a backend without `/slots`.
+fn first_without_slots(sample: &WatchSample, state: WatchState) -> bool {
+    matches!(state, WatchState::Generating | WatchState::Ready)
+        && sample
             .snapshot
             .models
             .first()
-            .and_then(|model| model.detail.as_ref())
-            .map(llama_core::detail::line)
-            .unwrap_or_default(),
-        WatchState::Starting | WatchState::AiDown | WatchState::NoLlama => String::new(),
+            .and_then(|model| model.backend)
+            .is_some_and(|info| !info.kind.has_slots())
+}
+
+/// Track when each model entered `stopping`; forget the rest.
+fn note_stopping(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now: Instant) {
+    since.retain(|name, _| {
+        models
+            .iter()
+            .any(|model| model.name == *name && model.state == "stopping")
+    });
+    for model in models.iter().filter(|model| model.state == "stopping") {
+        since.entry(model.name.clone()).or_insert(now);
     }
+}
+
+/// The header model has been `stopping` for more than [`STUCK_STOPPING`].
+fn model_stuck(
+    sample: &WatchSample,
+    state: WatchState,
+    since: &HashMap<String, Instant>,
+    now: Instant,
+) -> bool {
+    matches!(state, WatchState::Generating | WatchState::Ready)
+        && sample
+            .snapshot
+            .models
+            .first()
+            .and_then(|model| since.get(&model.name))
+            .is_some_and(|at| now.saturating_duration_since(*at) > STUCK_STOPPING)
+}
+
+/// `sglang  running 1/4 · queued 0 · KV 37 % · hit 80 %` for each ready model
+/// without `/slots`. Unknown gauges are `--`.
+fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
+    if !matches!(state, WatchState::Generating | WatchState::Ready) {
+        return Vec::new();
+    }
+    let sep = llama_core::detail::SEPARATOR;
+    let num = |value: Option<u16>| value.map_or_else(|| "--".to_owned(), |n| n.to_string());
+    let pct = |permille: Option<u16>| {
+        permille.map_or_else(
+            || "--".to_owned(),
+            |p| format!("{} %", (u32::from(p) + 5) / 10),
+        )
+    };
+    sample
+        .snapshot
+        .models
+        .iter()
+        .filter(|model| model.state == "ready")
+        .filter_map(|model| model.backend)
+        .filter(|info| !info.kind.has_slots())
+        .map(|info| {
+            let running = match (info.running, info.max_running) {
+                (Some(n), Some(max)) => format!("{n}/{max}"),
+                (running, _) => num(running),
+            };
+            let mut line = format!(
+                "{}  running {running}{sep}queued {}{sep}KV {}",
+                info.kind.as_str(),
+                num(info.queued),
+                pct(info.kv_permille),
+            );
+            if info.hit_permille.is_some() {
+                line.push_str(&format!("{sep}hit {}", pct(info.hit_permille)));
+            }
+            line
+        })
+        .collect()
 }
 
 fn slots_line(detail: &LlamaDetail, state: WatchState) -> String {
@@ -1035,8 +1156,8 @@ fn layout_requests(rows: &[ActivityRow], state: WatchState) -> Vec<Activity> {
             input_tok: row.input_tokens.unwrap_or(0),
             cached_tok: row.cached_tokens.unwrap_or(0),
             output_tok: row.output_tokens.unwrap_or(0),
-            prompt_tps: row.prompt_tps.unwrap_or(0.0),
-            gen_tps: row.gen_tps.unwrap_or(0.0),
+            prompt_tps: row.prompt_tps,
+            gen_tps: row.gen_tps,
             dur: match row.duration_ms {
                 Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
                 None => "--".to_owned(),
@@ -1309,6 +1430,7 @@ fn format_span(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llama_core::backend::BackendInfo;
 
     #[test]
     fn layout_slots_keeps_context_fields() {
@@ -1850,6 +1972,7 @@ mod tests {
         );
         sample.snapshot.ai = AiState::Loaded;
         sample.snapshot.models = vec![llama_core::sample::ModelInfo {
+            backend: None,
             name: "Ternary Bon…".to_owned(),
             state: "ready".to_owned(),
             full_name: Some("Ternary Bonsai 2 27B".to_owned()),
@@ -1875,6 +1998,125 @@ mod tests {
         sample.snapshot.models[0].detail = None;
         assert_eq!(model_name(&sample, WatchState::Ready), "Ternary Bon…");
         assert_eq!(model_detail(&sample, WatchState::Ready), "");
+    }
+
+    fn backend_sample(models: Vec<ModelInfo>) -> WatchSample {
+        let mut sample = FixedCpu.sample(
+            Instant::now(),
+            SystemTime::UNIX_EPOCH,
+            &LlamaView {
+                ai: AiState::Loaded,
+                models: Vec::new(),
+                decoded_total: None,
+            },
+        );
+        sample.snapshot.ai = AiState::Loaded;
+        sample.snapshot.models = models;
+        sample
+    }
+
+    fn served(name: &str, state: &str, backend: Option<BackendInfo>) -> ModelInfo {
+        ModelInfo {
+            name: name.to_owned(),
+            state: state.to_owned(),
+            full_name: None,
+            detail: None,
+            backend,
+        }
+    }
+
+    fn sglang(running: Option<u16>) -> BackendInfo {
+        BackendInfo {
+            kind: Backend::SgLang,
+            max_running: Some(4),
+            running,
+            queued: Some(0),
+            kv_permille: Some(372),
+            hit_permille: None,
+        }
+    }
+
+    #[test]
+    fn non_llamacpp_backend_leads_the_detail_and_gets_a_slots_line() {
+        let mut flash = served("flash", "ready", Some(sglang(Some(1))));
+        flash.detail = Some(llama_core::detail::ModelDetail {
+            ctx: Some(204_800),
+            kv_k: Some("fp8_e4m3".to_owned()),
+            kv_v: Some("fp8_e4m3".to_owned()),
+            quant: Some("exl3".to_owned()),
+            ..llama_core::detail::ModelDetail::default()
+        });
+        let tabby = served(
+            "tabby",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::OpenAi,
+                ..BackendInfo::default()
+            }),
+        );
+        let sample = backend_sample(vec![flash, tabby.clone()]);
+        assert_eq!(
+            model_detail(&sample, WatchState::Ready),
+            "sglang · 200k · kv fp8_e4m3 · exl3"
+        );
+        assert_eq!(
+            backend_lines(&sample, WatchState::Ready),
+            vec![
+                "sglang  running 1/4 · queued 0 · KV 37 %".to_owned(),
+                "openai  running -- · queued -- · KV --".to_owned(),
+            ]
+        );
+        assert!(backend_lines(&sample, WatchState::AiDown).is_empty());
+        assert!(first_without_slots(&sample, WatchState::Ready));
+        assert_eq!(
+            watch_state(&sample, &TickState::new(2, 6).detail, true, true),
+            WatchState::Generating,
+            "a running SGLang request is generating"
+        );
+        let idle = backend_sample(vec![served("flash", "ready", Some(sglang(Some(0))))]);
+        assert_eq!(
+            watch_state(&idle, &TickState::new(2, 6).detail, true, true),
+            WatchState::Ready
+        );
+        let sample = backend_sample(vec![tabby]);
+        assert_eq!(model_detail(&sample, WatchState::Ready), "openai");
+        // llama.cpp and an older snapshot: no backend word, no line.
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..sglang(Some(1))
+        };
+        let sample = backend_sample(vec![
+            served("q", "ready", Some(llama)),
+            served("o", "ready", None),
+        ]);
+        assert_eq!(model_detail(&sample, WatchState::Ready), "");
+        assert!(backend_lines(&sample, WatchState::Ready).is_empty());
+        assert!(!first_without_slots(&sample, WatchState::Ready));
+    }
+
+    #[test]
+    fn stopping_for_over_a_minute_is_stuck() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        let stopping = backend_sample(vec![served("flash", "stopping", None)]);
+        note_stopping(&mut since, &stopping.snapshot.models, t0);
+        let later = t0 + Duration::from_secs(30);
+        note_stopping(&mut since, &stopping.snapshot.models, later);
+        assert!(!model_stuck(&stopping, WatchState::Ready, &since, later));
+        let at = t0 + Duration::from_secs(61);
+        assert!(model_stuck(&stopping, WatchState::Ready, &since, at));
+        assert!(!model_stuck(&stopping, WatchState::AiDown, &since, at));
+        // Back to ready and stopping again: the clock restarts.
+        let ready = backend_sample(vec![served("flash", "ready", None)]);
+        note_stopping(&mut since, &ready.snapshot.models, at);
+        assert!(since.is_empty());
+        note_stopping(&mut since, &stopping.snapshot.models, at);
+        assert!(!model_stuck(
+            &stopping,
+            WatchState::Ready,
+            &since,
+            at + Duration::from_secs(10)
+        ));
     }
 
     struct FixedCpu;

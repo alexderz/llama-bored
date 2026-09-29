@@ -202,11 +202,21 @@ fn ai_of(snapshot: &Snapshot) -> Ai {
                 .take(wire::MAX_MODELS)
                 .map(|model| {
                     let name = sanitize_wire(&model.name);
+                    // Gauges only for a backend without `/slots`; llama.cpp
+                    // keeps its slot view on the tty.
+                    let gauges = model.backend.filter(|info| !info.kind.has_slots());
                     ModelWire {
                         full_name: wire_full_name(model.full_name.as_deref(), &name),
                         detail: model.detail.clone().filter(detail::is_valid),
                         name,
                         state: model_state(&model.state),
+                        backend: model.backend.map(|info| info.kind),
+                        running: gauges.and_then(|info| info.running).map(cap_reqs),
+                        queued: gauges.and_then(|info| info.queued).map(cap_reqs),
+                        kv_fill: gauges
+                            .and_then(|info| info.kv_permille)
+                            .filter(|permille| *permille <= 1000)
+                            .map(|permille| f32::from(permille) / 1000.0),
                     }
                 })
                 .collect(),
@@ -220,6 +230,10 @@ fn ai_of(snapshot: &Snapshot) -> Ai {
             models: Vec::new(),
         },
     }
+}
+
+fn cap_reqs(n: u16) -> u16 {
+    n.min(wire::MAX_REQS)
 }
 
 /// The full name when it adds something to `name` and is canonical.

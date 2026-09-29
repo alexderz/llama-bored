@@ -239,7 +239,7 @@ fn happy_world() -> World {
             "model": "qwen3.6-35b-a3b",
             "name": "Qwen",
             "state": "ready",
-            "cmd": SENTINEL
+            "cmd": format!("llama-server {SENTINEL}")
         }],
         "note": SENTINEL
     }))

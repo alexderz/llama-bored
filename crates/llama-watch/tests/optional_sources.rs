@@ -326,6 +326,7 @@ fn llama_disabled_is_idle_with_no_error_and_no_llama_log() {
     for stale in [AiState::Down, AiState::NoData, AiState::Loaded] {
         let mut llama = view(stale);
         llama.models = vec![ModelInfo {
+            backend: None,
             name: "stale".to_owned(),
             state: "ready".to_owned(),
             full_name: None,

@@ -1778,6 +1778,7 @@ fn sample(state: WatchState) -> TtyModel {
         host: "AIBOX".to_string(),
         model_name: model_name.to_string(),
         model_detail: String::new(),
+        model_stuck: false,
         slots_line: slots_line.to_string(),
         swap_line: swap_line.to_string(),
         cool_c: cool,
@@ -1807,6 +1808,8 @@ fn sample(state: WatchState) -> TtyModel {
         gen_ceiling: 250.0,
         prompt_ceiling: 1500.0,
         slots,
+        backend_lines: Vec::new(),
+        text_note: String::new(),
         requests,
         in_title: String::new(),
         out_title: String::new(),
@@ -2153,8 +2156,8 @@ fn activity(
         input_tok,
         cached_tok,
         output_tok,
-        prompt_tps,
-        gen_tps,
+        prompt_tps: Some(prompt_tps),
+        gen_tps: Some(gen_tps),
         dur: dur.to_string(),
         err,
     }
@@ -3205,5 +3208,103 @@ fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
     for label in ["VRAM", "MEM"] {
         let bar = bar_from(&grid, meter_row(&grid, label), 27);
         assert_eq!(steps_of(&bar), [C16::BrightWhite], "{label} {bar:?}");
+    }
+}
+
+/// An SGLang model (T72): no `/slots`, a backend line in SLOTS, a note in
+/// IN/OUT, and RECENT rows whose rates llama-swap could not report.
+fn sglang_model() -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    model.model_name = "flash".to_string();
+    model.model_detail = "sglang · 200k · kv fp8_e4m3 · exl3".to_string();
+    model.slots_line = "--".to_string();
+    model.slots = Vec::new();
+    model.backend_lines = vec!["sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %".to_string()];
+    model.text_note = "text needs llama.cpp /slots".to_string();
+    model.in_title = "  IN".to_string();
+    model.out_title = "  OUT".to_string();
+    model.in_lines = Vec::new();
+    model.out_lines = Vec::new();
+    model.prompt_last = None;
+    for req in &mut model.requests {
+        req.model = "flash".to_string();
+        req.prompt_tps = None;
+        req.gen_tps = None;
+    }
+    model
+}
+
+const SGLANG_GOLDENS: [(&str, u16, u16); 2] =
+    [("sglang-240.json", 240, 67), ("sglang-160.json", 160, 48)];
+
+#[test]
+fn sglang_goldens_match_character_and_colour() {
+    for (name, _, _) in SGLANG_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &sglang_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the T72 SGLang goldens"]
+fn dump_sglang_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in SGLANG_GOLDENS {
+        let grid = draw(&sglang_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write sglang golden");
+    }
+}
+
+#[test]
+fn sglang_frame_names_the_backend_and_its_gauges() {
+    let model = sglang_model();
+    for (cols, rows) in [(160, 48), (240, 67), (480, 135)] {
+        let grid = draw(&model, cols, rows);
+        let header = row_string(&grid, 0);
+        assert!(header.contains("flash  sglang · 200k"), "{header}");
+        let slots = row_with(&grid, "SLOTS");
+        let line = row_string(&grid, slots + 1);
+        assert!(
+            line.contains("sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %"),
+            "{cols}: {line}"
+        );
+        let in_row = (0..grid.rows())
+            .find(|row| row_string(&grid, *row).trim_start() == "IN")
+            .expect("IN title");
+        let notes: Vec<u16> = (in_row..grid.rows())
+            .filter(|row| row_string(&grid, *row).contains("text needs llama.cpp /slots"))
+            .collect();
+        assert_eq!(notes.len(), 2, "IN and OUT each say why: {cols}");
+        let recent = row_with(&grid, "flash ");
+        assert!(row_string(&grid, recent).contains("--"), "{cols}");
+        for row in 0..grid.rows() {
+            assert_eq!(grid.get(cols - 1, row).unwrap().ch, ' ', "last col {cols}");
+        }
+    }
+}
+
+#[test]
+fn text_note_gives_way_to_real_text() {
+    let mut model = sglang_model();
+    model.in_lines = vec!["  prompt".to_string()];
+    let grid = draw(&model, 240, 67);
+    assert!(
+        (0..grid.rows()).all(|row| !row_string(&grid, row).contains("text needs")),
+        "a note only fills empty panels"
+    );
+}
+
+#[test]
+fn a_model_stuck_stopping_is_tagged_in_the_header() {
+    let mut model = sample(WatchState::Ready);
+    let grid = draw(&model, 240, 67);
+    assert!(!row_string(&grid, 0).contains("stuck"));
+    model.model_stuck = true;
+    for cols in [160, 240] {
+        let grid = draw(&model, cols, 67);
+        let header = row_string(&grid, 0);
+        assert!(header.contains("Qwen 35B  stopping (stuck?)"), "{header}");
+        let at = col_of(&grid, 0, "stopping (stuck?)");
+        assert_eq!(grid.get(at, 0).unwrap().fg, C16::Yellow);
     }
 }
