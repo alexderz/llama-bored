@@ -23,7 +23,8 @@ use crate::load::{IdleFloor, Winner};
 
 pub use llama_core::sample::{AiState, ModelInfo, Snapshot};
 
-/// VRAM and power for the TTY. Not part of the snapshot.
+/// VRAM and power for the TTY. Not on [`Snapshot`]; the publisher puts
+/// them on the wire for llama-metrics (#11).
 ///
 /// Each field is `None` when that NVML call failed. Bytes are from
 /// `memory_info`; power is milliwatts from `power_usage` and
@@ -77,7 +78,8 @@ pub struct WatchSample {
     /// What set [`Snapshot::activity`] on this tick.
     pub load_source: LoadSource,
     /// Read-only fan speeds for the tty FANS panel. `None` when `[fans]` is
-    /// off. Absent from [`Snapshot`] and the wire.
+    /// off. Absent from [`Snapshot`]; the publisher copies rpm and pwm to the
+    /// wire (#11).
     pub fans: Option<FanPanel>,
 }
 

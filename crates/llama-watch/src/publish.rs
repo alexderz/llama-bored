@@ -19,7 +19,8 @@ use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, Host, ModelState, ModelWire, Tokens, WireError, WireSnapshot,
+    self, Ai, AiWire, FanWire, Host, ModelState, ModelWire, Sources, Tokens, WireError,
+    WireSnapshot,
 };
 use thiserror::Error;
 
@@ -45,6 +46,31 @@ pub enum PublishError {
     /// it on every tick.
     #[error("could not write the snapshot")]
     Write(#[source] IoError),
+}
+
+/// Watcher numbers that are not on [`Snapshot`] or [`LlamaView`] but go on
+/// the wire for llama-metrics (#11). `Default` is "nothing known".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Extras {
+    /// GPU power, watts.
+    pub gpu_w: Option<f64>,
+    /// GPU enforced power limit, watts.
+    pub gpu_limit_w: Option<f64>,
+    /// CPU socket power, watts.
+    pub cpu_w: Option<f64>,
+    /// VRAM used and total, bytes.
+    pub vram_used: Option<u64>,
+    pub vram_total: Option<u64>,
+    /// System memory used and total, bytes.
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+    /// llama.cpp slots per model: `(display name, busy, total)`. The name is
+    /// the [`llama_core::sample::ModelInfo::name`] the slots belong to.
+    pub slots: Vec<(String, usize, usize)>,
+    /// Configured fans: `(channel, label, rpm, pwm 0..=255)`.
+    pub fans: Vec<(u32, String, Option<u32>, Option<u8>)>,
+    /// The tty health line, as wire sources. `None` while starting.
+    pub sources: Option<Sources>,
 }
 
 /// Publishes validated snapshots into one directory.
@@ -92,8 +118,18 @@ impl<L: Sink> Publisher<L> {
 
     /// Validate, then replace `snapshot.json`. A refusal leaves the previous file.
     pub fn publish(&mut self, snapshot: &Snapshot, llama: &LlamaView) -> Result<(), PublishError> {
+        self.publish_with(snapshot, llama, &Extras::default())
+    }
+
+    /// [`Self::publish`] with the llama-metrics extras (#11).
+    pub fn publish_with(
+        &mut self,
+        snapshot: &Snapshot,
+        llama: &LlamaView,
+        extras: &Extras,
+    ) -> Result<(), PublishError> {
         let seq = self.seq.saturating_add(1);
-        let wire_snapshot = build(snapshot, llama, self.run_id, seq);
+        let wire_snapshot = build(snapshot, llama, extras, self.run_id, seq);
         if let Err(err) = wire::validate(&wire_snapshot) {
             self.log_invalid(&err);
             return Err(PublishError::Invalid(err));
@@ -167,7 +203,16 @@ impl<L: Sink> Publisher<L> {
     }
 }
 
-fn build(snapshot: &Snapshot, llama: &LlamaView, run_id: u64, seq: u64) -> WireSnapshot {
+/// Assemble the wire snapshot. Every extra that is out of its wire range is
+/// left out rather than failing [`wire::validate`], so one odd reading never
+/// stops the publish.
+pub fn build(
+    snapshot: &Snapshot,
+    llama: &LlamaView,
+    extras: &Extras,
+    run_id: u64,
+    seq: u64,
+) -> WireSnapshot {
     WireSnapshot {
         schema: wire::SCHEMA,
         run_id,
@@ -184,15 +229,85 @@ fn build(snapshot: &Snapshot, llama: &LlamaView, run_id: u64, seq: u64) -> WireS
             coolant_c: snapshot.coolant_c,
             cpu_c: snapshot.cpu_c,
             gpu_c: snapshot.gpu_c,
+            gpu_w: watts(extras.gpu_w),
+            gpu_limit_w: watts(extras.gpu_limit_w),
+            cpu_w: watts(extras.cpu_w),
+            vram_used_bytes: mem_bytes(extras.vram_used),
+            vram_total_bytes: mem_bytes(extras.vram_total),
+            mem_used_bytes: mem_bytes(extras.mem_used),
+            mem_total_bytes: mem_bytes(extras.mem_total),
         },
-        ai: ai_of(snapshot),
+        ai: ai_of(snapshot, &extras.slots),
         tokens: Tokens {
             decoded_total: llama.decoded_total,
+            prompt_total: llama.prompt_total,
         },
+        fans: fans_of(&extras.fans),
+        sources: extras.sources.map(sources_of),
     }
 }
 
-fn ai_of(snapshot: &Snapshot) -> Ai {
+fn watts(value: Option<f64>) -> Option<f32> {
+    value
+        .filter(|w| w.is_finite() && (0.0..=f64::from(wire::MAX_WATTS)).contains(w))
+        .map(|w| w as f32)
+}
+
+fn mem_bytes(value: Option<u64>) -> Option<u64> {
+    value.filter(|b| *b <= wire::MAX_MEM_BYTES)
+}
+
+/// Fans in config order; a channel or label the wire refuses is dropped.
+fn fans_of(fans: &[(u32, String, Option<u32>, Option<u8>)]) -> Vec<FanWire> {
+    let mut out: Vec<FanWire> = Vec::new();
+    for (channel, label, rpm, pwm) in fans {
+        let Some(channel) = u8::try_from(*channel)
+            .ok()
+            .filter(|c| (1..=wire::MAX_FAN_CHANNEL).contains(c))
+        else {
+            continue;
+        };
+        let label = sanitize(label, wire::MAX_FAN_LABEL_CHARS);
+        if label.is_empty()
+            || !label.is_ascii()
+            || out.len() >= wire::MAX_FANS
+            || out.iter().any(|fan| fan.channel == channel)
+        {
+            continue;
+        }
+        out.push(FanWire {
+            channel,
+            label,
+            rpm: rpm.filter(|r| *r <= wire::MAX_FAN_RPM),
+            pwm: pwm.map(|p| f32::from(p) / 255.0),
+        });
+    }
+    out
+}
+
+/// Latencies over [`wire::MAX_LATENCY_S`] are dropped; the up flag stays.
+fn sources_of(mut sources: Sources) -> Sources {
+    for source in [
+        &mut sources.llama_swap,
+        &mut sources.running,
+        &mut sources.slots,
+        &mut sources.metrics,
+        &mut sources.activity,
+        &mut sources.gpu,
+        &mut sources.hwmon,
+        &mut sources.proc,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        source.latency_s = source
+            .latency_s
+            .filter(|s| s.is_finite() && (0.0..=wire::MAX_LATENCY_S).contains(s));
+    }
+    sources
+}
+
+fn ai_of(snapshot: &Snapshot, slots: &[(String, usize, usize)]) -> Ai {
     match snapshot.ai {
         AiState::Loaded => Ai {
             state: AiWire::Loaded,
@@ -201,6 +316,16 @@ fn ai_of(snapshot: &Snapshot) -> Ai {
                 .iter()
                 .take(wire::MAX_MODELS)
                 .map(|model| {
+                    let slot_counts = slots
+                        .iter()
+                        .find(|(owner, _, total)| *owner == model.name && *total > 0)
+                        .and_then(|(_, busy, total)| {
+                            let total = u16::try_from(*total)
+                                .ok()
+                                .filter(|t| *t <= wire::MAX_SLOTS)?;
+                            let busy = u16::try_from(*busy).ok().filter(|b| *b <= total)?;
+                            Some((busy, total))
+                        });
                     let name = sanitize_wire(&model.name);
                     // Gauges only for a backend without `/slots`; llama.cpp
                     // keeps its slot view on the tty.
@@ -213,10 +338,10 @@ fn ai_of(snapshot: &Snapshot) -> Ai {
                         backend: model.backend.map(|info| info.kind),
                         running: gauges.and_then(|info| info.running).map(cap_reqs),
                         queued: gauges.and_then(|info| info.queued).map(cap_reqs),
-                        kv_fill: gauges
-                            .and_then(|info| info.kv_permille)
-                            .filter(|permille| *permille <= 1000)
-                            .map(|permille| f32::from(permille) / 1000.0),
+                        kv_fill: gauges.and_then(|info| info.kv_permille).and_then(ratio),
+                        cache_hit: gauges.and_then(|info| info.hit_permille).and_then(ratio),
+                        slots_busy: slot_counts.map(|(busy, _)| busy),
+                        slots_total: slot_counts.map(|(_, total)| total),
                     }
                 })
                 .collect(),
@@ -230,6 +355,10 @@ fn ai_of(snapshot: &Snapshot) -> Ai {
             models: Vec::new(),
         },
     }
+}
+
+fn ratio(permille: u16) -> Option<f32> {
+    (permille <= 1000).then(|| f32::from(permille) / 1000.0)
 }
 
 fn cap_reqs(n: u16) -> u16 {

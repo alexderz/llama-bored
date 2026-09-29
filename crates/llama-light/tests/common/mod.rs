@@ -13,6 +13,7 @@ use llama_light::aura::proto::{EncodedReport, REPORT_LEN};
 use llama_light::config::{ConfigError, ConfigSource, LightConfig, Stamp};
 use llama_light::service::{Clock, Notifier};
 use llama_light::snapshot::SnapshotSource;
+use std::borrow::Cow;
 
 pub const SEC: u64 = 1_000_000_000;
 
@@ -33,6 +34,13 @@ pub fn snap(seq: u64, t_mono_ns: u64) -> SnapshotV1 {
             coolant_c: Some(33.0),
             cpu_c: Some(55.0),
             gpu_c: Some(60.0),
+            gpu_w: None,
+            gpu_limit_w: None,
+            cpu_w: None,
+            vram_used_bytes: None,
+            vram_total_bytes: None,
+            mem_used_bytes: None,
+            mem_total_bytes: None,
         },
         ai: Ai {
             state: AiWire::Idle,
@@ -40,7 +48,10 @@ pub fn snap(seq: u64, t_mono_ns: u64) -> SnapshotV1 {
         },
         tokens: Tokens {
             decoded_total: Some(1000),
+            prompt_total: None,
         },
+        fans: Vec::new(),
+        sources: None,
     }
 }
 
@@ -112,8 +123,8 @@ impl Feed {
 }
 
 impl SnapshotSource for Feed {
-    fn read(&mut self) -> Result<SnapshotV1, &'static str> {
-        self.0.borrow().clone()
+    fn read(&mut self) -> Result<SnapshotV1, Cow<'static, str>> {
+        self.0.borrow().clone().map_err(Cow::Borrowed)
     }
 }
 

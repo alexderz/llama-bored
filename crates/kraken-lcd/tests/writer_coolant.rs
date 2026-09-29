@@ -59,6 +59,13 @@ fn publish(path: &std::path::Path, t_mono_ns: u64) {
             coolant_c: Some(99.0),
             cpu_c: Some(40.0),
             gpu_c: Some(40.0),
+            gpu_w: None,
+            gpu_limit_w: None,
+            cpu_w: None,
+            vram_used_bytes: None,
+            vram_total_bytes: None,
+            mem_used_bytes: None,
+            mem_total_bytes: None,
         },
         ai: Ai {
             state: AiWire::Idle,
@@ -66,7 +73,10 @@ fn publish(path: &std::path::Path, t_mono_ns: u64) {
         },
         tokens: Tokens {
             decoded_total: Some(1),
+            prompt_total: None,
         },
+        fans: Vec::new(),
+        sources: None,
     };
     let bytes = wire::to_json(&snapshot).expect("json");
     std::fs::write(path, bytes).expect("write");

@@ -16,7 +16,7 @@ use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
 use crate::poller::{self, LlamaDetail, PollLatencies};
-use crate::publish::{PublishError, Publisher};
+use crate::publish::{Extras, PublishError, Publisher};
 use crate::slots::{SlotView, pick_slot};
 use crate::sources::Roots;
 use crate::sources::gpu::{GpuBackend, NvidiaGpu};
@@ -30,6 +30,7 @@ use crate::tty::term::{ConsoleBlank, Term};
 use llama_core::backend::Backend;
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
+use llama_core::wire::{SourceWire, Sources};
 
 /// Injected clock. Production sleeps; tests advance a fake instant.
 pub trait Clock {
@@ -75,7 +76,13 @@ pub trait SampleStep {
 /// Step 3.
 pub trait PublishStep {
     /// Validate and publish. [`PublishError::Write`] is logged by the loop.
-    fn publish(&mut self, snapshot: &Snapshot, llama: &LlamaView) -> Result<(), PublishError>;
+    /// `extras` are the llama-metrics numbers that are not on `snapshot` (#11).
+    fn publish(
+        &mut self,
+        snapshot: &Snapshot,
+        llama: &LlamaView,
+        extras: &Extras,
+    ) -> Result<(), PublishError>;
 }
 
 /// Step 4. Builds nothing itself: the loop has already mapped the [`TtyModel`].
@@ -95,8 +102,13 @@ where
 }
 
 impl<L: Sink> PublishStep for Publisher<L> {
-    fn publish(&mut self, snapshot: &Snapshot, llama: &LlamaView) -> Result<(), PublishError> {
-        Publisher::publish(self, snapshot, llama)
+    fn publish(
+        &mut self,
+        snapshot: &Snapshot,
+        llama: &LlamaView,
+        extras: &Extras,
+    ) -> Result<(), PublishError> {
+        Publisher::publish_with(self, snapshot, llama, extras)
     }
 }
 
@@ -351,7 +363,7 @@ where
         started: input.started,
         host: host_label(&roots.proc),
         cpu_cores: cpu_cores(&roots.proc),
-        mem_total_gb: mem_total_gb(&roots.proc),
+        mem_total_bytes: mem_total_bytes(&roots.proc),
         llama_enabled: input.config.llama.enabled,
         show_text: input.config.tty.show_text,
     };
@@ -410,6 +422,7 @@ impl TickState {
                 ai: AiState::Down,
                 models: Vec::new(),
                 decoded_total: None,
+                prompt_total: None,
             },
             detail: LlamaDetail {
                 slots: Vec::new(),
@@ -443,7 +456,7 @@ struct FrameCtx {
     started: Instant,
     host: String,
     cpu_cores: Option<u32>,
-    mem_total_gb: Option<f64>,
+    mem_total_bytes: Option<u64>,
     /// `[llama] enabled`. False draws [`WatchState::NoLlama`] from the first frame.
     llama_enabled: bool,
     /// `tty.show_text`. False hands the layout no llama text at all.
@@ -472,7 +485,8 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         state.heard = true;
     }
     let sample = input.sampler.sample(mono, wall, &state.llama);
-    note_publish(input, state, &sample, mono);
+    let extras = publish_extras(&sample, state, ctx);
+    note_publish(input, state, &sample, &extras, mono);
     match sample.snapshot.ai {
         AiState::Down | AiState::NoData => {
             if state.down_since.is_none() {
@@ -502,6 +516,7 @@ fn note_publish<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
     input: &mut LoopInput<'_, Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>,
     state: &mut TickState,
     sample: &WatchSample,
+    extras: &Extras,
     mono: Instant,
 ) where
     Feed: LlamaFeed,
@@ -513,7 +528,10 @@ fn note_publish<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
     Stp: Stop,
     Lg: Sink,
 {
-    match input.publisher.publish(&sample.snapshot, &state.llama) {
+    match input
+        .publisher
+        .publish(&sample.snapshot, &state.llama, extras)
+    {
         Ok(()) => {
             if state.write_down {
                 log::emit(&mut input.log, Priority::Info, "snapshot write recovered");
@@ -824,11 +842,8 @@ fn tty_model(
     } else {
         FrameText::default()
     };
-    let mem_total = ctx.mem_total_gb;
-    let mem_used = match (sample.snapshot.mem_pct, mem_total) {
-        (Some(pct), Some(total)) if pct.is_finite() => Some(total * f64::from(pct) / 100.0),
-        _ => None,
-    };
+    let mem_total = ctx.mem_total_bytes.map(gib);
+    let mem_used = mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes).map(gib);
     TtyModel {
         state: watch,
         host: ctx.host.clone(),
@@ -1317,7 +1332,82 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
 
-fn mem_total_gb(proc_root: &Path) -> Option<f64> {
+/// Used memory as the tty shows it: `mem_pct` of `MemTotal`.
+fn mem_used_bytes(mem_pct: Option<f32>, total: Option<u64>) -> Option<u64> {
+    match (mem_pct, total) {
+        (Some(pct), Some(total)) if pct.is_finite() => {
+            Some((total as f64 * f64::from(pct.clamp(0.0, 100.0)) / 100.0).round() as u64)
+        }
+        _ => None,
+    }
+}
+
+/// The numbers llama-metrics exports beyond the [`Snapshot`] (#11), taken
+/// from what this tick's tty frame shows.
+fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Extras {
+    let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
+    let mut slots: Vec<(String, usize, usize)> = Vec::new();
+    for slot in &tick.detail.slots {
+        match slots.iter_mut().find(|(model, _, _)| *model == slot.model) {
+            Some(entry) => {
+                entry.1 += usize::from(slot.is_processing);
+                entry.2 += 1;
+            }
+            None => slots.push((slot.model.clone(), usize::from(slot.is_processing), 1)),
+        }
+    }
+    Extras {
+        gpu_w: sample.gpu.power_mw.map(|mw| f64::from(mw) / 1000.0),
+        gpu_limit_w: sample.gpu.power_limit_mw.map(|mw| f64::from(mw) / 1000.0),
+        cpu_w: sample.cpu_w,
+        vram_used: sample.gpu.vram_used,
+        vram_total: sample.gpu.vram_total,
+        mem_used: mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes),
+        mem_total: ctx.mem_total_bytes,
+        slots,
+        fans: sample
+            .fans
+            .iter()
+            .flat_map(|panel| &panel.fans)
+            .map(|fan| (fan.channel, fan.label.clone(), fan.rpm, fan.pwm))
+            .collect(),
+        sources: wire_sources(&health(sample, &tick.detail, watch), &tick.detail.latencies),
+    }
+}
+
+/// The health line as wire sources: OK and idle are up, down is down, and
+/// pending or absent (llama-swap off or down, still starting) is left out.
+/// Latencies are the ones the line shows; `running` shares llama-swap's.
+fn wire_sources(segs: &[HealthSeg], latencies: &PollLatencies) -> Option<Sources> {
+    let mut sources = Sources::default();
+    let mut any = false;
+    for seg in segs {
+        let up = match seg.status {
+            HealthStatus::Ok | HealthStatus::Idle => true,
+            HealthStatus::Down => false,
+            HealthStatus::Pending | HealthStatus::Absent => continue,
+        };
+        let (slot, latency) = match seg.name.as_str() {
+            "llama-swap" => (&mut sources.llama_swap, latencies.running),
+            "/running" => (&mut sources.running, latencies.running),
+            "/slots" => (&mut sources.slots, latencies.slots),
+            "metrics" => (&mut sources.metrics, latencies.metrics),
+            "activity" => (&mut sources.activity, latencies.activity),
+            "nvml" => (&mut sources.gpu, None),
+            "hwmon" => (&mut sources.hwmon, None),
+            "proc" => (&mut sources.proc, None),
+            _ => continue,
+        };
+        *slot = Some(SourceWire {
+            up,
+            latency_s: latency.map(|d| d.as_secs_f32()),
+        });
+        any = true;
+    }
+    any.then_some(sources)
+}
+
+fn mem_total_bytes(proc_root: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(proc_root.join("meminfo")).ok()?;
     for line in text.lines() {
         let Some((key, rest)) = line.split_once(':') else {
@@ -1330,7 +1420,7 @@ fn mem_total_gb(proc_root: &Path) -> Option<f64> {
         if kb == 0 {
             return None;
         }
-        return Some(kb as f64 / 1_048_576.0);
+        return kb.checked_mul(1024);
     }
     None
 }
@@ -1793,6 +1883,7 @@ mod tests {
                     ai: AiState::Loaded,
                     models: Vec::new(),
                     decoded_total: None,
+                    prompt_total: None,
                 },
                 crate::poller::LlamaDetail {
                     slots: vec![SlotView {
@@ -1947,6 +2038,7 @@ mod tests {
                     ai: AiState::Idle,
                     models: Vec::new(),
                     decoded_total: None,
+                    prompt_total: None,
                 },
                 crate::poller::LlamaDetail {
                     slots: Vec::new(),
@@ -1968,6 +2060,7 @@ mod tests {
                 ai: AiState::Loaded,
                 models: Vec::new(),
                 decoded_total: None,
+                prompt_total: None,
             },
         );
         sample.snapshot.ai = AiState::Loaded;
@@ -2008,6 +2101,7 @@ mod tests {
                 ai: AiState::Loaded,
                 models: Vec::new(),
                 decoded_total: None,
+                prompt_total: None,
             },
         );
         sample.snapshot.ai = AiState::Loaded;
@@ -2034,6 +2128,134 @@ mod tests {
             kv_permille: Some(372),
             hit_permille: None,
         }
+    }
+
+    fn frame_ctx(mem_total_bytes: Option<u64>, llama_enabled: bool) -> FrameCtx {
+        FrameCtx {
+            output_cap: 100,
+            input_cap: 100,
+            gen_ceiling: 250.0,
+            prompt_ceiling: 1500.0,
+            chart_bucket_s: 2,
+            chart_glyphs: ChartGlyphs::default(),
+            ctx_history_h: 6,
+            started: Instant::now(),
+            host: "titan".to_owned(),
+            cpu_cores: None,
+            mem_total_bytes,
+            llama_enabled,
+            show_text: false,
+        }
+    }
+
+    /// #11: what the tty frame shows goes on the wire for llama-metrics.
+    #[test]
+    fn publish_extras_mirror_the_frame() {
+        let mut sample = backend_sample(vec![served("m", "ready", None)]);
+        sample.snapshot.mem_pct = Some(25.0);
+        sample.gpu = crate::collector::GpuExtra {
+            vram_used: Some(1 << 30),
+            vram_total: Some(4 << 30),
+            power_mw: Some(312_500),
+            power_limit_mw: Some(600_000),
+        };
+        sample.cpu_w = Some(90.5);
+        sample.fans = Some(crate::sources::fans::FanPanel {
+            chip: "nct6798".to_owned(),
+            present: true,
+            fans: vec![crate::sources::fans::FanReading {
+                channel: 2,
+                label: "CPU".to_owned(),
+                rpm: Some(1100),
+                pwm: Some(128),
+                mode: Some(5),
+            }],
+        });
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mut other = slot(0, 1, false, "", "");
+        other.model = "n".to_owned();
+        tick.detail.slots = vec![
+            slot(0, 5, true, "", ""),
+            slot(1, 4, false, "", ""),
+            slot(2, 3, true, "", ""),
+            other,
+        ];
+        tick.detail.latencies.running = Some(Duration::from_millis(3));
+        tick.detail.latencies.slots = Some(Duration::from_millis(7));
+        let extras = publish_extras(&sample, &tick, &frame_ctx(Some(8 << 30), true));
+        assert_eq!(extras.gpu_w, Some(312.5));
+        assert_eq!(extras.gpu_limit_w, Some(600.0));
+        assert_eq!(extras.cpu_w, Some(90.5));
+        assert_eq!(
+            (extras.vram_used, extras.vram_total),
+            (Some(1 << 30), Some(4 << 30))
+        );
+        assert_eq!(
+            (extras.mem_used, extras.mem_total),
+            (Some(2 << 30), Some(8 << 30))
+        );
+        assert_eq!(
+            extras.slots,
+            vec![("m".to_owned(), 2, 3), ("n".to_owned(), 0, 1)]
+        );
+        assert_eq!(
+            extras.fans,
+            vec![(2, "CPU".to_owned(), Some(1100), Some(128))]
+        );
+        let sources = extras.sources.expect("sources");
+        let names: Vec<(&str, Option<bool>)> = sources
+            .entries()
+            .iter()
+            .map(|(name, source)| (*name, source.map(|s| s.up)))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("llama-swap", Some(true)),
+                ("running", Some(true)),
+                ("slots", Some(true)),
+                ("metrics", Some(true)),
+                ("activity", Some(true)),
+                ("gpu", Some(true)),
+                ("hwmon", Some(true)),
+                ("proc", Some(true)),
+            ]
+        );
+        assert_eq!(sources.llama_swap.and_then(|s| s.latency_s), Some(0.003));
+        assert_eq!(sources.running.and_then(|s| s.latency_s), Some(0.003));
+        assert_eq!(sources.slots.and_then(|s| s.latency_s), Some(0.007));
+        assert_eq!(sources.gpu.and_then(|s| s.latency_s), None);
+    }
+
+    #[test]
+    fn wire_sources_leave_out_what_the_health_line_does_not_poll() {
+        let mut sample = backend_sample(Vec::new());
+        sample.snapshot.errors.insert(SourceId::Gpu);
+        let mut tick = TickState::new(2, 6);
+        // Starting: every segment pending, no sources at all.
+        let extras = publish_extras(&sample, &tick, &frame_ctx(None, true));
+        assert_eq!(extras.sources, None);
+        assert_eq!(extras.mem_used, None);
+        // llama-swap down: it and /running are down, its taps absent.
+        tick.heard = true;
+        sample.snapshot.ai = AiState::Down;
+        let sources = publish_extras(&sample, &tick, &frame_ctx(None, true))
+            .sources
+            .expect("sources");
+        assert_eq!(sources.llama_swap.map(|s| s.up), Some(false));
+        assert_eq!(sources.running.map(|s| s.up), Some(false));
+        assert_eq!(sources.slots, None);
+        assert_eq!(sources.metrics, None);
+        assert_eq!(sources.activity, None);
+        assert_eq!(sources.gpu.map(|s| s.up), Some(false));
+        assert_eq!(sources.proc.map(|s| s.up), Some(true));
+        // [llama] off: the llama taps are absent, the host ones stay.
+        let sources = publish_extras(&sample, &tick, &frame_ctx(None, false))
+            .sources
+            .expect("sources");
+        assert_eq!(sources.llama_swap, None);
+        assert_eq!(sources.hwmon.map(|s| s.up), Some(true));
     }
 
     #[test]
@@ -2157,6 +2379,7 @@ mod tests {
             &mut self,
             _snapshot: &Snapshot,
             _llama: &LlamaView,
+            _extras: &Extras,
         ) -> Result<(), crate::publish::PublishError> {
             Ok(())
         }

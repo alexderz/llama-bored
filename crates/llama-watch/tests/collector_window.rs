@@ -192,6 +192,7 @@ fn idle_view() -> LlamaView {
         ai: AiState::Idle,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     }
 }
 
@@ -311,6 +312,7 @@ fn injected_llama_view_is_used_and_running_is_not_called() {
             detail: None,
         }],
         decoded_total: Some(42),
+        prompt_total: None,
     };
     let sampled = collector.sample(now, wall, &loaded);
     assert_eq!(sampled.snapshot.ai, AiState::Loaded);
@@ -366,6 +368,7 @@ fn watcher_never_produces_no_data() {
             detail: None,
         }],
         decoded_total: Some(9),
+        prompt_total: None,
     };
     let sampled = collector.sample(Instant::now(), SystemTime::UNIX_EPOCH, &view);
     assert_ne!(sampled.snapshot.ai, AiState::NoData);
@@ -630,6 +633,7 @@ fn view_with(ai: AiState) -> LlamaView {
         ai,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     }
 }
 

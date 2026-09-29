@@ -1,9 +1,10 @@
 //! Prometheus text exposition format 0.0.4, from one snapshot read.
 //!
 //! Every metric is named `llamabored_*`. The only strings exported are model
-//! display names and their allowlisted tuning tokens, as label values. The
-//! snapshot carries no prompt or output text, and nothing here could export
-//! it: every value is a number from a typed field.
+//! display names and their allowlisted tuning tokens, fan labels (short
+//! printable ASCII from `[fans]`) and fixed source names, as label values.
+//! The snapshot carries no prompt or output text, and nothing here could
+//! export it: every value is a number from a typed field.
 //!
 //! A stale or unreadable snapshot exports only the exporter's own series,
 //! `llamabored_snapshot_up`, `llamabored_snapshot_stale`, and (when it could be
@@ -14,7 +15,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use llama_core::detail::{self, KV_DEFAULT, ModelDetail, NCMOE_ALL};
-use llama_core::wire::{self, AiWire, ModelWire, WireSnapshot};
+use llama_core::wire::{self, AiWire, FanWire, ModelState, ModelWire, WireSnapshot};
 
 use crate::snapshot::ReadError;
 
@@ -113,6 +114,53 @@ impl Out {
             self.sample(name, &[], &format!("{value}"));
         }
     }
+
+    fn bytes_opt(&mut self, name: &str, help: &str, value: Option<u64>) {
+        if let Some(value) = value {
+            self.family(name, "gauge", help);
+            self.sample(name, &[], &value.to_string());
+        }
+    }
+
+    /// One family of `(labels, value)` rows; nothing when `rows` is empty.
+    fn rows(&mut self, name: &str, kind: &str, help: &str, rows: &[(Vec<(&str, &str)>, String)]) {
+        if rows.is_empty() {
+            return;
+        }
+        self.family(name, kind, help);
+        for (labels, value) in rows {
+            self.sample(name, labels, value);
+        }
+    }
+}
+
+/// An `f32` sample value, printed like [`Out::gauge_opt`] prints one.
+fn num(value: f32) -> String {
+    format!("{value}")
+}
+
+/// Picks one model's value for a per-model family.
+type ModelValue = fn(&ModelWire) -> Option<String>;
+
+/// One value per model, keyed by `(name, full_name)` like
+/// `llamabored_model_ctx_size_tokens`: sorted, and the first model with a
+/// given key wins, so a repeated name never repeats a label set.
+fn per_model(
+    models: &[ModelWire],
+    value: impl Fn(&ModelWire) -> Option<String>,
+) -> Vec<(String, String, String)> {
+    let mut rows: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for model in models {
+        let Some(value) = value(model) else {
+            continue;
+        };
+        let labels = ModelLabels::of(model);
+        if seen.insert((labels.name.clone(), labels.full_name.clone())) {
+            rows.insert((labels.name, labels.full_name, value));
+        }
+    }
+    rows.into_iter().collect()
 }
 
 /// Model labels, in export order.
@@ -184,6 +232,15 @@ fn kv_label(detail: &ModelDetail) -> String {
     let k = token(&detail.kv_k);
     let v = token(&detail.kv_v);
     if k == v { k } else { format!("{k}/{v}") }
+}
+
+fn model_state_label(state: ModelState) -> &'static str {
+    match state {
+        ModelState::Ready => "ready",
+        ModelState::Starting => "starting",
+        ModelState::Stopping => "stopping",
+        ModelState::Other => "other",
+    }
 }
 
 fn ai_label(state: AiWire) -> &'static str {
@@ -315,6 +372,42 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         host.gpu_c,
     );
 
+    out.gauge_opt(
+        "llamabored_gpu_power_watts",
+        "GPU power draw, watts.",
+        host.gpu_w,
+    );
+    out.gauge_opt(
+        "llamabored_gpu_power_limit_watts",
+        "GPU enforced power limit, watts.",
+        host.gpu_limit_w,
+    );
+    out.gauge_opt(
+        "llamabored_cpu_power_watts",
+        "CPU socket power, watts.",
+        host.cpu_w,
+    );
+    out.bytes_opt(
+        "llamabored_gpu_memory_used_bytes",
+        "GPU memory in use, bytes.",
+        host.vram_used_bytes,
+    );
+    out.bytes_opt(
+        "llamabored_gpu_memory_total_bytes",
+        "GPU memory total, bytes.",
+        host.vram_total_bytes,
+    );
+    out.bytes_opt(
+        "llamabored_memory_used_bytes",
+        "System memory in use (MemTotal - MemAvailable), bytes.",
+        host.mem_used_bytes,
+    );
+    out.bytes_opt(
+        "llamabored_memory_total_bytes",
+        "System memory total, bytes.",
+        host.mem_total_bytes,
+    );
+
     if let Some(total) = snap.tokens.decoded_total {
         out.family(
             "llamabored_tokens_decoded_total",
@@ -322,6 +415,14 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             "Tokens decoded since the watcher started.",
         );
         out.sample("llamabored_tokens_decoded_total", &[], &total.to_string());
+    }
+    if let Some(total) = snap.tokens.prompt_total {
+        out.family(
+            "llamabored_tokens_prompt_total",
+            "counter",
+            "Prompt tokens processed since the watcher started.",
+        );
+        out.sample("llamabored_tokens_prompt_total", &[], &total.to_string());
     }
 
     out.family(
@@ -346,31 +447,147 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             out.sample("llamabored_model_loaded", &labels.pairs(), "1");
         }
     }
-    let mut ctx: BTreeSet<(String, String, u32)> = BTreeSet::new();
-    for model in &snap.ai.models {
-        if let Some(size) = model.detail.as_ref().and_then(|d| d.ctx).filter(|c| *c > 0) {
-            let labels = ModelLabels::of(model);
-            ctx.insert((labels.name, labels.full_name, size));
+    let models = &snap.ai.models;
+    let states = per_model(models, |m| Some(model_state_label(m.state).to_owned()));
+    if !states.is_empty() {
+        out.family(
+            "llamabored_model_state",
+            "gauge",
+            "Lifecycle of a loaded model; the current state is 1.",
+        );
+        for (name, full_name, current) in &states {
+            for state in ["ready", "starting", "stopping", "other"] {
+                out.sample(
+                    "llamabored_model_state",
+                    &[("name", name), ("full_name", full_name), ("state", state)],
+                    if state == current { "1" } else { "0" },
+                );
+            }
         }
     }
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut first = true;
-    for (name, full_name, size) in ctx {
-        if !seen.insert((name.clone(), full_name.clone())) {
-            continue;
-        }
-        if first {
-            out.family(
-                "llamabored_model_ctx_size_tokens",
-                "gauge",
-                "Configured context size of a loaded model, tokens.",
-            );
-            first = false;
-        }
-        out.sample(
+    let model_families: [(&str, &str, &str, ModelValue); 7] = [
+        (
             "llamabored_model_ctx_size_tokens",
-            &[("name", &name), ("full_name", &full_name)],
-            &size.to_string(),
+            "gauge",
+            "Configured context size of a loaded model, tokens.",
+            |m| {
+                m.detail
+                    .as_ref()
+                    .and_then(|d| d.ctx)
+                    .filter(|c| *c > 0)
+                    .map(|c| c.to_string())
+            },
+        ),
+        (
+            "llamabored_model_requests_running",
+            "gauge",
+            "Requests a loaded model is running now (SGLang, vLLM and other backends without slots).",
+            |m| m.running.map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_requests_queued",
+            "gauge",
+            "Requests waiting for a loaded model (SGLang, vLLM and other backends without slots).",
+            |m| m.queued.map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_kv_cache_usage_ratio",
+            "gauge",
+            "KV cache fill of a loaded model, 0 to 1 (SGLang, vLLM and other backends without slots).",
+            |m| m.kv_fill.filter(|v| v.is_finite()).map(num),
+        ),
+        (
+            "llamabored_model_cache_hit_ratio",
+            "gauge",
+            "Prefix cache hit ratio of a loaded model, 0 to 1 (SGLang, vLLM).",
+            |m| m.cache_hit.filter(|v| v.is_finite()).map(num),
+        ),
+        (
+            "llamabored_slots_busy",
+            "gauge",
+            "llama.cpp slots of a loaded model that are processing.",
+            |m| m.slots_busy.map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_slots_total",
+            "gauge",
+            "llama.cpp slots of a loaded model.",
+            |m| m.slots_total.map(|n| n.to_string()),
+        ),
+    ];
+    for (name, kind, help, value) in model_families {
+        let keyed = per_model(models, value);
+        let rows: Vec<(Vec<(&str, &str)>, String)> = keyed
+            .iter()
+            .map(|(model, full, value)| {
+                (
+                    vec![("name", model.as_str()), ("full_name", full.as_str())],
+                    value.clone(),
+                )
+            })
+            .collect();
+        out.rows(name, kind, help, &rows);
+    }
+
+    // Fans: the wire already refuses a repeated channel, so each label set
+    // is unique; the channel is the key and the label rides along.
+    let mut fans: Vec<&FanWire> = snap.fans.iter().collect();
+    fans.sort_by_key(|fan| fan.channel);
+    let channels: Vec<String> = fans.iter().map(|fan| fan.channel.to_string()).collect();
+    let fan_rows = |value: fn(&FanWire) -> Option<String>| -> Vec<(Vec<(&str, &str)>, String)> {
+        fans.iter()
+            .zip(&channels)
+            .filter_map(|(fan, channel)| {
+                Some((
+                    vec![("channel", channel.as_str()), ("label", fan.label.as_str())],
+                    value(fan)?,
+                ))
+            })
+            .collect()
+    };
+    out.rows(
+        "llamabored_fan_rpm",
+        "gauge",
+        "Fan speed, rpm, per configured [fans] channel.",
+        &fan_rows(|fan| fan.rpm.map(|rpm| rpm.to_string())),
+    );
+    out.rows(
+        "llamabored_fan_pwm_ratio",
+        "gauge",
+        "Fan PWM duty, 0 to 1, per configured [fans] channel (read only).",
+        &fan_rows(|fan| fan.pwm.filter(|v| v.is_finite()).map(num)),
+    );
+
+    if let Some(sources) = &snap.sources {
+        let entries = sources.entries();
+        let up: Vec<(Vec<(&str, &str)>, String)> = entries
+            .iter()
+            .filter_map(|(name, source)| {
+                let source = (*source)?;
+                Some((
+                    vec![("source", *name)],
+                    if source.up { "1" } else { "0" }.to_owned(),
+                ))
+            })
+            .collect();
+        out.rows(
+            "llamabored_source_up",
+            "gauge",
+            "1 when a watcher source answered on its last poll, 0 when it failed; absent when not polled.",
+            &up,
+        );
+        let latency: Vec<(Vec<(&str, &str)>, String)> = entries
+            .iter()
+            .filter_map(|(name, source)| {
+                let seconds = (*source)?.latency_s.filter(|v| v.is_finite())?;
+                Some((vec![("source", *name)], num(seconds)))
+            })
+            .collect();
+        out.rows(
+            "llamabored_source_latency_seconds",
+            "gauge",
+            "Duration of a watcher source's last poll, seconds.",
+            &latency,
         );
     }
     out.text

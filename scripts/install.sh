@@ -944,8 +944,11 @@ the steps below; run them yourself, as root, one at a time.
   # 4. Then start the writer:
   systemctl enable --now kraken-lcd
 
-Upgrading an install that already runs? Restart instead:
-  systemctl try-restart llama-watch kraken-lcd
+Upgrading an install that already runs? Move the running units onto the new
+binaries. try-restart restarts only units that are running now (here any of
+llama-watch, kraken-lcd, llama-light, llama-metrics); a stopped unit stays
+stopped and nothing is enabled:
+  systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics
 
 Optional:
   systemctl --global enable kraken-lcd-halt.path   # desktop alert on HALTED
@@ -2498,7 +2501,7 @@ self_test() {
     "install -d -o kraken-lcd -g kraken-lcd -m 0755 /var/lib/kraken-lcd" \
     "runuser -u kraken-lcd -- /usr/local/libexec/llama-bored/kraken-lcd show-image --view <test-card>" \
     "systemctl enable --now kraken-lcd" \
-    "systemctl try-restart llama-watch kraken-lcd" \
+    "systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics" \
     "systemctl --global enable kraken-lcd-halt.path" \
     'usermod -aG llama-view $SUDO_USER' \
     "how to roll back"; do

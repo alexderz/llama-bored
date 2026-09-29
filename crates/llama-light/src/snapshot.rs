@@ -5,6 +5,7 @@
 //! larger than `wire::MAX_BYTES`, and is accepted only through
 //! `wire::parse_validated`.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use llama_core::wire::{self, SnapshotV1};
@@ -15,13 +16,14 @@ pub const MISSING: &str = "snapshot missing";
 pub const NOT_REGULAR: &str = "snapshot not a regular file";
 /// Over the size cap.
 pub const TOO_LARGE: &str = "snapshot too large";
-/// Failed to read, parse or validate.
+/// Failed to open or read.
 pub const INVALID: &str = "snapshot invalid";
 
 /// Where snapshots come from. Tests supply a fake.
 pub trait SnapshotSource {
-    /// The current snapshot, validated.
-    fn read(&mut self) -> Result<SnapshotV1, &'static str>;
+    /// The current snapshot, validated. The error is the log line: one of
+    /// the constants above, or `snapshot rejected: <validator reason>`.
+    fn read(&mut self) -> Result<SnapshotV1, Cow<'static, str>>;
 }
 
 /// The published snapshot file.
@@ -46,7 +48,16 @@ impl SnapshotFile {
 }
 
 impl SnapshotSource for SnapshotFile {
-    fn read(&mut self) -> Result<SnapshotV1, &'static str> {
+    fn read(&mut self) -> Result<SnapshotV1, Cow<'static, str>> {
+        self.read_file()
+            .map_err(Cow::Borrowed)?
+            .map_err(|err| Cow::Owned(format!("snapshot rejected: {err}")))
+    }
+}
+
+impl SnapshotFile {
+    /// The file checks; the inner result is the validated parse.
+    fn read_file(&self) -> Result<Result<SnapshotV1, wire::WireError>, &'static str> {
         let fd = match rustix::fs::open(
             &self.path,
             rustix::fs::OFlags::RDONLY
@@ -80,6 +91,6 @@ impl SnapshotSource for SnapshotFile {
         if filled > wire::MAX_BYTES {
             return Err(TOO_LARGE);
         }
-        wire::parse_validated(&buf[..filled]).map_err(|_| INVALID)
+        Ok(wire::parse_validated(&buf[..filled]))
     }
 }

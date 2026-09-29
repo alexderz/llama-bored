@@ -11,7 +11,8 @@
 //! sysfs and drive the fans. This module only ever reads them, with
 //! [`std::fs::read_to_string`]. `tests/s14_fans_readonly.rs` fences it.
 //!
-//! Fans stay in the watcher: the snapshot and wire schema do not carry them.
+//! The snapshot carries each fan's rpm and pwm as read-only numbers for
+//! llama-metrics (#11); nothing reads them back to drive a fan.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

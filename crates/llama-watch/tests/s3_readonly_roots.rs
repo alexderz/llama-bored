@@ -159,6 +159,7 @@ fn readonly_roots_complete_collect() {
         ai: AiState::Idle,
         models: Vec::new(),
         decoded_total: None,
+        prompt_total: None,
     };
     let snapshot = collector
         .sample(Instant::now(), SystemTime::UNIX_EPOCH, &view)

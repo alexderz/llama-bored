@@ -20,8 +20,10 @@ pub const KV_DEFAULT: &str = "f16";
 pub const SEPARATOR: &str = " \u{00B7} ";
 
 /// Tuning numbers and tokens for one model. Every field is optional.
+///
+/// Part of the snapshot wire: an unknown key is ignored, like every wire
+/// struct (see [`crate::wire`], Compatibility).
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelDetail {
     /// Context size in tokens (`-c`). Absent or zero is the model default.
     #[serde(default, skip_serializing_if = "Option::is_none")]

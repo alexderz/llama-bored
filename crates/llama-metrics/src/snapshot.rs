@@ -14,7 +14,10 @@ pub enum ReadError {
     Missing,
     NotRegular,
     TooLarge,
+    /// The file could not be opened or read.
     Invalid,
+    /// [`wire::parse_validated`] refused the bytes.
+    Rejected(wire::WireError),
 }
 
 impl ReadError {
@@ -26,6 +29,19 @@ impl ReadError {
             Self::NotRegular => "not_regular",
             Self::TooLarge => "too_large",
             Self::Invalid => "invalid",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    /// Why, for the log: the label, or the validator's reason.
+    #[must_use]
+    pub fn reason(self) -> String {
+        match self {
+            Self::Missing => "missing".to_owned(),
+            Self::NotRegular => "not a regular file".to_owned(),
+            Self::TooLarge => "too large".to_owned(),
+            Self::Invalid => "unreadable".to_owned(),
+            Self::Rejected(err) => err.to_string(),
         }
     }
 }
@@ -88,7 +104,7 @@ impl SnapshotFile {
         if filled > wire::MAX_BYTES {
             return Err(ReadError::TooLarge);
         }
-        wire::parse_validated(&buf[..filled]).map_err(|_| ReadError::Invalid)
+        wire::parse_validated(&buf[..filled]).map_err(ReadError::Rejected)
     }
 }
 

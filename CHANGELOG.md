@@ -6,6 +6,23 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- llama-metrics exports everything the dashboards show: GPU and CPU power
+  and the GPU power limit, VRAM and system memory in bytes, a prompt-token
+  counter, llama.cpp slots busy and total, SGLang/vLLM running and queued
+  requests, KV cache fill and cache hit ratio, model lifecycle state, fan
+  rpm and pwm, and per-source health and latency. A test fails when a
+  snapshot field is not exported (#11).
+
+### Fixed
+
+- Readers ignore unknown snapshot fields within the same schema number
+  (known fields stay strictly validated), so upgrading llama-watch no
+  longer blinds an older llama-metrics or llama-light; both now log once
+  why they reject a snapshot. install.sh's printed restart step covers all
+  four units (#12).
+
 ## 0.2.0 — 2026-09-29
 
 ### Added

@@ -18,6 +18,7 @@ use crate::backend::Backend;
 use crate::config::{ConfigSource, LightConfig, Stamp};
 use crate::mapping::{Frames, Renderer, fade, keyboard_neutral_frame, neutral_frame};
 use crate::snapshot::SnapshotSource;
+use std::borrow::Cow;
 
 /// A snapshot older than this is stale: the last frame is held.
 pub const HOLD_AFTER: Duration = Duration::from_secs(5);
@@ -238,7 +239,7 @@ pub struct Light<C, S, F, N, L> {
     /// The stamp of the last rejected file (`Some(None)`: the file was gone).
     rejected: Option<Option<Stamp>>,
     latest: Option<SnapshotV1>,
-    snapshot_label: Option<&'static str>,
+    snapshot_label: Option<Cow<'static, str>>,
     live_frame: Option<Frames>,
     frames_sent: u64,
     keyboard_frames_sent: u64,
@@ -447,29 +448,31 @@ where
     }
 
     fn read_snapshot(&mut self, now: u64) {
-        let label = match self.snapshots.read() {
+        // Logged once per distinct label, so a rejection reason logs once
+        // and again only after a good read or a different reason (#12).
+        let label: Cow<'static, str> = match self.snapshots.read() {
             Ok(snapshot) if snapshot.t_mono_ns > now.saturating_add(nanos(FUTURE_SLACK)) => {
-                "snapshot from the future"
+                Cow::Borrowed("snapshot from the future")
             }
             Ok(snapshot) => {
                 let fresh = now.saturating_sub(snapshot.t_mono_ns) <= nanos(HOLD_AFTER);
                 self.latest = Some(snapshot);
-                if fresh {
+                Cow::Borrowed(if fresh {
                     "snapshot fresh"
                 } else {
                     "snapshot stale"
-                }
+                })
             }
             Err(label) => label,
         };
-        if self.snapshot_label != Some(label) {
-            self.snapshot_label = Some(label);
+        if self.snapshot_label.as_deref() != Some(label.as_ref()) {
             let priority = if label == "snapshot fresh" {
                 Priority::Info
             } else {
                 Priority::Warning
             };
-            log::emit(&mut self.sink, priority, label);
+            log::emit(&mut self.sink, priority, &label);
+            self.snapshot_label = Some(label);
         }
     }
 

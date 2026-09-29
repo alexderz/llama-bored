@@ -101,10 +101,25 @@ falls back to utilisation.
 
 **llama-metrics** (Prometheus)
 
-- `GET /metrics` on `:19477` for a CIDR allowlist, with gauges for activity,
-  load, CPU, GPU, memory, temperatures, model state and context size, a
-  decoded-token counter, and snapshot age and staleness. Numbers and model
-  names only; never prompt or output text.
+- `GET /metrics` on `:19477` for a CIDR allowlist. Numbers and model names
+  only; never prompt or output text. Everything the dashboards show is
+  exported (a test fails if a snapshot field is not):
+
+| Series | Labels | Meaning |
+|---|---|---|
+| `llamabored_activity_pct`, `_load_pct`, `_cpu_pct`, `_cpu_topk_pct`, `_gpu_pct`, `_mem_pct` | | Host load, % |
+| `llamabored_coolant_celsius`, `_cpu_celsius`, `_gpu_celsius` | | Temperatures |
+| `llamabored_gpu_power_watts`, `_gpu_power_limit_watts`, `_cpu_power_watts` | | Power draw and GPU limit |
+| `llamabored_gpu_memory_used_bytes`, `_total_bytes`; `llamabored_memory_used_bytes`, `_total_bytes` | | VRAM and system memory |
+| `llamabored_tokens_decoded_total`, `llamabored_tokens_prompt_total` | | Counters since the watcher started; use `rate()` for tok/s |
+| `llamabored_ai_state` | `state` | down / idle / loaded |
+| `llamabored_model_loaded`, `_model_ctx_size_tokens`, `_model_state` | `name`, `full_name`, ... | Loaded models, context size, lifecycle (ready / starting / stopping) |
+| `llamabored_slots_busy`, `llamabored_slots_total` | `name`, `full_name` | llama.cpp slots |
+| `llamabored_model_requests_running`, `_requests_queued`, `_kv_cache_usage_ratio`, `_cache_hit_ratio` | `name`, `full_name` | SGLang / vLLM request and cache gauges |
+| `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
+| `llamabored_source_up`, `llamabored_source_latency_seconds` | `source` | Health of each watcher source (llama-swap, running, slots, metrics, activity, gpu, hwmon, proc) |
+| `llamabored_snapshot_up`, `_snapshot_stale`, `_snapshot_age_seconds`, `_snapshot_seq` | | Snapshot freshness |
+| `llamabored_exporter_build_info`, `_exporter_rejected_connections_total` | | Exporter version and refusals |
 
 **Backends behind llama-swap.** llama-bored tells each model's server apart
 by its launch command (or `[llama.backends]` in `watch.toml`):

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot};
 use llama_core::wire::{self, AiWire, ModelState};
-use llama_watch::publish::{PublishError, Publisher};
+use llama_watch::publish::{Extras, PublishError, Publisher};
 
 fn scratch(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -73,6 +73,7 @@ fn view(ai: AiState, models: Vec<ModelInfo>, decoded: Option<u64>) -> LlamaView 
         ai,
         models,
         decoded_total: decoded,
+        prompt_total: None,
     }
 }
 
@@ -226,6 +227,169 @@ fn wire_fields_come_from_the_snapshot_and_the_llama_view() {
     assert_eq!(again.run_id, first_run);
     assert_eq!(again.seq, 3);
     assert!(again.t_mono_ns >= first_mono);
+}
+
+fn sglang(hit_permille: Option<u16>) -> Option<llama_core::backend::BackendInfo> {
+    Some(llama_core::backend::BackendInfo {
+        kind: llama_core::backend::Backend::SgLang,
+        running: Some(2),
+        queued: Some(1),
+        kv_permille: Some(370),
+        hit_permille,
+        ..Default::default()
+    })
+}
+
+fn model(name: &str, backend: Option<llama_core::backend::BackendInfo>) -> ModelInfo {
+    ModelInfo {
+        backend,
+        name: name.to_owned(),
+        state: "ready".to_owned(),
+        full_name: None,
+        detail: None,
+    }
+}
+
+#[test]
+fn metrics_extras_reach_the_wire() {
+    let dir = scratch("extras");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let mut snap = snapshot(
+        SystemTime::now(),
+        None,
+        AiState::Loaded,
+        vec![
+            model("flash", sglang(Some(800))),
+            model(
+                "bonsai",
+                Some(llama_core::backend::BackendInfo {
+                    kind: llama_core::backend::Backend::LlamaCpp,
+                    // llama.cpp keeps its slot view; no gauges on the wire.
+                    hit_permille: Some(500),
+                    ..Default::default()
+                }),
+            ),
+        ],
+    );
+    snap.mem_pct = Some(50.0);
+    let mut llama = view(AiState::Loaded, snap.models.clone(), Some(10));
+    llama.prompt_total = Some(4_000);
+    let extras = Extras {
+        gpu_w: Some(312.5),
+        gpu_limit_w: Some(600.0),
+        cpu_w: Some(88.25),
+        vram_used: Some(20 << 30),
+        vram_total: Some(32 << 30),
+        mem_used: Some(64 << 30),
+        mem_total: Some(128 << 30),
+        slots: vec![("bonsai".to_owned(), 1, 4), ("gone".to_owned(), 1, 1)],
+        fans: vec![
+            (2, "CPU".to_owned(), Some(1200), Some(255)),
+            (3, "fan3".to_owned(), None, Some(0)),
+        ],
+        sources: Some(wire::Sources {
+            llama_swap: Some(wire::SourceWire {
+                up: true,
+                latency_s: Some(0.003),
+            }),
+            ..Default::default()
+        }),
+    };
+    publisher
+        .publish_with(&snap, &llama, &extras)
+        .expect("publish");
+    let wire = wire::parse_validated(&std::fs::read(dir.join("snapshot.json")).unwrap())
+        .expect("validates");
+    assert_eq!(wire.host.gpu_w, Some(312.5));
+    assert_eq!(wire.host.gpu_limit_w, Some(600.0));
+    assert_eq!(wire.host.cpu_w, Some(88.25));
+    assert_eq!(wire.host.vram_used_bytes, Some(20 << 30));
+    assert_eq!(wire.host.vram_total_bytes, Some(32 << 30));
+    assert_eq!(wire.host.mem_used_bytes, Some(64 << 30));
+    assert_eq!(wire.host.mem_total_bytes, Some(128 << 30));
+    assert_eq!(wire.tokens.prompt_total, Some(4_000));
+    let flash = &wire.ai.models[0];
+    assert_eq!(
+        (flash.running, flash.queued, flash.kv_fill, flash.cache_hit),
+        (Some(2), Some(1), Some(0.37), Some(0.8))
+    );
+    assert_eq!((flash.slots_busy, flash.slots_total), (None, None));
+    let bonsai = &wire.ai.models[1];
+    assert_eq!(bonsai.cache_hit, None, "llama.cpp gauges stay off the wire");
+    assert_eq!((bonsai.slots_busy, bonsai.slots_total), (Some(1), Some(4)));
+    assert_eq!(wire.fans.len(), 2);
+    assert_eq!(wire.fans[0].channel, 2);
+    assert_eq!(wire.fans[0].label, "CPU");
+    assert_eq!(wire.fans[0].rpm, Some(1200));
+    assert_eq!(wire.fans[0].pwm, Some(1.0));
+    assert_eq!(wire.fans[1].rpm, None);
+    assert_eq!(wire.fans[1].pwm, Some(0.0));
+    let sources = wire.sources.expect("sources");
+    assert_eq!(
+        sources.llama_swap,
+        Some(wire::SourceWire {
+            up: true,
+            latency_s: Some(0.003)
+        })
+    );
+    assert_eq!(sources.proc, None);
+}
+
+#[test]
+fn out_of_range_extras_are_left_out_not_fatal() {
+    let dir = scratch("extras-bad");
+    let lines = Capture::default();
+    let mut publisher = Publisher::open(&dir, lines.clone()).expect("open");
+    let extras = Extras {
+        gpu_w: Some(f64::NAN),
+        gpu_limit_w: Some(1e9),
+        cpu_w: Some(-1.0),
+        vram_used: Some(u64::MAX),
+        slots: vec![("x".to_owned(), 9, 4)],
+        fans: vec![
+            (0, "zero".to_owned(), None, None),
+            (17, "high".to_owned(), None, None),
+            (1, "\n\t".to_owned(), None, None),
+            (2, "fast".to_owned(), Some(u32::MAX), None),
+            (2, "again".to_owned(), None, None),
+        ],
+        sources: Some(wire::Sources {
+            metrics: Some(wire::SourceWire {
+                up: false,
+                latency_s: Some(1e6),
+            }),
+            ..Default::default()
+        }),
+        ..Extras::default()
+    };
+    let snap = snapshot(
+        SystemTime::now(),
+        None,
+        AiState::Loaded,
+        vec![model("x", None)],
+    );
+    let llama = view(AiState::Loaded, snap.models.clone(), None);
+    publisher
+        .publish_with(&snap, &llama, &extras)
+        .expect("still publishes");
+    let wire = wire::parse_validated(&std::fs::read(dir.join("snapshot.json")).unwrap())
+        .expect("validates");
+    assert_eq!(wire.host.gpu_w, None);
+    assert_eq!(wire.host.gpu_limit_w, None);
+    assert_eq!(wire.host.cpu_w, None);
+    assert_eq!(wire.host.vram_used_bytes, None);
+    assert_eq!(wire.ai.models[0].slots_busy, None);
+    assert_eq!(wire.ai.models[0].slots_total, None);
+    assert_eq!(wire.fans.len(), 1, "{:?}", wire.fans);
+    assert_eq!((wire.fans[0].channel, wire.fans[0].rpm), (2, None));
+    assert_eq!(
+        wire.sources.and_then(|s| s.metrics),
+        Some(wire::SourceWire {
+            up: false,
+            latency_s: None
+        })
+    );
+    assert!(lines.lines().is_empty(), "{:?}", lines.lines());
 }
 
 #[test]
@@ -553,6 +717,8 @@ fn backend_and_its_gauges_reach_the_wire() {
     );
     assert_eq!(m[3].backend, None);
     let text = std::str::from_utf8(&bytes).expect("utf8");
-    assert!(!text.contains("hit"), "hit rate stays off the wire: {text}");
+    // Since #11 the hit rate is on the wire as `cache_hit`, for llama-metrics.
+    assert_eq!(m[0].cache_hit, Some(0.8));
+    assert_eq!(m[1].cache_hit, None);
     assert!(!text.contains("max_running"), "{text}");
 }

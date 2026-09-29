@@ -748,8 +748,9 @@ impl<P: service::PublishStep> service::PublishStep for SeqLog<P> {
         &mut self,
         snapshot: &llama_core::sample::Snapshot,
         llama: &LlamaView,
+        extras: &llama_watch::publish::Extras,
     ) -> Result<(), llama_watch::publish::PublishError> {
-        self.inner.publish(snapshot, llama)?;
+        self.inner.publish(snapshot, llama, extras)?;
         let bytes = std::fs::read(&self.path).unwrap_or_default();
         let wire = wire::parse_validated(&bytes).expect("tick snapshot validates");
         self.seqs.lock().expect("seqs").push(wire.seq);
@@ -1065,7 +1066,12 @@ impl Fixture {
 struct OkPublish;
 
 impl service::PublishStep for OkPublish {
-    fn publish(&mut self, _snapshot: &Snapshot, _llama: &LlamaView) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        _snapshot: &Snapshot,
+        _llama: &LlamaView,
+        _extras: &llama_watch::publish::Extras,
+    ) -> Result<(), PublishError> {
         Ok(())
     }
 }
@@ -1075,7 +1081,12 @@ struct SeenPublish {
 }
 
 impl service::PublishStep for SeenPublish {
-    fn publish(&mut self, _snapshot: &Snapshot, llama: &LlamaView) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        _snapshot: &Snapshot,
+        llama: &LlamaView,
+        _extras: &llama_watch::publish::Extras,
+    ) -> Result<(), PublishError> {
         let name = llama
             .models
             .first()
@@ -1091,7 +1102,12 @@ struct Flaky {
 }
 
 impl service::PublishStep for Flaky {
-    fn publish(&mut self, _snapshot: &Snapshot, _llama: &LlamaView) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        _snapshot: &Snapshot,
+        _llama: &LlamaView,
+        _extras: &llama_watch::publish::Extras,
+    ) -> Result<(), PublishError> {
         if self.left > 0 {
             self.left -= 1;
             return Err(PublishError::Write(io::Error::other("disk")));
@@ -1241,6 +1257,7 @@ fn view_named(name: &str) -> LlamaView {
             detail: None,
         }],
         decoded_total: Some(1),
+        prompt_total: None,
     }
 }
 
@@ -1338,7 +1355,12 @@ struct FailAfterOk {
 }
 
 impl service::PublishStep for FailAfterOk {
-    fn publish(&mut self, _snapshot: &Snapshot, _llama: &LlamaView) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        _snapshot: &Snapshot,
+        _llama: &LlamaView,
+        _extras: &llama_watch::publish::Extras,
+    ) -> Result<(), PublishError> {
         if self.left > 0 {
             self.left -= 1;
             Ok(())
