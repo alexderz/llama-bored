@@ -21,6 +21,11 @@ const WRITE_FILES: &[&str] = &[
     // forbids any file write in that crate.
     "crates/llama-cast/src/http.rs",
     "crates/llama-cast/src/encoder.rs",
+    // #22: llama-watch's root pre-step writes one space and a carriage
+    // return to /dev/tty11 to end a deferred framebuffer console take-over
+    // before setfont. S13 pins its only paths to /dev/tty11, the font dir,
+    // setfont and stty.
+    "crates/llama-watch/src/tty/setup.rs",
 ];
 /// S16: llama-metrics and llama-cast are the only crates that may name a
 /// listening or datagram socket, or bind one. Every other crate

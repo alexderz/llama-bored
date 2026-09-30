@@ -6,6 +6,13 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- The configured tty11 `[tty] font` and `size` now survive a reboot: at boot
+  the framebuffer console's take-over can still be deferred, so
+  `llama-watch tty-setup` writes one space to tty11 first and retries
+  `setfont` for up to 5 s before setting the size (#22).
+
 ## 0.3.0 — 2026-09-30
 
 ### Added
