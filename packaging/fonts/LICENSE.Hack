@@ -1,7 +1,8 @@
-llama-hack-12x24.psfu is a bitmap console font rendered by build-psf.py from
+llama-hack-12x24.psfu and llama-hack-12x22.psfu are bitmap console fonts rendered
+by build-psf.py from
 Hack Regular 3.003 (https://github.com/source-foundry/Hack). The block elements
-U+2580-2595 are drawn by build-psf.py, not taken from Hack. The font is renamed
-and does not use the reserved names "Bitstream" or "Vera".
+U+2580-2595 are drawn by build-psf.py, not taken from Hack. The fonts are renamed
+and do not use the reserved names "Bitstream" or "Vera".
 
 Upstream license, verbatim from /usr/share/licenses/source-foundry-hack-fonts/LICENSE.md
 (source-foundry-hack-fonts-3.003-7.fc44):

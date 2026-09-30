@@ -227,6 +227,7 @@ assert_packaging_contract() {
   assert_hidraw_rules_golden "$rules"
   assert_light_contract "$root"
   assert_metrics_contract "$root"
+  assert_cast_contract "$root"
 }
 
 # llama-light, the RGB writer. Colour only, its own uid, only the Aura
@@ -523,6 +524,155 @@ assert_metrics_contract() {
   assert_metrics_unit_golden "$unit"
 }
 
+# llama-cast, the LAN DLNA streamer. Its own uid, the llama-view group for
+# tty11's screen, one device (/dev/vcsa11, read-only), IP allowlist plus the
+# SSDP group and both bind ports pinned in the kernel. Directives only
+# (comments ignored).
+cast_directive_golden() {
+  cat <<'EOF'
+[Unit]
+Description=Llama Cast - tty11 dashboard as a DLNA live video (read-only, LAN)
+After=llama-watch.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+[Service]
+Type=notify
+NotifyAccess=main
+User=llama-cast
+Group=llama-cast
+SupplementaryGroups=llama-view
+ExecStart=/usr/local/libexec/llama-bored/llama-cast run --config /etc/llama-bored/cast.toml
+ExecStop=/usr/local/libexec/llama-bored/llama-cast bye --config /etc/llama-bored/cast.toml
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+WatchdogSec=10
+TimeoutStopSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+InaccessiblePaths=/sys
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+DeviceAllow=/dev/vcsa11 r
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressAllow=192.168.0.0/16 127.0.0.1/32 239.255.255.250/32
+IPAddressDeny=any
+SocketBindAllow=tcp:19478
+SocketBindAllow=udp:1900
+SocketBindDeny=any
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+assert_cast_unit_golden() {
+  local unit=$1 got want tmp extra
+  got="$(unit_directives "$unit")"
+  want="$(cast_directive_golden)"
+  assert_text_eq "$got" "$want" "llama-cast unit directive set drifted"
+  local -a plants=(
+    'DeviceAllow=char-hidraw rw'
+    'DeviceAllow=/dev/vcsa11 rw'
+    'DeviceAllow=char-vcs r'
+    'DeviceAllow=/dev/tty11 rw'
+    'SupplementaryGroups=kraken-lcd'
+    'SupplementaryGroups=tty'
+    'IPAddressAllow=any'
+    'IPAddressAllow=0.0.0.0/0'
+    'SocketBindAllow=any'
+    'SocketBindAllow=tcp:80'
+    'ReadWritePaths=/run/llama-watch'
+    'ReadOnlyPaths=/sys'
+    'AmbientCapabilities=CAP_NET_BIND_SERVICE'
+    'MemoryDenyWriteExecute=no'
+    'User=llama-watch'
+  )
+  for extra in "${plants[@]}"; do
+    tmp="$(mktemp)"
+    cat -- "$unit" >"$tmp"
+    printf '\n%s\n' "$extra" >>"$tmp"
+    got="$(unit_directives "$tmp")"
+    rm -f -- "$tmp"
+    if [[ "$got" == "$want" ]]; then
+      echo "stage self-test: llama-cast unit accepted an added directive: $extra" >&2
+      exit 1
+    fi
+  done
+}
+
+# The example config's allow list plus the SSDP group must be the unit's
+# IPAddressAllow=, and its listen port and udp/1900 the unit's
+# SocketBindAllow=. crates/llama-cast/tests/packaging.rs checks the same
+# with the real config parser.
+assert_cast_contract() {
+  local root=$1 unit sys example f allow_cfg allow_unit port_cfg binds
+  unit="$root/packaging/llama-cast.service"
+  sys="$root/packaging/llama-bored.sysusers"
+  example="$root/packaging/cast.example.toml"
+  for f in "$unit" "$example"; do
+    if [[ ! -f "$f" ]]; then
+      echo "stage self-test: missing $f" >&2
+      exit 1
+    fi
+  done
+  if ! grep -F -q -x -- 'u llama-cast - "Llama Cast DLNA streamer" / /usr/sbin/nologin' "$sys"; then
+    echo "stage self-test: sysusers missing the llama-cast user" >&2
+    exit 1
+  fi
+  if grep -E -q '^m[[:space:]]+llama-cast' "$sys"; then
+    echo "stage self-test: llama-cast must not get extra groups from sysusers" >&2
+    exit 1
+  fi
+  if unit_directives "$unit" | grep -E -i -q '1e71|hidraw|i2c|usb|nvidia|ReadWritePaths'; then
+    echo "stage self-test: llama-cast unit names a cooling or bus device, or a writable path" >&2
+    exit 1
+  fi
+  if [[ "$(unit_directives "$unit" | grep -E '^DeviceAllow=')" != 'DeviceAllow=/dev/vcsa11 r' ]]; then
+    echo "stage self-test: llama-cast may read /dev/vcsa11 and no other device" >&2
+    exit 1
+  fi
+  allow_cfg="$( { sed -n 's/^allow = \[\(.*\)\]$/\1/p' "$example" | tr ',' '\n' | tr -d '" '; echo 239.255.255.250/32; } | LC_ALL=C sort | tr '\n' ' ')"
+  allow_unit="$(sed -n 's/^IPAddressAllow=//p' "$unit" | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')"
+  if [[ "$allow_cfg" == "239.255.255.250/32 " || "$allow_cfg" != "$allow_unit" ]]; then
+    echo "stage self-test: cast.example.toml allow + SSDP group ($allow_cfg) is not IPAddressAllow= ($allow_unit)" >&2
+    exit 1
+  fi
+  port_cfg="$(sed -n 's/^listen = ".*:\([0-9][0-9]*\)"$/\1/p' "$example")"
+  binds="$(sed -n 's/^SocketBindAllow=//p' "$unit" | tr '\n' ' ')"
+  if [[ -z "$port_cfg" || "$binds" != "tcp:$port_cfg udp:1900 " ]]; then
+    echo "stage self-test: cast.example.toml listen port ($port_cfg) and udp:1900 are not SocketBindAllow= ($binds)" >&2
+    exit 1
+  fi
+  if ! grep -F -q 'LAN-exposed by design' "$example"; then
+    echo "stage self-test: cast.example.toml does not say it is LAN-exposed" >&2
+    exit 1
+  fi
+  assert_cast_unit_golden "$unit"
+}
+
 # Directives only: comments and blank lines are not part of the pin.
 unit_directives() {
   awk '
@@ -746,7 +896,7 @@ _stage_review() {
   # make an unlanded HEAD installable.
   refuse_unless_landed "$repo" || return 1
   provenance="$repo/target/check-provenance.txt"
-  for name in kraken-lcd llama-watch llama-view llama-light llama-metrics; do
+  for name in kraken-lcd llama-watch llama-view llama-light llama-metrics llama-cast; do
     binary="$repo/target/release/$name"
     if [[ ! -f "$binary" || -L "$binary" ]]; then
       echo "stage.sh: release binary missing at $binary" >&2
@@ -768,17 +918,18 @@ _stage_review() {
     "$repo/target/release/llama-watch" \
     "$repo/target/release/llama-view" \
     "$repo/target/release/llama-light" \
-    "$repo/target/release/llama-metrics" || return 1
+    "$repo/target/release/llama-metrics" \
+    "$repo/target/release/llama-cast" || return 1
   anchor_summary "$repo" "$installed_sha_file" || return 1
 }
 
 check_provenance() {
   local repo=$1 file=$2
-  local -a prov=() sums=() binaries=(kraken-lcd llama-watch llama-view llama-light llama-metrics)
+  local -a prov=() sums=() binaries=(kraken-lcd llama-watch llama-view llama-light llama-metrics llama-cast)
   local rustc_v cargo_v current head describe live_hash recorded_hash path i
   mapfile -t prov <"$file" || return 1
-  if [[ ${#prov[@]} -ne 11 ]]; then
-    echo "stage.sh: $file must have 11 lines from scripts/check.sh" >&2
+  if [[ ${#prov[@]} -ne 12 ]]; then
+    echo "stage.sh: $file must have 12 lines from scripts/check.sh" >&2
     return 1
   fi
   if ! capture rustc_v rustc -V; then
@@ -829,9 +980,9 @@ check_provenance() {
     return 1
   fi
   # Line 7 is kraken-lcd, line 8 is llama-watch, line 9 is llama-view,
-  # line 10 is llama-light, line 11 is llama-metrics. S6 still checks the
-  # LCD writer.
-  for i in 0 1 2 3 4; do
+  # line 10 is llama-light, line 11 is llama-metrics, line 12 is llama-cast.
+  # S6 still checks the LCD writer.
+  for i in 0 1 2 3 4 5; do
     path="$repo/target/release/${binaries[$i]}"
     if ! capture live_hash sha256sum -- "$path"; then
       echo "stage.sh: sha256sum of $path failed" >&2
@@ -940,6 +1091,7 @@ review_since() {
 anchor_summary() {
   local repo=$1 installed_sha_file=$2
   local line since label head subject dash_hash watch_hash view_hash light_hash metrics_hash
+  local cast_hash
   line="$(resolve_since "$repo" "$installed_sha_file")" || return 1
   since="${line%%$'\t'*}"
   label="${line#*$'\t'}"
@@ -971,6 +1123,10 @@ anchor_summary() {
     echo "stage.sh: sha256sum of llama-metrics failed" >&2
     return 1
   fi
+  if ! capture cast_hash sha256sum -- "$repo/target/release/llama-cast"; then
+    echo "stage.sh: sha256sum of llama-cast failed" >&2
+    return 1
+  fi
   echo "----- anchor -----"
   echo "HEAD: $head"
   echo "subject: $subject"
@@ -979,6 +1135,7 @@ anchor_summary() {
   echo "${view_hash%% *}  llama-view"
   echo "${light_hash%% *}  llama-light"
   echo "${metrics_hash%% *}  llama-metrics"
+  echo "${cast_hash%% *}  llama-cast"
   echo "----- diff stat since $label -----"
   git_safe -C "$repo" --no-pager diff --stat --no-textconv --no-ext-diff \
     "$since" HEAD || return 1
@@ -1007,10 +1164,10 @@ write_provenance() {
     git -C "$repo" rev-parse HEAD || return 1
     git -C "$repo" describe --always --dirty || return 1
     # Writer (line 7), watcher (line 8), view (line 9), light (line 10),
-    # metrics (line 11).
+    # metrics (line 11), cast (line 12).
     (cd "$repo" && sha256sum target/release/kraken-lcd target/release/llama-watch \
       target/release/llama-view target/release/llama-light \
-      target/release/llama-metrics) || return 1
+      target/release/llama-metrics target/release/llama-cast) || return 1
   } >"$repo/target/check-provenance.txt"
 }
 
@@ -1045,6 +1202,7 @@ self_test() {
   printf 'fake-view\n' >"$repo/target/release/llama-view"
   printf 'fake-light\n' >"$repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
   printf 'base\n' >"$repo/README"
   git -C "$repo" init -b work >/dev/null
   git_commit "$repo" "base" .gitignore Cargo.lock rust-toolchain.toml README
@@ -1063,27 +1221,27 @@ self_test() {
   mkdir -p -- "$tmp/hooks"
   STAGE_HOOKS="$tmp/hooks"
   prov_err="$tmp/prov-err"
-  # Twelve lines first. A file that is otherwise valid is accepted when the
-  # count check is missing; ten lines then die on an unset array slot
-  # before this message can be checked.
+  # Thirteen lines first. A file that is otherwise valid is accepted when
+  # the count check is missing; eleven lines then die on an unset array
+  # slot before this message can be checked.
   printf '%s\n' "$prov_good" >"$prov_file"
   printf 'extra\n' >>"$prov_file"
   if check_provenance "$repo" "$prov_file" >"$prov_err" 2>&1; then
-    echo "stage self-test: 12-line provenance was accepted" >&2
+    echo "stage self-test: 13-line provenance was accepted" >&2
     exit 1
   fi
-  if ! grep -F -q "must have 11 lines" "$prov_err"; then
-    echo "stage self-test: 12-line provenance did not fail the line count" >&2
+  if ! grep -F -q "must have 12 lines" "$prov_err"; then
+    echo "stage self-test: 13-line provenance did not fail the line count" >&2
     cat -- "$prov_err" >&2
     exit 1
   fi
-  head -n 10 <<<"$prov_good" >"$prov_file"
+  head -n 11 <<<"$prov_good" >"$prov_file"
   if check_provenance "$repo" "$prov_file" >"$prov_err" 2>&1; then
-    echo "stage self-test: 10-line provenance was accepted" >&2
+    echo "stage self-test: 11-line provenance was accepted" >&2
     exit 1
   fi
-  if ! grep -F -q "must have 11 lines" "$prov_err"; then
-    echo "stage self-test: 10-line provenance did not fail the line count" >&2
+  if ! grep -F -q "must have 12 lines" "$prov_err"; then
+    echo "stage self-test: 11-line provenance did not fail the line count" >&2
     cat -- "$prov_err" >&2
     exit 1
   fi
@@ -1102,8 +1260,9 @@ self_test() {
     && "$out" == *"  $repo/target/release/llama-watch"* \
     && "$out" == *"  $repo/target/release/llama-view"* \
     && "$out" == *"  $repo/target/release/llama-light"* \
-    && "$out" == *"  $repo/target/release/llama-metrics"* ]] || {
-    echo "stage self-test: review did not hash all five binaries" >&2
+    && "$out" == *"  $repo/target/release/llama-metrics"* \
+    && "$out" == *"  $repo/target/release/llama-cast"* ]] || {
+    echo "stage self-test: review did not hash all six binaries" >&2
     exit 1
   }
   first="$(git -C "$repo" rev-list --max-parents=0 HEAD)"
@@ -1119,6 +1278,7 @@ self_test() {
   view_hash="$(sha256sum -- "$repo/target/release/llama-view" | awk '{ print $1 }')"
   light_hash="$(sha256sum -- "$repo/target/release/llama-light" | awk '{ print $1 }')"
   metrics_hash="$(sha256sum -- "$repo/target/release/llama-metrics" | awk '{ print $1 }')"
+  cast_hash="$(sha256sum -- "$repo/target/release/llama-cast" | awk '{ print $1 }')"
   [[ "$out" == *"----- anchor -----"* \
     && "$out" == *"HEAD: $head_now"* \
     && "$out" == *"subject: readme"* \
@@ -1127,6 +1287,7 @@ self_test() {
     && "$out" == *"$view_hash  llama-view"* \
     && "$out" == *"$light_hash  llama-light"* \
     && "$out" == *"$metrics_hash  llama-metrics"* \
+    && "$out" == *"$cast_hash  llama-cast"* \
     && "$out" == *"----- diff stat since $first -----"* ]] || {
     echo "stage self-test: anchor summary missing HEAD, subject, hashes, or diff stat" >&2
     printf '%s\n' "$out" >&2
@@ -1189,6 +1350,20 @@ self_test() {
     exit 1
   fi
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+
+  printf 'tampered\n' >>"$repo/target/release/llama-cast"
+  if stage_review "$repo" "$tmp/INSTALLED_SHA" >/dev/null; then
+    echo "stage self-test: tampered llama-cast matched provenance" >&2
+    exit 1
+  fi
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
+
+  rm -f -- "$repo/target/release/llama-cast"
+  if stage_review "$repo" "$tmp/INSTALLED_SHA" >/dev/null; then
+    echo "stage self-test: missing llama-cast was accepted" >&2
+    exit 1
+  fi
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
 
   rm -f -- "$repo/target/release/llama-view"
   if stage_review "$repo" "$tmp/INSTALLED_SHA" >/dev/null; then

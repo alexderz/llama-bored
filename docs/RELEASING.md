@@ -19,7 +19,7 @@ llama-bored follows [Semantic Versioning](https://semver.org/) and keeps a
   an older kraken-lcd, llama-light or llama-metrics.
 - After an upgrade, restart every running unit so all of them run the new
   binaries: `systemctl try-restart llama-watch kraken-lcd llama-light
-  llama-metrics` (install.sh prints this; it never restarts units itself).
+  llama-metrics llama-cast` (install.sh prints this; it never restarts units itself).
 
 ## Changelog
 

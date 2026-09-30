@@ -1,0 +1,52 @@
+# /etc/llama-bored/cast.toml: llama-cast, tty11 as a live video for TVs.
+#
+# LAN-exposed by design. It announces a DLNA/UPnP MediaServer over SSDP
+# (udp/1900) and serves the tty11 dashboard as MPEG-TS video (1920x1080,
+# H.264) to the networks below and to nobody else. Anyone allowed can watch
+# what tty11 shows: model names, rates, context use, host load. It carries
+# no prompt or output text; the dashboard shows none.
+#
+# It reads /dev/vcsa11 (read-only), the console font below, /etc/machine-id
+# (hashed into the device id) and this file. It opens no other device,
+# writes no file, dials nothing, and runs only `ffmpeg` (one per viewer).
+#
+# On the TV (Roku Media Player): Media type Video -> "llama-bored" ->
+# "llama-bored live".
+
+# IPv4:PORT for the HTTP server (descriptions, control, the stream).
+# 19478 sits next to llama-metrics' 19477. Changing it needs a unit drop-in
+# (SocketBindAllow=, see llama-cast.service) and a firewall change.
+listen = "0.0.0.0:19478"
+
+# CIDR allowlist, checked for every connection before a byte is read and
+# for every SSDP search before it is answered. Host bits must be zero and
+# /0 is refused. 1..=32 entries. The shipped value is an example: every
+# 192.168.x.x host plus loopback. Narrow it to your LAN or to the TVs, for
+# example ["192.168.1.0/24"] or ["192.168.1.40/32", "192.168.1.41/32"].
+# Keep this equal to IPAddressAllow= in llama-cast.service (which also
+# lists the SSDP group 239.255.255.250/32).
+allow = ["192.168.0.0/16", "127.0.0.1/32"]
+
+# This host's LAN address: SSDP joins the multicast group and announces on
+# it, and it is the address in every URL the TV is given. Required when
+# listen is 0.0.0.0; with a specific listen address it must be that one.
+# CHANGE THIS to the address the TVs can reach.
+interface_addr = "192.168.1.20"
+
+# The server name the TV lists. 1..=64 printable characters.
+name = "llama-bored"
+
+# Frames rendered from tty11 per second, 1..=5. ffmpeg repeats them to
+# 10 fps; each viewer costs one ffmpeg (roughly a fifth of a core at 2).
+fps = 2
+
+# Viewers at once, 1..=4. One more is answered 503.
+max_clients = 2
+
+# The encoder, an absolute path. It needs libx264. Run with a fixed
+# argument list, no shell and an empty environment.
+ffmpeg = "/usr/bin/ffmpeg"
+
+# tty11's console font: "12x24" (default) or "12x22". Must match
+# `[tty] font` in watch.toml, or the picture is garbled.
+font = "12x24"

@@ -1,0 +1,80 @@
+{
+  "engine": {
+    "model": "qwen3.8-flash-next",
+    "max_context": 262144,
+    "images": false,
+    "version": "0.1.27",
+    "context": 262144,
+    "kv": "q8",
+    "kv_resident": 0,
+    "expert_slots": 96,
+    "expert_cache_mib": 9216,
+    "spec": 1,
+    "mtp_max": 3,
+    "lookup": 0,
+    "vram_free_mib": 812,
+    "cvec": "0",
+    "arena_mib": 20480,
+    "pool_workers": 8,
+    "pcie_frac": 0.5,
+    "spec_min_p": 0.1,
+    "engine": "0.1.27"
+  },
+  "live": {
+    "state": "generating",
+    "queued": 2,
+    "phase": "answering",
+    "prompt_tokens": 1800,
+    "prompt_read": null,
+    "prompt_total": null,
+    "generated": 40,
+    "max_tokens": 4096,
+    "elapsed_s": 3.2,
+    "tok_s": 31.5,
+    "tok_s_mean": 30.1,
+    "tok_s_window_s": 3
+  },
+  "requests": [
+    {
+      "projection": null,
+      "time": 1790000000.5,
+      "duration_s": 12.4,
+      "finish": "stop",
+      "prompt_tokens": 1500,
+      "reused": 1200,
+      "output_tokens": 300,
+      "engine_generated": 300,
+      "prompt_ms": 420.5,
+      "decode_ms": 9800.0,
+      "decode_tok_s": 30.6,
+      "hit_rate": 0.912
+    }
+  ],
+  "requests_kept": 1,
+  "totals": {
+    "since": 1789990000.25,
+    "requests": 7,
+    "prompt_tokens": 12000,
+    "reused": 9000,
+    "output_tokens": 2500,
+    "prompt_ms": 3100.0,
+    "decode_ms": 81000.0
+  },
+  "hardware": {
+    "gpu_util": 97,
+    "gpu_mem_used": 22548578304,
+    "gpu_mem_total": 25769803776,
+    "gpu_temp": 64,
+    "gpu_power": 301.5,
+    "ram_used": 60129542144,
+    "ram_total": 137438953472
+  },
+  "hardware_static": {
+    "gpu_name": "Example GPU"
+  },
+  "history": {
+    "gpu_util": [[1790000010.0, 95], [1790000011.0, 97]],
+    "gpu_power": [[1790000010.0, 298.0], [1790000011.0, 301.5]]
+  },
+  "time": 1790000012.0
+}

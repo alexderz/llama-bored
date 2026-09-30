@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion><major>1</major><minor>0</minor></specVersion>
+<device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><friendlyName>llama-bored</friendlyName>
+<manufacturer>llama-bored</manufacturer><modelName>llama-bored cast</modelName><UDN>uuid:5a1e0c2d-7b3f-5e41-9c8d-2f6a4b1e0d93</UDN>
+<serviceList>
+<service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/cds.xml</SCPDURL><controlURL>/ctl/cds</controlURL><eventSubURL>/evt/cds</eventSubURL></service>
+<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/cms.xml</SCPDURL><controlURL>/ctl/cms</controlURL><eventSubURL>/evt/cms</eventSubURL></service>
+</serviceList></device></root>

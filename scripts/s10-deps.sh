@@ -52,6 +52,25 @@ metrics_forbidden=(
   mio
 )
 
+# S18: llama-cast (the LAN DLNA streamer) has its own pin,
+# scripts/s18-cast-allow.txt, deliberately the same set as llama-metrics:
+# std sockets and rustix only. No HTTP/UPnP/SSDP framework, no TLS, no
+# async runtime, no image or video crate (it renders with std and spawns
+# ffmpeg), no device crates, and no other workspace binary crate.
+cast_forbidden=(
+  "${metrics_forbidden[@]}"
+  llama-metrics
+  llama-view
+  rupnp
+  ssdp-client
+  image
+  ffmpeg-next
+  ffmpeg-sys-next
+  png
+  fontdue
+  tiny-skia
+)
+
 # Print tree lines whose package name is forbidden. Empty output is a pass.
 # The name is the first field of `cargo tree --prefix none`, so `http-body`
 # is not `http` and `ureq-proto` is not `ureq`.
@@ -166,6 +185,22 @@ s10_self_test() {
     printf '%s\n' "${hits}" >&2
     exit 1
   fi
+
+  for crate in "${cast_forbidden[@]}"; do
+    planted=$(printf '%s\n' "llama-cast v0.1.0" "${crate} v9.9.9" "llama-core v0.1.0")
+    hits="$(s10_hits cast_forbidden <<<"${planted}")"
+    if [[ -z "${hits}" ]]; then
+      echo "S18 self-test: planted ${crate} in llama-cast was allowed" >&2
+      exit 1
+    fi
+  done
+  planted=$(printf '%s\n' "llama-cast v0.1.0" "image-lookalike v0.1.0" "rustix v1.0.0")
+  hits="$(s10_hits cast_forbidden <<<"${planted}")"
+  if [[ -n "${hits}" ]]; then
+    echo "S18 self-test: lookalike crates were rejected in llama-cast:" >&2
+    printf '%s\n' "${hits}" >&2
+    exit 1
+  fi
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -223,6 +258,21 @@ metrics_allow="${root}/scripts/s16-metrics-allow.txt"
 added="$(s10_added_names "${metrics_allow}" <<<"${metrics_tree}")"
 if [[ -n "${added}" ]]; then
   echo "S16: llama-metrics gained a normal dependency that is not in scripts/s16-metrics-allow.txt; review it before adding:" >&2
+  printf '%s\n' "${added}" >&2
+  exit 1
+fi
+
+cast_tree="$(cargo tree -p llama-cast -e normal --locked --prefix none)"
+hits="$(s10_hits cast_forbidden <<<"${cast_tree}")"
+if [[ -n "${hits}" ]]; then
+  echo "S18: llama-cast normal dependency tree contains a forbidden crate:" >&2
+  printf '%s\n' "${hits}" >&2
+  exit 1
+fi
+cast_allow="${root}/scripts/s18-cast-allow.txt"
+added="$(s10_added_names "${cast_allow}" <<<"${cast_tree}")"
+if [[ -n "${added}" ]]; then
+  echo "S18: llama-cast gained a normal dependency that is not in scripts/s18-cast-allow.txt; review it before adding:" >&2
   printf '%s\n' "${added}" >&2
   exit 1
 fi

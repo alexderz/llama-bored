@@ -1614,7 +1614,7 @@ fn backend_overrides_parse_known_words_only() {
     let good = dir.join("good.toml");
     std::fs::write(
         &good,
-        "[llama.backends]\n\"flash\" = \"sglang\"\n\"big\" = \"vllm\"\n\"tabby\" = \"openai\"\n\"q\" = \"llamacpp\"\n\"not-loaded\" = \"sglang\"\n",
+        "[llama.backends]\n\"flash\" = \"sglang\"\n\"big\" = \"vllm\"\n\"tabby\" = \"openai\"\n\"q\" = \"llamacpp\"\n\"not-loaded\" = \"sglang\"\n\"next\" = \"strata\"\n",
     )
     .expect("write");
     let cfg = Config::load_validated(&good, 8).expect("valid overrides");
@@ -1622,7 +1622,8 @@ fn backend_overrides_parse_known_words_only() {
     assert_eq!(cfg.llama.backends.get("big"), Some(&Backend::Vllm));
     assert_eq!(cfg.llama.backends.get("tabby"), Some(&Backend::OpenAi));
     assert_eq!(cfg.llama.backends.get("q"), Some(&Backend::LlamaCpp));
-    for bad in ["\"tabbyapi\"", "\"SGLang\"", "1", "\"\""] {
+    assert_eq!(cfg.llama.backends.get("next"), Some(&Backend::Strata));
+    for bad in ["\"tabbyapi\"", "\"SGLang\"", "\"Strata\"", "1", "\"\""] {
         let path = dir.join("bad.toml");
         std::fs::write(&path, format!("[llama.backends]\n\"m\" = {bad}\n")).expect("write");
         assert!(

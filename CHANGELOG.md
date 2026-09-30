@@ -6,6 +6,30 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-30
+
+### Added
+
+- **llama-cast: watch tty11 on a TV.** A DLNA/UPnP media server that streams
+  the tty11 dashboard as live 1920x1080 H.264 (MPEG-TS, rendered from the
+  console at 2 fps with the bundled Hack font) to players on your LAN.
+  Tested with Roku Media Player on TCL Roku TVs: open it, choose
+  **llama-bored**, then **llama-bored live**. Off by default; its own user,
+  an in-process CIDR allowlist plus `IPAddressAllow=`, pinned ports (a TCP
+  stream port and UDP 1900 for SSDP), strict HTTP, one `ffmpeg` per viewer
+  with a fixed argument list, no outbound connections, and a new source
+  fence (S18). Setup: README "Watch tty11 on a TV".
+- **Strata backend** ([Strata](https://github.com/Niko1221/Strata),
+  `serve/server.py --engine strata`): detected from the launch command;
+  tok/s, running and queued requests, prompt and cached-prompt counters and
+  the context size from its JSON `/metrics`. Snapshot readers now read an
+  unknown backend word as `openai` instead of rejecting the snapshot.
+
+### Changed
+
+- Only llama-metrics and llama-cast may listen (S16 now allows both, each
+  under its own fence). The printed upgrade step restarts llama-cast too.
+
 ## 0.2.3 — 2026-09-30
 
 ### Fixed

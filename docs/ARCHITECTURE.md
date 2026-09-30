@@ -15,10 +15,12 @@ listens on the network opens no device.
 | `llama-light` | system unit, user `llama-light` | The snapshot; `light.toml`; the Aura node's sysfs ids | The Aura controller's and the keyboard lighting interface's hidraw nodes (colour only) | **None** (`PrivateNetwork=yes`) |
 | `llama-metrics` | system unit, user `llama-metrics` | The snapshot; `metrics.toml` | HTTP responses | **Listens** on TCP 19477 for a CIDR allowlist; dials nothing |
 | `llama-view` | any user in group `llama-view` | `/dev/vcsa11` | Its own terminal | None |
+| `llama-cast` | system unit, user `llama-cast` (group `llama-view`) | `/dev/vcsa11`, the console font, `cast.toml` | An H.264 MPEG-TS stream from one `ffmpeg` per viewer | **Listens** on a TCP port and UDP 1900 (SSDP) for a CIDR allowlist; dials nothing |
 
-**Only `llama-metrics` listens (S16).** No other crate may name a listening
-socket, a datagram socket or `bind`; the exporter has exactly one
-`TcpListener::bind`. The three snapshot readers (`kraken-lcd`, `llama-light`,
+**Only `llama-metrics` and `llama-cast` listen (S16, S18).** No other crate
+may name a listening socket, a datagram socket or `bind`; the exporter has
+exactly one `TcpListener::bind`, and llama-cast one TCP listener and one UDP
+socket on port 1900. The three snapshot readers (`kraken-lcd`, `llama-light`,
 `llama-metrics`) get the snapshot through `SupplementaryGroups=llama-watch`
 and parse it with the same validator in `llama-core`.
 
@@ -32,6 +34,7 @@ The workspace crates:
 | `llama-light` | Config and `[[light]]` mappings, metric and palette maths, the closed Aura and keyboard encoders, the pinned hidraw opens, the frame engine (tweening), service with live reload | `rustix`, `toml`. Dependency allowlist (S10/S15) |
 | `llama-metrics` | CIDR allowlist, bounded HTTP/1.1 server, text exposition, service | `rustix`, `toml`. Dependency allowlist (S10/S16) |
 | `llama-view` | vcsa reader and terminal painter | `rustix` |
+| `llama-cast` | Config and allowlist, vcsa reader and PSF renderer, SSDP responder, DLNA MediaServer (description, ContentDirectory), bounded HTTP server, `ffmpeg` encoder process | `rustix`, `toml`. Dependency allowlist (S10/S18) |
 
 `unsafe` is forbidden workspace-wide. Release builds use fat LTO and
 `panic = "abort"`.
@@ -266,7 +269,8 @@ build.
 | **S13** tty syscalls | The tty code's only termios or ioctl call is `tcgetwinsize`. No `VT_`, `KD` or `TIOCSCTTY` |
 | **S14** fans read-only | The fan source and its hwmon helpers contain no write-capable file API (`write`, `OpenOptions`, `File::create`, rename, remove, ...) |
 | **S15** llama-light colour-only | No network, process control, i2c/SMBus, NZXT id, pwm or hwmon; filesystem calls only in allowlisted files, no filesystem writes, fixed path literals; the opcode table in `aura/proto.rs` is exactly `0x35` and `0x40`, and save/config opcodes (`0x3F`, `0x3E`, ...) never appear. Each rule is shown to bite on a planted violation |
-| **S16** one listener | Only `llama-metrics` names a listening socket, datagram socket or bind, with exactly one `TcpListener::bind`; it has no `/sys`, `/dev`, hidraw, USB, NVML, outbound socket, process spawn, `unsafe` or file write, and its dependencies are pinned |
+| **S18** llama-cast | One TCP listener and one UDP socket on port 1900, no outbound connection, no Unix sockets, no `/sys`, `/proc`, hidraw, USB, NVML or llama API paths; reads only `/dev/vcsa11`, the font, the machine id and its config; no file writes; exactly one `Command::new` (the configured `ffmpeg`, fixed arguments, `env_clear()`); fixed path literals and pinned dependencies |
+| **S16** listeners | Only `llama-metrics` and `llama-cast` name a listening socket, datagram socket or bind, with exactly one `TcpListener::bind`; it has no `/sys`, `/dev`, hidraw, USB, NVML, outbound socket, process spawn, `unsafe` or file write, and its dependencies are pinned |
 
 S4 and S5 are unused numbers. Also in the gate: `cargo fmt`, `clippy -D
 warnings`, `cargo audit`, the installer and packaging self-tests, and a

@@ -8,9 +8,10 @@
 //!
 //! The server is told by its entry point (T72): a `llama-server` binary under
 //! any path, `sglang.launch_server` / `sglang serve`, `vllm serve` /
-//! `vllm.entrypoints`, else any OpenAI-compatible server. SGLang and vLLM
-//! flags are read only after the entry point, so a `podman run ...` wrapper
-//! in front cannot lend its own flags.
+//! `vllm.entrypoints`, Strata's `serve/server.py` (see [`strata_at`]), else
+//! any OpenAI-compatible server. SGLang and vLLM flags are read only after
+//! the entry point, so a `podman run ...` wrapper in front cannot lend its
+//! own flags.
 
 use llama_core::backend::Backend;
 use llama_core::detail::{MAX_TOKEN_CHARS, ModelDetail, NCMOE_ALL, is_token};
@@ -25,7 +26,8 @@ pub struct Launch {
     pub backend: Backend,
     /// Tuning detail. `None` for a server whose flags are not read.
     pub detail: Option<ModelDetail>,
-    /// `--max-running-requests` (SGLang) or `--max-num-seqs` (vLLM).
+    /// `--max-running-requests` (SGLang) or `--max-num-seqs` (vLLM); 1 for
+    /// Strata, which serves one request at a time.
     pub max_running: Option<u16>,
 }
 
@@ -38,6 +40,17 @@ pub fn parse_launch(cmd: &str) -> Launch {
             backend: Backend::LlamaCpp,
             detail: Some(parse(cmd)),
             max_running: None,
+        },
+        // Strata's flags name only a JSON config: ctx and KV come from its
+        // `/metrics` (`engine.max_context`, `engine.kv`) once it answers.
+        (Backend::Strata, _) => Launch {
+            backend: Backend::Strata,
+            detail: Some(ModelDetail {
+                kv_k: Some(KV_AUTO.to_owned()),
+                kv_v: Some(KV_AUTO.to_owned()),
+                ..ModelDetail::default()
+            }),
+            max_running: Some(1),
         },
         (Backend::OpenAi, _) => Launch {
             backend: Backend::OpenAi,
@@ -68,8 +81,45 @@ fn detect(args: &[&str]) -> (Backend, usize) {
         if arg.starts_with("vllm.entrypoints") {
             return (Backend::Vllm, index + 1);
         }
+        if strata_at(args, index) {
+            return (Backend::Strata, index + 1);
+        }
     }
     (Backend::OpenAi, args.len())
+}
+
+/// Strata's server script: `serve/server.py`, bare or under a directory.
+fn is_strata_script(arg: &str) -> bool {
+    arg == "serve/server.py" || arg.ends_with("/serve/server.py")
+}
+
+/// `args[index]` is Strata's `serve/server.py` and either
+/// - a later `--engine strata` (or `--engine=strata`) picks its engine, or
+/// - it runs as `<image> python… serve/server.py` where the image's last
+///   path segment starts with `strata` (`localhost/strata:v0.1.27-sm86`).
+///
+/// A `serve/server.py` of some other project, or `strata` elsewhere in a
+/// path, is not enough.
+fn strata_at(args: &[&str], index: usize) -> bool {
+    if !args.get(index).is_some_and(|arg| is_strata_script(arg)) {
+        return false;
+    }
+    let rest = &args[index + 1..];
+    let engine = rest.iter().enumerate().any(|(at, arg)| {
+        *arg == "--engine=strata" || (*arg == "--engine" && rest.get(at + 1) == Some(&"strata"))
+    });
+    if engine {
+        return true;
+    }
+    let Some(before) = index.checked_sub(2) else {
+        return false;
+    };
+    let python = args[index - 1]
+        .rsplit('/')
+        .next()
+        .is_some_and(|base| base.starts_with("python"));
+    let image = args[before].rsplit('/').next().unwrap_or_default();
+    python && !args[before].starts_with('-') && image.starts_with("strata")
 }
 
 /// SGLang or vLLM flags. KV is `auto` unless a dtype is given.
@@ -355,6 +405,68 @@ mod tests {
         assert_eq!(kind("sglang-exl3 --port 1"), Backend::OpenAi);
         assert_eq!(kind(""), Backend::OpenAi);
         assert_eq!(parse_launch("python3 main.py").detail, None);
+    }
+
+    /// The real-shaped llama-swap Strata command (podman wrapper, generic names).
+    const STRATA_PODMAN: &str = "podman run --rm --name flash-strata --network llama --device nvidia.com/gpu=all -v /models/strata:/data:ro localhost/strata:v0.1.27-sm86 python serve/server.py --engine strata --config /data/strata.json --port 8095";
+
+    #[test]
+    fn strata_is_told_by_its_script_and_engine_or_image() {
+        let kind = |cmd: &str| parse_launch(cmd).backend;
+        let launch = parse_launch(STRATA_PODMAN);
+        assert_eq!(launch.backend, Backend::Strata);
+        assert_eq!(launch.max_running, Some(1));
+        let detail = launch.detail.expect("strata detail");
+        assert_eq!(detail.ctx, None, "ctx comes from /metrics");
+        assert_eq!(detail.kv_k.as_deref(), Some(KV_AUTO));
+        assert_eq!(detail.quant, None);
+        let debug = format!("{detail:?}");
+        assert!(
+            !debug.contains("/data") && !debug.contains("8095"),
+            "{debug}"
+        );
+
+        for cmd in [
+            "python serve/server.py --engine strata",
+            "python3 /opt/strata/serve/server.py --config c.json --engine=strata",
+            "/venv/bin/python serve/server.py --port 1 --engine strata --config x",
+            // The image alone is enough when it runs python serve/server.py.
+            "podman run --rm localhost/strata:v0.1.27-sm86 python serve/server.py --config /data/strata.json",
+            "docker run ghcr.io/example/strata-sm86@sha256:abc python3 serve/server.py",
+        ] {
+            assert_eq!(kind(cmd), Backend::Strata, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn strata_in_a_path_is_not_strata() {
+        let kind = |cmd: &str| parse_launch(cmd).backend;
+        // A llama-server whose paths say strata stays llama.cpp.
+        assert_eq!(
+            kind("/opt/strata/llama-server -m /models/strata/x-Q4_K_M.gguf --port 8095"),
+            Backend::LlamaCpp
+        );
+        assert_eq!(
+            kind("podman run -v /models/strata:/m img llama-server -m /m/x.gguf"),
+            Backend::LlamaCpp
+        );
+        for cmd in [
+            // Another project's serve/server.py.
+            "python serve/server.py --port 8095",
+            "python serve/server.py --engine mock",
+            // strata only in a volume or a config path.
+            "podman run -v /data/strata:/data img python serve/server.py --config /data/strata.json",
+            "python /srv/strata/app.py --engine strata",
+            "python serve/server.py.bak --engine strata",
+            "python notserve/server.py --engine strata",
+            // --engine strata before the script belongs to the wrapper.
+            "run --engine strata --rm python serve/server.py",
+            // The image must sit right before python.
+            "podman run localhost/strata:v1 sh -c python serve/server.py",
+            "strata",
+        ] {
+            assert_eq!(kind(cmd), Backend::OpenAi, "{cmd}");
+        }
     }
 
     #[test]

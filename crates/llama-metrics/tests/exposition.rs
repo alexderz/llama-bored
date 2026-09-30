@@ -389,6 +389,31 @@ fn model_labels_round_trip_through_the_parser() {
 }
 
 #[test]
+fn strata_is_one_more_backend_label_value() {
+    let mut snap = load("snapshot-loaded.json");
+    snap.ai.models[2].backend = Some(wire::Backend::Strata);
+    snap.ai.models[2].running = Some(1);
+    snap.ai.models[2].queued = Some(0);
+    let text = render(&Ok(snap), T0);
+    let all = samples(&text);
+    let tiny = all
+        .iter()
+        .find(|(n, l, _)| n == "llamabored_model_loaded" && l[0].1 == "tiny")
+        .expect("tiny");
+    assert_eq!(tiny.1[6], ("backend".to_owned(), "strata".to_owned()));
+    let running = all
+        .iter()
+        .find(|(n, l, _)| n == "llamabored_model_requests_running" && l[0].1 == "tiny")
+        .expect("running");
+    assert_eq!(running.2, "1");
+    assert!(
+        !all.iter()
+            .any(|(n, l, _)| n == "llamabored_model_kv_cache_usage_ratio" && l[0].1 == "tiny"),
+        "Strata has no KV fill"
+    );
+}
+
+#[test]
 fn duplicate_models_export_one_series() {
     let mut snap = load("snapshot-loaded.json");
     let first = snap.ai.models[0].clone();
@@ -532,7 +557,7 @@ fn no_prompt_or_output_text_is_exported() {
     let mut allowed: BTreeSet<String> =
         ["", "down", "idle", "loaded", "busy", "denied", "all", "f16"]
             .into_iter()
-            .chain(["llamacpp", "sglang", "vllm", "openai"])
+            .chain(["llamacpp", "sglang", "vllm", "strata", "openai"])
             .chain(["compacted", "new", "evicted", "unknown"])
             .map(str::to_owned)
             .collect();
