@@ -6,6 +6,17 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.2.3 — 2026-09-30
+
+### Fixed
+
+- kraken-lcd: right after it opens the device, the Kraken can refuse bucket
+  commands for several seconds (seen after a restart, while the previous
+  process's stock screen settles). Until the first successful upload, for
+  up to 60 s, refusals now back off without counting toward `fail_limit`;
+  after that, failures count as before and persistent ones still restore
+  the stock screen (#14).
+
 ## 0.2.2 — 2026-09-29
 
 ### Added

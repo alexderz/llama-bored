@@ -671,6 +671,10 @@ struct TimedLcd {
     clock: Arc<Mutex<Instant>>,
     origin: Instant,
     attempts: Arc<Mutex<Vec<Duration>>>,
+    /// Cooling checks (`pace_guard` defaults to `tick`), as offsets from `origin`.
+    guards: Arc<Mutex<Vec<Duration>>>,
+    /// Uploads attempted before this offset are refused at `DeleteBucket`.
+    refuse_before: Duration,
 }
 
 impl TimedLcd {
@@ -680,7 +684,21 @@ impl TimedLcd {
             clock: clock.mono.clone(),
             origin,
             attempts: Arc::new(Mutex::new(Vec::new())),
+            guards: Arc::new(Mutex::new(Vec::new())),
+            refuse_before: Duration::ZERO,
         }
+    }
+
+    fn at(&self) -> Duration {
+        let now = *self.clock.lock().unwrap_or_else(|err| err.into_inner());
+        now.saturating_duration_since(self.origin)
+    }
+
+    fn guards(&self) -> Vec<Duration> {
+        self.guards
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
     }
 
     fn attempts(&self) -> Vec<Duration> {
@@ -696,11 +714,14 @@ impl LcdSink for TimedLcd {
         self.show_slot(0, frame)
     }
     fn show_slot(&mut self, slot: u8, frame: &Frame) -> Result<(), SinkError> {
-        let now = *self.clock.lock().unwrap_or_else(|err| err.into_inner());
+        let at = self.at();
         self.attempts
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .push(now.saturating_duration_since(self.origin));
+            .push(at);
+        if at < self.refuse_before {
+            return refused(kraken_lcd::device::Step::DeleteBucket);
+        }
         self.inner.show_slot(slot, frame)
     }
     fn restore_stock(&mut self) {
@@ -710,6 +731,11 @@ impl LcdSink for TimedLcd {
         self.inner.needs_reupload();
     }
     fn tick(&mut self) -> Result<(), SinkError> {
+        let at = self.at();
+        self.guards
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(at);
         self.inner.tick()
     }
     fn blocked(&mut self) -> bool {
@@ -717,53 +743,182 @@ impl LcdSink for TimedLcd {
     }
 }
 
+fn busy() -> Steady {
+    Steady {
+        samples: Arc::new(Mutex::new(Vec::new())),
+        origin: Instant::now(),
+        load_of: |i| (i % 5) as f32 * 20.0,
+        cpu_of: |i| (i % 5) as f32 * 20.0,
+        fresh: true,
+        n: std::cell::Cell::new(0),
+    }
+}
+
+/// `service::START_GRACE`, private to keep S11's public surface fixed.
+const START_GRACE: Duration = Duration::from_secs(60);
+
+/// The retry offsets inside the grace window after an open at 0:
+/// 2, 4, 8, 16 s, then clamped to the window's end.
+fn grace_schedule() -> Vec<Duration> {
+    [0, 2, 6, 14, 30].map(Duration::from_secs).to_vec()
+}
+
+/// GitHub #14 reopened: the device refuses for longer than the 2 + 4 s the
+/// counted backoff allowed. Within the startup grace nothing counts, so a 20 s
+/// refusal after open is survived, then the writer streams.
 #[test]
-fn stream_fail_limit_restores_without_the_change_interval() {
-    let scratch = Scratch::new("fail");
+fn stream_grace_survives_refusals_for_20s_after_open() {
+    let scratch = Scratch::new("grace20");
+    let config = stream_config(&scratch.0, 10, 60, 2.0);
+    let (mut clock, origin) = FakeClock::new();
+    let mut lcd = TimedLcd::new(&clock, origin);
+    lcd.refuse_before = Duration::from_secs(20);
+    let mut log = quiet_log();
+    let exit = run(&config, 400, busy(), &mut clock, lcd.clone(), &mut log);
+    assert_eq!(exit, LoopExit::Stopped, "the writer survives");
+    assert_eq!(liquids_of(&lcd.inner), 0, "no restore to stock");
+    let attempts = lcd.attempts();
+    assert_eq!(&attempts[..5], &grace_schedule()[..], "{attempts:?}");
+    assert!(attempts.len() > 10, "then it streams: {attempts:?}");
+    for pair in attempts[4..].windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            Duration::from_millis(100),
+            "{attempts:?}"
+        );
+    }
+    let slots = slots_of(&lcd.inner);
+    assert_eq!(&slots[..4], &[0, 1, 0, 1], "ping-pong from slot 0");
+    let lines = log.0.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    let graced: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("device settling") && line.contains("(grace, "))
+        .collect();
+    assert_eq!(graced.len(), 4, "each grace failure is logged: {lines:?}");
+    assert!(
+        graced[0].contains("retry in 2s (grace, 60s left)"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("/3)")),
+        "nothing counted: {lines:?}"
+    );
+    let guards = lcd.guards();
+    for pair in guards.windows(2) {
+        assert!(
+            pair[1] - pair[0] <= Duration::from_secs(1),
+            "cooling guard keeps 1 Hz through the grace wait: {guards:?}"
+        );
+    }
+    assert!(guards.len() >= 20, "{guards:?}");
+}
+
+/// A device that never settles: the grace window ends, then `fail_limit`
+/// failures count as before (2 s, then 4 s apart) and stock is restored.
+#[test]
+fn stream_grace_ends_then_fail_limit_restores() {
+    let scratch = Scratch::new("graceforever");
+    let config = stream_config(&scratch.0, 10, 60, 2.0);
+    let (mut clock, origin) = FakeClock::new();
+    let mut lcd = TimedLcd::new(&clock, origin);
+    lcd.refuse_before = Duration::from_secs(3600);
+    let mut log = quiet_log();
+    let exit = run(&config, 3000, busy(), &mut clock, lcd.clone(), &mut log);
+    assert_eq!(exit, LoopExit::Restored, "persistent failures still exit");
+    assert_eq!(liquids_of(&lcd.inner), 1);
+    assert!(slots_of(&lcd.inner).is_empty(), "nothing was ever shown");
+    let attempts = lcd.attempts();
+    let mut want = grace_schedule();
+    want.extend([60, 62, 66].map(Duration::from_secs));
+    assert_eq!(attempts, want, "grace, then exactly fail_limit counted");
+    let elapsed = clock.mono().saturating_duration_since(origin);
+    assert!(
+        elapsed < START_GRACE + RETRY_START * 3 + Duration::from_secs(1),
+        "bounded: {elapsed:?}"
+    );
+    let lines = log.0.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    assert!(
+        lines.iter().any(|line| line.contains("retry in 2s (1/3)")),
+        "the counted line is unchanged after the window: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("retry in 4s (2/3)")),
+        "{lines:?}"
+    );
+    let guards = lcd.guards();
+    for pair in guards.windows(2) {
+        assert!(pair[1] - pair[0] <= Duration::from_secs(1), "{guards:?}");
+    }
+}
+
+/// After the first successful upload the grace is spent: a refusal counts
+/// at once, and `fail_limit` of them restore stock on the old schedule.
+#[test]
+fn stream_failure_after_first_success_counts_at_once() {
+    let scratch = Scratch::new("graceafter");
     let config = stream_config(&scratch.0, 10, 60, 2.0);
     let (mut clock, origin) = FakeClock::new();
     let lcd = TimedLcd::new(&clock, origin);
+    lcd.inner.lock().script(Ok(()));
     for _ in 0..3 {
         lcd.inner
             .lock()
             .script(refused(kraken_lcd::device::Step::SetupBucket));
     }
     let mut log = quiet_log();
-    let exit = run(
-        &config,
-        600,
-        Steady {
-            samples: Arc::new(Mutex::new(Vec::new())),
-            origin,
-            load_of: |i| (i % 5) as f32 * 20.0,
-            cpu_of: |i| (i % 5) as f32 * 20.0,
-            fresh: true,
-            n: std::cell::Cell::new(0),
-        },
-        &mut clock,
-        lcd.clone(),
-        &mut log,
-    );
-    assert_eq!(exit, LoopExit::Restored, "persistent failures still exit");
+    let exit = run(&config, 600, busy(), &mut clock, lcd.clone(), &mut log);
+    assert_eq!(exit, LoopExit::Restored);
     assert_eq!(liquids_of(&lcd.inner), 1);
-    assert!(slots_of(&lcd.inner).is_empty(), "nothing was ever shown");
     let attempts = lcd.attempts();
-    assert_eq!(
-        attempts.len(),
-        3,
-        "exactly fail_limit attempts: {attempts:?}"
-    );
-    assert_eq!(attempts[1] - attempts[0], RETRY_START, "{attempts:?}");
-    assert_eq!(attempts[2] - attempts[1], RETRY_START * 2, "{attempts:?}");
-    assert!(
-        clock.mono().saturating_duration_since(origin) < Duration::from_secs(60),
-        "failures are spaced by the retry backoff, not by min_interval_s"
-    );
+    assert_eq!(attempts.len(), 4, "{attempts:?}");
+    assert_eq!(attempts[2] - attempts[1], RETRY_START, "{attempts:?}");
+    assert_eq!(attempts[3] - attempts[2], RETRY_START * 2, "{attempts:?}");
     let lines = log.0.lock().unwrap_or_else(|err| err.into_inner()).clone();
     assert!(
-        lines.iter().any(|line| line.contains("upload failed")),
-        "each failure is logged: {lines:?}"
+        lines.iter().any(|line| line.contains("retry in 2s (1/3)")),
+        "{lines:?}"
     );
+    assert!(
+        !lines.iter().any(|line| line.contains("grace")),
+        "{lines:?}"
+    );
+}
+
+/// A re-open after a detach starts a fresh grace window.
+#[test]
+fn stream_grace_resets_on_reopen_after_detach() {
+    let scratch = Scratch::new("gracereopen");
+    let config = stream_config(&scratch.0, 10, 60, 2.0);
+    let (mut clock, origin) = FakeClock::new();
+    let lcd = TimedLcd::new(&clock, origin);
+    lcd.inner
+        .lock()
+        .script(refused(kraken_lcd::device::Step::DeleteBucket));
+    lcd.inner
+        .lock()
+        .script(refused(kraken_lcd::device::Step::DeleteBucket));
+    lcd.inner.lock().script(Err(SinkError::DeviceUnavailable));
+    for _ in 0..20 {
+        lcd.inner
+            .lock()
+            .script(refused(kraken_lcd::device::Step::DeleteBucket));
+    }
+    let mut log = quiet_log();
+    let exit = run(&config, 3000, busy(), &mut clock, lcd.clone(), &mut log);
+    assert_eq!(exit, LoopExit::Restored);
+    let attempts = lcd.attempts();
+    // Open at 0: refused at 0 and 2, detached at 6, re-opened 10 s later.
+    assert_eq!(
+        &attempts[..3],
+        &[0, 2, 6].map(Duration::from_secs)[..],
+        "{attempts:?}"
+    );
+    let reopen = attempts[3];
+    assert!(reopen >= Duration::from_secs(16), "{attempts:?}");
+    let after: Vec<_> = attempts[3..].iter().map(|at| *at - reopen).collect();
+    let mut want = grace_schedule();
+    want.extend([60, 62, 66].map(Duration::from_secs));
+    assert_eq!(after, want, "a full grace from the re-open: {attempts:?}");
 }
 
 /// GitHub #14: the device refuses the first uploads right after open (the

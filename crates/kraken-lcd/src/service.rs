@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::config::{Config, InvalidConfig, UploadMode, ValidConfig};
 use crate::device::{
     HidPort, KrakenLcd, LcdSink, NoBulk, OpenRequest, PortError, STATE_DIR, SYS_ROOT, SinkError,
-    open_resolved_hid,
+    UploadFailed, open_resolved_hid,
 };
 use crate::history::History;
 use crate::log::{self, Priority};
@@ -398,6 +398,7 @@ where
         stream_slot: 0,
         guard_at: None,
         stream_retry: None,
+        grace_until: None,
         phase: if input.latch_at_start {
             crit(
                 &mut input.log,
@@ -580,6 +581,9 @@ struct LoopState<S> {
     /// Stream mode after `UploadFailed`: no upload before `.0`; `.1` is the
     /// wait that set it. Cleared by a success and by a new open.
     stream_retry: Option<(Instant, Duration)>,
+    /// Stream mode: end of the startup grace ([`START_GRACE`]) set by each
+    /// open. Cleared by the first success and by the first failure after it.
+    grace_until: Option<Instant>,
     phase: Phase,
 }
 
@@ -606,6 +610,7 @@ where
             state.stream_slot = 0;
             state.guard_at = None;
             state.stream_retry = None;
+            state.grace_until = Some(now + START_GRACE);
             state.sink = Some(lcd);
             state.phase = Phase::Ours;
             note_operation(state, now);
@@ -651,6 +656,12 @@ const STREAM_RETRY_START: Duration = Duration::from_secs(2);
 
 /// Cap of the stream retry wait.
 const STREAM_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// Stream mode: how long after an open a refused or unanswered upload does not
+/// count toward `fail_limit`, until the first success. Right after the previous
+/// process restored stock the Kraken refuses `DeleteBucket` for more than 6 s
+/// but less than a minute (GitHub #14).
+const START_GRACE: Duration = Duration::from_secs(60);
 
 /// The wait after one more stream `UploadFailed` in a row.
 fn next_stream_retry(last: Option<Duration>) -> Duration {
@@ -699,17 +710,46 @@ where
             state.policy.mark_uploaded(view, now);
             state.fail_streak = 0;
             state.stream_retry = None;
+            state.grace_until = None;
+            TickDev::Continue
+        }
+        Err(SinkError::UploadFailed(
+            err @ (UploadFailed::Refused(_) | UploadFailed::NoReply(_)),
+        )) if state.grace_until.is_some_and(|end| now < end) => {
+            // Startup grace: back off without counting. The retry never lands
+            // past the window's end, so the counted phase starts on time.
+            let end = state.grace_until.unwrap_or(now);
+            let left = end.saturating_duration_since(now);
+            let wait = next_stream_retry(state.stream_retry.map(|(_, last)| last)).min(left);
+            state.stream_retry = Some((now + wait, wait));
+            log::emit(
+                &mut input.log,
+                Priority::Warning,
+                &format!(
+                    "upload failed: {err}; device settling, retry in {}s (grace, {}s left)",
+                    wait.as_secs(),
+                    left.as_secs()
+                ),
+            );
             TickDev::Continue
         }
         Err(SinkError::UploadFailed(err)) => {
             if let TickDev::Exit(exit) = count_upload_fail(state, &mut input.log, fail_limit) {
                 return TickDev::Exit(exit);
             }
+            // The first failure after the grace window starts the
+            // backoff afresh, so counting runs exactly as without a grace.
+            let last = if state.grace_until.is_some_and(|end| now >= end) {
+                state.grace_until = None;
+                None
+            } else {
+                state.stream_retry.map(|(_, last)| last)
+            };
             // Back off instead of retrying on the next frame. At 10 fps an
             // unspaced retry spent `fail_limit` within 300 ms, so a device
             // still settling after the previous process restored stock
             // exited the writer (GitHub #14).
-            let wait = next_stream_retry(state.stream_retry.map(|(_, last)| last));
+            let wait = next_stream_retry(last);
             state.stream_retry = Some((now + wait, wait));
             log::emit(
                 &mut input.log,
