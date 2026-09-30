@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.2.2 — 2026-09-29
+
 ### Added
 
 - Install without an NZXT Kraken Z: with none attached, the installer sets
