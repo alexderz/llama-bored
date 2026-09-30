@@ -3,12 +3,15 @@
 //! Each backend has its own Prometheus names (T72). Names are matched
 //! exactly; SGLang and vLLM label their series (`model_name`, `engine`), so
 //! their values are summed across label sets, and a ratio takes the largest.
+//! Strata answers JSON instead ([`parse_strata`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use llama_core::backend::Backend;
+use llama_core::detail::is_token;
 use llama_core::rate::{counter_delta, delta_per_s};
+use serde::{Deserialize, Deserializer};
 
 const FRESH: Duration = Duration::from_secs(1);
 
@@ -110,6 +113,7 @@ pub fn parse_metrics_for(backend: Backend, body: &str) -> MetricsSample {
         Backend::LlamaCpp => &LLAMACPP,
         Backend::SgLang => &SGLANG,
         Backend::Vllm => &VLLM,
+        Backend::Strata => return parse_strata(body).0,
         Backend::OpenAi => return MetricsSample::default(),
     };
     let mut decode = Acc::default();
@@ -164,6 +168,139 @@ pub fn parse_metrics_for(backend: Backend, body: &str) -> MetricsSample {
         cache_hit: hit.or(prefix),
         cached_total: cached.0.and_then(finite_u64),
     }
+}
+
+/// [`parse_metrics_for`] plus the engine facts only Strata reports.
+#[must_use]
+pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Option<EngineFacts>) {
+    if backend == Backend::Strata {
+        let (sample, facts) = parse_strata(body);
+        (sample, Some(facts))
+    } else {
+        (parse_metrics_for(backend, body), None)
+    }
+}
+
+/// Tuning facts a server reports about itself (Strata's `engine` object),
+/// for a detail line its launch command cannot give.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EngineFacts {
+    /// `engine.max_context`, when a positive `u32`.
+    pub ctx: Option<u32>,
+    /// `engine.kv` lowercased, when it is a short token (`q8`, `f16`).
+    pub kv: Option<String>,
+}
+
+/// The parts of Strata's `GET /metrics` JSON this reads. Everything else
+/// (the last requests, hardware and its history) is skipped unread.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataDoc {
+    engine: StrataEngine,
+    live: StrataLive,
+    totals: StrataTotals,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataEngine {
+    #[serde(deserialize_with = "number")]
+    max_context: Option<f64>,
+    #[serde(deserialize_with = "word")]
+    kv: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataLive {
+    #[serde(deserialize_with = "word")]
+    state: Option<String>,
+    #[serde(deserialize_with = "number")]
+    queued: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    generated: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataTotals {
+    #[serde(deserialize_with = "number")]
+    prompt_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    reused: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    output_tokens: Option<f64>,
+}
+
+/// A finite, non-negative number; any other JSON value is `None`.
+fn number<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_f64().filter(|n| n.is_finite() && *n >= 0.0))
+}
+
+/// A JSON string; any other value is `None`.
+fn word<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => Ok(Some(text)),
+        _ => Ok(None),
+    }
+}
+
+/// Strata's `/metrics` JSON (not Prometheus text).
+///
+/// - decode: `totals.output_tokens` (finished requests) plus
+///   `live.generated` while a request runs, so tok/s moves live. Strata
+///   copies both under one lock and moves a request's tokens from `live` to
+///   `totals` in the same step, so the sum never goes down while it runs; a
+///   restart zeroes it, which [`counter_delta`] already treats as a restart.
+/// - prompt and cached: `totals.prompt_tokens` and `totals.reused` (the
+///   reused prefix is part of the prompt, as SGLang's cached counter is).
+/// - running: 1 while `live.state` is `reading` or `generating`, 0 when
+///   `idle`; queued: `live.queued`.
+/// - no KV fill (Strata has none) and no hit ratio: `totals` holds only
+///   lifetime sums, not the recent-window rate other backends report.
+///
+/// A body that is not such a JSON object reads as all `None`.
+#[must_use]
+pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
+    let Ok(doc) = serde_json::from_str::<StrataDoc>(body) else {
+        return (MetricsSample::default(), EngineFacts::default());
+    };
+    let busy = match doc.live.state.as_deref() {
+        Some("reading" | "generating") => Some(true),
+        Some("idle") => Some(false),
+        _ => None,
+    };
+    let live = match busy {
+        Some(true) => doc.live.generated.unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let sample = MetricsSample {
+        n_decode_total: doc
+            .totals
+            .output_tokens
+            .and_then(|done| finite_u64(done + live)),
+        requests_processing: busy.map(|busy| if busy { 1.0 } else { 0.0 }),
+        prompt_total: doc.totals.prompt_tokens.and_then(finite_u64),
+        queued: doc.live.queued,
+        kv_fill: None,
+        cache_hit: None,
+        cached_total: doc.totals.reused.and_then(finite_u64),
+    };
+    let facts = EngineFacts {
+        ctx: doc
+            .engine
+            .max_context
+            .and_then(finite_u64)
+            .and_then(|ctx| u32::try_from(ctx).ok())
+            .filter(|ctx| *ctx > 0),
+        kv: doc
+            .engine
+            .kv
+            .map(|kv| kv.to_ascii_lowercase())
+            .filter(|kv| is_token(kv)),
+    };
+    (sample, facts)
 }
 
 /// One series value: the sum over label sets, or the last one.
@@ -427,6 +564,131 @@ fn finite_u64(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STRATA: &str = include_str!("../../../fixtures/llama/strata-metrics.json");
+
+    /// The fixture with `live` replaced.
+    fn strata_live(live: &str) -> String {
+        let mut doc: serde_json::Value = serde_json::from_str(STRATA).expect("fixture");
+        doc["live"] = serde_json::from_str(live).expect("live");
+        doc.to_string()
+    }
+
+    #[test]
+    fn strata_generating_counts_the_running_request() {
+        let (sample, facts) = parse_strata(STRATA);
+        assert_eq!(
+            sample,
+            MetricsSample {
+                n_decode_total: Some(2540),
+                requests_processing: Some(1.0),
+                prompt_total: Some(12_000),
+                queued: Some(2.0),
+                kv_fill: None,
+                cache_hit: None,
+                cached_total: Some(9000),
+            }
+        );
+        assert_eq!(
+            facts,
+            EngineFacts {
+                ctx: Some(262_144),
+                kv: Some("q8".to_owned()),
+            }
+        );
+        assert_eq!(parse_metrics_for(Backend::Strata, STRATA), sample);
+        assert_eq!(
+            parse_metrics_full(Backend::Strata, STRATA),
+            (sample, Some(facts))
+        );
+    }
+
+    #[test]
+    fn strata_reading_and_idle() {
+        let reading = strata_live(
+            r#"{"state":"reading","queued":0,"phase":"reading the prompt","prompt_tokens":1800,
+                "prompt_read":900,"prompt_total":1800,"generated":0,"max_tokens":4096,"elapsed_s":1.0,
+                "tok_s":null,"tok_s_mean":null,"tok_s_window_s":null}"#,
+        );
+        let sample = parse_metrics_for(Backend::Strata, &reading);
+        assert_eq!(sample.requests_processing, Some(1.0));
+        assert_eq!(sample.queued, Some(0.0));
+        assert_eq!(sample.n_decode_total, Some(2500));
+
+        let idle = strata_live(
+            r#"{"state":"idle","queued":0,"phase":null,"prompt_tokens":null,"prompt_read":null,
+                "prompt_total":null,"generated":null,"max_tokens":null,"elapsed_s":null,
+                "tok_s":null,"tok_s_mean":null,"tok_s_window_s":null}"#,
+        );
+        let sample = parse_metrics_for(Backend::Strata, &idle);
+        assert_eq!(sample.requests_processing, Some(0.0));
+        assert_eq!(sample.n_decode_total, Some(2500));
+        assert_eq!(sample.cached_total, Some(9000));
+
+        // An unknown state is not a guess.
+        let odd = strata_live(r#"{"state":"sleeping","queued":1,"generated":5}"#);
+        let sample = parse_metrics_for(Backend::Strata, &odd);
+        assert_eq!(sample.requests_processing, None);
+        assert_eq!(sample.n_decode_total, Some(2500));
+    }
+
+    #[test]
+    fn strata_rejects_what_is_not_its_json() {
+        let empty = (MetricsSample::default(), EngineFacts::default());
+        assert_eq!(parse_strata(""), empty);
+        assert_eq!(parse_strata("llamacpp:n_decode_total 5\n"), empty);
+        assert_eq!(parse_strata("[1,2]"), empty);
+        assert_eq!(parse_strata(r#"{"totals":{"output_tokens":5}"#), empty);
+        // Wrong types and hostile values drop one field, not the rest.
+        let (sample, facts) = parse_strata(
+            r#"{"engine":{"max_context":-5,"kv":"../../etc/passwd"},
+                "live":{"state":7,"queued":"many","generated":-3},
+                "totals":{"output_tokens":10,"prompt_tokens":"x","reused":null}}"#,
+        );
+        assert_eq!(sample.n_decode_total, Some(10));
+        assert_eq!(sample.requests_processing, None);
+        assert_eq!(sample.queued, None);
+        assert_eq!(sample.prompt_total, None);
+        assert_eq!(sample.cached_total, None);
+        assert_eq!(facts, EngineFacts::default());
+        let (_, facts) = parse_strata(r#"{"engine":{"max_context":1e12,"kv":"Q8_0"}}"#);
+        assert_eq!(facts.ctx, None);
+        assert_eq!(facts.kv.as_deref(), Some("q8_0"));
+        // Strata's Prometheus-less body read as SGLang gives nothing.
+        assert_eq!(
+            parse_metrics_for(Backend::SgLang, STRATA),
+            MetricsSample::default()
+        );
+    }
+
+    #[test]
+    fn strata_restart_resets_the_counter_without_a_jump() {
+        let mut counter = DecodedCounter::default();
+        let at = Instant::now();
+        let first = parse_metrics_for(Backend::Strata, STRATA);
+        counter.observe("flash", first.n_decode_total.expect("decode"), None, at);
+        // The request finishes: its 40 tokens move from live to totals in one
+        // step, so the counter stays put instead of looking like a restart.
+        let mut doc: serde_json::Value = serde_json::from_str(STRATA).expect("fixture");
+        doc["totals"]["output_tokens"] = serde_json::json!(2540);
+        doc["live"] = serde_json::json!({"state": "idle", "queued": 0});
+        let finished = parse_metrics_for(Backend::Strata, &doc.to_string());
+        assert_eq!(finished.n_decode_total, Some(2540));
+        counter.observe("flash", 2540, None, at);
+        assert_eq!(counter.total(), 0);
+        // Strata restarted: totals start again from zero.
+        doc["totals"]["output_tokens"] = serde_json::json!(12);
+        let restarted = parse_metrics_for(Backend::Strata, &doc.to_string());
+        counter.observe("flash", restarted.n_decode_total.expect("decode"), None, at);
+        assert_eq!(counter.total(), 12);
+
+        let mut cache = PromptCache::default();
+        cache.observe_metrics("flash", Some(12_000), Some(9000));
+        cache.observe_metrics("flash", Some(12_500), Some(9400));
+        cache.observe_metrics("flash", Some(300), Some(100));
+        let (prompt, cached) = cache.get("flash").expect("counted");
+        assert_eq!((prompt, cached), (800, Some(500)));
+    }
 
     #[test]
     fn metrics_parse_ignores_extra_lines_missing_names_and_nan() {

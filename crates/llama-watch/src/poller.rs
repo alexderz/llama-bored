@@ -31,6 +31,10 @@
 //! `/metrics` (and any OpenAI-compatible server) falls back to llama-swap's
 //! activity rows: each finished request adds its `output_tokens` to the
 //! decoded counter once, so the counter still moves, at request end.
+//! Strata's `/metrics` is JSON ([`crate::metrics::parse_strata`]); its
+//! `engine` facts fill the model's ctx and KV, which its launch command
+//! cannot give. A 401 or 403 (Strata started with an API key; llama-bored
+//! keeps no secrets) falls back like any missing `/metrics`.
 //!
 //! The thread never touches the console or the snapshot file.
 
@@ -50,7 +54,9 @@ use llama_core::wire::CANONICAL_NAME_CHARS;
 use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
-use crate::metrics::{DecodedCounter, GenRate, MetricsSample, PromptCache, parse_metrics_for};
+use crate::metrics::{
+    DecodedCounter, EngineFacts, GenRate, MetricsSample, PromptCache, parse_metrics_full,
+};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
 use crate::tty::grid::Cell;
@@ -343,6 +349,8 @@ struct State<L> {
     ready: Vec<ReadyModel>,
     /// Gauges per model id from the last backend `/metrics` read.
     gauges: HashMap<String, Gauges>,
+    /// Engine facts per ready model id from its last `/metrics` read (Strata).
+    engine_facts: HashMap<String, EngineFacts>,
     /// Ready model ids counted from activity rows instead of `/metrics`.
     fallback: HashSet<String>,
     /// Model ids whose missing `/metrics` was logged this run.
@@ -393,6 +401,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         model_ids: Vec::new(),
         ready: Vec::new(),
         gauges: HashMap::new(),
+        engine_facts: HashMap::new(),
         fallback: HashSet::new(),
         no_metrics_logged: HashSet::new(),
         activity_seen: None,
@@ -526,6 +535,8 @@ impl<L: Sink> State<L> {
         }
         self.fallback.retain(|id| ready.contains(id.as_str()));
         self.gauges.retain(|id, _| ready.contains(id.as_str()));
+        self.engine_facts
+            .retain(|id, _| ready.contains(id.as_str()));
         for model in &self.ready {
             if !model.backend.has_metrics() {
                 self.fallback.insert(model.id.clone());
@@ -572,8 +583,14 @@ impl<L: Sink> State<L> {
             )
             .map_err(TapError::label)
             .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
-            .map(|text| parse_metrics_for(model.backend, &text));
+            .map(|text| parse_metrics_full(model.backend, &text));
             let now = Instant::now();
+            let read = read.map(|(sample, facts)| {
+                if let Some(facts) = facts {
+                    self.engine_facts.insert(model.id.clone(), facts);
+                }
+                sample
+            });
             let decoded = match &read {
                 Ok(sample) => sample.n_decode_total,
                 Err(_) => None,
@@ -942,11 +959,15 @@ impl<L: Sink> State<L> {
         Ok(())
     }
 
-    /// [`Self::models`] with each backend's fresh gauges filled in.
+    /// [`Self::models`] with each backend's fresh gauges filled in, and
+    /// engine facts where the launch command gave no ctx or KV.
     fn models_with_gauges(&self, now: Instant) -> Vec<ModelInfo> {
         let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
         let mut models = self.models.clone();
         for (model, id) in models.iter_mut().zip(&self.model_ids) {
+            if let Some(facts) = self.engine_facts.get(id) {
+                with_facts(&mut model.detail, facts);
+            }
             let Some(info) = model.backend.as_mut() else {
                 continue;
             };
@@ -1018,6 +1039,8 @@ enum TapError {
     Timeout,
     Refused,
     Status,
+    /// 401 or 403: the server wants an API key llama-bored does not keep.
+    Unauthorized,
     Oversize,
     Failed,
 }
@@ -1028,8 +1051,28 @@ impl TapError {
             Self::Timeout => "timeout",
             Self::Refused => "connection refused",
             Self::Status => "http status",
+            Self::Unauthorized => "unauthorized, API key set",
             Self::Oversize => "oversized body",
             Self::Failed => "request failed",
+        }
+    }
+}
+
+/// Fill `detail`'s ctx when the launch command gave none, and its KV when
+/// it is unknown or `auto`, from the server's own report.
+fn with_facts(detail: &mut Option<llama_core::detail::ModelDetail>, facts: &EngineFacts) {
+    if facts.ctx.is_none() && facts.kv.is_none() {
+        return;
+    }
+    let detail = detail.get_or_insert_with(Default::default);
+    if detail.ctx.is_none() {
+        detail.ctx = facts.ctx;
+    }
+    if let Some(kv) = &facts.kv {
+        for side in [&mut detail.kv_k, &mut detail.kv_v] {
+            if side.as_deref().is_none_or(|old| old == "auto") {
+                *side = Some(kv.clone());
+            }
         }
     }
 }
@@ -1067,7 +1110,11 @@ fn get_limited(
         .build()
         .call()
         .map_err(classify)?;
-    if response.status().as_u16() != 200 {
+    let status = response.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(TapError::Unauthorized);
+    }
+    if status != 200 {
         return Err(TapError::Status);
     }
     let mut buf = Vec::new();
@@ -1089,6 +1136,7 @@ fn classify(err: ureq::Error) -> TapError {
     match err {
         ureq::Error::Timeout(_) => TapError::Timeout,
         ureq::Error::ConnectionFailed => TapError::Refused,
+        ureq::Error::StatusCode(401 | 403) => TapError::Unauthorized,
         ureq::Error::Io(io) => classify_io(&io),
         _ => TapError::Failed,
     }

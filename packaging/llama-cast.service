@@ -1,0 +1,82 @@
+# llama-cast: the tty11 dashboard as a live DLNA/UPnP video on the LAN, for
+# smart TVs (Roku Media Player on TCL Roku TVs is tested).
+# LAN-exposed by design. It reads /dev/vcsa11 (read-only, through the
+# llama-view group), the console font, /etc/machine-id and its config;
+# writes no file; dials nothing; and runs only the configured ffmpeg.
+# Installed, never enabled by install.sh.
+#
+# Keep IPAddressAllow= equal to `allow` in /etc/llama-bored/cast.toml plus
+# the SSDP group 239.255.255.250/32, and SocketBindAllow= equal to the port
+# of `listen` plus udp:1900. The config is checked in process; these lines
+# are the kernel's copy of the same rule. Change both together with a
+# drop-in (an empty `IPAddressAllow=` or `SocketBindAllow=` first resets
+# the list), e.g. for a 192.168.1.0/24 LAN and port 19480:
+#   [Service]
+#   IPAddressAllow=
+#   IPAddressAllow=192.168.1.0/24 239.255.255.250/32
+#   SocketBindAllow=
+#   SocketBindAllow=tcp:19480
+#   SocketBindAllow=udp:1900
+# The firewall must also let the LAN reach udp/1900 and tcp/<port>.
+#
+# ffmpeg runs as a child under this same sandbox; libx264 encodes with
+# MemoryDenyWriteExecute=yes and the @system-service filter (tested with
+# ffmpeg 8.1). ExecStop= sends SSDP byebye before the stop signal.
+[Unit]
+Description=Llama Cast - tty11 dashboard as a DLNA live video (read-only, LAN)
+After=llama-watch.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=llama-cast
+Group=llama-cast
+SupplementaryGroups=llama-view
+ExecStart=/usr/local/libexec/llama-bored/llama-cast run --config /etc/llama-bored/cast.toml
+ExecStop=/usr/local/libexec/llama-bored/llama-cast bye --config /etc/llama-bored/cast.toml
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+WatchdogSec=10
+TimeoutStopSec=5
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+InaccessiblePaths=/sys
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+DevicePolicy=closed
+DeviceAllow=/dev/vcsa11 r
+RestrictAddressFamilies=AF_INET AF_UNIX
+IPAddressAllow=192.168.0.0/16 127.0.0.1/32 239.255.255.250/32
+IPAddressDeny=any
+SocketBindAllow=tcp:19478
+SocketBindAllow=udp:1900
+SocketBindDeny=any
+
+[Install]
+WantedBy=multi-user.target

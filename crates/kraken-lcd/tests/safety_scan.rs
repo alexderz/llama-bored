@@ -16,13 +16,19 @@ const WRITE_FILES: &[&str] = &[
     // T58: llama-metrics writes HTTP responses to its sockets. S16
     // (crates/llama-metrics/tests) forbids any file write in that crate.
     "crates/llama-metrics/src/http.rs",
+    // llama-cast writes HTTP responses and the stream to its sockets, and
+    // raw frames to ffmpeg's stdin pipe. S18 (crates/llama-cast/tests)
+    // forbids any file write in that crate.
+    "crates/llama-cast/src/http.rs",
+    "crates/llama-cast/src/encoder.rs",
 ];
-/// S16: llama-metrics is the only crate that may name a listening or
-/// datagram socket, or bind one. Every other crate (llama-watch,
-/// kraken-lcd, llama-view, llama-light, ...) keeps no listening port.
-/// Inside llama-metrics, its own S16 scan keeps the listener to http.rs and
-/// service.rs.
-const LISTENER_CRATE: &str = "crates/llama-metrics/";
+/// S16: llama-metrics and llama-cast are the only crates that may name a
+/// listening or datagram socket, or bind one. Every other crate
+/// (llama-watch, kraken-lcd, llama-view, llama-light, ...) keeps no
+/// listening port. Inside each, its own scan (S16 for llama-metrics, S18
+/// for llama-cast) scopes the sockets to reviewed files: llama-metrics one
+/// TCP listener; llama-cast one TCP listener and one UDP socket on 1900.
+const LISTENER_CRATES: &[&str] = &["crates/llama-metrics/", "crates/llama-cast/"];
 const BULK_FILE: &str = "crates/kraken-lcd/src/device/bulk.rs";
 const GPU_FILE: &str = "crates/llama-watch/src/sources/gpu.rs";
 
@@ -65,6 +71,10 @@ fn src_tree_passes_s1_and_the_s3_scan() {
         "crates/llama-watch/src/sources/gpu.rs",
         "crates/llama-metrics/src/http.rs",
         "crates/llama-metrics/src/service.rs",
+        "crates/llama-cast/src/http.rs",
+        "crates/llama-cast/src/service.rs",
+        "crates/llama-cast/src/discovery.rs",
+        "crates/llama-cast/src/encoder.rs",
         // S16 covers the RGB writer too: it must keep no listening socket.
         "crates/llama-light/src/service.rs",
         "crates/llama-light/src/aura/device.rs",
@@ -112,7 +122,7 @@ fn scanner_flags_forbidden_tokens_and_sys_writes() {
 }
 
 #[test]
-fn s16_only_llama_metrics_may_listen() {
+fn s16_only_llama_metrics_and_llama_cast_may_listen() {
     for (rel, planted) in [
         (
             "crates/llama-watch/src/service.rs",
@@ -134,6 +144,10 @@ fn s16_only_llama_metrics_may_listen() {
             "crates/llama-metrics-lookalike/src/lib.rs",
             "let l = TcpListener::bind(a);\n",
         ),
+        (
+            "crates/llama-cast-lookalike/src/lib.rs",
+            "let s = UdpSocket::bind(a);\n",
+        ),
     ] {
         let hits = scan_source(rel, planted);
         assert!(
@@ -144,6 +158,7 @@ fn s16_only_llama_metrics_may_listen() {
     for rel in [
         "crates/llama-metrics/src/http.rs",
         "crates/llama-metrics/src/service.rs",
+        "crates/llama-cast/src/service.rs",
     ] {
         let hits = scan_source(rel, "let l = TcpListener::bind(a)?;\n");
         assert!(hits.iter().all(|hit| !hit.contains("S16")), "{hits:?}");
@@ -546,13 +561,13 @@ fn scan_source(rel: &str, text: &str) -> Vec<String> {
     if rel != BULK_FILE && code.contains("nusb") {
         hits.push(format!("{rel}: nusb is only allowed in {BULK_FILE}"));
     }
-    if !rel.starts_with(LISTENER_CRATE) {
+    if !LISTENER_CRATES.iter().any(|c| rel.starts_with(c)) {
         hits.extend(listener_hits(rel, &code));
     }
     let writes = write_apis(&code);
     if writes && !WRITE_FILES.contains(&rel) {
         hits.push(format!(
-            "{rel}: write API outside hid.rs, guard.rs, main.rs, llama-light hidraw.rs, and llama-metrics http.rs"
+            "{rel}: write API outside hid.rs, guard.rs, main.rs, llama-light hidraw.rs, llama-metrics http.rs, and llama-cast http.rs/encoder.rs"
         ));
     }
     if writes && (code.contains("\"/sys") || code.contains("\"/proc")) {

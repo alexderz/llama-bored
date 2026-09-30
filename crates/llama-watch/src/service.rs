@@ -1117,7 +1117,8 @@ fn model_stuck(
 }
 
 /// `sglang  running 1/4 · queued 0 · KV 37 % · hit 80 %` for each ready model
-/// without `/slots`. Unknown gauges are `--`.
+/// without `/slots`. Unknown gauges are `--`. Strata has no KV gauge:
+/// `strata  running 1/1 · queued 0`.
 fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return Vec::new();
@@ -1143,11 +1144,13 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
                 (running, _) => num(running),
             };
             let mut line = format!(
-                "{}  running {running}{sep}queued {}{sep}KV {}",
+                "{}  running {running}{sep}queued {}",
                 info.kind.as_str(),
                 num(info.queued),
-                pct(info.kv_permille),
             );
+            if info.kind.has_kv_gauge() {
+                line.push_str(&format!("{sep}KV {}", pct(info.kv_permille)));
+            }
             if info.hit_permille.is_some() {
                 line.push_str(&format!("{sep}hit {}", pct(info.hit_permille)));
             }
@@ -2385,6 +2388,41 @@ mod tests {
         assert_eq!(model_detail(&sample, WatchState::Ready), "");
         assert!(backend_lines(&sample, WatchState::Ready).is_empty());
         assert!(!first_without_slots(&sample, WatchState::Ready));
+    }
+
+    #[test]
+    fn strata_leads_the_detail_and_its_line_has_no_kv() {
+        let mut flash = served(
+            "flash",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::Strata,
+                max_running: Some(1),
+                running: Some(1),
+                queued: Some(0),
+                ..BackendInfo::default()
+            }),
+        );
+        flash.detail = Some(llama_core::detail::ModelDetail {
+            ctx: Some(262_144),
+            kv_k: Some("q8".to_owned()),
+            kv_v: Some("q8".to_owned()),
+            ..llama_core::detail::ModelDetail::default()
+        });
+        let sample = backend_sample(vec![flash]);
+        assert_eq!(
+            model_detail(&sample, WatchState::Ready),
+            "strata · 256k · kv q8"
+        );
+        assert_eq!(
+            backend_lines(&sample, WatchState::Ready),
+            vec!["strata  running 1/1 · queued 0".to_owned()]
+        );
+        assert!(first_without_slots(&sample, WatchState::Ready));
+        assert_eq!(
+            watch_state(&sample, &TickState::new(2, 6).detail, true, true),
+            WatchState::Generating
+        );
     }
 
     /// #5: a header model without `/slots` shows its last capture, titled

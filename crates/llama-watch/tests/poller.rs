@@ -1351,6 +1351,216 @@ fn config_override_beats_the_launch_command() {
     assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
 }
 
+// ---- Strata: JSON /metrics, no slots -----------------------------------------
+
+/// The real-shaped llama-swap Strata command (podman wrapper, generic names).
+const STRATA_CMD: &str = "podman run --rm --name flash --device nvidia.com/gpu=all -v /models/strata:/data:ro localhost/strata:v0.1.27-sm86 python serve/server.py --engine strata --config /data/strata.json --port 8095";
+
+/// `fixtures/llama/strata-metrics.json` with invented counters and state.
+fn strata_metrics(output: u64, prompt: u64, reused: u64, state: &str, generated: u64) -> Vec<u8> {
+    let text = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/llama/strata-metrics.json"),
+    )
+    .expect("strata fixture");
+    let mut doc: serde_json::Value = serde_json::from_str(&text).expect("fixture json");
+    doc["totals"]["output_tokens"] = serde_json::json!(output);
+    doc["totals"]["prompt_tokens"] = serde_json::json!(prompt);
+    doc["totals"]["reused"] = serde_json::json!(reused);
+    doc["live"]["state"] = serde_json::json!(state);
+    doc["live"]["generated"] = if state == "idle" {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(generated)
+    };
+    serde_json::to_vec(&doc).expect("json")
+}
+
+#[test]
+fn strata_reads_its_json_metrics_and_never_slots() {
+    let mut world = World::running(running_cmd("flash", STRATA_CMD));
+    world.metrics.insert(
+        "flash".to_owned(),
+        strata_metrics(1000, 8000, 6000, "generating", 20),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+            && view.models[0]
+                .backend
+                .is_some_and(|info| info.running.is_some())
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kind, llama_core::backend::Backend::Strata);
+    assert_eq!(info.running, Some(1));
+    assert_eq!(info.queued, Some(2));
+    assert_eq!(info.max_running, Some(1));
+    assert_eq!(info.kv_permille, None);
+    assert_eq!(info.hit_permille, None);
+    // ctx and KV come from `engine`, which the launch command lacks.
+    let model_detail = view.models[0].detail.as_ref().expect("detail");
+    assert_eq!(model_detail.ctx, Some(262_144));
+    assert_eq!(model_detail.kv_k.as_deref(), Some("q8"));
+    assert_eq!(model_detail.quant, None);
+    assert_eq!(prompt_cache_of(&detail, "flash"), Some((0, Some(0))));
+
+    // Live tokens count while the request runs; finishing moves them to
+    // totals without a jump; the prompt and reused counters move at the end.
+    server.update(|world| {
+        world.metrics.insert(
+            "flash".to_owned(),
+            strata_metrics(1000, 8000, 6000, "generating", 50),
+        );
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(30)
+    });
+    server.update(|world| {
+        world.metrics.insert(
+            "flash".to_owned(),
+            strata_metrics(1050, 9500, 7200, "idle", 0),
+        );
+    });
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, detail| {
+        view.models[0]
+            .backend
+            .is_some_and(|info| info.running == Some(0))
+            && prompt_cache_of(detail, "flash") == Some((1500, Some(1200)))
+    });
+    assert_eq!(view.decoded_total, Some(30));
+    assert_eq!(prompt_cache_of(&detail, "flash"), Some((1500, Some(1200))));
+    // Strata restarted: its totals start again and count from zero.
+    server.update(|world| {
+        world
+            .metrics
+            .insert("flash".to_owned(), strata_metrics(7, 100, 0, "idle", 0));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(37)
+    });
+
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(
+        hits.iter().any(|path| path == "/upstream/flash/metrics"),
+        "{hits:?}"
+    );
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+    let lines = log.lines().join("\n");
+    assert!(!lines.contains("metrics:"), "{lines}");
+    assert!(!lines.contains("no /metrics"), "{lines}");
+}
+
+/// Strata started with `--api-key`: `/metrics` answers 401. llama-bored
+/// keeps no secrets, so the model is counted from activity rows, logged once.
+#[test]
+fn strata_with_an_api_key_falls_back_to_activity_and_logs_once() {
+    for status in [401, 403] {
+        let mut world = World::running(running_cmd("flash", STRATA_CMD));
+        world.metrics_status = status;
+        world.activity = activity_page(&[(7, "flash", 500)]);
+        let server = Server::start(world);
+        let log = MemLog::new();
+        let config = watch(server.port, 12, 4_194_304, 0.15);
+        let (_poller, rx) = spawn(&config, &log);
+        wait_msg(&rx, Duration::from_secs(2), |view, _| {
+            view.decoded_total == Some(0)
+        });
+        server.update(|world| {
+            world.activity = activity_page(&[(8, "flash", 25), (7, "flash", 500)]);
+        });
+        let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+            view.decoded_total == Some(25)
+        });
+        let info = view.models[0].backend.expect("backend");
+        assert_eq!(info.kind, llama_core::backend::Backend::Strata);
+        assert_eq!(info.running, None);
+        thread::sleep(Duration::from_millis(600));
+        let lines = log.lines();
+        let notes: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("no /metrics"))
+            .collect();
+        assert_eq!(notes.len(), 1, "{lines:?}");
+        assert!(
+            notes[0].contains(
+                "flash: no /metrics from strata (unauthorized, API key set); using llama-swap activity"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("metrics: ")),
+            "no metrics failure flag: {lines:?}"
+        );
+        let hits = server.hits();
+        assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+    }
+}
+
+/// Strata's `/metrics` carries a minute of hardware history. Past the
+/// 1 MiB server cap it is dropped, not parsed, and the model falls back.
+#[test]
+fn strata_metrics_over_the_cap_fall_back() {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&strata_metrics(1000, 10, 0, "idle", 0)).expect("json");
+    let point = serde_json::json!([1_790_000_000.0, 97]);
+    doc["history"]["gpu_util"] = serde_json::Value::Array(vec![point; 80_000]);
+    let body = serde_json::to_vec(&doc).expect("json");
+    assert!(body.len() > 1024 * 1024, "{}", body.len());
+    let mut world = World::running(running_cmd("flash", STRATA_CMD));
+    world.metrics.insert("flash".to_owned(), body);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    assert_eq!(view.models[0].backend.expect("backend").running, None);
+    let lines = log.lines().join("\n");
+    assert!(
+        lines.contains("flash: no /metrics from strata (oversized body)"),
+        "{lines}"
+    );
+}
+
+#[test]
+fn config_override_can_name_strata() {
+    let mut world = World::running(running_cmd("flash", "python3 app.py --port 8095"));
+    world
+        .metrics
+        .insert("flash".to_owned(), strata_metrics(10, 10, 0, "reading", 0));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(
+        server.port,
+        12,
+        4_194_304,
+        0.15,
+        "[llama.backends]\n\"flash\" = \"strata\"\n",
+    );
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.running == Some(1))
+    });
+    assert_eq!(
+        view.models[0].backend.expect("backend").kind,
+        llama_core::backend::Backend::Strata
+    );
+    // No launch detail: the engine's ctx and KV still show.
+    let detail = view.models[0].detail.as_ref().expect("detail from engine");
+    assert_eq!(detail.ctx, Some(262_144));
+    assert_eq!(detail.kv_k.as_deref(), Some("q8"));
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+}
+
 // ---- #10: per-model prompt and cached-prompt counters -----------------------
 
 fn cache_row(id: i64, model: &str, input: i64, cache: i64) -> serde_json::Value {

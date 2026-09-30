@@ -210,7 +210,7 @@ scripts/check.sh
 ```
 
 `check.sh` runs formatting, clippy, all tests, `cargo deny`, `cargo audit`, the
-safety fences (S1–S3, S6–S16), the installer self-tests, and the **release build**. It
+safety fences (S1–S3, S6–S18), the installer self-tests, and the **release build**. It
 ends by writing `target/check-provenance.txt` (toolchain, `Cargo.lock` hash,
 HEAD, binary hashes). If it fails, **STOP** and report the failing step. Do not
 patch the code.

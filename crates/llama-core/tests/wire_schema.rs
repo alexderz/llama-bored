@@ -659,15 +659,36 @@ fn backend_gauges_are_additive_on_schema_v1() {
     assert!(text.contains(r#""backend":"llamacpp""#), "{text}");
     assert_eq!(parse_validated(&bytes).expect("round trip"), snap);
 
-    for word in ["vllm", "openai", "llamacpp", "sglang"] {
+    let mut strata = valid();
+    strata.ai.models[0].backend = Some(wire::Backend::Strata);
+    strata.ai.models[0].running = Some(1);
+    strata.ai.models[0].queued = Some(0);
+    let bytes = to_json(&strata).expect("encode");
+    let text = std::str::from_utf8(&bytes).expect("utf-8");
+    assert!(
+        text.contains(r#""backend":"strata","running":1,"queued":0"#),
+        "{text}"
+    );
+    assert_eq!(parse_validated(&bytes).expect("strata round trip"), strata);
+
+    for word in ["vllm", "openai", "llamacpp", "sglang", "strata"] {
         let json = insert_after(
             &base_json(),
             r#""state":"ready""#,
             &format!(r#","backend":"{word}""#),
         );
-        assert!(parse_validated(&json).is_ok(), "{word}");
+        let snap = parse_validated(&json).expect(word);
+        assert_eq!(
+            snap.ai.models[0].backend.map(wire::Backend::as_str),
+            Some(word)
+        );
     }
+    // A newer watcher's backend word reads as openai (no gauges this reader
+    // knows) instead of rejecting the whole snapshot. A non-string still fails.
     let json = insert_after(&base_json(), r#""state":"ready""#, r#","backend":"tabby""#);
+    let snap = parse_validated(&json).expect("unknown backend word");
+    assert_eq!(snap.ai.models[0].backend, Some(wire::Backend::OpenAi));
+    let json = insert_after(&base_json(), r#""state":"ready""#, r#","backend":1"#);
     assert_eq!(parse_validated(&json), Err(WireError::Parse));
     let json = insert_after(&base_json(), r#""state":"ready""#, r#","running":-1"#);
     assert_eq!(parse_validated(&json), Err(WireError::Parse));

@@ -3,7 +3,8 @@
 //! llama.cpp (and its forks) answer `/slots` and `llamacpp:*` metrics.
 //! SGLang and vLLM have their own Prometheus names and no `/slots`. Any
 //! other OpenAI-compatible server (TabbyAPI, ExLlamaV3) has neither, and
-//! the watcher falls back to llama-swap's activity log for it.
+//! the watcher falls back to llama-swap's activity log for it. Strata serves
+//! one request at a time and answers `/metrics` with JSON, not Prometheus.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,9 @@ pub enum Backend {
     SgLang,
     /// vLLM (`vllm serve`, `vllm.entrypoints`).
     Vllm,
+    /// Strata (`serve/server.py --engine strata`): JSON `/metrics`, one
+    /// request at a time, no usable `/slots`.
+    Strata,
     /// Any other OpenAI-compatible server.
     OpenAi,
 }
@@ -33,8 +37,41 @@ impl Backend {
             Self::LlamaCpp => "llamacpp",
             Self::SgLang => "sglang",
             Self::Vllm => "vllm",
+            Self::Strata => "strata",
             Self::OpenAi => "openai",
         }
+    }
+
+    /// The kind for a wire or config word; `None` for an unknown word.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        [
+            Self::LlamaCpp,
+            Self::SgLang,
+            Self::Vllm,
+            Self::Strata,
+            Self::OpenAi,
+        ]
+        .into_iter()
+        .find(|kind| kind.as_str() == word)
+    }
+
+    /// Wire read of a backend word. A word this reader does not know (a
+    /// newer watcher's backend) reads as [`Self::OpenAi`], a server with no
+    /// gauges this reader can show, instead of rejecting the snapshot.
+    /// `watch.toml` stays strict: it uses the derived `Deserialize`.
+    pub fn deserialize_lenient<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let word = Option::<std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Ok(word.map(|word| Self::from_word(&word).unwrap_or(Self::OpenAi)))
+    }
+
+    /// Whether the server reports a KV cache fill. Strata has none.
+    #[must_use]
+    pub fn has_kv_gauge(self) -> bool {
+        self != Self::Strata
     }
 
     /// Only llama.cpp answers `/slots`.
@@ -90,6 +127,7 @@ mod tests {
             Backend::LlamaCpp,
             Backend::SgLang,
             Backend::Vllm,
+            Backend::Strata,
             Backend::OpenAi,
         ] {
             let json = serde_json::to_string(&kind).expect("encode");
@@ -101,6 +139,38 @@ mod tests {
         }
         assert!(serde_json::from_str::<Backend>("\"tabby\"").is_err());
         assert!(serde_json::from_str::<Backend>("\"SGLang\"").is_err());
+        assert_eq!(Backend::from_word("strata"), Some(Backend::Strata));
+        assert_eq!(Backend::from_word("Strata"), None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Lenient {
+        #[serde(default, deserialize_with = "Backend::deserialize_lenient")]
+        backend: Option<Backend>,
+    }
+
+    #[test]
+    fn lenient_read_maps_unknown_words_to_openai() {
+        let read = |json: &str| serde_json::from_str::<Lenient>(json).map(|l| l.backend);
+        assert_eq!(
+            read(r#"{"backend":"strata"}"#).ok(),
+            Some(Some(Backend::Strata))
+        );
+        assert_eq!(
+            read(r#"{"backend":"sglang"}"#).ok(),
+            Some(Some(Backend::SgLang))
+        );
+        assert_eq!(
+            read(r#"{"backend":"tabby"}"#).ok(),
+            Some(Some(Backend::OpenAi))
+        );
+        assert_eq!(
+            read(r#"{"backend":"strata\u0031"}"#).ok(),
+            Some(Some(Backend::OpenAi))
+        );
+        assert_eq!(read(r#"{"backend":null}"#).ok(), Some(None));
+        assert_eq!(read("{}").ok(), Some(None));
+        assert!(read(r#"{"backend":7}"#).is_err());
     }
 
     #[test]
@@ -108,6 +178,10 @@ mod tests {
         assert!(Backend::LlamaCpp.has_slots());
         assert!(!Backend::SgLang.has_slots());
         assert!(!Backend::Vllm.has_slots());
+        assert!(!Backend::Strata.has_slots());
+        assert!(Backend::Strata.has_metrics());
+        assert!(!Backend::Strata.has_kv_gauge());
+        assert!(Backend::SgLang.has_kv_gauge());
         assert!(Backend::SgLang.has_metrics());
         assert!(!Backend::OpenAi.has_metrics());
     }

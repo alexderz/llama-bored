@@ -13,9 +13,9 @@
 //!   `TcpListener::bind`, in `service.rs`;
 //! - the manifest's dependencies are pinned.
 //!
-//! The workspace-wide half (no other crate binds or listens) is in
-//! `crates/kraken-lcd/tests/safety_scan.rs`. Each rule is shown to bite on a
-//! planted source below.
+//! The workspace-wide half (no crate but this one and llama-cast binds or
+//! listens) is in `crates/kraken-lcd/tests/safety_scan.rs`. Each rule is
+//! shown to bite on a planted source below.
 
 use std::fs;
 use std::path::{Path, PathBuf};

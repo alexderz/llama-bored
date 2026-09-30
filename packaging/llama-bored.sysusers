@@ -3,3 +3,4 @@ u llama-watch - "Llama Watch reader/tty" / /usr/sbin/nologin
 g llama-view -
 u llama-light - "Llama Light RGB writer" / /usr/sbin/nologin
 u llama-metrics - "Llama Metrics exporter" / /usr/sbin/nologin
+u llama-cast - "Llama Cast DLNA streamer" / /usr/sbin/nologin

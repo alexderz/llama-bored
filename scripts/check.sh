@@ -31,11 +31,12 @@ fi
 scripts/install.sh --self-test
 scripts/ramp-monitor.sh --self-test
 
-# Eleven lines, in this order. scripts/stage.sh and the root installer
-# both parse this file. The last five lines are the release binaries.
+# Twelve lines, in this order. scripts/stage.sh and the root installer
+# both parse this file. The last six lines are the release binaries.
 # S6 still checks only the LCD writer (kraken-lcd); S15 (cargo test) and
 # scripts/s10-deps.sh fence llama-light; S16 (cargo test) and
-# scripts/s10-deps.sh fence llama-metrics.
+# scripts/s10-deps.sh fence llama-metrics; S18 (cargo test) and
+# scripts/s10-deps.sh fence llama-cast.
 mkdir -p target
 {
   rustc -V
@@ -44,5 +45,5 @@ mkdir -p target
   git rev-parse HEAD
   git describe --always --dirty
   sha256sum target/release/kraken-lcd target/release/llama-watch target/release/llama-view \
-    target/release/llama-light target/release/llama-metrics
+    target/release/llama-light target/release/llama-metrics target/release/llama-cast
 } > target/check-provenance.txt

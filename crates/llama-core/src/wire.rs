@@ -241,7 +241,13 @@ pub struct ModelWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ModelDetail>,
     /// Server kind (T72). Omitted by an older watcher; absent reads as llama.cpp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A word this reader does not know reads as [`Backend::OpenAi`], so a
+    /// newer watcher's backend never rejects the snapshot.
+    #[serde(
+        default,
+        deserialize_with = "Backend::deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub backend: Option<Backend>,
     /// Requests running, from a backend without `/slots`. At most [`MAX_REQS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

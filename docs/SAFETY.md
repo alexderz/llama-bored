@@ -28,7 +28,7 @@ wrong, and which risks remain.
   `pwmN` and `pwmN_enable` of one motherboard hwmon, chosen by name, and fence
   S14 checks that its code has no way to write them.
 - **No liquidctl at runtime**, and nothing calls `initialize`.
-- **Checked on every build** by safety fences S1–S3 and S6–S16 (see
+- **Checked on every build** by safety fences S1–S3 and S6–S18 (see
   [ARCHITECTURE.md](ARCHITECTURE.md#safety-fences)).
 
 Cooling never depends on kraken-lcd. The cooler's firmware and the kernel
@@ -134,9 +134,10 @@ when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
 
 ## The network exporter (llama-metrics)
 
-- **Only llama-metrics listens (S16).** No other crate names a listening
-  socket or `bind`. The exporter binds exactly once, and the unit pins the
-  port with `SocketBindAllow=tcp:19477` / `SocketBindDeny=any`.
+- **Only llama-metrics and llama-cast listen (S16, S18).** No other crate
+  names a listening socket or `bind`. The exporter binds exactly once, and
+  the unit pins the port with `SocketBindAllow=tcp:19477` /
+  `SocketBindDeny=any`.
 - **Two copies of the allowlist.** The config's `allow` is checked in process
   before a byte is read; the unit's `IPAddressAllow=` (with
   `IPAddressDeny=any`) makes the kernel enforce the same list. `/0` and
@@ -153,6 +154,28 @@ when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
   (`max_conns`) with `503` beyond it. No body is read.
 - **Off by default.** The installer never enables it and never touches the
   firewall.
+
+## The TV stream (llama-cast)
+
+- **Off by default.** The installer installs it but never enables it.
+- **What it can reach.** It reads tty11's screen buffer (`/dev/vcsa11`,
+  read-only, through the `llama-view` group), the console font, the machine
+  id (to derive a stable device id; the id itself is never sent) and its
+  config. It writes no files and connects to nothing. Fence S18 pins all of
+  this in the source: one TCP listener and one UDP socket on port 1900, no
+  outbound connection, no `/sys`, hidraw, USB or NVML, and exactly one
+  process spawn: the configured `ffmpeg` with a fixed argument list and an
+  empty environment, no shell.
+- **Two copies of the allowlist,** as for llama-metrics: `allow` is checked
+  in process before a byte is read (and before answering discovery), and
+  the unit's `IPAddressAllow=` (plus the SSDP multicast group) with
+  `IPAddressDeny=any` makes the kernel enforce it. `SocketBindAllow=` pins
+  the stream port and UDP 1900.
+- **Strict, small HTTP.** Fixed paths, request-line, head, header-count and
+  body caps, deadlines, a client cap (one `ffmpeg` per viewer), and only the
+  DLNA actions a player needs.
+- **By design, anyone in `allow` can watch tty11,** including the IN/OUT
+  text when `show_text` is on. Narrow `allow` to the TVs, or turn text off.
 
 ## Other failure behaviour
 
@@ -205,6 +228,7 @@ anomalies. Nothing on the device needs cleaning up after uninstall.
 | RR-L1 | An RGB write path next to fan headers could be misused to change fan behaviour or persist settings | Colour-only crate (S15), two-opcode encoder with no save/commit, no i2c/hwmon/pwm, `ReadOnlyPaths=/sys`, one pinned node, restore without commit | **Closed** |
 | RR-L2 | Direct mode overrides the board's stored effect while llama-light runs | By design; nothing is saved, and the stored effect returns at the next power cycle | **Accepted** |
 | RR-M1 | llama-metrics is reachable from the LAN | Off by default; in-process allowlist plus `IPAddressAllow=`; pinned port; strict HTTP limits; no device, `/sys` or outbound access (S16). Opening the firewall is the operator's step | **Operator's choice** |
+| RR-C1 | llama-cast shows tty11 (possibly prompt and output text) to the LAN | Off by default; in-process allowlist plus `IPAddressAllow=`; pinned ports; strict HTTP; no outbound, `/sys` or device access beyond read-only `/dev/vcsa11`; one fixed `ffmpeg` spawn (S18). Narrow `allow`, or set `show_text = false` | **Accepted** |
 | RR-M2 | Scrapers learn model names, tuning tokens and activity patterns | Numbers and allowlisted names only, never prompt or output text (the snapshot has none). Restrict `allow` to the Prometheus host if that matters | **Accepted** |
 
 ## If you are changing the code
@@ -214,7 +238,7 @@ anomalies. Nothing on the device needs cleaning up after uninstall.
   purpose.
 - The writer crates must never gain a network or NVML dependency (S10, S11,
   S15). Adding an Aura opcode is a safety review, like a Kraken command.
-- Only llama-metrics may listen (S16).
+- Only llama-metrics and llama-cast may listen (S16, S18).
 - The snapshot schema is frozen at v1. Any change bumps `schema`.
 - Record `pwm*_enable`, pump rpm and coolant before and after any
   device-facing test. `scripts/cooling-snapshot.sh` prints one line, and

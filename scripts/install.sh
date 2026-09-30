@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install kraken-lcd, llama-watch, llama-view, llama-light and
-# llama-metrics. Run with sudo. It is idempotent.
+# Install kraken-lcd, llama-watch, llama-view, llama-light, llama-metrics
+# and llama-cast. Run with sudo. It is idempotent.
 #
 # Root never runs git, cargo, rustc, or brew. scripts/stage.sh does that
 # review as the repo owner ($SUDO_USER). Root's PATH is only
@@ -17,9 +17,10 @@
 # output says how to add it later; more than one refuses. llama-light (RGB
 # lighting) is installed but enabled for boot only with --enable-light; it
 # is never started here.
-# llama-metrics (the LAN Prometheus exporter) is installed but never enabled
-# or started here, and the firewall is never touched: enabling it is a
-# printed operator step.
+# llama-metrics (the LAN Prometheus exporter) and llama-cast (tty11 as a
+# DLNA live video for TVs) are installed but never enabled or started here,
+# and the firewall is never touched: enabling them is a printed operator
+# step.
 #
 # `--self-test` refuses root and does not call sudo, udevadm,
 # systemd-sysusers, setfacl, or systemctl.
@@ -91,7 +92,7 @@ copy_regular() {
 # re-read a user-writable path.
 freeze_staging() {
   local repo=$1 dest_root=$2
-  local dir config_dest config_new watch_dest light_dest metrics_dest
+  local dir config_dest config_new watch_dest light_dest metrics_dest cast_dest
   dir="$(mktemp -d)"
   chmod 0700 "$dir" || {
     rm -rf -- "$dir"
@@ -126,6 +127,14 @@ freeze_staging() {
     return 1
   }
   copy_regular "$repo/packaging/llama-metrics.service" "$dir/llama-metrics.service" || {
+    rm -rf -- "$dir"
+    return 1
+  }
+  copy_regular "$repo/target/release/llama-cast" "$dir/llama-cast" || {
+    rm -rf -- "$dir"
+    return 1
+  }
+  copy_regular "$repo/packaging/llama-cast.service" "$dir/llama-cast.service" || {
     rm -rf -- "$dir"
     return 1
   }
@@ -290,6 +299,33 @@ freeze_staging() {
       return 1
     }
   fi
+  # cast.toml: the operator's file is kept; the example is installed only
+  # when there is none.
+  cast_dest="$(dest_path "$dest_root" /etc/llama-bored/cast.toml)"
+  if [[ -e "$cast_dest" ]]; then
+    if [[ -L "$cast_dest" || ! -f "$cast_dest" ]]; then
+      echo "install.sh: $cast_dest is not a regular file" >&2
+      rm -rf -- "$dir"
+      return 1
+    fi
+    copy_regular "$cast_dest" "$dir/cast.toml" || {
+      rm -rf -- "$dir"
+      return 1
+    }
+    printf 'keep\n' >"$dir/cast.mode" || {
+      rm -rf -- "$dir"
+      return 1
+    }
+  else
+    copy_regular "$repo/packaging/cast.example.toml" "$dir/cast.toml" || {
+      rm -rf -- "$dir"
+      return 1
+    }
+    printf 'install\n' >"$dir/cast.mode" || {
+      rm -rf -- "$dir"
+      return 1
+    }
+  fi
   printf '%s\n' "$dir"
 }
 
@@ -303,10 +339,12 @@ show_staging_hashes() {
     "$staging/llama-view"
     "$staging/llama-light"
     "$staging/llama-metrics"
+    "$staging/llama-cast"
     "$staging/kraken-lcd.service"
     "$staging/llama-watch.service"
     "$staging/llama-light.service"
     "$staging/llama-metrics.service"
+    "$staging/llama-cast.service"
     "$staging/llama-bored.sysusers"
     "$staging/71-kraken-lcd.rules"
     "$staging/72-llama-view.rules"
@@ -317,6 +355,7 @@ show_staging_hashes() {
     "$staging/config.toml"
     "$staging/light.toml"
     "$staging/metrics.toml"
+    "$staging/cast.toml"
   )
   # watch.toml is always staged. config.toml.new is the operator's hand-off, listed
   # when he prepared one, so the hashes cover the bytes that will be installed.
@@ -331,16 +370,17 @@ show_staging_hashes() {
 
 verify_staged_binary() {
   local staging=$1 got want count i name line
-  local -a names=(kraken-lcd llama-watch llama-view llama-light llama-metrics)
-  local -a lines=(7 8 9 10 11)
+  local -a names=(kraken-lcd llama-watch llama-view llama-light llama-metrics llama-cast)
+  local -a lines=(7 8 9 10 11 12)
   # Line 7 is the writer, line 8 the watcher, line 9 the view, line 10 the
-  # light writer, line 11 the metrics exporter. Same order as check.sh.
+  # light writer, line 11 the metrics exporter, line 12 the DLNA streamer.
+  # Same order as check.sh.
   count="$(awk 'END { print NR }' "$staging/check-provenance.txt")"
-  if [[ "$count" -ne 11 ]]; then
-    echo "install.sh: staged provenance must have 11 lines" >&2
+  if [[ "$count" -ne 12 ]]; then
+    echo "install.sh: staged provenance must have 12 lines" >&2
     return 1
   fi
-  for i in 0 1 2 3 4; do
+  for i in 0 1 2 3 4 5; do
     name="${names[$i]}"
     line="${lines[$i]}"
     if ! got="$(sha256sum -- "$staging/$name")"; then
@@ -363,7 +403,7 @@ verify_staged_binary() {
 verify_staged_matches_disk() {
   local staging=$1 repo=$2 dest_root=$3
   local config_mode config_src config_new watch_mode watch_src light_mode light_src pair staged live
-  local metrics_mode metrics_src
+  local metrics_mode metrics_src cast_mode cast_src
   local -a pairs=(
     kraken-lcd:target/release/kraken-lcd
     llama-watch:target/release/llama-watch
@@ -373,6 +413,8 @@ verify_staged_matches_disk() {
     94-llama-light-hidraw.rules:packaging/94-llama-light-hidraw.rules
     llama-metrics:target/release/llama-metrics
     llama-metrics.service:packaging/llama-metrics.service
+    llama-cast:target/release/llama-cast
+    llama-cast.service:packaging/llama-cast.service
     kraken-lcd.service:packaging/kraken-lcd.service
     llama-watch.service:packaging/llama-watch.service
     llama-bored.sysusers:packaging/llama-bored.sysusers
@@ -443,6 +485,19 @@ verify_staged_matches_disk() {
   fi
   if ! cmp -s -- "$staging/metrics.toml" "$metrics_src"; then
     echo "install.sh: staged metrics.toml does not match the reviewed metrics.toml" >&2
+    return 1
+  fi
+  if ! cast_mode="$(tr -d '[:space:]' <"$staging/cast.mode")"; then
+    echo "install.sh: staged cast mode is unreadable" >&2
+    return 1
+  fi
+  if [[ "$cast_mode" == "install" ]]; then
+    cast_src="$repo/packaging/cast.example.toml"
+  else
+    cast_src="$(dest_path "$dest_root" /etc/llama-bored/cast.toml)"
+  fi
+  if ! cmp -s -- "$staging/cast.toml" "$cast_src"; then
+    echo "install.sh: staged cast.toml does not match the reviewed cast.toml" >&2
     return 1
   fi
   config_new="$(dest_path "$dest_root" /etc/llama-bored/config.toml.new)"
@@ -836,6 +891,18 @@ rollback_note_metrics() {
   fi
 }
 
+# "Created llama-cast": same rule as llama-metrics.
+# shellcheck disable=SC2329 # called from commit_new_file
+rollback_note_cast() {
+  local base
+  base="$(basename -- "$1")"
+  if [[ "$base" == "llama-cast" || "$base" == "llama-cast.service" ]]; then
+    if [[ "${INSTALL_CAST_WAS_ABSENT:-}" == 1 ]]; then
+      INSTALL_CREATED_CAST=1
+    fi
+  fi
+}
+
 # A failed run with a non-empty record leaves this file. The next install
 # refuses until the printed rollback removes it.
 rollback_marker_path() {
@@ -914,6 +981,9 @@ print_rollback() {
   if [[ "${INSTALL_CREATED_METRICS:-0}" == 1 ]]; then
     echo "  systemctl disable --now llama-metrics.service"
   fi
+  if [[ "${INSTALL_CREATED_CAST:-0}" == 1 ]]; then
+    echo "  systemctl disable --now llama-cast.service"
+  fi
   n=${#ROLLBACK_KIND[@]}
   for ((i = n - 1; i >= 0; i--)); do
     path="${ROLLBACK_PATH[$i]}"
@@ -979,9 +1049,9 @@ the steps below; run them yourself, as root, one at a time.
 
 Upgrading an install that already runs? Move the running units onto the new
 binaries. try-restart restarts only units that are running now (here any of
-llama-watch, kraken-lcd, llama-light, llama-metrics); a stopped unit stays
-stopped and nothing is enabled:
-  systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics
+llama-watch, kraken-lcd, llama-light, llama-metrics, llama-cast); a stopped
+unit stays stopped and nothing is enabled:
+  systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics llama-cast
 
 Optional:
   systemctl --global enable kraken-lcd-halt.path   # desktop alert on HALTED
@@ -989,6 +1059,7 @@ Optional:
 EOF
   print_light_steps
   print_metrics_steps
+  print_cast_steps
   print_rollback
 }
 
@@ -1006,9 +1077,9 @@ a time.
 
 Upgrading an install that already runs? Move the running units onto the new
 binaries. try-restart restarts only units that are running now (here any of
-llama-watch, llama-light, llama-metrics); a stopped unit stays stopped and
-nothing is enabled:
-  systemctl try-restart llama-watch llama-light llama-metrics
+llama-watch, llama-light, llama-metrics, llama-cast); a stopped unit stays
+stopped and nothing is enabled:
+  systemctl try-restart llama-watch llama-light llama-metrics llama-cast
 
 Optional:
   usermod -aG llama-view $SUDO_USER   # mirror tty11 with llama-view; log in again
@@ -1020,6 +1091,7 @@ The installer then sets it up and prints the LCD steps; it never starts it.
 EOF
   print_light_steps
   print_metrics_steps
+  print_cast_steps
   print_rollback
 }
 
@@ -1036,6 +1108,28 @@ To turn it on:
   to allow and the listen port in /etc/llama-bored/metrics.toml.
   Open the port in the firewall zone that holds your LAN yourself, for example:
   firewall-cmd --permanent --zone=internal --add-port=19477/tcp && firewall-cmd --reload
+EOF
+}
+
+print_cast_steps() {
+  cat <<'EOF'
+
+TV cast (llama-cast) is installed, not enabled. It shows the tty11
+dashboard as a live video to DLNA/UPnP players on the LAN (Roku Media
+Player is tested). LAN-exposed by design: anyone in `allow` can watch
+tty11. It needs ffmpeg with libx264 (/usr/bin/ffmpeg by default).
+To turn it on:
+  Set interface_addr (this host's LAN address) and allow in
+  /etc/llama-bored/cast.toml, and font to match [tty] font in watch.toml.
+  /usr/local/libexec/llama-bored/llama-cast check --config /etc/llama-bored/cast.toml
+  systemctl enable --now llama-cast
+  Keep IPAddressAllow= in llama-cast.service equal to allow plus
+  239.255.255.250/32, and SocketBindAllow= equal to tcp:<listen port> and
+  udp:1900 (a drop-in, see the unit's comments).
+  Open SSDP and the stream port in the firewall zone that holds your LAN
+  yourself, for example:
+  firewall-cmd --permanent --zone=internal --add-port=1900/udp --add-port=19478/tcp && firewall-cmd --reload
+  On the TV: Roku Media Player -> llama-bored -> llama-bored live.
 EOF
 }
 
@@ -1466,6 +1560,7 @@ commit_new_file() {
   rollback_note_rules "$dest"
   rollback_note_watch "$dest"
   rollback_note_metrics "$dest"
+  rollback_note_cast "$dest"
 }
 
 # shellcheck disable=SC2329 # called as `must commit_installed_sha`
@@ -1522,6 +1617,7 @@ apply_from_staging() {
   local light_binary light_unit light_rule light_mode light_dest aura_node aura_pin aura_mode
   local kbd_node kbd_pin kbd_mode
   local metrics_binary metrics_unit metrics_mode metrics_dest
+  local cast_binary cast_unit cast_mode cast_dest
   local kraken_count kraken_rel kraken_path
   local -a scan=() trial=()
   ROLLBACK_KIND=()
@@ -1537,6 +1633,8 @@ apply_from_staging() {
   INSTALL_WATCH_WAS_ABSENT=0
   INSTALL_CREATED_METRICS=0
   INSTALL_METRICS_WAS_ABSENT=0
+  INSTALL_CREATED_CAST=0
+  INSTALL_CAST_WAS_ABSENT=0
   INSTALL_RULES_CHANGED=0
   INSTALL_CONFIG_BAK_NEW=0
   INSTALL_CONFIG_BAK_PATH=""
@@ -1609,6 +1707,10 @@ apply_from_staging() {
     echo "install.sh: staged metrics mode is unreadable" >&2
     return 1
   fi
+  if ! cast_mode="$(tr -d '[:space:]' <"$staging/cast.mode")"; then
+    echo "install.sh: staged cast mode is unreadable" >&2
+    return 1
+  fi
 
   binary_dest="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/kraken-lcd)"
   watch_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-watch)"
@@ -1632,6 +1734,12 @@ apply_from_staging() {
   if [[ ! -e "$metrics_binary" && ! -e "$metrics_unit" ]]; then
     INSTALL_METRICS_WAS_ABSENT=1
   fi
+  cast_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-cast)"
+  cast_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-cast.service)"
+  cast_dest="$(dest_path "$dest_root" /etc/llama-bored/cast.toml)"
+  if [[ ! -e "$cast_binary" && ! -e "$cast_unit" ]]; then
+    INSTALL_CAST_WAS_ABSENT=1
+  fi
 
   # Writes start here. The hook arms on the first one.
   must backup_live_config "$staging" "$dest_root" "$prev" || return 1
@@ -1651,6 +1759,12 @@ apply_from_staging() {
     "staged llama-metrics.service.new" || return 1
   if [[ "$metrics_mode" == "install" ]]; then
     must stage_new_file 0644 "$staging/metrics.toml" "$metrics_dest" "staged metrics.toml.new" || return 1
+  fi
+  must stage_new_file 0755 "$staging/llama-cast" "$cast_binary" "staged llama-cast.new" || return 1
+  must stage_new_file 0644 "$staging/llama-cast.service" "$cast_unit" \
+    "staged llama-cast.service.new" || return 1
+  if [[ "$cast_mode" == "install" ]]; then
+    must stage_new_file 0644 "$staging/cast.toml" "$cast_dest" "staged cast.toml.new" || return 1
   fi
   must stage_new_file 0644 "$staging/llama-hack-12x24.psfu" "$font_dest" \
     "staged llama-hack-12x24.psfu.new" || return 1
@@ -1813,6 +1927,11 @@ apply_from_staging() {
   if [[ "$metrics_mode" == "install" ]]; then
     must commit_new_file "$metrics_dest" || return 1
   fi
+  must commit_new_file "$cast_binary" || return 1
+  must commit_new_file "$cast_unit" || return 1
+  if [[ "$cast_mode" == "install" ]]; then
+    must commit_new_file "$cast_dest" || return 1
+  fi
   must commit_new_file "$font_dest" || return 1
   must commit_new_file "$font22_dest" || return 1
   if [[ "$INSTALL_KRAKEN" == 1 ]]; then
@@ -1862,8 +1981,9 @@ apply_from_staging() {
     INSTALL_ENABLED_LIGHT=1
     mark_write "enabled llama-light"
   fi
-  # llama-metrics is never enabled or started here, and the firewall is
-  # never touched. print_metrics_steps prints the operator's steps.
+  # llama-metrics and llama-cast are never enabled or started here, and the
+  # firewall is never touched. print_metrics_steps and print_cast_steps
+  # print the operator's steps.
 
   sha_dest="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
   must commit_installed_sha "$sha_dest" "$head" || return 1
@@ -2010,17 +2130,18 @@ write_real_provenance() {
     git -C "$repo" describe --always --dirty || return 1
     (cd "$repo" && sha256sum target/release/kraken-lcd target/release/llama-watch \
       target/release/llama-view target/release/llama-light \
-      target/release/llama-metrics) || return 1
+      target/release/llama-metrics target/release/llama-cast) || return 1
   } >"$repo/target/check-provenance.txt"
 }
 
 write_fixture_provenance() {
-  local repo=$1 head=$2 hash watch_hash view_hash light_hash metrics_hash
+  local repo=$1 head=$2 hash watch_hash view_hash light_hash metrics_hash cast_hash
   hash="$(sha256sum -- "$repo/target/release/kraken-lcd" | awk '{ print $1 }')"
   watch_hash="$(sha256sum -- "$repo/target/release/llama-watch" | awk '{ print $1 }')"
   view_hash="$(sha256sum -- "$repo/target/release/llama-view" | awk '{ print $1 }')"
   light_hash="$(sha256sum -- "$repo/target/release/llama-light" | awk '{ print $1 }')"
   metrics_hash="$(sha256sum -- "$repo/target/release/llama-metrics" | awk '{ print $1 }')"
+  cast_hash="$(sha256sum -- "$repo/target/release/llama-cast" | awk '{ print $1 }')"
   mkdir -p -- "$repo/target"
   {
     echo "rustc-fixture"
@@ -2034,6 +2155,7 @@ write_fixture_provenance() {
     echo "$view_hash  target/release/llama-view"
     echo "$light_hash  target/release/llama-light"
     echo "$metrics_hash  target/release/llama-metrics"
+    echo "$cast_hash  target/release/llama-cast"
   } >"$repo/target/check-provenance.txt"
 }
 
@@ -2438,6 +2560,8 @@ self_test() {
   cp -- "$ROOT/packaging/light.example.toml" "$repo/packaging/light.example.toml"
   cp -- "$ROOT/packaging/llama-metrics.service" "$repo/packaging/llama-metrics.service"
   cp -- "$ROOT/packaging/metrics.example.toml" "$repo/packaging/metrics.example.toml"
+  cp -- "$ROOT/packaging/llama-cast.service" "$repo/packaging/llama-cast.service"
+  cp -- "$ROOT/packaging/cast.example.toml" "$repo/packaging/cast.example.toml"
   cp -- "$ROOT/packaging/fonts/llama-hack-12x24.psfu" "$repo/packaging/fonts/llama-hack-12x24.psfu"
   cp -- "$ROOT/packaging/fonts/llama-hack-12x22.psfu" "$repo/packaging/fonts/llama-hack-12x22.psfu"
   cp -- "$ROOT/packaging/config.example.toml" "$repo/packaging/config.example.toml"
@@ -2451,6 +2575,7 @@ self_test() {
   printf 'fake-view\n' >"$repo/target/release/llama-view"
   printf 'fake-light\n' >"$repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
   write_fixture_provenance "$repo" "$head"
 
   body="$(awk '/^install_real\(\)/{f=1} f{print} f && /^}$/{exit}' "$ROOT/scripts/install.sh")"
@@ -2626,7 +2751,7 @@ self_test() {
     "install -d -o kraken-lcd -g kraken-lcd -m 0755 /var/lib/kraken-lcd" \
     "runuser -u kraken-lcd -- /usr/local/libexec/llama-bored/kraken-lcd show-image --view <test-card>" \
     "systemctl enable --now kraken-lcd" \
-    "systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics" \
+    "systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics llama-cast" \
     "systemctl --global enable kraken-lcd-halt.path" \
     'usermod -aG llama-view $SUDO_USER' \
     "how to roll back"; do
@@ -3525,7 +3650,7 @@ self_test() {
   # prompt would fail the success case.
   local anchor_repo anchor_ok anchor_out anchor_status anchor_err
   local anchor_first anchor_head anchor_dirty anchor_prov anchor_ahead
-  local prov_file dash_hash watch_hash view_hash metrics_hash anchor_email
+  local prov_file dash_hash watch_hash view_hash metrics_hash cast_hash anchor_email
   anchor_repo="$repo"
   # Built at runtime so a literal-email scan of the tree stays empty.
   anchor_email="test$(printf '\x40')example.invalid"
@@ -3534,6 +3659,7 @@ self_test() {
   printf 'fake-view\n' >"$anchor_repo/target/release/llama-view"
   printf 'fake-light\n' >"$anchor_repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$anchor_repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$anchor_repo/target/release/llama-cast"
   printf 'lock\n' >"$anchor_repo/Cargo.lock"
   printf 'toolchain\n' >"$anchor_repo/rust-toolchain.toml"
   printf 'target/\n' >"$anchor_repo/.gitignore"
@@ -3576,6 +3702,7 @@ self_test() {
   watch_hash="$(sha256sum -- "$anchor_repo/target/release/llama-watch" | awk '{ print $1 }')"
   view_hash="$(sha256sum -- "$anchor_repo/target/release/llama-view" | awk '{ print $1 }')"
   metrics_hash="$(sha256sum -- "$anchor_repo/target/release/llama-metrics" | awk '{ print $1 }')"
+  cast_hash="$(sha256sum -- "$anchor_repo/target/release/llama-cast" | awk '{ print $1 }')"
   [[ "$anchor_out" == *"----- anchor -----"* \
     && "$anchor_out" == *"HEAD: $anchor_head"* \
     && "$anchor_out" == *"subject: anchor-subject"* \
@@ -3583,6 +3710,7 @@ self_test() {
     && "$anchor_out" == *"$watch_hash  llama-watch"* \
     && "$anchor_out" == *"$view_hash  llama-view"* \
     && "$anchor_out" == *"$metrics_hash  llama-metrics"* \
+    && "$anchor_out" == *"$cast_hash  llama-cast"* \
     && "$anchor_out" == *"----- diff stat since $anchor_first -----"* \
     && "$anchor_out" == *"ANCHOR_MARKER"* ]] || {
     echo "install self-test: dry-run summary missing HEAD, subject, hashes, or diff stat" >&2
@@ -3738,6 +3866,7 @@ self_test() {
   printf 'fake-view\n' >"$repo/target/release/llama-view"
   printf 'fake-light\n' >"$repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
   write_fixture_provenance "$repo" "$head"
   INSTALL_FAKE_STAT='660 kraken-lcd'
   INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
@@ -4027,6 +4156,7 @@ self_test() {
   printf 'fake-view\n' >"$repo/target/release/llama-view"
   printf 'fake-light\n' >"$repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
   write_fixture_provenance "$repo" "$head"
   unset INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT
   LIGHT_ENABLE=0
@@ -4164,6 +4294,152 @@ self_test() {
     "old-metrics" "rollback restored the previous llama-metrics"
   rm -rf -- "$metrics_stage"
 
+  # llama-cast. Same contract as llama-metrics: staged and hashed with the
+  # rest; its unit and config land verbatim; it is never enabled or
+  # started, and no firewall command runs; the rollback removes what this
+  # run created and disables the unit first.
+  local cast cast_stage cast_out cast_section cast_log
+  printf 'fake-binary\n' >"$repo/target/release/kraken-lcd"
+  printf 'fake-watch\n' >"$repo/target/release/llama-watch"
+  printf 'fake-view\n' >"$repo/target/release/llama-view"
+  printf 'fake-light\n' >"$repo/target/release/llama-light"
+  printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
+  write_fixture_provenance "$repo" "$head"
+  unset INSTALL_FAIL_AT
+
+  cast="$tmp/cast-fresh"
+  mkdir -p -- "$cast"
+  snapshot_tree "$cast" "$tmp/snap-cast-fresh"
+  : >"$INSTALL_LOG"
+  cast_stage="$(freeze_staging "$repo" "$cast")"
+  for f in llama-cast llama-cast.service cast.toml; do
+    [[ -f "$cast_stage/$f" ]] || {
+      echo "install self-test: $f was not staged" >&2
+      exit 1
+    }
+    [[ "$(show_staging_hashes "$cast_stage")" == *"$(sha256sum -- "$cast_stage/$f" | awk '{ print $1 }')  $cast_stage/$f"* ]] || {
+      echo "install self-test: staged hash of $f was not shown" >&2
+      exit 1
+    }
+  done
+  assert_eq "$(tr -d '[:space:]' <"$cast_stage/cast.mode")" "install" "absent cast.toml is installed"
+  run_expect_ok verify_staged_binary "$cast_stage"
+  printf 'tampered-cast\n' >"$cast_stage/llama-cast"
+  run_expect_fail verify_staged_binary "$cast_stage"
+  printf 'fake-cast\n' >"$cast_stage/llama-cast"
+  run_expect_ok verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  printf 'tampered\n' >"$repo/target/release/llama-cast"
+  run_expect_fail verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
+  printf '\n# tampered\n' >>"$repo/packaging/llama-cast.service"
+  run_expect_fail verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  cp -- "$ROOT/packaging/llama-cast.service" "$repo/packaging/llama-cast.service"
+  printf '\n# tampered\n' >>"$repo/packaging/cast.example.toml"
+  run_expect_fail verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  cp -- "$ROOT/packaging/cast.example.toml" "$repo/packaging/cast.example.toml"
+  run_expect_ok verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+
+  cast_out="$(apply_from_staging "$cast_stage" "$cast" "$sys" "$head")"
+  assert_eq "$(cat -- "$(dest_path "$cast" /usr/local/libexec/llama-bored/llama-cast)")" \
+    "fake-cast" "installed llama-cast"
+  assert_eq "$(stat -c '%a' -- "$(dest_path "$cast" /usr/local/libexec/llama-bored/llama-cast)")" \
+    "755" "llama-cast mode"
+  cmp -s -- "$ROOT/packaging/llama-cast.service" \
+    "$(dest_path "$cast" /etc/systemd/system/llama-cast.service)" || {
+    echo "install self-test: llama-cast.service was not installed verbatim" >&2
+    exit 1
+  }
+  cmp -s -- "$ROOT/packaging/cast.example.toml" \
+    "$(dest_path "$cast" /etc/llama-bored/cast.toml)" || {
+    echo "install self-test: absent cast.toml was not installed from the example" >&2
+    exit 1
+  }
+  assert_eq "$(stat -c '%a' -- "$(dest_path "$cast" /etc/llama-bored/cast.toml)")" \
+    "644" "cast.toml mode"
+  cast_log="$(cat -- "$INSTALL_LOG")"
+  if [[ "$cast_log" =~ (enable|start|restart|reload-or)[^$'\n']*llama-cast ]]; then
+    echo "install self-test: the installer enabled or started llama-cast" >&2
+    printf '%s\n' "$cast_log" >&2
+    exit 1
+  fi
+  if [[ "$cast_log" == *firewall* || "$cast_log" == *nft* || "$cast_log" == *iptables* ]]; then
+    echo "install self-test: the installer ran a firewall command" >&2
+    printf '%s\n' "$cast_log" >&2
+    exit 1
+  fi
+  [[ "$cast_out" == *"llama-cast) is installed, not enabled"* \
+    && "$cast_out" == *"llama-cast check --config /etc/llama-bored/cast.toml"* \
+    && "$cast_out" == *"systemctl enable --now llama-cast"* \
+    && "$cast_out" == *"--add-port=19478/tcp"* \
+    && "$cast_out" == *"--add-port=1900/udp"* \
+    && "$cast_out" == *"239.255.255.250/32"* \
+    && "$cast_out" == *"IPAddressAllow="* ]] || {
+    echo "install self-test: next steps do not explain how to enable llama-cast" >&2
+    printf '%s\n' "$cast_out" >&2
+    exit 1
+  }
+  cast_section="$(rollback_section "$cast_out")"
+  [[ "$cast_section" == *"systemctl disable --now llama-cast.service"* \
+    && "$cast_section" == *"rm -f -- /usr/local/libexec/llama-bored/llama-cast"* \
+    && "$cast_section" == *"rm -f -- /etc/systemd/system/llama-cast.service"* \
+    && "$cast_section" == *"rm -f -- /etc/llama-bored/cast.toml"* ]] || {
+    echo "install self-test: rollback record does not cover the llama-cast files" >&2
+    printf '%s\n' "$cast_section" >&2
+    exit 1
+  }
+  local disable_at remove_at
+  disable_at="$(grep -n -F -m 1 'systemctl disable --now llama-cast.service' <<<"$cast_section" | cut -d: -f1)"
+  remove_at="$(grep -n -F -m 1 'rm -f -- /etc/systemd/system/llama-cast.service' <<<"$cast_section" | cut -d: -f1)"
+  if [[ "$disable_at" -ge "$remove_at" ]]; then
+    echo "install self-test: rollback removes the llama-cast unit before disabling it" >&2
+    exit 1
+  fi
+  assert_disable_first "$cast_out"
+  assert_rollback_order "$cast_out"
+  execute_printed_rollback "$cast_out" "$cast"
+  assert_same_tree "$cast" "$tmp/snap-cast-fresh" "llama-cast fresh rollback"
+  rm -rf -- "$cast_stage"
+
+  # An existing cast.toml is the operator's: kept, and never in the
+  # rollback. A reinstall over an existing streamer does not disable it.
+  cast="$tmp/cast-keep"
+  mkdir -p "$(dest_path "$cast" /etc/llama-bored)" \
+    "$(dest_path "$cast" /usr/local/libexec/llama-bored)" \
+    "$(dest_path "$cast" /etc/systemd/system)"
+  printf 'listen = "127.0.0.1:19478"\nallow = ["127.0.0.1/32"]\n' \
+    >"$(dest_path "$cast" /etc/llama-bored/cast.toml)"
+  printf 'old-cast\n' >"$(dest_path "$cast" /usr/local/libexec/llama-bored/llama-cast)"
+  cp -- "$ROOT/packaging/llama-cast.service" \
+    "$(dest_path "$cast" /etc/systemd/system/llama-cast.service)"
+  snapshot_tree "$cast" "$tmp/snap-cast-keep"
+  : >"$INSTALL_LOG"
+  cast_stage="$(freeze_staging "$repo" "$cast")"
+  assert_eq "$(tr -d '[:space:]' <"$cast_stage/cast.mode")" "keep" "existing cast.toml kept"
+  run_expect_ok verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  printf '# edited after staging\n' >>"$(dest_path "$cast" /etc/llama-bored/cast.toml)"
+  run_expect_fail verify_staged_matches_disk "$cast_stage" "$repo" "$cast"
+  cp -- "$tmp/snap-cast-keep/etc/llama-bored/cast.toml" \
+    "$(dest_path "$cast" /etc/llama-bored/cast.toml)"
+  cast_out="$(apply_from_staging "$cast_stage" "$cast" "$sys" "$head")"
+  assert_eq "$(cat -- "$(dest_path "$cast" /etc/llama-bored/cast.toml)")" \
+    "$(printf 'listen = "127.0.0.1:19478"\nallow = ["127.0.0.1/32"]\n')" "operator cast.toml preserved"
+  assert_eq "$(cat -- "$(dest_path "$cast" /usr/local/libexec/llama-bored/llama-cast)")" \
+    "fake-cast" "llama-cast upgraded"
+  cast_section="$(rollback_section "$cast_out")"
+  [[ "$cast_section" != *"cast.toml"* \
+    && "$cast_section" != *"disable --now llama-cast"* \
+    && "$cast_section" == *"/usr/local/libexec/llama-bored/llama-cast.bak-"* ]] || {
+    echo "install self-test: upgrade rollback touches the kept cast.toml, disables the streamer, or loses the old binary" >&2
+    printf '%s\n' "$cast_section" >&2
+    exit 1
+  }
+  assert_rollback_order "$cast_out"
+  execute_printed_rollback "$cast_out" "$cast"
+  assert_eq "$(cat -- "$(dest_path "$cast" /usr/local/libexec/llama-bored/llama-cast)")" \
+    "old-cast" "rollback restored the previous llama-cast"
+  rm -rf -- "$cast_stage"
+
   # GitHub #6: no Kraken Z attached. Everything but kraken-lcd's unit, its
   # udev rules (71-, 93-), its desktop-alert user units and its state dir is
   # installed; no Kraken hidraw check runs; the next steps never tell the
@@ -4178,6 +4454,7 @@ self_test() {
   printf 'fake-view\n' >"$repo/target/release/llama-view"
   printf 'fake-light\n' >"$repo/target/release/llama-light"
   printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  printf 'fake-cast\n' >"$repo/target/release/llama-cast"
   write_fixture_provenance "$repo" "$head"
   unset INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
   unset INSTALL_FAIL_AT
@@ -4206,11 +4483,13 @@ self_test() {
     /usr/local/bin/llama-view \
     /usr/local/libexec/llama-bored/llama-light \
     /usr/local/libexec/llama-bored/llama-metrics \
+    /usr/local/libexec/llama-bored/llama-cast \
     /usr/local/libexec/llama-bored/INSTALLED_SHA \
     /usr/local/share/llama-bored/llama-hack-12x24.psfu \
     /etc/systemd/system/llama-watch.service \
     /etc/systemd/system/llama-light.service \
     /etc/systemd/system/llama-metrics.service \
+    /etc/systemd/system/llama-cast.service \
     /etc/udev/rules.d/72-llama-view.rules \
     /etc/udev/rules.d/94-llama-light-hidraw.rules \
     /etc/sysusers.d/llama-bored.conf \
@@ -4255,7 +4534,7 @@ self_test() {
     "kraken-lcd was skipped: no NZXT Kraken Z (1e71:3008) is attached" \
     "attach the cooler and run sudo scripts/install.sh again" \
     "systemctl start llama-watch" \
-    "systemctl try-restart llama-watch llama-light llama-metrics" \
+    "systemctl try-restart llama-watch llama-light llama-metrics llama-cast" \
     "how to roll back"; do
     [[ "$nok_out" == *"$p"* ]] || {
       echo "install self-test: no-Kraken next steps are missing: $p" >&2

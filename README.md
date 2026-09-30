@@ -39,7 +39,8 @@ buffer.</sub>
 | `llama-view` | none | Read-only mirror of tty11 for tmux or SSH (group `llama-view`) |
 | `kraken-lcd` | `kraken-lcd.service` | Draws the snapshot on the NZXT Kraken Z LCD. LCD only, no network |
 | `llama-light` | `llama-light.service` | Sets ASUS Aura and Corsair keyboard RGB colours from the snapshot. Colour only, no network |
-| `llama-metrics` | `llama-metrics.service` | Prometheus exporter on port 19477 (`llamabored_*`). The only process that listens |
+| `llama-metrics` | `llama-metrics.service` | Prometheus exporter on port 19477 (`llamabored_*`). Off by default |
+| `llama-cast` | `llama-cast.service` | tty11 as a live video for TVs on your LAN (DLNA). Off by default |
 
 `llama-core` is the shared library: the snapshot schema and its validator, the
 name sanitiser, logging.
@@ -139,6 +140,7 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 | llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text, the tuning line |
 | SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
 | vLLM | The same from `vllm:*` metrics; tuning line from its flags; IN/OUT from llama-swap captures |
+| Strata (`serve/server.py --engine strata`) | tok/s, running and queued requests (one at a time) and context from its JSON `/metrics`; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
 | Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
 
 A llama.cpp server started through a wrapper script, without `llama-server`
@@ -203,7 +205,7 @@ main risk:
   class-wide in the unit, and udev gives only the cooler's usbfs node to its
   group. llama-light is pinned the same way to two hidraw nodes, the Aura
   controller and the keyboard's lighting interface. One exporter that opens
-  no device. Only llama-metrics listens.
+  no device. Only llama-metrics and llama-cast listen, both off by default.
 - **Stock restore on stop.** Stopping or crashing kraken-lcd gives the screen
   back to the stock readout; llama-light leaves a neutral colour in RAM and
   hands the keyboard back to its own lighting.
@@ -281,7 +283,7 @@ required. Check a file without starting anything:
 | Key | Meaning |
 |---|---|
 | `[llama] enabled`, `url` | Poll llama-swap at a **loopback** URL (default `http://127.0.0.1:8080`). Point it at llama-swap itself, not a proxy in front of it |
-| `[llama.backends]` | `"model-id" = "llamacpp"`, `"sglang"`, `"vllm"` or `"openai"`: overrides the backend detected from the launch command |
+| `[llama.backends]` | `"model-id" = "llamacpp"`, `"sglang"`, `"vllm"`, `"strata"` or `"openai"`: overrides the backend detected from the launch command |
 | `[models.aliases]` | `"long-model-id" = "Short Name"` |
 | `[load] cpu_limit_w`, `nominal_frac` | CPU full-load socket watts; `nominal_frac` (0.8) of each limit reads 100 |
 | `[load] idle`, `gpu_idle_w`, `cpu_idle_w` | `"auto"` learns idle floors; `"fixed"` uses the watts as given |
@@ -381,6 +383,42 @@ pre-step (`llama-watch tty-setup`) that runs `setfont` and `stty` from the
 validated values; restart the unit after a change. Under 48 rows the
 dashboard drops panels to fit (IN/OUT first, then FANS, then the chart
 shrinks) and shows `tty too small` only below 160x26.
+
+## Watch tty11 on a TV
+
+`llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players
+on your LAN. Tested with Roku Media Player on TCL Roku TVs. It announces a
+media server over SSDP and streams 1920x1080 H.264 in MPEG-TS, rendered from
+tty11 at 2 frames per second. Each viewer gets its own `ffmpeg` (libx264
+required), two at a time by default.
+
+It is LAN-exposed by design: any host in `allow` can watch whatever tty11
+shows. It reads tty11's screen read-only, writes no file, and connects to
+nothing. The installer installs it but never enables it.
+
+1. Edit `/etc/llama-bored/cast.toml`: set `listen` and `interface_addr` to
+   this host's LAN address, narrow `allow` to your LAN or to the TVs, and
+   set `font` to the same value as `[tty] font` in `watch.toml`.
+2. Keep `llama-cast.service` in step with the config. `IPAddressAllow=`
+   must be `allow` plus `239.255.255.250/32`, and `SocketBindAllow=` must be
+   `tcp:<listen port>` and `udp:1900`. Use a drop-in, as the unit's comments
+   show.
+3. Check the config, then enable the unit:
+
+   ```sh
+   sudo /usr/local/libexec/llama-bored/llama-cast check --config /etc/llama-bored/cast.toml
+   sudo systemctl enable --now llama-cast
+   ```
+
+4. Open SSDP and the stream port to your LAN in the firewall, for example:
+
+   ```sh
+   sudo firewall-cmd --permanent --zone=internal --add-port=1900/udp --add-port=19478/tcp
+   sudo firewall-cmd --reload
+   ```
+
+5. On the TV, open Roku Media Player, choose **llama-bored**, then
+   **llama-bored live**.
 
 ## Troubleshooting
 
