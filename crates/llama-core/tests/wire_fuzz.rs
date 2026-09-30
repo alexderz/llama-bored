@@ -55,6 +55,9 @@ fn sample() -> WireSnapshot {
                 cache_hit: None,
                 slots_busy: None,
                 slots_total: None,
+                prompt_tokens: None,
+                prompt_cached_tokens: None,
+                slot_ctx: Vec::new(),
             }],
         },
         tokens: Tokens {

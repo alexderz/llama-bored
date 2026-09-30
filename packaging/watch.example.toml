@@ -73,7 +73,20 @@ gen_ceiling_tps = 250               # decode; finite, (0, 100000]
 prompt_ceiling_tps = 1500           # prefill; finite, (0, 100000]
 chart_bucket_s = 2                  # 1..=60; one tty chart column
 ctx_history_h = 6                   # 1..=24; hours of per-slot context in the SLOTS sparklines
-chart_glyphs = "eighths"            # "eighths" needs llama-hack-12x24 on tty11; "halves" renders with eurlatgr (code default)
+chart_glyphs = "eighths"            # "eighths" needs a llama-hack font on tty11; "halves" renders with eurlatgr (code default)
+# Console font and size, applied to tty11 before the watcher starts by the
+# unit's root pre-step (`llama-watch tty-setup`, which reads only these two
+# keys and runs setfont, then stty). Every display on a GPU shows the same
+# console, sized at boot for the largest; on a smaller screen tty11 shows
+# only its top-left corner. Size tty11 to the smallest screen:
+#   font  "12x24" (default) or "12x22" (same glyphs, two more rows at 1080p).
+#   size  "COLSxROWS", 160x26..=1024x512; unset keeps the kernel's size.
+#         Pixels / cell: 1920x1080 is 160x45 in 12x24, 160x49 in 12x22.
+# Under 48 rows the dashboard drops panels to fit: IN/OUT first, then FANS,
+# then the chart shrinks. 160x26 is the floor ("tty too small" below it).
+# Takes effect on the next start: systemctl restart llama-watch.
+font = "12x24"
+#size = "160x49"
 # false hides the IN/OUT prompt and output panels (their rows go to the chart
 # and RECENT) and the watcher stops keeping llama text at all. The header
 # then shows "text off". `llama-watch run --config PATH --no-text` forces

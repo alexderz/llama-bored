@@ -19,9 +19,11 @@ use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, FanWire, Host, ModelState, ModelWire, Sources, Tokens, WireError,
-    WireSnapshot,
+    self, Ai, AiWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire, SlotResetsWire, Sources,
+    Tokens, WireError, WireSnapshot,
 };
+
+use crate::resets::ResetCounts;
 use thiserror::Error;
 
 const TMP_NAME: &str = "snapshot.json.tmp";
@@ -67,10 +69,28 @@ pub struct Extras {
     /// llama.cpp slots per model: `(display name, busy, total)`. The name is
     /// the [`llama_core::sample::ModelInfo::name`] the slots belong to.
     pub slots: Vec<(String, usize, usize)>,
+    /// Per-model prompt token counters (#10): `(display name, prompt,
+    /// cached)`, the name as in `slots`.
+    pub prompt_cache: Vec<(String, u64, Option<u64>)>,
+    /// llama.cpp slot context (#10), one entry per slot.
+    pub slot_ctx: Vec<SlotCtx>,
     /// Configured fans: `(channel, label, rpm, pwm 0..=255)`.
     pub fans: Vec<(u32, String, Option<u32>, Option<u8>)>,
     /// The tty health line, as wire sources. `None` while starting.
     pub sources: Option<Sources>,
+}
+
+/// One llama.cpp slot's context numbers for the wire (#10).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlotCtx {
+    /// Display name of the model that owns the slot.
+    pub model: String,
+    /// llama-server slot id.
+    pub slot: i64,
+    /// Context tokens held, `None` when `/slots` gave no prompt count.
+    pub used: Option<u64>,
+    /// Context drops seen this run, by reason (#9).
+    pub resets: ResetCounts,
 }
 
 /// Publishes validated snapshots into one directory.
@@ -237,7 +257,7 @@ pub fn build(
             mem_used_bytes: mem_bytes(extras.mem_used),
             mem_total_bytes: mem_bytes(extras.mem_total),
         },
-        ai: ai_of(snapshot, &extras.slots),
+        ai: ai_of(snapshot, extras),
         tokens: Tokens {
             decoded_total: llama.decoded_total,
             prompt_total: llama.prompt_total,
@@ -307,7 +327,9 @@ fn sources_of(mut sources: Sources) -> Sources {
     sources
 }
 
-fn ai_of(snapshot: &Snapshot, slots: &[(String, usize, usize)]) -> Ai {
+fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
+    let slots = &extras.slots;
+    let mut slot_rows_left = wire::MAX_SLOT_CTX;
     match snapshot.ai {
         AiState::Loaded => Ai {
             state: AiWire::Loaded,
@@ -330,6 +352,14 @@ fn ai_of(snapshot: &Snapshot, slots: &[(String, usize, usize)]) -> Ai {
                     // Gauges only for a backend without `/slots`; llama.cpp
                     // keeps its slot view on the tty.
                     let gauges = model.backend.filter(|info| !info.kind.has_slots());
+                    let (prompt_tokens, prompt_cached_tokens) = extras
+                        .prompt_cache
+                        .iter()
+                        .find(|(owner, _, _)| *owner == model.name)
+                        .map_or((None, None), |(_, prompt, cached)| {
+                            (Some(*prompt), cached.map(|cached| cached.min(*prompt)))
+                        });
+                    let slot_ctx = slot_ctx_of(&extras.slot_ctx, &model.name, &mut slot_rows_left);
                     ModelWire {
                         full_name: wire_full_name(model.full_name.as_deref(), &name),
                         detail: model.detail.clone().filter(detail::is_valid),
@@ -342,6 +372,9 @@ fn ai_of(snapshot: &Snapshot, slots: &[(String, usize, usize)]) -> Ai {
                         cache_hit: gauges.and_then(|info| info.hit_permille).and_then(ratio),
                         slots_busy: slot_counts.map(|(busy, _)| busy),
                         slots_total: slot_counts.map(|(_, total)| total),
+                        prompt_tokens,
+                        prompt_cached_tokens,
+                        slot_ctx,
                     }
                 })
                 .collect(),
@@ -355,6 +388,36 @@ fn ai_of(snapshot: &Snapshot, slots: &[(String, usize, usize)]) -> Ai {
             models: Vec::new(),
         },
     }
+}
+
+/// `model`'s slots, lowest id first, at most `left` of them; `left` goes
+/// down by what was taken. A slot id the wire refuses, a repeat, or a slot
+/// with no context count is skipped.
+fn slot_ctx_of(rows: &[SlotCtx], model: &str, left: &mut usize) -> Vec<SlotCtxWire> {
+    let mut out: Vec<SlotCtxWire> = rows
+        .iter()
+        .filter(|row| row.model == model)
+        .filter_map(|row| {
+            let slot = u16::try_from(row.slot)
+                .ok()
+                .filter(|slot| *slot < wire::MAX_SLOTS)?;
+            Some(SlotCtxWire {
+                slot,
+                used: row.used?.min(wire::MAX_CTX_TOKENS),
+                resets: SlotResetsWire {
+                    compacted: row.resets.compacted,
+                    new: row.resets.new,
+                    evicted: row.resets.evicted,
+                    unknown: row.resets.unknown,
+                },
+            })
+        })
+        .collect();
+    out.sort_by_key(|row| row.slot);
+    out.dedup_by_key(|row| row.slot);
+    out.truncate(*left);
+    *left -= out.len();
+    out
 }
 
 fn ratio(permille: u16) -> Option<f32> {

@@ -11,8 +11,12 @@
 # copies. There is no typed-SHA prompt.
 # After the files are in place, llama-watch is enabled for boot.
 # kraken-lcd is never started, restarted, or enabled. The next step is
-# printed for the operator. llama-light (RGB lighting) is installed but
-# enabled for boot only with --enable-light; it is never started here.
+# printed for the operator. The NZXT Kraken Z is optional (GitHub #6): with
+# none attached, kraken-lcd's unit, udev rules, alert units, hidraw checks
+# and state dir are skipped (its binary is still installed, inert) and the
+# output says how to add it later; more than one refuses. llama-light (RGB
+# lighting) is installed but enabled for boot only with --enable-light; it
+# is never started here.
 # llama-metrics (the LAN Prometheus exporter) is installed but never enabled
 # or started here, and the firewall is never touched: enabling it is a
 # printed operator step.
@@ -150,6 +154,10 @@ freeze_staging() {
     return 1
   }
   copy_regular "$repo/packaging/fonts/llama-hack-12x24.psfu" "$dir/llama-hack-12x24.psfu" || {
+    rm -rf -- "$dir"
+    return 1
+  }
+  copy_regular "$repo/packaging/fonts/llama-hack-12x22.psfu" "$dir/llama-hack-12x22.psfu" || {
     rm -rf -- "$dir"
     return 1
   }
@@ -305,6 +313,7 @@ show_staging_hashes() {
     "$staging/93-kraken-lcd-hidraw.rules"
     "$staging/94-llama-light-hidraw.rules"
     "$staging/llama-hack-12x24.psfu"
+    "$staging/llama-hack-12x22.psfu"
     "$staging/config.toml"
     "$staging/light.toml"
     "$staging/metrics.toml"
@@ -371,6 +380,7 @@ verify_staged_matches_disk() {
     72-llama-view.rules:packaging/72-llama-view.rules
     93-kraken-lcd-hidraw.rules:packaging/93-kraken-lcd-hidraw.rules
     llama-hack-12x24.psfu:packaging/fonts/llama-hack-12x24.psfu
+    llama-hack-12x22.psfu:packaging/fonts/llama-hack-12x22.psfu
     kraken-lcd-halt.path:packaging/user/kraken-lcd-halt.path
     kraken-lcd-halt-notify.service:packaging/user/kraken-lcd-halt-notify.service
     check-provenance.txt:target/check-provenance.txt
@@ -632,11 +642,13 @@ resolve_keyboard_hidraw() {
   fi
 }
 
-resolve_kraken_hidraw() {
+# Every USB device directory that is a Kraken Z (1e71:3008), one per line.
+# Reads idVendor/idProduct only; nothing under /dev is opened. A missing
+# devices directory is an error, never "no Kraken".
+kraken_usb_devices() {
   local sys=$1
   local devices="$sys/bus/usb/devices"
-  local dev base vendor product device name iface hid node target driver_name raw
-  local -a found=() nodes=() hidraws=()
+  local dev base vendor product
   if [[ ! -d "$devices" ]]; then
     echo "install.sh: $devices is not a directory" >&2
     return 1
@@ -651,9 +663,26 @@ resolve_kraken_hidraw() {
     vendor="${vendor,,}"
     product="${product,,}"
     if [[ "$vendor" == "1e71" && "$product" == "3008" ]]; then
-      found+=("$dev")
+      printf '%s\n' "$dev"
     fi
   done < <(find "$devices" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)
+}
+
+# How many Kraken Z coolers are attached (GitHub #6: 0 skips kraken-lcd).
+kraken_device_count() {
+  local sys=$1 list
+  local -a found=()
+  list="$(kraken_usb_devices "$sys")" || return 1
+  [[ -z "$list" ]] || mapfile -t found <<<"$list"
+  printf '%s\n' "${#found[@]}"
+}
+
+resolve_kraken_hidraw() {
+  local sys=$1
+  local base device name iface hid node target driver_name raw list
+  local -a found=() nodes=() hidraws=()
+  list="$(kraken_usb_devices "$sys")" || return 1
+  [[ -z "$list" ]] || mapfile -t found <<<"$list"
   if [[ ${#found[@]} -ne 1 ]]; then
     echo "install.sh: expected one 1e71:3008 device, found ${#found[@]}" >&2
     return 1
@@ -924,6 +953,10 @@ print_rollback() {
 }
 
 print_phase_b() {
+  if [[ "${INSTALL_KRAKEN:-1}" != 1 ]]; then
+    print_phase_b_no_kraken
+    return
+  fi
   cat <<'EOF'
 install.sh: files are installed. llama-watch is enabled for boot but not
 started. kraken-lcd is neither started nor enabled. This script never runs
@@ -953,6 +986,37 @@ stopped and nothing is enabled:
 Optional:
   systemctl --global enable kraken-lcd-halt.path   # desktop alert on HALTED
   usermod -aG llama-view $SUDO_USER   # mirror tty11 with llama-view; log in again
+EOF
+  print_light_steps
+  print_metrics_steps
+  print_rollback
+}
+
+# GitHub #6: no Kraken Z, so kraken-lcd has no unit and nothing below
+# names it as something to start, enable or restart.
+print_phase_b_no_kraken() {
+  cat <<'EOF'
+install.sh: files are installed. llama-watch is enabled for boot but not
+started. kraken-lcd was skipped: no NZXT Kraken Z (1e71:3008) is attached.
+This script never runs the steps below; run them yourself, as root, one at
+a time.
+
+  # 1. llama-watch is enabled; start it (tty11 dashboard, Ctrl+Alt+F11 to look):
+  systemctl start llama-watch
+
+Upgrading an install that already runs? Move the running units onto the new
+binaries. try-restart restarts only units that are running now (here any of
+llama-watch, llama-light, llama-metrics); a stopped unit stays stopped and
+nothing is enabled:
+  systemctl try-restart llama-watch llama-light llama-metrics
+
+Optional:
+  usermod -aG llama-view $SUDO_USER   # mirror tty11 with llama-view; log in again
+
+Kraken Z LCD (kraken-lcd): its binary is installed, but not its unit, udev
+rules, desktop alert or state directory. To add it later:
+  attach the cooler and run sudo scripts/install.sh again
+The installer then sets it up and prints the LCD steps; it never starts it.
 EOF
   print_light_steps
   print_metrics_steps
@@ -1453,10 +1517,12 @@ apply_from_staging() {
   local staging=$1 dest_root=$2 sys_root=$3 head=$4
   local config_dest min_interval unit watch_unit sysusers rule71 rule93
   local binary_dest watch_binary view_binary view_rule watch_mode watch_dest user_dir font_dest
+  local font22_dest
   local node hidraw_name mode_group pin sha_dest prev interval_src config_bak
   local light_binary light_unit light_rule light_mode light_dest aura_node aura_pin aura_mode
   local kbd_node kbd_pin kbd_mode
   local metrics_binary metrics_unit metrics_mode metrics_dest
+  local kraken_count kraken_rel kraken_path
   local -a scan=() trial=()
   ROLLBACK_KIND=()
   ROLLBACK_PATH=()
@@ -1474,6 +1540,7 @@ apply_from_staging() {
   INSTALL_RULES_CHANGED=0
   INSTALL_CONFIG_BAK_NEW=0
   INSTALL_CONFIG_BAK_PATH=""
+  INSTALL_KRAKEN=1
   INSTALL_DEST_ROOT="${dest_root%/}"
   INSTALL_SAVED_EXIT="$(trap -p EXIT || true)"
   refuse_rollback_pending || return 1
@@ -1491,6 +1558,33 @@ apply_from_staging() {
     echo "install.sh: a udev rule still gives the Kraken (1e71) to a user with OWNER=:" >&2
     printf '%s\n' "${trial[@]}" >&2
     return 1
+  fi
+
+  # The Kraken Z is optional (GitHub #6). None attached: kraken-lcd's unit,
+  # its udev rules (71-, 93-), its desktop-alert user units, the hidraw
+  # checks and its state dir are skipped; its binary is still installed with
+  # the others (inert without a unit). More than one still refuses. Both
+  # decisions come before any write.
+  kraken_count="$(kraken_device_count "$sys_root")" || return 1
+  if [[ "$kraken_count" -gt 1 ]]; then
+    echo "install.sh: expected one 1e71:3008 device, found $kraken_count" >&2
+    return 1
+  fi
+  if [[ "$kraken_count" -eq 0 ]]; then
+    # A unit or rule from an earlier install would be left stale beside the
+    # new binary, and a cooler that vanished is worth a look first.
+    for kraken_rel in /etc/systemd/system/kraken-lcd.service \
+      /etc/udev/rules.d/71-kraken-lcd.rules \
+      /etc/udev/rules.d/93-kraken-lcd-hidraw.rules; do
+      kraken_path="$(dest_path "$dest_root" "$kraken_rel")"
+      if [[ -e "$kraken_path" || -L "$kraken_path" ]]; then
+        echo "install.sh: no NZXT Kraken Z (1e71:3008) is attached, but kraken-lcd is installed here ($kraken_rel)." >&2
+        echo "install.sh: reconnect the cooler and run the installer again; if it is gone for good, remove kraken-lcd.service and the 71-/93-kraken-lcd udev rules yourself first." >&2
+        return 1
+      fi
+    done
+    INSTALL_KRAKEN=0
+    echo "install.sh: no NZXT Kraken Z (1e71:3008) is attached; skipping kraken-lcd's unit, udev rules, hidraw checks and state dir" >&2
   fi
 
   plan_config "$staging" "$dest_root" || return 1
@@ -1520,8 +1614,10 @@ apply_from_staging() {
   watch_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-watch)"
   view_binary="$(dest_path "$dest_root" /usr/local/bin/llama-view)"
   view_rule="$(dest_path "$dest_root" /etc/udev/rules.d/72-llama-view.rules)"
-  # tty11 console font, loaded by the watcher unit's ExecStartPre.
+  # tty11 console fonts. The watcher unit's root pre-step
+  # (llama-watch tty-setup) loads the one `[tty] font` names.
   font_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-12x24.psfu)"
+  font22_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-12x22.psfu)"
   watch_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-watch.service)"
   light_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-light)"
   light_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-light.service)"
@@ -1558,10 +1654,14 @@ apply_from_staging() {
   fi
   must stage_new_file 0644 "$staging/llama-hack-12x24.psfu" "$font_dest" \
     "staged llama-hack-12x24.psfu.new" || return 1
+  must stage_new_file 0644 "$staging/llama-hack-12x22.psfu" "$font22_dest" \
+    "staged llama-hack-12x22.psfu.new" || return 1
 
   unit="$(dest_path "$dest_root" /etc/systemd/system/kraken-lcd.service)"
-  must stage_new_file 0644 "$staging/kraken-lcd.service" "$unit" "staged kraken-lcd.service.new" || return 1
-  must rewrite_restart_sec "$unit.new" "$min_interval" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must stage_new_file 0644 "$staging/kraken-lcd.service" "$unit" "staged kraken-lcd.service.new" || return 1
+    must rewrite_restart_sec "$unit.new" "$min_interval" || return 1
+  fi
   must stage_new_file 0644 "$staging/llama-watch.service" "$watch_unit" "staged llama-watch.service.new" || return 1
 
   watch_dest="$(dest_path "$dest_root" /etc/llama-bored/watch.toml)"
@@ -1570,10 +1670,12 @@ apply_from_staging() {
   fi
 
   user_dir="$(dest_path "$dest_root" /etc/systemd/user)"
-  must stage_new_file 0644 "$staging/kraken-lcd-halt.path" \
-    "$user_dir/kraken-lcd-halt.path" "staged halt.path.new" || return 1
-  must stage_new_file 0644 "$staging/kraken-lcd-halt-notify.service" \
-    "$user_dir/kraken-lcd-halt-notify.service" "staged halt-notify.service.new" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must stage_new_file 0644 "$staging/kraken-lcd-halt.path" \
+      "$user_dir/kraken-lcd-halt.path" "staged halt.path.new" || return 1
+    must stage_new_file 0644 "$staging/kraken-lcd-halt-notify.service" \
+      "$user_dir/kraken-lcd-halt-notify.service" "staged halt-notify.service.new" || return 1
+  fi
 
   # udev and sysusers have to be in place before the hidraw check.
   sysusers="$(dest_path "$dest_root" /etc/sysusers.d/llama-bored.conf)"
@@ -1581,10 +1683,12 @@ apply_from_staging() {
   rule93="$(dest_path "$dest_root" /etc/udev/rules.d/93-kraken-lcd-hidraw.rules)"
   must stage_new_file 0644 "$staging/llama-bored.sysusers" "$sysusers" "staged sysusers.new" || return 1
   must commit_new_file "$sysusers" || return 1
-  must stage_new_file 0644 "$staging/71-kraken-lcd.rules" "$rule71" "staged 71-rules.new" || return 1
-  must commit_new_file "$rule71" || return 1
-  must stage_new_file 0644 "$staging/93-kraken-lcd-hidraw.rules" "$rule93" "staged 93-rules.new" || return 1
-  must commit_new_file "$rule93" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must stage_new_file 0644 "$staging/71-kraken-lcd.rules" "$rule71" "staged 71-rules.new" || return 1
+    must commit_new_file "$rule71" || return 1
+    must stage_new_file 0644 "$staging/93-kraken-lcd-hidraw.rules" "$rule93" "staged 93-rules.new" || return 1
+    must commit_new_file "$rule93" || return 1
+  fi
   must stage_new_file 0644 "$staging/72-llama-view.rules" "$view_rule" "staged 72-rules.new" || return 1
   must commit_new_file "$view_rule" || return 1
   must stage_new_file 0644 "$staging/94-llama-light-hidraw.rules" "$light_rule" "staged 94-rules.new" || return 1
@@ -1609,31 +1713,35 @@ apply_from_staging() {
   # re-apply the hidraw rules directly (idempotent; seen on a test machine with the
   # Aura node staying 0666 after install).
   must host_cmd udevadm trigger --action=change --subsystem-match=hidraw || return 1
-  node="$(resolve_kraken_hidraw "$sys_root")" || fail_install || return 1
-  hidraw_name="${node#/dev/}"
-  must host_cmd udevadm trigger --action=change "$sys_root/class/hidraw/$hidraw_name" || return 1
-  must host_cmd udevadm settle || return 1
-  mark_write "udev settle"
-  must host_cmd setfacl -b -- "$node" || return 1
-  if ! mode_group="$(hidraw_mode_group "$node")"; then
-    echo "install.sh: stat of $node failed" >&2
-    fail_install || return 1
+  # The Kraken's node is kraken-lcd's alone, and its pin names it. Not
+  # attached: kraken-lcd was skipped above, so there is nothing to check.
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    node="$(resolve_kraken_hidraw "$sys_root")" || fail_install || return 1
+    hidraw_name="${node#/dev/}"
+    must host_cmd udevadm trigger --action=change "$sys_root/class/hidraw/$hidraw_name" || return 1
+    must host_cmd udevadm settle || return 1
+    mark_write "udev settle"
+    must host_cmd setfacl -b -- "$node" || return 1
+    if ! mode_group="$(hidraw_mode_group "$node")"; then
+      echo "install.sh: stat of $node failed" >&2
+      fail_install || return 1
+    fi
+    if [[ "$mode_group" != "660 kraken-lcd" ]]; then
+      echo "install.sh: $node is '$mode_group', expected '660 kraken-lcd'" >&2
+      fail_install || return 1
+    fi
+    if hidraw_has_user_acl "$node"; then
+      echo "install.sh: $node still has a named user ACL after setfacl -b" >&2
+      fail_install || return 1
+    fi
+    # The writer unit's only hidraw DeviceAllow= is this symlink (SAFETY.md RR7).
+    pin="$(hidraw_pin_target)"
+    if [[ "$pin" != "$node" ]]; then
+      echo "install.sh: /dev/kraken-lcd/hid resolves to '${pin:-nothing}', expected $node" >&2
+      fail_install || return 1
+    fi
+    mark_write "hidraw check passed"
   fi
-  if [[ "$mode_group" != "660 kraken-lcd" ]]; then
-    echo "install.sh: $node is '$mode_group', expected '660 kraken-lcd'" >&2
-    fail_install || return 1
-  fi
-  if hidraw_has_user_acl "$node"; then
-    echo "install.sh: $node still has a named user ACL after setfacl -b" >&2
-    fail_install || return 1
-  fi
-  # The writer unit's only hidraw DeviceAllow= is this symlink (SAFETY.md RR7).
-  pin="$(hidraw_pin_target)"
-  if [[ "$pin" != "$node" ]]; then
-    echo "install.sh: /dev/kraken-lcd/hid resolves to '${pin:-nothing}', expected $node" >&2
-    fail_install || return 1
-  fi
-  mark_write "hidraw check passed"
 
   # The Aura controller's node is llama-light's alone (0660, no
   # uaccess ACL), and its pin names it. Not attached: nothing to check;
@@ -1706,13 +1814,18 @@ apply_from_staging() {
     must commit_new_file "$metrics_dest" || return 1
   fi
   must commit_new_file "$font_dest" || return 1
-  must commit_new_file "$unit" || return 1
+  must commit_new_file "$font22_dest" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must commit_new_file "$unit" || return 1
+  fi
   must commit_new_file "$watch_unit" || return 1
   if [[ "$watch_mode" == "install" ]]; then
     must commit_new_file "$watch_dest" || return 1
   fi
-  must commit_new_file "$user_dir/kraken-lcd-halt.path" || return 1
-  must commit_new_file "$user_dir/kraken-lcd-halt-notify.service" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must commit_new_file "$user_dir/kraken-lcd-halt.path" || return 1
+    must commit_new_file "$user_dir/kraken-lcd-halt-notify.service" || return 1
+  fi
 
   config_dest="$(dest_path "$dest_root" /etc/llama-bored/config.toml)"
   config_bak="$(dest_path "$dest_root" "/etc/llama-bored/config.toml.bak-$prev")"
@@ -1730,7 +1843,9 @@ apply_from_staging() {
     fi
   fi
 
-  must ensure_state_dir "$dest_root" || return 1
+  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
+    must ensure_state_dir "$dest_root" || return 1
+  fi
 
   if [[ "${INSTALL_FAIL_AT:-}" == "daemon-reload" ]]; then
     echo "install.sh: injected failure at daemon-reload" >&2
@@ -2324,6 +2439,7 @@ self_test() {
   cp -- "$ROOT/packaging/llama-metrics.service" "$repo/packaging/llama-metrics.service"
   cp -- "$ROOT/packaging/metrics.example.toml" "$repo/packaging/metrics.example.toml"
   cp -- "$ROOT/packaging/fonts/llama-hack-12x24.psfu" "$repo/packaging/fonts/llama-hack-12x24.psfu"
+  cp -- "$ROOT/packaging/fonts/llama-hack-12x22.psfu" "$repo/packaging/fonts/llama-hack-12x22.psfu"
   cp -- "$ROOT/packaging/config.example.toml" "$repo/packaging/config.example.toml"
   cp -- "$ROOT/packaging/watch.example.toml" "$repo/packaging/watch.example.toml"
   cp -- "$ROOT/packaging/llama-watch.service" "$repo/packaging/llama-watch.service"
@@ -2456,6 +2572,13 @@ self_test() {
     echo "install self-test: staged font hash was not shown" >&2
     exit 1
   }
+  printf 'x' >>"$repo/packaging/fonts/llama-hack-12x22.psfu"
+  run_expect_fail verify_staged_matches_disk "$staging" "$repo" "$dest"
+  cp -- "$ROOT/packaging/fonts/llama-hack-12x22.psfu" "$repo/packaging/fonts/llama-hack-12x22.psfu"
+  [[ "$(show_staging_hashes "$staging")" == *"$(sha256sum -- "$ROOT/packaging/fonts/llama-hack-12x22.psfu" | awk '{ print $1 }')  $staging/llama-hack-12x22.psfu"* ]] || {
+    echo "install self-test: staged 12x22 font hash was not shown" >&2
+    exit 1
+  }
   out="$(apply_from_staging "$staging" "$dest" "$sys" "$head")"
   assert_eq "$(cat -- "$(dest_path "$dest" /usr/local/libexec/llama-bored/kraken-lcd)")" \
     "fake-binary" "installed the staged binary"
@@ -2476,18 +2599,20 @@ self_test() {
     "$(dest_path "$dest" /etc/udev/rules.d/93-kraken-lcd-hidraw.rules)"
   cmp -s "$ROOT/packaging/user/kraken-lcd-halt.path" \
     "$(dest_path "$dest" /etc/systemd/user/kraken-lcd-halt.path)"
-  local font_installed
-  font_installed="$(dest_path "$dest" /usr/local/share/llama-bored/llama-hack-12x24.psfu)"
-  cmp -s -- "$ROOT/packaging/fonts/llama-hack-12x24.psfu" "$font_installed" || {
-    echo "install self-test: console font was not installed from staging" >&2
-    exit 1
-  }
-  assert_eq "$(stat -c '%a' -- "$font_installed")" "644" "font mode"
-  # The first apply created the font, so its rollback removes it.
-  [[ "$(rollback_section "$out")" == *"rm -f -- /usr/local/share/llama-bored/llama-hack-12x24.psfu"* ]] || {
-    echo "install self-test: rollback record does not remove the console font this run created" >&2
-    exit 1
-  }
+  local font_installed font_name
+  for font_name in llama-hack-12x24.psfu llama-hack-12x22.psfu; do
+    font_installed="$(dest_path "$dest" "/usr/local/share/llama-bored/$font_name")"
+    cmp -s -- "$ROOT/packaging/fonts/$font_name" "$font_installed" || {
+      echo "install self-test: console font $font_name was not installed from staging" >&2
+      exit 1
+    }
+    assert_eq "$(stat -c '%a' -- "$font_installed")" "644" "font mode $font_name"
+    # The first apply created the font, so its rollback removes it.
+    [[ "$(rollback_section "$out")" == *"rm -f -- /usr/local/share/llama-bored/$font_name"* ]] || {
+      echo "install self-test: rollback record does not remove the console font $font_name this run created" >&2
+      exit 1
+    }
+  done
   cmp -s "$ROOT/packaging/user/kraken-lcd-halt-notify.service" \
     "$(dest_path "$dest" /etc/systemd/user/kraken-lcd-halt-notify.service)"
   # Generic, public next steps. install.sh prints them and runs none of them
@@ -4038,6 +4163,252 @@ self_test() {
   assert_eq "$(cat -- "$(dest_path "$metrics" /usr/local/libexec/llama-bored/llama-metrics)")" \
     "old-metrics" "rollback restored the previous llama-metrics"
   rm -rf -- "$metrics_stage"
+
+  # GitHub #6: no Kraken Z attached. Everything but kraken-lcd's unit, its
+  # udev rules (71-, 93-), its desktop-alert user units and its state dir is
+  # installed; no Kraken hidraw check runs; the next steps never tell the
+  # operator to start kraken-lcd; the rollback is byte-for-byte. A cooler
+  # attached later is added by re-running the installer. Two Krakens, or a
+  # kraken-lcd install whose cooler has gone missing, refuse before any write.
+  local nok nok_sys nok_stage nok_out nok_out2 nok_err nok_section nok_steps p
+  local nok_later nok_later_out two_sys two_dest two_err two_status
+  local old_dest old_err old_status old_rel
+  printf 'fake-binary\n' >"$repo/target/release/kraken-lcd"
+  printf 'fake-watch\n' >"$repo/target/release/llama-watch"
+  printf 'fake-view\n' >"$repo/target/release/llama-view"
+  printf 'fake-light\n' >"$repo/target/release/llama-light"
+  printf 'fake-metrics\n' >"$repo/target/release/llama-metrics"
+  write_fixture_provenance "$repo" "$head"
+  unset INSTALL_FAKE_AURA_PIN INSTALL_FAKE_AURA_STAT INSTALL_FAKE_KBD_PIN INSTALL_FAKE_KBD_STAT
+  unset INSTALL_FAIL_AT
+  LIGHT_ENABLE=0
+  # A Kraken hidraw check that did run would fail on every one of these.
+  INSTALL_FAKE_STAT='666 root'
+  INSTALL_FAKE_GETFACL=$'user::rw-\nuser:someone:rw-\n'
+  INSTALL_FAKE_PIN=''
+  nok_sys="$tmp/sys-no-kraken"
+  mkdir -p "$nok_sys/bus/usb/devices/1-4" "$nok_sys/class/hidraw"
+  printf '1b1c\n' >"$nok_sys/bus/usb/devices/1-4/idVendor"
+  printf '1b48\n' >"$nok_sys/bus/usb/devices/1-4/idProduct"
+  assert_eq "$(kraken_device_count "$nok_sys")" "0" "no Kraken in sysfs"
+  assert_eq "$(kraken_device_count "$sys")" "1" "one Kraken in sysfs"
+  run_expect_fail kraken_device_count "$tmp/sys-missing"
+
+  nok="$tmp/no-kraken"
+  mkdir -p -- "$nok"
+  snapshot_tree "$nok" "$tmp/snap-no-kraken"
+  : >"$INSTALL_LOG"
+  nok_stage="$(freeze_staging "$repo" "$nok")"
+  nok_err="$tmp/no-kraken.err"
+  nok_out="$(apply_from_staging "$nok_stage" "$nok" "$nok_sys" "$head" 2>"$nok_err")"
+  for p in /usr/local/libexec/llama-bored/kraken-lcd \
+    /usr/local/libexec/llama-bored/llama-watch \
+    /usr/local/bin/llama-view \
+    /usr/local/libexec/llama-bored/llama-light \
+    /usr/local/libexec/llama-bored/llama-metrics \
+    /usr/local/libexec/llama-bored/INSTALLED_SHA \
+    /usr/local/share/llama-bored/llama-hack-12x24.psfu \
+    /etc/systemd/system/llama-watch.service \
+    /etc/systemd/system/llama-light.service \
+    /etc/systemd/system/llama-metrics.service \
+    /etc/udev/rules.d/72-llama-view.rules \
+    /etc/udev/rules.d/94-llama-light-hidraw.rules \
+    /etc/sysusers.d/llama-bored.conf \
+    /etc/llama-bored/config.toml \
+    /etc/llama-bored/watch.toml; do
+    [[ -f "$(dest_path "$nok" "$p")" ]] || {
+      echo "install self-test: no-Kraken install did not install $p" >&2
+      exit 1
+    }
+  done
+  assert_eq "$(cat -- "$(dest_path "$nok" /usr/local/libexec/llama-bored/kraken-lcd)")" \
+    "fake-binary" "no-Kraken install keeps the binaries uniform"
+  for p in /etc/systemd/system/kraken-lcd.service \
+    /etc/udev/rules.d/71-kraken-lcd.rules \
+    /etc/udev/rules.d/93-kraken-lcd-hidraw.rules \
+    /etc/systemd/user/kraken-lcd-halt.path \
+    /etc/systemd/user/kraken-lcd-halt-notify.service \
+    /var/lib/kraken-lcd; do
+    if [[ -e "$(dest_path "$nok" "$p")" ]]; then
+      echo "install self-test: no-Kraken install created $p" >&2
+      exit 1
+    fi
+  done
+  assert_no_new "$nok"
+  if log_has 'setfacl' || log_has "$nok_sys/class/hidraw" || log_has 'kraken-lcd:kraken-lcd'; then
+    echo "install self-test: no-Kraken install ran a Kraken hidraw or state-dir command" >&2
+    cat -- "$INSTALL_LOG" >&2
+    exit 1
+  fi
+  log_has 'systemctl daemon-reload'
+  log_has 'systemctl enable llama-watch.service'
+  if log_mentions_writer_lifecycle; then
+    echo "install self-test: dry-run log starts, restarts, or enables kraken-lcd" >&2
+    exit 1
+  fi
+  grep -F -q 'no NZXT Kraken Z (1e71:3008) is attached' "$nok_err" || {
+    echo "install self-test: no-Kraken install did not say why kraken-lcd was skipped" >&2
+    cat -- "$nok_err" >&2
+    exit 1
+  }
+  for p in \
+    "kraken-lcd was skipped: no NZXT Kraken Z (1e71:3008) is attached" \
+    "attach the cooler and run sudo scripts/install.sh again" \
+    "systemctl start llama-watch" \
+    "systemctl try-restart llama-watch llama-light llama-metrics" \
+    "how to roll back"; do
+    [[ "$nok_out" == *"$p"* ]] || {
+      echo "install self-test: no-Kraken next steps are missing: $p" >&2
+      printf '%s\n' "$nok_out" >&2
+      exit 1
+    }
+  done
+  nok_steps="${nok_out%%how to roll back*}"
+  if grep -E 'systemctl|runuser|install -d' <<<"$nok_steps" | grep -F -q 'kraken-lcd'; then
+    echo "install self-test: no-Kraken next steps tell the operator to run kraken-lcd" >&2
+    printf '%s\n' "$nok_steps" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$nok_steps" | grep -E -q 'RR-?[A-Z0-9]|\bT[0-9]+\b|Phase B|--trace-hid|was restarted'; then
+    echo "install self-test: no-Kraken next steps use internal ticket jargon or claim a restart" >&2
+    exit 1
+  fi
+  nok_section="$(rollback_section "$nok_out")"
+  [[ "$nok_section" == *"rm -f -- /usr/local/libexec/llama-bored/kraken-lcd"* \
+    && "$nok_section" != *"kraken-lcd.service"* \
+    && "$nok_section" != *"kraken-lcd.rules"* \
+    && "$nok_section" != *"kraken-lcd-hidraw.rules"* \
+    && "$nok_section" != *"/var/lib/kraken-lcd"* ]] || {
+    echo "install self-test: no-Kraken rollback does not match what was installed" >&2
+    printf '%s\n' "$nok_section" >&2
+    exit 1
+  }
+  assert_rollback_order "$nok_out"
+  # Idempotent: a second run with no Kraken swaps nothing (the live-config
+  # backup every re-run takes aside). Each run freezes its own staging, as
+  # a real run does.
+  rm -rf -- "$nok_stage"
+  nok_stage="$(freeze_staging "$repo" "$nok")"
+  : >"$INSTALL_LOG"
+  nok_out2="$(apply_from_staging "$nok_stage" "$nok" "$nok_sys" "$head" 2>/dev/null)"
+  if rollback_section "$nok_out2" | grep -E '^  (rm|mv|rmdir) ' \
+    | grep -v -e 'ROLLBACK_PENDING' -e 'config.toml.bak-' | grep -q .; then
+    echo "install self-test: no-Kraken re-run changed files" >&2
+    rollback_section "$nok_out2" >&2
+    exit 1
+  fi
+  assert_no_new "$nok"
+  # Unwind newest first: the re-run, then the first install.
+  execute_printed_rollback "$nok_out2" "$nok"
+  execute_printed_rollback "$nok_out" "$nok"
+  assert_same_tree "$nok" "$tmp/snap-no-kraken" "no-Kraken rollback"
+  assert_no_new "$nok"
+
+  # The cooler attached later: re-running the installer adds kraken-lcd's
+  # unit, rules and state dir, checks the pin, and its rollback returns the
+  # tree to the no-Kraken install byte for byte.
+  nok_later="$tmp/no-kraken-later"
+  mkdir -p -- "$nok_later"
+  rm -rf -- "$nok_stage"
+  nok_stage="$(freeze_staging "$repo" "$nok_later")"
+  apply_from_staging "$nok_stage" "$nok_later" "$nok_sys" "$head" >/dev/null 2>&1
+  snapshot_tree "$nok_later" "$tmp/snap-no-kraken-later"
+  rm -rf -- "$nok_stage"
+  nok_stage="$(freeze_staging "$repo" "$nok_later")"
+  INSTALL_FAKE_STAT='660 kraken-lcd'
+  INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
+  INSTALL_FAKE_PIN=/dev/hidraw0
+  : >"$INSTALL_LOG"
+  nok_later_out="$(apply_from_staging "$nok_stage" "$nok_later" "$sys" "$head" 2>/dev/null)"
+  for p in /etc/systemd/system/kraken-lcd.service \
+    /etc/udev/rules.d/71-kraken-lcd.rules \
+    /etc/udev/rules.d/93-kraken-lcd-hidraw.rules \
+    /etc/systemd/user/kraken-lcd-halt.path \
+    /etc/systemd/user/kraken-lcd-halt-notify.service \
+    /var/lib/kraken-lcd; do
+    [[ -e "$(dest_path "$nok_later" "$p")" ]] || {
+      echo "install self-test: re-run with the Kraken attached did not add $p" >&2
+      exit 1
+    }
+  done
+  log_has 'setfacl -b -- /dev/hidraw0'
+  [[ "$nok_later_out" == *"systemctl enable --now kraken-lcd"* \
+    && "$nok_later_out" != *"kraken-lcd was skipped"* ]] || {
+    echo "install self-test: re-run with the Kraken attached printed the wrong next steps" >&2
+    exit 1
+  }
+  if log_mentions_writer_lifecycle; then
+    echo "install self-test: dry-run log starts, restarts, or enables kraken-lcd" >&2
+    exit 1
+  fi
+  assert_rollback_order "$nok_later_out"
+  execute_printed_rollback "$nok_later_out" "$nok_later"
+  assert_same_tree "$nok_later" "$tmp/snap-no-kraken-later" "Kraken-added rollback"
+  if [[ -e "$(dest_path "$nok_later" /var/lib/kraken-lcd)" ]]; then
+    echo "install self-test: Kraken-added rollback left the state dir it created" >&2
+    exit 1
+  fi
+
+  # No Kraken, but kraken-lcd's unit or a rule from an earlier install is
+  # still there: refuse before any write rather than leave a stale unit
+  # beside a new binary.
+  INSTALL_FAKE_STAT='666 root'
+  INSTALL_FAKE_PIN=''
+  for old_rel in /etc/systemd/system/kraken-lcd.service \
+    /etc/udev/rules.d/71-kraken-lcd.rules \
+    /etc/udev/rules.d/93-kraken-lcd-hidraw.rules; do
+    old_dest="$tmp/no-kraken-old"
+    rm -rf -- "$old_dest"
+    mkdir -p -- "$(dirname -- "$(dest_path "$old_dest" "$old_rel")")"
+    printf 'old\n' >"$(dest_path "$old_dest" "$old_rel")"
+    snapshot_tree "$old_dest" "$tmp/snap-no-kraken-old"
+    : >"$INSTALL_LOG"
+    set +e
+    old_err="$(apply_from_staging "$nok_stage" "$old_dest" "$nok_sys" "$head" 2>&1 >/dev/null)"
+    old_status=$?
+    set -e
+    [[ "$old_status" -ne 0 && "$old_err" == *"no NZXT Kraken Z (1e71:3008) is attached"* \
+      && "$old_err" == *"$old_rel"* && "$old_err" != *"how to roll back"* ]] || {
+      echo "install self-test: no Kraken with $old_rel installed was not refused before writes" >&2
+      printf '%s\n' "$old_err" >&2
+      exit 1
+    }
+    assert_same_tree "$old_dest" "$tmp/snap-no-kraken-old" "no-Kraken refusal with $old_rel"
+    [[ ! -s "$INSTALL_LOG" ]] || {
+      echo "install self-test: no-Kraken refusal ran host commands" >&2
+      exit 1
+    }
+  done
+
+  # Two Krakens: refused (unchanged), now before any write.
+  two_sys="$tmp/sys-two-kraken"
+  cp -a -- "$sys" "$two_sys"
+  mkdir -p "$two_sys/bus/usb/devices/3-6"
+  printf '1e71\n' >"$two_sys/bus/usb/devices/3-6/idVendor"
+  printf '3008\n' >"$two_sys/bus/usb/devices/3-6/idProduct"
+  assert_eq "$(kraken_device_count "$two_sys")" "2" "two Krakens in sysfs"
+  two_dest="$tmp/two-kraken"
+  mkdir -p -- "$two_dest"
+  snapshot_tree "$two_dest" "$tmp/snap-two-kraken"
+  INSTALL_FAKE_STAT='660 kraken-lcd'
+  INSTALL_FAKE_PIN=/dev/hidraw0
+  : >"$INSTALL_LOG"
+  set +e
+  two_err="$(apply_from_staging "$nok_stage" "$two_dest" "$two_sys" "$head" 2>&1 >/dev/null)"
+  two_status=$?
+  set -e
+  [[ "$two_status" -ne 0 && "$two_err" == *"expected one 1e71:3008 device, found 2"* ]] || {
+    echo "install self-test: two Krakens were not refused" >&2
+    printf '%s\n' "$two_err" >&2
+    exit 1
+  }
+  assert_same_tree "$two_dest" "$tmp/snap-two-kraken" "two-Kraken refusal"
+  [[ ! -s "$INSTALL_LOG" && ! -e "$(dest_path "$two_dest" /usr/local/libexec/llama-bored/ROLLBACK_PENDING)" ]] || {
+    echo "install self-test: two-Kraken refusal wrote or ran something" >&2
+    exit 1
+  }
+  INSTALL_FAKE_GETFACL=$'user::rw-\ngroup::rw-\n'
+  rm -rf -- "$nok_stage"
 
   unset INSTALL_DRY INSTALL_ALLOW_UNPRIV_COPY INSTALL_FAKE_STAT INSTALL_FAKE_GETFACL INSTALL_FAKE_PIN INSTALL_LOG INSTALL_FAIL_AT INSTALL_FAIL_MARKER
   unset INSTALL_OWNER_MODE INSTALL_TAMPER_LIVE

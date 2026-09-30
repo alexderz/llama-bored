@@ -12,9 +12,10 @@ to look at while it does.
 It never touches the pump or fans. Everything it draws on hardware is colour
 and pixels, through small closed command sets.
 
-It needs Linux with systemd and, for now, an NZXT Kraken Z: the installer
-requires exactly one (`1e71:3008`). NVIDIA, llama-swap, ASUS Aura and the
-Corsair keyboard are optional.
+It needs Linux with systemd. Everything else is optional: an NZXT Kraken Z
+(`1e71:3008`) for the LCD, NVIDIA, llama-swap, ASUS Aura and the Corsair
+keyboard. Without a Kraken Z the installer sets up everything except the
+LCD writer.
 
 <p align="center">
   <img src="docs/media/kraken-lcd.gif" width="560" alt="The Kraken LCD while a new model loads and starts generating: the activity gauge swings from idle into the redline">
@@ -53,10 +54,16 @@ name sanitiser, logging.
   (generation up, prompt down, newest on the left), log-scaled to
   `gen_ceiling_tps` and `prompt_ceiling_tps`.
 - **SLOTS:** per-slot context fill and a context-history sparkline (6 h by
-  default) with red markers where a context was reset.
+  default) with a marker where a context dropped, labelled by best-guess
+  reason from token counts: `c` compacted (same conversation, mostly
+  cached), `n` new conversation, `e` evicted (a conversation came back with
+  nothing cached), red `v` unknown.
 - **RECENT:** the last requests across the full width, with timestamps.
 - **IN / OUT:** the live prompt and output tails of the busy slot. IN strips
-  chat-template tokens by default. Turn all text off with `show_text = false`.
+  chat-template tokens by default. For SGLang, vLLM and other servers
+  without `/slots`, IN/OUT show the last finished exchange from llama-swap's
+  request captures (when its `captureBuffer` is on; read up to 2 MiB per
+  capture). Turn all text off, captures included, with `show_text = false`.
 - **FANS** (optional): read-only rpm and pwm of motherboard fans from a
   Super-I/O hwmon chosen by name.
 - The model's full name and a tuning line (ctx, KV cache type, quant, CPU MoE
@@ -115,6 +122,9 @@ falls back to utilisation.
 | `llamabored_ai_state` | `state` | down / idle / loaded |
 | `llamabored_model_loaded`, `_model_ctx_size_tokens`, `_model_state` | `name`, `full_name`, ... | Loaded models, context size, lifecycle (ready / starting / stopping) |
 | `llamabored_slots_busy`, `llamabored_slots_total` | `name`, `full_name` | llama.cpp slots |
+| `llamabored_slot_ctx_used_tokens` | `name`, `full_name`, `slot` | Context a llama.cpp slot holds |
+| `llamabored_slot_ctx_resets_total` | `name`, `full_name`, `slot`, `reason` | Context drops by best-guess reason (compacted, new, evicted, unknown) |
+| `llamabored_model_prompt_tokens_total`, `_model_prompt_cached_tokens_total` | `name`, `full_name` | Prompt tokens and the cached part; hit ratio = `rate(cached) / rate(total)` |
 | `llamabored_model_requests_running`, `_requests_queued`, `_kv_cache_usage_ratio`, `_cache_hit_ratio` | `name`, `full_name` | SGLang / vLLM request and cache gauges |
 | `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
 | `llamabored_source_up`, `llamabored_source_latency_seconds` | `source` | Health of each watcher source (llama-swap, running, slots, metrics, activity, gpu, hwmon, proc) |
@@ -126,17 +136,16 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 
 | Backend | What you get |
 |---|---|
-| llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill, IN/OUT text, the tuning line |
-| SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; no IN/OUT text |
-| vLLM | The same from `vllm:*` metrics; tuning line from its flags; no IN/OUT text |
+| llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text, the tuning line |
+| SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
+| vLLM | The same from `vllm:*` metrics; tuning line from its flags; IN/OUT from llama-swap captures |
 | Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
 
 A llama.cpp server started through a wrapper script, without `llama-server`
 in its command, needs `"model-id" = "llamacpp"` under `[llama.backends]`.
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
-controller are optional; missing sources show "—". The installer does
-currently expect one Kraken Z, because it pins the cooler's hidraw node.
+controller are optional; missing sources show "—".
 
 ## Supported hardware
 
@@ -155,8 +164,12 @@ software check can tell them apart. If you try one, read
 
 ## Requirements
 
-- Linux with **systemd**, one NZXT Kraken Z, and the **`nzxt-kraken3`**
-  hwmon driver (mainline since 6.9) bound to it.
+- Linux with **systemd**.
+- For the LCD (optional): one NZXT Kraken Z and the **`nzxt-kraken3`** hwmon
+  driver (mainline since 6.9) bound to it. With none attached the installer
+  skips kraken-lcd's unit, udev rules and state directory (the binary is
+  still installed) and says how to add it later: attach the cooler and run
+  the installer again. With more than one it refuses.
 - **Rust** via rustup (`rust-toolchain.toml` pins the version), plus
   `cargo-deny` and `cargo-audit` for `scripts/check.sh`.
 - For the build and install scripts: `git`, a C compiler as the linker
@@ -275,6 +288,7 @@ required. Check a file without starting anything:
 | `[tty] blank_min`, `sleep_min` | Burn-in guard for the tty11 monitor: blank after N min without a keypress, power down at M (0 = off) |
 | `[tty] show_text`, `prompt_view` | Show the live prompt/output (`true`) and strip chat templates (`"clean"`) or not (`"raw"`) |
 | `[tty] gen_ceiling_tps`, `prompt_ceiling_tps` | Tops of the tok/s scales (250, 1500) |
+| `[tty] font`, `size` | `"12x24"` (default) or `"12x22"`; `size = "COLSxROWS"` (160x26 to 1024x512) sizes tty11 at start. See below |
 | `[tty] chart_glyphs`, `ctx_history_h` | `"eighths"` (bundled font) or `"halves"`; SLOTS history hours (1–24) |
 | `[fans] enabled`, `hwmon`, `channels`, `labels` | Off by default. `hwmon` is a **name** from `cat /sys/class/hwmon/*/name` |
 
@@ -350,6 +364,23 @@ scrape_configs:
 
 After editing `watch.toml` or `config.toml`, restart that service
 (`llama-watch` or `kraken-lcd`). `light.toml` reloads by itself.
+
+**tty11 on small or mixed screens.** Every display on a GPU shows the same
+console, sized at boot for the largest one, so a smaller screen shows only
+tty11's top-left corner. Size tty11 for the smallest screen:
+
+```toml
+[tty]
+font = "12x22"     # "12x24" (default) or "12x22": same glyphs, two more rows
+size = "160x49"    # COLSxROWS, 160x26 to 1024x512; unset keeps the boot size
+```
+
+At 1920x1080 the 12x24 font gives 160x45 and the 12x22 font 160x49.
+`llama-watch.service` applies both before the watcher starts, through a root
+pre-step (`llama-watch tty-setup`) that runs `setfont` and `stty` from the
+validated values; restart the unit after a change. Under 48 rows the
+dashboard drops panels to fit (IN/OUT first, then FANS, then the chart
+shrinks) and shows `tty too small` only below 160x26.
 
 ## Troubleshooting
 

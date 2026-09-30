@@ -319,3 +319,64 @@ fn strip_comments(src: &str) -> String {
     }
     out
 }
+
+/// #7: only the root pre-step (`tty/setup.rs`, `llama-watch tty-setup`)
+/// starts programs, and only setfont and stty, never a shell. The watcher
+/// (`run`) spawns nothing.
+#[test]
+fn only_tty_setup_spawns_and_only_setfont_and_stty() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&src, &mut files);
+    let mut hits = Vec::new();
+    for path in &files {
+        let full = strip_comments(&fs::read_to_string(path).expect("read source"));
+        // Unit tests may spawn helpers (service.rs re-execs under taskset).
+        // The test module sits at the end of each file.
+        let code = full.split("#[cfg(test)]").next().unwrap_or_default();
+        let rel = path
+            .strip_prefix(&src)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let spawns = [
+            "process::Command",
+            "Command::new",
+            "execv",
+            "posix_spawn",
+            "fork",
+        ]
+        .iter()
+        .any(|token| code.contains(token));
+        if spawns && rel != "tty/setup.rs" {
+            hits.push(format!("{rel} starts a program"));
+        }
+        if rel == "tty/setup.rs" {
+            for shell in ["/bin/sh", "/usr/bin/sh", "bash", "\"sh\"", "\"-c\""] {
+                if code.contains(shell) {
+                    hits.push(format!("tty/setup.rs names {shell}"));
+                }
+            }
+            let programs: Vec<&str> = code
+                .match_indices("\"/")
+                .map(|(at, _)| {
+                    let rest = &code[at + 1..];
+                    &rest[..rest.find('"').unwrap_or(rest.len())]
+                })
+                .collect();
+            for program in &programs {
+                let known = [
+                    "/dev/tty11",
+                    "/usr/local/share/llama-bored",
+                    "/usr/bin/setfont",
+                    "/usr/bin/stty",
+                    "/",
+                ];
+                if !known.contains(program) {
+                    hits.push(format!("tty/setup.rs names path {program}"));
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}

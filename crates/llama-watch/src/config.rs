@@ -281,6 +281,20 @@ pub enum InvalidWatchConfig {
         /// Which limit failed.
         reason: &'static str,
     },
+    /// `tty.size` is below the layout floor or above the console bound.
+    #[error(
+        "tty.size {cols}x{rows} is outside {min_cols}x{min_rows}..={max_cols}x{max_rows}",
+        min_cols = crate::tty::layout::MIN_COLS,
+        min_rows = crate::tty::layout::MIN_ROWS,
+        max_cols = TTY_SIZE_MAX_COLS,
+        max_rows = TTY_SIZE_MAX_ROWS
+    )]
+    TtySize {
+        /// Requested columns.
+        cols: u16,
+        /// Requested rows.
+        rows: u16,
+    },
 }
 
 /// `[collector]`.
@@ -448,6 +462,86 @@ pub struct Tty {
     /// watcher sends `ESC [ 14 ; sleep_min - blank_min ]` once at start-up.
     #[serde(default)]
     pub sleep_min: u32,
+    /// Console font the root pre-step `llama-watch tty-setup` loads on
+    /// tty11. See [`TtyFont`].
+    #[serde(default)]
+    pub font: TtyFont,
+    /// Console size the root pre-step sets on tty11 after the font, or
+    /// `None` (default) to keep the size the kernel picked. `"COLSxROWS"`.
+    #[serde(default)]
+    pub size: Option<TtySize>,
+}
+
+/// `tty.font`: which bundled Hack console font tty11 loads. Both have the
+/// same glyphs; 12x22 fits two more rows on a short screen (160x49 on a
+/// 1920x1080 display instead of 160x45).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum TtyFont {
+    /// `llama-hack-12x24.psfu` (default).
+    #[default]
+    #[serde(rename = "12x24")]
+    Hack12x24,
+    /// `llama-hack-12x22.psfu`.
+    #[serde(rename = "12x22")]
+    Hack12x22,
+}
+
+impl TtyFont {
+    /// File name under the install's font directory. A fixed string per
+    /// variant: no config text reaches a path.
+    #[must_use]
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Self::Hack12x24 => "llama-hack-12x24.psfu",
+            Self::Hack12x22 => "llama-hack-12x22.psfu",
+        }
+    }
+}
+
+/// Largest `tty.size` columns. The console itself allows more; the layout
+/// has nothing to gain past this.
+pub const TTY_SIZE_MAX_COLS: u16 = 1024;
+/// Largest `tty.size` rows.
+pub const TTY_SIZE_MAX_ROWS: u16 = 512;
+
+/// `tty.size`: columns and rows. Parsed from `"COLSxROWS"`: ASCII digits
+/// without a leading zero or sign, a lowercase `x`, nothing else. Bounds are
+/// checked by [`Config::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TtySize {
+    /// Columns.
+    pub cols: u16,
+    /// Rows.
+    pub rows: u16,
+}
+
+impl TtySize {
+    /// `"160x49"`. `None` for anything else.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let (cols, rows) = text.split_once('x')?;
+        Some(Self {
+            cols: dimension(cols)?,
+            rows: dimension(rows)?,
+        })
+    }
+}
+
+fn dimension(text: &str) -> Option<u16> {
+    let digits = text.as_bytes();
+    if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+impl<'de> Deserialize<'de> for TtySize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom("tty.size must be \"COLSxROWS\", such as \"160x49\"")
+        })
+    }
 }
 
 /// `tty.prompt_view`: whether chat-template control tokens stay in IN.
@@ -466,7 +560,7 @@ pub enum PromptView {
 
 /// `tty.chart_glyphs`: which block glyphs the token chart draws with.
 ///
-/// Whether `setfont` loaded llama-hack-12x24 cannot be seen from the
+/// Whether `setfont` loaded a llama-hack font (`tty.font`) cannot be seen from the
 /// watcher, so this is a setting. `halves` is the code default and uses only
 /// glyphs eurlatgr has; `packaging/watch.example.toml` sets `eighths`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -476,7 +570,7 @@ pub enum ChartGlyphs {
     #[default]
     Halves,
     /// Lower eighths `▁`–`▇` and `█`: 8 levels per row. The falling half
-    /// inverts the lower eighths. Needs llama-hack-12x24.
+    /// inverts the lower eighths. Needs a llama-hack font (12x24 or 12x22).
     Eighths,
 }
 
@@ -781,6 +875,8 @@ impl Default for Tty {
             ctx_history_h: defaults::ctx_history_h(),
             blank_min: 0,
             sleep_min: 0,
+            font: TtyFont::default(),
+            size: None,
         }
     }
 }
@@ -969,6 +1065,12 @@ impl Config {
                 sleep_min,
                 blank_min,
             });
+        }
+        if let Some(TtySize { cols, rows }) = self.tty.size
+            && !((crate::tty::layout::MIN_COLS..=TTY_SIZE_MAX_COLS).contains(&cols)
+                && (crate::tty::layout::MIN_ROWS..=TTY_SIZE_MAX_ROWS).contains(&rows))
+        {
+            return Err(InvalidWatchConfig::TtySize { cols, rows });
         }
         let smooth_s = self.load.smooth_s;
         if !smooth_s.is_finite() || !(0.0..=5.0).contains(&smooth_s) {

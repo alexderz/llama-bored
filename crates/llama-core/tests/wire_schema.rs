@@ -49,6 +49,9 @@ fn valid() -> WireSnapshot {
                     cache_hit: None,
                     slots_busy: None,
                     slots_total: None,
+                    prompt_tokens: None,
+                    prompt_cached_tokens: None,
+                    slot_ctx: Vec::new(),
                 },
                 ModelWire {
                     backend: None,
@@ -62,6 +65,9 @@ fn valid() -> WireSnapshot {
                     cache_hit: None,
                     slots_busy: None,
                     slots_total: None,
+                    prompt_tokens: None,
+                    prompt_cached_tokens: None,
+                    slot_ctx: Vec::new(),
                 },
             ],
         },
@@ -122,6 +128,9 @@ fn sanitize_wire_names_pass_validate() {
             cache_hit: None,
             slots_busy: None,
             slots_total: None,
+            prompt_tokens: None,
+            prompt_cached_tokens: None,
+            slot_ctx: Vec::new(),
         }];
         assert_eq!(validate(&snap), Ok(()), "raw={raw:?} name={name:?}");
         assert!(
@@ -441,6 +450,9 @@ fn model_count_and_loaded_state() {
             cache_hit: None,
             slots_busy: None,
             slots_total: None,
+            prompt_tokens: None,
+            prompt_cached_tokens: None,
+            slot_ctx: Vec::new(),
         })
         .collect();
     assert_eq!(validate(&snap), Ok(()));
@@ -457,6 +469,9 @@ fn model_count_and_loaded_state() {
         cache_hit: None,
         slots_busy: None,
         slots_total: None,
+        prompt_tokens: None,
+        prompt_cached_tokens: None,
+        slot_ctx: Vec::new(),
     });
     assert_eq!(validate(&snap), Err(WireError::TooManyModels));
 
@@ -482,6 +497,9 @@ fn name_length_and_canonical_form() {
         cache_hit: None,
         slots_busy: None,
         slots_total: None,
+        prompt_tokens: None,
+        prompt_cached_tokens: None,
+        slot_ctx: Vec::new(),
     }];
     assert_eq!(validate(&snap), Ok(()));
 
@@ -782,6 +800,9 @@ fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
         cache_hit: Some(0.123_456_7),
         slots_busy: Some(wire::MAX_SLOTS),
         slots_total: Some(wire::MAX_SLOTS),
+        prompt_tokens: None,
+        prompt_cached_tokens: None,
+        slot_ctx: Vec::new(),
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
     snap.host.load_pct = Some(12.345_678);
@@ -883,4 +904,170 @@ fn metrics_fields_are_bounded() {
     let json = insert_after(&base_json(), "{", r#""sources":{"tpu":{"up":true}},"#);
     let snap = parse_validated(&json).expect("unknown source is ignored");
     assert_eq!(snap.sources, Some(wire::Sources::default()));
+}
+
+// ---- #10: per-slot context and prompt cache counters ------------------------
+
+fn slot_row(slot: u16, used: u64, resets: u64) -> wire::SlotCtxWire {
+    wire::SlotCtxWire {
+        slot,
+        used,
+        resets: wire::SlotResetsWire {
+            new: resets,
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn slot_ctx_and_prompt_counters_are_additive_on_schema_v1() {
+    // An older watcher's model has none of them.
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#10 snapshot");
+    assert_eq!(old.ai.models[0].prompt_tokens, None);
+    assert_eq!(old.ai.models[0].prompt_cached_tokens, None);
+    assert!(old.ai.models[0].slot_ctx.is_empty());
+    let text = String::from_utf8(to_json(&valid()).expect("encode")).expect("utf8");
+    for key in ["prompt_tokens", "prompt_cached", "slot_ctx"] {
+        assert!(!text.contains(key), "{key}: {text}");
+    }
+
+    let mut snap = valid();
+    snap.ai.models[0].prompt_tokens = Some(u64::MAX);
+    snap.ai.models[0].prompt_cached_tokens = Some(u64::MAX);
+    snap.ai.models[0].slot_ctx = vec![
+        slot_row(0, wire::MAX_CTX_TOKENS, u64::MAX),
+        slot_row(wire::MAX_SLOTS - 1, 0, 0),
+    ];
+    let bytes = to_json(&snap).expect("encode");
+    assert_eq!(parse_validated(&bytes).expect("round trip"), snap);
+
+    // A reader that predates `resets` inside a row still reads the row.
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","prompt_tokens":10,"prompt_cached_tokens":4,"slot_ctx":[{"slot":1,"used":5}]"#,
+    );
+    let snap = parse_validated(&json).expect("resets defaults to 0");
+    assert_eq!(snap.ai.models[0].slot_ctx, vec![slot_row(1, 5, 0)]);
+    assert_eq!(snap.ai.models[0].prompt_cached_tokens, Some(4));
+
+    // #9: drops by reason; a zero is omitted, and a reason this reader does
+    // not know is ignored like any unknown field.
+    let mut two = valid();
+    two.ai.models[0].slot_ctx = vec![slot_row(0, 9, 2)];
+    let text = String::from_utf8(to_json(&two).expect("encode")).expect("utf8");
+    assert!(text.contains(r#""resets":{"new":2}"#), "{text}");
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","slot_ctx":[{"slot":0,"used":9,"resets":{"compacted":1,"evicted":3,"unknown":4,"merged":7}}]"#,
+    );
+    let snap = parse_validated(&json).expect("unknown reason ignored");
+    assert_eq!(
+        snap.ai.models[0].slot_ctx[0].resets,
+        wire::SlotResetsWire {
+            compacted: 1,
+            new: 0,
+            evicted: 3,
+            unknown: 4
+        }
+    );
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","slot_ctx":[{"slot":0,"used":9,"resets":{"new":-1}}]"#,
+    );
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
+}
+
+#[test]
+fn slot_ctx_and_prompt_counters_are_bounded() {
+    let cases: [Mutate; 7] = [
+        |s| s.ai.models[0].prompt_cached_tokens = Some(1),
+        |s| {
+            s.ai.models[0].prompt_tokens = Some(3);
+            s.ai.models[0].prompt_cached_tokens = Some(4);
+        },
+        |s| s.ai.models[0].slot_ctx = vec![slot_row(wire::MAX_SLOTS, 1, 0)],
+        |s| s.ai.models[0].slot_ctx = vec![slot_row(0, wire::MAX_CTX_TOKENS + 1, 0)],
+        |s| s.ai.models[0].slot_ctx = vec![slot_row(2, 1, 0), slot_row(2, 3, 0)],
+        |s| {
+            s.ai.models[0].slot_ctx = (0..=wire::MAX_SLOT_CTX as u16)
+                .map(|id| slot_row(id, 1, 0))
+                .collect();
+        },
+        // The cap counts every model's rows together.
+        |s| {
+            s.ai.models[0].slot_ctx = (0..20).map(|id| slot_row(id, 1, 0)).collect();
+            s.ai.models[1].slot_ctx = (0..13).map(|id| slot_row(id, 1, 0)).collect();
+        },
+    ];
+    for (i, bad) in cases.into_iter().enumerate() {
+        let mut snap = valid();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+    // The same slot id in two models is fine; so is exactly the cap.
+    let mut snap = valid();
+    snap.ai.models[0].slot_ctx = (0..16).map(|id| slot_row(id, 1, 0)).collect();
+    snap.ai.models[1].slot_ctx = (0..16).map(|id| slot_row(id, 1, 0)).collect();
+    assert_eq!(validate(&snap), Ok(()));
+    // Negative or text values are parse errors.
+    for extra in [
+        r#","slot_ctx":[{"slot":-1,"used":1}]"#,
+        r#","slot_ctx":[{"slot":0,"used":"lots"}]"#,
+        r#","prompt_tokens":-5"#,
+    ] {
+        let json = insert_after(&base_json(), r#""state":"ready""#, extra);
+        assert_eq!(parse_validated(&json), Err(WireError::Parse), "{extra}");
+    }
+}
+
+#[test]
+fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
+    let mut snap = full();
+    let model = ModelWire {
+        name: "Qwen3-Coder…".to_owned(),
+        state: ModelState::Ready,
+        full_name: Some("x".repeat(wire::MAX_FULL_NAME_CHARS)),
+        detail: Some(wire::ModelDetail {
+            ctx: Some(u32::MAX),
+            ncmoe: Some(u16::MAX),
+            kv_k: Some("a".repeat(16)),
+            kv_v: Some("b".repeat(16)),
+            quant: Some("c".repeat(16)),
+            fa: Some(true),
+        }),
+        backend: Some(wire::Backend::LlamaCpp),
+        running: Some(wire::MAX_REQS),
+        queued: Some(wire::MAX_REQS),
+        kv_fill: Some(0.123_456_7),
+        cache_hit: Some(0.123_456_7),
+        slots_busy: Some(wire::MAX_SLOTS),
+        slots_total: Some(wire::MAX_SLOTS),
+        prompt_tokens: Some(u64::MAX),
+        prompt_cached_tokens: Some(u64::MAX),
+        slot_ctx: Vec::new(),
+    };
+    snap.ai.models = vec![model; wire::MAX_MODELS];
+    snap.ai.models[0].slot_ctx = (0..wire::MAX_SLOT_CTX as u16)
+        .map(|id| wire::SlotCtxWire {
+            slot: wire::MAX_SLOTS - 1 - id,
+            used: wire::MAX_CTX_TOKENS,
+            resets: wire::SlotResetsWire {
+                compacted: u64::MAX,
+                new: u64::MAX,
+                evicted: u64::MAX,
+                unknown: u64::MAX,
+            },
+        })
+        .collect();
+    snap.host.load_pct = Some(12.345_678);
+    let bytes = to_json(&snap).expect("encode");
+    assert!(
+        bytes.len() < wire::MAX_BYTES - 1024,
+        "worst case is {} bytes",
+        bytes.len()
+    );
+    assert!(parse_validated(&bytes).is_ok());
 }

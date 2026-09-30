@@ -10,10 +10,17 @@
 //!
 //! The taps run in series on this thread. With eight ready models the worst
 //! case is one `/running` timeout, eight `/metrics` timeouts, eight `/slots`
-//! timeouts, and one activity timeout. At the default timeouts that is
-//! 0.25 + 8×0.2 + 8×0.5 + 0.25 = 6.1 s when every call hangs. The consumer
-//! calls [`SampleRx::take`], which does not wait, so that hang cannot stall
-//! the main loop.
+//! timeouts, one activity timeout and one capture timeout. At the default
+//! timeouts that is 0.25 + 8×0.2 + 8×0.5 + 0.25 + 1 = 7.1 s when every call
+//! hangs. The consumer calls [`SampleRx::take`], which does not wait, so that
+//! hang cannot stall the main loop.
+//!
+//! IN and OUT for a model without `/slots` come from llama-swap's request
+//! capture of its newest finished activity row (#5, [`crate::capture`]):
+//! `GET /api/captures/<id>` once per new row id, only with
+//! `tty.show_text = true`, only for a row marked `has_capture`, at most
+//! [`CAPTURE_CAP`] bytes. The capture's bodies become sanitised tails here
+//! and are dropped.
 //!
 //! Samples leave in a one-deep slot. A new sample replaces an unread one, so
 //! a stalled consumer holds exactly the newest publish and nothing older.
@@ -41,10 +48,12 @@ use llama_core::sample::{AiState, LlamaView, ModelInfo};
 use llama_core::wire::CANONICAL_NAME_CHARS;
 
 use crate::activity::{self, ActivityRow};
+use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
-use crate::metrics::{DecodedCounter, GenRate, MetricsSample, parse_metrics_for};
-use crate::slots::{SlotBook, SlotView};
+use crate::metrics::{DecodedCounter, GenRate, MetricsSample, PromptCache, parse_metrics_for};
+use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
+use crate::tty::grid::Cell;
 
 const RUNNING_CAP: usize = 64 * 1024;
 /// llama-server's `/metrics` is a few KiB.
@@ -53,6 +62,8 @@ const LLAMACPP_METRICS_CAP: usize = 64 * 1024;
 /// about 70 KiB with one model loaded and grows with its labels.
 const SERVER_METRICS_CAP: usize = 1024 * 1024;
 const ACTIVITY_CAP: usize = 256 * 1024;
+/// A capture read may take longer than the activity page: it can be MiBs.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 const MODEL_PLACEHOLDER: &str = "model";
 /// Backend gauges older than this (or two metrics periods) are not shown.
 const FRESH_GAUGES: Duration = Duration::from_secs(1);
@@ -83,6 +94,35 @@ pub struct LlamaDetail {
     pub prompt_tps: Option<f64>,
     /// Last poll durations.
     pub latencies: PollLatencies,
+    /// Prompt and cached-prompt counters of each ready model (#10).
+    pub prompt_cache: Vec<ModelPromptCache>,
+    /// The last finished exchange of a model without `/slots`, from a
+    /// llama-swap capture (#5). Always `None` with `tty.show_text = false`.
+    pub capture: Option<CaptureView>,
+}
+
+/// IN and OUT from one llama-swap capture (#5): sanitised tails only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureView {
+    /// Display name of the model that served it.
+    pub model: String,
+    /// The activity row id it belongs to.
+    pub id: i64,
+    /// The last user message, as IN shows it (`tty.prompt_view`).
+    pub input: Vec<Cell>,
+    /// The answer.
+    pub output: Vec<Cell>,
+}
+
+/// One ready model's prompt token counters since the watcher started (#10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPromptCache {
+    /// Display name, as [`SlotView::model`] and the snapshot use it.
+    pub model: String,
+    /// Prompt tokens of finished requests, cached ones included.
+    pub prompt: u64,
+    /// Of those, served from the prompt cache. `None` when no source says.
+    pub cached: Option<u64>,
 }
 
 /// Latest sample from the poller. [`Self::put`] replaces an unread value.
@@ -315,6 +355,8 @@ struct State<L> {
     /// Box prompt-token total for the snapshot (#11): every metered model's
     /// prompt counter, or its activity rows' `input_tokens` in fallback.
     prompt_box: DecodedCounter,
+    /// Per-model prompt and cached-prompt counters (#10).
+    prompt_cache: PromptCache,
     running_up: bool,
     unmetered: bool,
     latencies: PollLatencies,
@@ -323,6 +365,12 @@ struct State<L> {
     metrics_failed: bool,
     slots_failed: bool,
     activity_failed: bool,
+    /// Newest activity row id a capture was considered for (#5).
+    capture_seen: Option<i64>,
+    /// The capture shown, with the raw id of its model.
+    capture: Option<(String, CaptureView)>,
+    capture_failed: bool,
+    capture_oversize: bool,
 }
 
 fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: Receiver<()>) {
@@ -351,6 +399,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         prompt_counter: DecodedCounter::default(),
         prompt_rate: GenRate::default(),
         prompt_box: DecodedCounter::default(),
+        prompt_cache: PromptCache::default(),
         running_up: false,
         unmetered: false,
         latencies: PollLatencies::default(),
@@ -359,6 +408,10 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         metrics_failed: false,
         slots_failed: false,
         activity_failed: false,
+        capture_seen: None,
+        capture: None,
+        capture_failed: false,
+        capture_oversize: false,
     };
     let mut next_running = Instant::now();
     let mut next_metrics = Instant::now();
@@ -464,6 +517,13 @@ impl<L: Sink> State<L> {
             }
         }
         let ready: HashSet<&str> = self.ready.iter().map(|model| model.id.as_str()).collect();
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|(id, _)| !ready.contains(id.as_str()))
+        {
+            self.capture = None;
+        }
         self.fallback.retain(|id| ready.contains(id.as_str()));
         self.gauges.retain(|id, _| ready.contains(id.as_str()));
         for model in &self.ready {
@@ -522,6 +582,11 @@ impl<L: Sink> State<L> {
             if let Ok(sample) = &read
                 && !model.backend.has_slots()
             {
+                self.prompt_cache.observe_metrics(
+                    &model.id,
+                    sample.prompt_total,
+                    sample.cached_total,
+                );
                 self.gauges
                     .insert(model.id.clone(), Gauges::of(sample, now));
                 if let Some(prompt) = sample.prompt_total {
@@ -650,15 +715,19 @@ impl<L: Sink> State<L> {
         }
         let started = Instant::now();
         let url = join_url(&self.limits.url, "api/metrics/activity");
+        let mut page: Vec<ActivityRow> = Vec::new();
         let failure = match get_exact(
             &self.agent,
             &url,
             self.limits.activity_timeout,
             ACTIVITY_CAP,
         ) {
-            Ok(bytes) => match activity::parse_activity_rows(&bytes, self.activity_rows()) {
-                Some(rows) => {
+            Ok(bytes) => match activity::parse_activity_rows(&bytes, activity::MAX_PAGE_ROWS) {
+                Some(mut rows) => {
                     self.count_activity(&rows);
+                    self.slots.note_activity(&rows, Instant::now());
+                    page = rows.clone();
+                    rows.truncate(self.activity_rows());
                     self.activity = rows;
                     None
                 }
@@ -666,22 +735,35 @@ impl<L: Sink> State<L> {
             },
             Err(err) => Some(err.label()),
         };
+        let activity_took = started.elapsed();
+        // After the activity timing, so a capture read does not count as
+        // activity latency on the health line.
+        self.poll_capture(&page);
+        if failure.is_some() {
+            // Drops waiting for their row still age out (#9).
+            self.slots.note_activity(&[], Instant::now());
+        }
         note_flag(
             &mut self.log,
             &mut self.activity_failed,
             failure,
             "activity",
         );
-        self.latencies.activity = Some(started.elapsed());
+        self.latencies.activity = Some(activity_took);
     }
 
-    /// Add each new row's `output_tokens` to its fallback model, once.
+    /// Add each new row's `output_tokens` to its fallback model, once, and
+    /// every ready model's prompt and cached tokens to its counters (#10).
     ///
     /// Rows are deduped by id. The first read only sets the baseline, so
     /// history from before the watcher started is not back-filled. A newest
     /// id below the baseline means llama-swap restarted: every row counts.
     /// Each fallback model is then fresh until the next activity read is due.
     fn count_activity(&mut self, rows: &[ActivityRow]) {
+        for model in &self.ready {
+            self.prompt_cache
+                .touch(&model.id, model.backend.has_slots());
+        }
         let newest = rows.iter().map(|row| row.id).max();
         let Some(seen) = self.activity_seen else {
             self.activity_seen = Some(newest.unwrap_or(-1));
@@ -692,6 +774,13 @@ impl<L: Sink> State<L> {
             _ => seen,
         };
         let now = Instant::now();
+        for model in &self.ready {
+            let key = activity::model_key(&model.id);
+            for row in rows.iter().filter(|row| row.id > seen && row.model == key) {
+                self.prompt_cache
+                    .add_row(&model.id, row.input_tokens, row.cached_tokens);
+            }
+        }
         let window = self.limits.activity_interval + self.limits.activity_timeout;
         let fallback: Vec<String> = self.fallback.iter().cloned().collect();
         for id in &fallback {
@@ -707,6 +796,72 @@ impl<L: Sink> State<L> {
             self.prompt_box.add(id, prompt, now, window);
         }
         self.activity_seen = Some(newest.map_or(seen, |newest| newest.max(seen)));
+    }
+
+    /// Fetch the capture of the newest finished row of a ready model
+    /// without `/slots`, once per row id (#5). Nothing with text off; a
+    /// row without `has_capture` (captures off, or already evicted from
+    /// llama-swap's buffer) keeps what is shown.
+    fn poll_capture(&mut self, rows: &[ActivityRow]) {
+        if !self.limits.show_text {
+            return;
+        }
+        let textless: Vec<(String, &ReadyModel)> = self
+            .ready
+            .iter()
+            .filter(|model| !model.backend.has_slots())
+            .map(|model| (activity::model_key(&model.id), model))
+            .collect();
+        let Some((row, model)) = rows
+            .iter()
+            .filter_map(|row| {
+                let (_, model) = textless.iter().find(|(key, _)| *key == row.model)?;
+                Some((row, *model))
+            })
+            .max_by_key(|(row, _)| row.id)
+        else {
+            return;
+        };
+        if self.capture_seen == Some(row.id) {
+            return;
+        }
+        self.capture_seen = Some(row.id);
+        if !row.captured || row.id < 0 {
+            return;
+        }
+        let url = join_url(&self.limits.url, &format!("api/captures/{}", row.id));
+        let failure = match get_limited(&self.agent, &url, CAPTURE_TIMEOUT, CAPTURE_CAP) {
+            Ok(Limited::Exact(bytes)) => match parse_capture(&bytes) {
+                Some(text) => {
+                    let view = CaptureView {
+                        model: model.name.clone(),
+                        id: row.id,
+                        input: prompt_cells(
+                            &text.input,
+                            self.limits.input_tail,
+                            self.limits.prompt_view,
+                        ),
+                        output: tail_cells(&text.output, self.limits.output_tail),
+                    };
+                    self.capture = Some((model.id.clone(), view));
+                    None
+                }
+                None => Some("malformed"),
+            },
+            Ok(Limited::Oversize) => {
+                if !self.capture_oversize {
+                    log::emit(
+                        &mut self.log,
+                        Priority::Info,
+                        &format!("captures: {} exceeds {CAPTURE_CAP} bytes; skipped", row.id),
+                    );
+                    self.capture_oversize = true;
+                }
+                None
+            }
+            Err(err) => Some(err.label()),
+        };
+        note_flag(&mut self.log, &mut self.capture_failed, failure, "captures");
     }
 
     /// RECENT rows worth keeping: eight with the text panels, more without.
@@ -766,6 +921,19 @@ impl<L: Sink> State<L> {
             gen_tps,
             prompt_tps,
             latencies: self.latencies,
+            prompt_cache: self
+                .ready
+                .iter()
+                .filter_map(|model| {
+                    let (prompt, cached) = self.prompt_cache.get(&model.id)?;
+                    Some(ModelPromptCache {
+                        model: model.name.clone(),
+                        prompt,
+                        cached,
+                    })
+                })
+                .collect(),
+            capture: self.capture.as_ref().map(|(_, view)| view.clone()),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());

@@ -5,15 +5,22 @@ Usage:
   build-psf.py TTF WxH OUT          write OUT
   build-psf.py --check TTF WxH OUT  rebuild in memory, compare with OUT byte
                                     for byte, exit 1 on any difference
-  build-psf.py --self-test          rebuild llama-hack-12x24.psfu from Hack
-                                    Regular and compare; skip (exit 0 with a
+  build-psf.py --self-test          rebuild llama-hack-12x24.psfu and
+                                    llama-hack-12x22.psfu from Hack Regular
+                                    and compare each; skip (exit 0 with a
                                     note) when Pillow or the TTF is absent
 
-The committed font is built with:
+The committed fonts are built with:
 
   packaging/fonts/build-psf.py \\
     /usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf 12x24 \\
     packaging/fonts/llama-hack-12x24.psfu
+  packaging/fonts/build-psf.py \\
+    /usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf 12x22 \\
+    packaging/fonts/llama-hack-12x22.psfu
+
+12x22 is `[tty] font = "12x22"`: two more rows on a 1080-line screen
+(160x49 at 1920x1080 instead of 160x45).
 
 Reference inputs (2026-09-25): Hack 3.003
 (source-foundry-hack-fonts-3.003-7.fc44), Pillow 12.3.0, FreeType 2.14.3.
@@ -50,8 +57,11 @@ EXTRA = (
 HERE = os.path.dirname(os.path.abspath(__file__))
 SELF_TEST_TTF = "/usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf"
 SELF_TEST_TTF_SHA256 = "15f55cc0c85a2988d2b4b3a8cdb5d77fdfbaf319e1bb5309d725db9818fb7125"
-SELF_TEST_CELL = (12, 24)
-SELF_TEST_OUT = os.path.join(HERE, "llama-hack-12x24.psfu")
+# Every committed font, rebuilt and compared by --self-test.
+SELF_TEST_FONTS = (
+    ((12, 24), os.path.join(HERE, "llama-hack-12x24.psfu")),
+    ((12, 22), os.path.join(HERE, "llama-hack-12x22.psfu")),
+)
 
 
 def slot_table():
@@ -204,8 +214,14 @@ def self_test():
             f"(sha256 {digest}); the committed PSF was not rebuilt"
         )
         return 0
-    width, height = SELF_TEST_CELL
-    return check(ttf, width, height, SELF_TEST_OUT)
+    failed = 0
+    for (width, height), out in SELF_TEST_FONTS:
+        if not os.path.isfile(out):
+            print(f"build-psf self-test: {out} is missing", file=sys.stderr)
+            failed = 1
+            continue
+        failed |= check(ttf, width, height, out)
+    return failed
 
 
 def main(argv):

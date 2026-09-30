@@ -109,6 +109,9 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
                 cache_hit: None,
                 slots_busy: None,
                 slots_total: None,
+                prompt_tokens: None,
+                prompt_cached_tokens: None,
+                slot_ctx: Vec::new(),
             }],
         },
         tokens: Tokens {

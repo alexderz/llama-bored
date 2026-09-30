@@ -462,6 +462,16 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.cache_hit",
         "ai.models.slots_busy",
         "ai.models.slots_total",
+        "ai.models.prompt_tokens",
+        "ai.models.prompt_cached_tokens",
+        "ai.models.slot_ctx",
+        "ai.models.slot_ctx.slot",
+        "ai.models.slot_ctx.used",
+        "ai.models.slot_ctx.resets",
+        "ai.models.slot_ctx.resets.compacted",
+        "ai.models.slot_ctx.resets.new",
+        "ai.models.slot_ctx.resets.evicted",
+        "ai.models.slot_ctx.resets.unknown",
         "tokens",
         "tokens.decoded_total",
         "tokens.prompt_total",
@@ -496,10 +506,20 @@ fn no_prompt_or_output_text_is_exported() {
         keys, pinned,
         "the snapshot wire changed; review llama-metrics for text before updating this pin"
     );
-    // A token count is not text: `prompt_total` is a u64 counter (#11),
-    // typed on the wire, so it is the one key allowed to say "prompt".
-    const COUNTS: [&str; 2] = ["tokens.prompt_total", "llamabored_tokens_prompt_total"];
+    // A token count is not text: `prompt_total` (#11) and the per-model
+    // prompt counters (#10) are u64 counters, typed on the wire, so they are
+    // the keys allowed to say "prompt".
+    const COUNTS: [&str; 6] = [
+        "tokens.prompt_total",
+        "llamabored_tokens_prompt_total",
+        "ai.models.prompt_tokens",
+        "ai.models.prompt_cached_tokens",
+        "llamabored_model_prompt_tokens_total",
+        "llamabored_model_prompt_cached_tokens_total",
+    ];
     assert!(json["tokens"]["prompt_total"].is_u64());
+    assert!(json["ai"]["models"][0]["prompt_tokens"].is_u64());
+    assert!(json["ai"]["models"][0]["prompt_cached_tokens"].is_u64());
     for key in keys.iter().filter(|key| !COUNTS.contains(&key.as_str())) {
         for word in ["prompt", "output", "input", "text", "content", "message"] {
             assert!(!key.contains(word), "wire key {key} looks like text");
@@ -513,6 +533,7 @@ fn no_prompt_or_output_text_is_exported() {
         ["", "down", "idle", "loaded", "busy", "denied", "all", "f16"]
             .into_iter()
             .chain(["llamacpp", "sglang", "vllm", "openai"])
+            .chain(["compacted", "new", "evicted", "unknown"])
             .map(str::to_owned)
             .collect();
     allowed.insert(env!("CARGO_PKG_VERSION").to_owned());
@@ -528,6 +549,9 @@ fn no_prompt_or_output_text_is_exported() {
     }
     allowed.insert(wire::SCHEMA.to_string());
     for model in &snap.ai.models {
+        for row in &model.slot_ctx {
+            allowed.insert(row.slot.to_string());
+        }
         allowed.insert(model.name.clone());
         if let Some(full) = &model.full_name {
             allowed.insert(full.clone());
@@ -562,15 +586,16 @@ fn no_prompt_or_output_text_is_exported() {
         "channel",
         "label",
         "source",
+        "slot",
     ]
     .into_iter()
     .collect();
     for (name, labels, _) in samples(&text) {
-        if COUNTS.contains(&name.as_str()) {
-            continue;
-        }
         for word in ["prompt", "output", "input", "text", "content", "message"] {
-            assert!(!name.contains(word), "{name} looks like a text metric");
+            assert!(
+                COUNTS.contains(&name.as_str()) || !name.contains(word),
+                "{name} looks like a text metric"
+            );
         }
         for (key, value) in labels {
             assert!(label_keys.contains(key.as_str()), "{name} has label {key}");
@@ -622,6 +647,32 @@ const EXPORTED: &[(&str, &str)] = &[
     ("ai.models.cache_hit", "llamabored_model_cache_hit_ratio"),
     ("ai.models.slots_busy", "llamabored_slots_busy"),
     ("ai.models.slots_total", "llamabored_slots_total"),
+    (
+        "ai.models.prompt_tokens",
+        "llamabored_model_prompt_tokens_total",
+    ),
+    (
+        "ai.models.prompt_cached_tokens",
+        "llamabored_model_prompt_cached_tokens_total",
+    ),
+    ("ai.models.slot_ctx.slot", "llamabored_slot_ctx_used_tokens"),
+    ("ai.models.slot_ctx.used", "llamabored_slot_ctx_used_tokens"),
+    (
+        "ai.models.slot_ctx.resets.compacted",
+        "llamabored_slot_ctx_resets_total",
+    ),
+    (
+        "ai.models.slot_ctx.resets.new",
+        "llamabored_slot_ctx_resets_total",
+    ),
+    (
+        "ai.models.slot_ctx.resets.evicted",
+        "llamabored_slot_ctx_resets_total",
+    ),
+    (
+        "ai.models.slot_ctx.resets.unknown",
+        "llamabored_slot_ctx_resets_total",
+    ),
     ("tokens.decoded_total", "llamabored_tokens_decoded_total"),
     ("tokens.prompt_total", "llamabored_tokens_prompt_total"),
     ("fans.channel", "llamabored_fan_rpm"),
@@ -741,4 +792,64 @@ fn collect_keys(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<Stri
         }
         _ => {}
     }
+}
+
+fn value_of(text: &str, metric: &str, slot: Option<&str>) -> Option<String> {
+    samples(text)
+        .into_iter()
+        .find(|(name, labels, _)| {
+            name == metric
+                && labels
+                    .iter()
+                    .any(|(k, v)| k == "name" && v == "Qwen3-Coder…")
+                && slot.is_none_or(|slot| labels.iter().any(|(k, v)| k == "slot" && v == slot))
+                && labels.iter().all(|(k, v)| k != "reason" || v == "new")
+        })
+        .map(|(_, _, value)| value)
+}
+
+/// #10: the counters are the watcher's, passed through. A watcher restart
+/// (new run_id) starts them at 0 again, which Prometheus reads as a counter
+/// reset; the exporter neither holds nor stitches them.
+#[test]
+fn slot_and_prompt_counters_pass_through_and_restart_with_the_watcher() {
+    let first = load("snapshot-loaded.json");
+    let text = render(&Ok(first.clone()), T0);
+    let counters = [
+        ("llamabored_model_prompt_tokens_total", None, "1622000"),
+        (
+            "llamabored_model_prompt_cached_tokens_total",
+            None,
+            "1500000",
+        ),
+        ("llamabored_slot_ctx_resets_total", Some("1"), "2"),
+        ("llamabored_slot_ctx_used_tokens", Some("1"), "91500"),
+    ];
+    for (metric, slot, want) in counters {
+        assert_eq!(
+            value_of(&text, metric, slot).as_deref(),
+            Some(want),
+            "{metric}"
+        );
+    }
+    let mut restarted = first;
+    restarted.run_id += 1;
+    restarted.seq = 1;
+    let qwen = &mut restarted.ai.models[0];
+    qwen.prompt_tokens = Some(0);
+    qwen.prompt_cached_tokens = Some(0);
+    for row in &mut qwen.slot_ctx {
+        row.resets = wire::SlotResetsWire::default();
+    }
+    let text = render(&Ok(restarted), T0);
+    for (metric, slot, _) in &counters[..3] {
+        assert_eq!(
+            value_of(&text, metric, *slot).as_deref(),
+            Some("0"),
+            "{metric}"
+        );
+    }
+    assert!(text.contains("# TYPE llamabored_slot_ctx_resets_total counter"));
+    assert!(text.contains("# TYPE llamabored_model_prompt_cached_tokens_total counter"));
+    assert!(text.contains("# TYPE llamabored_slot_ctx_used_tokens gauge"));
 }

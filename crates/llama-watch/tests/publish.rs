@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot};
 use llama_core::wire::{self, AiWire, ModelState};
-use llama_watch::publish::{Extras, PublishError, Publisher};
+use llama_watch::publish::{Extras, PublishError, Publisher, SlotCtx};
+use llama_watch::resets::ResetCounts;
 
 fn scratch(label: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -283,6 +284,30 @@ fn metrics_extras_reach_the_wire() {
         mem_used: Some(64 << 30),
         mem_total: Some(128 << 30),
         slots: vec![("bonsai".to_owned(), 1, 4), ("gone".to_owned(), 1, 1)],
+        prompt_cache: vec![
+            ("flash".to_owned(), 9_000, Some(8_000)),
+            ("bonsai".to_owned(), 700, None),
+        ],
+        slot_ctx: vec![
+            SlotCtx {
+                model: "bonsai".to_owned(),
+                slot: 1,
+                used: Some(91_000),
+                resets: new_resets(3),
+            },
+            SlotCtx {
+                model: "bonsai".to_owned(),
+                slot: 0,
+                used: Some(5),
+                resets: new_resets(0),
+            },
+            SlotCtx {
+                model: "gone".to_owned(),
+                slot: 0,
+                used: Some(5),
+                resets: new_resets(0),
+            },
+        ],
         fans: vec![
             (2, "CPU".to_owned(), Some(1200), Some(255)),
             (3, "fan3".to_owned(), None, Some(0)),
@@ -317,6 +342,31 @@ fn metrics_extras_reach_the_wire() {
     let bonsai = &wire.ai.models[1];
     assert_eq!(bonsai.cache_hit, None, "llama.cpp gauges stay off the wire");
     assert_eq!((bonsai.slots_busy, bonsai.slots_total), (Some(1), Some(4)));
+    // #10: prompt counters by display name, slots lowest id first.
+    assert_eq!(
+        (flash.prompt_tokens, flash.prompt_cached_tokens),
+        (Some(9_000), Some(8_000))
+    );
+    assert!(flash.slot_ctx.is_empty());
+    assert_eq!(
+        (bonsai.prompt_tokens, bonsai.prompt_cached_tokens),
+        (Some(700), None)
+    );
+    assert_eq!(
+        bonsai.slot_ctx,
+        vec![
+            wire::SlotCtxWire {
+                slot: 0,
+                used: 5,
+                resets: wire_resets(0)
+            },
+            wire::SlotCtxWire {
+                slot: 1,
+                used: 91_000,
+                resets: wire_resets(3)
+            },
+        ]
+    );
     assert_eq!(wire.fans.len(), 2);
     assert_eq!(wire.fans[0].channel, 2);
     assert_eq!(wire.fans[0].label, "CPU");
@@ -346,6 +396,25 @@ fn out_of_range_extras_are_left_out_not_fatal() {
         cpu_w: Some(-1.0),
         vram_used: Some(u64::MAX),
         slots: vec![("x".to_owned(), 9, 4)],
+        // Cached above the prompt is cut to it.
+        prompt_cache: vec![("x".to_owned(), 10, Some(50))],
+        // A negative or too-high slot id, a slot with no count, a repeat,
+        // and a context past the wire top.
+        slot_ctx: [
+            (-1, Some(1)),
+            (i64::from(wire::MAX_SLOTS), Some(1)),
+            (3, None),
+            (4, Some(u64::MAX)),
+            (4, Some(2)),
+        ]
+        .into_iter()
+        .map(|(slot, used)| SlotCtx {
+            model: "x".to_owned(),
+            slot,
+            used,
+            resets: new_resets(1),
+        })
+        .collect(),
         fans: vec![
             (0, "zero".to_owned(), None, None),
             (17, "high".to_owned(), None, None),
@@ -380,6 +449,15 @@ fn out_of_range_extras_are_left_out_not_fatal() {
     assert_eq!(wire.host.vram_used_bytes, None);
     assert_eq!(wire.ai.models[0].slots_busy, None);
     assert_eq!(wire.ai.models[0].slots_total, None);
+    assert_eq!(wire.ai.models[0].prompt_cached_tokens, Some(10));
+    assert_eq!(
+        wire.ai.models[0].slot_ctx,
+        vec![wire::SlotCtxWire {
+            slot: 4,
+            used: wire::MAX_CTX_TOKENS,
+            resets: wire_resets(1)
+        }]
+    );
     assert_eq!(wire.fans.len(), 1, "{:?}", wire.fans);
     assert_eq!((wire.fans[0].channel, wire.fans[0].rpm), (2, None));
     assert_eq!(
@@ -390,6 +468,59 @@ fn out_of_range_extras_are_left_out_not_fatal() {
         })
     );
     assert!(lines.lines().is_empty(), "{:?}", lines.lines());
+}
+
+fn new_resets(n: u64) -> ResetCounts {
+    ResetCounts {
+        new: n,
+        ..ResetCounts::default()
+    }
+}
+
+fn wire_resets(n: u64) -> wire::SlotResetsWire {
+    wire::SlotResetsWire {
+        new: n,
+        ..wire::SlotResetsWire::default()
+    }
+}
+
+/// #10: more slots than the wire carries keeps the first models' lowest
+/// slots, and the snapshot still publishes.
+#[test]
+fn slot_rows_past_the_wire_cap_are_dropped_not_fatal() {
+    let dir = scratch("slot-cap");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let names = ["a", "b", "c"];
+    let snap = snapshot(
+        SystemTime::now(),
+        None,
+        AiState::Loaded,
+        names.iter().map(|name| model(name, None)).collect(),
+    );
+    let llama = view(AiState::Loaded, snap.models.clone(), None);
+    let extras = Extras {
+        slot_ctx: names
+            .iter()
+            .flat_map(|name| {
+                (0..20).rev().map(|slot| SlotCtx {
+                    model: (*name).to_owned(),
+                    slot,
+                    used: Some(1_000),
+                    resets: new_resets(0),
+                })
+            })
+            .collect(),
+        ..Extras::default()
+    };
+    publisher
+        .publish_with(&snap, &llama, &extras)
+        .expect("publishes");
+    let wire = wire::parse_validated(&std::fs::read(dir.join("snapshot.json")).unwrap())
+        .expect("validates");
+    let counts: Vec<usize> = wire.ai.models.iter().map(|m| m.slot_ctx.len()).collect();
+    assert_eq!(counts, vec![20, wire::MAX_SLOT_CTX - 20, 0]);
+    let b: Vec<u16> = wire.ai.models[1].slot_ctx.iter().map(|r| r.slot).collect();
+    assert_eq!(b, (0..12).collect::<Vec<u16>>());
 }
 
 #[test]

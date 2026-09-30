@@ -38,7 +38,13 @@
           "fa": true
         },
         "slots_busy": 1,
-        "slots_total": 4
+        "slots_total": 4,
+        "prompt_tokens": 1622000,
+        "prompt_cached_tokens": 1500000,
+        "slot_ctx": [
+          { "slot": 1, "used": 91500, "resets": { "compacted": 3, "new": 2, "evicted": 1, "unknown": 4 } },
+          { "slot": 0, "used": 0 }
+        ]
       },
       {
         "name": "Bonsai 8B",
@@ -48,6 +54,7 @@
         "queued": 1,
         "kv_fill": 0.25,
         "cache_hit": 0.75,
+        "prompt_tokens": 900,
         "detail": {
           "ctx": 131072,
           "ncmoe": 65535,
