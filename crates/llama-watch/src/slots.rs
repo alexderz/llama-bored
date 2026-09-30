@@ -1,14 +1,18 @@
-//! `/upstream/<model>/slots`: declared fields, tail text, prompt rate.
+//! `/upstream/<model>/slots`: declared fields, tail text, prompt rate, and
+//! each slot's held context and drops by reason for the snapshot (#10, #9).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use llama_core::rate::{counter_delta, delta_per_s};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
+use crate::activity::{ActivityRow, model_key};
 use crate::config::PromptView;
+use crate::resets::{Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
 use crate::tty::chat_template::clean;
+use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, is_drop};
 use crate::tty::grid::Cell;
 use crate::tty::sanitize::sanitize;
 
@@ -39,6 +43,16 @@ pub struct SlotView {
     /// Sanitised generated tail from this poll, or the previous tail when
     /// text was skipped.
     pub output: Vec<Cell>,
+    /// Context the slot holds (#10): prompt plus decoded, and an idle slot
+    /// keeps its last value (its KV cache stays). `None` until `/slots`
+    /// gave a prompt count.
+    pub ctx_used: Option<u64>,
+    /// Context drops this slot had since the watcher started (#10), by the
+    /// sparkline's rule ([`is_drop`] while busy), by reason (#9). A drop is
+    /// counted when its reason is decided, up to [`PENDING_TTL`] later.
+    pub resets: ResetCounts,
+    /// The last decided reason (#9).
+    pub last_reset: Option<ResetReason>,
 }
 
 /// The one slot that both IN and OUT show.
@@ -72,6 +86,73 @@ struct Tracked {
     captured_task: Option<i64>,
 }
 
+/// One slot's context across the whole watcher run (#10, #9).
+#[derive(Debug, Default)]
+struct CtxTrack {
+    held: Option<u64>,
+    resets: ResetCounts,
+    last: Option<ResetReason>,
+    /// A drop waiting for its evidence (#9).
+    pending: Option<Pending>,
+}
+
+/// A drop whose reason is not decided yet. Numbers only.
+#[derive(Debug)]
+struct Pending {
+    /// Context the slot held before the drop: the conversation that left.
+    left: u64,
+    /// The new task's prompt tokens.
+    prompt: u64,
+    /// `/slots` `n_prompt_tokens_cache` at the drop, when the server sent it.
+    slots_cached: Option<u64>,
+    /// Newest activity row id when the drop was seen. The request's own row
+    /// appears after it, when the request finishes.
+    after: Option<i64>,
+    /// When an activity read first saw it waiting; [`PENDING_TTL`] runs from here.
+    since: Option<Instant>,
+}
+
+impl CtxTrack {
+    /// The [`crate::tty::ctx_history::CtxHistory::sample`] rule: only a busy
+    /// slot can drop, and an idle slot that reads lower keeps its value.
+    /// Returns the context held before a drop.
+    fn sample(&mut self, used: Option<u64>, busy: bool) -> Option<u64> {
+        let prev = self.held;
+        let dropped = match (used, prev) {
+            (Some(v), Some(p)) if busy && is_drop(p, v) => Some(p),
+            _ => None,
+        };
+        self.held = match (used, prev) {
+            (Some(v), Some(p)) if !busy && v < p => Some(p),
+            (Some(v), _) => Some(v),
+            (None, p) => p,
+        };
+        dropped
+    }
+
+    /// Decide the pending drop with `cached` as its evidence.
+    fn decide(&mut self, cached: Option<u64>, displaced: &mut Displaced, now: Instant) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let reason = classify(pending.prompt, cached, displaced, now);
+        self.resets.add(reason);
+        self.last = Some(reason);
+        if reason != ResetReason::Compacted {
+            displaced.push(pending.left, now);
+        }
+    }
+}
+
+/// True when an activity row's prompt (`input + cache`, llama.cpp timings)
+/// is `prompt`, give or take 0.5 % (at least 8 tokens).
+fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
+    let (Some(input), Some(cache)) = (row.input_tokens, row.cached_tokens) else {
+        return false;
+    };
+    input.saturating_add(cache).abs_diff(prompt) <= (prompt / 200).max(8)
+}
+
 /// Slot numbers and tails across polls.
 ///
 /// [`Self::without_text`] builds a book that never keeps llama text: the
@@ -87,6 +168,15 @@ pub struct SlotBook {
     round_delta: u64,
     round_seen: bool,
     prompt_tps: Option<f64>,
+    /// Held context and drop counts by `(model id, slot id)`, at most
+    /// [`MAX_TRACKED_SLOTS`]. [`Self::clear`] and [`Self::retain_models`]
+    /// forget the held context but keep the counts, so a counter only
+    /// restarts with the watcher.
+    ctx: HashMap<(String, i64), CtxTrack>,
+    /// Conversations each model's slots lost, by model id (#9).
+    displaced: HashMap<String, Displaced>,
+    /// Newest llama-swap activity row id seen (#9).
+    activity_newest: Option<i64>,
 }
 
 impl SlotBook {
@@ -114,13 +204,113 @@ impl SlotBook {
         }
     }
 
-    /// Drop every slot, tail, and prompt-rate baseline. The text mode stays.
+    /// Drop every slot, tail, and prompt-rate baseline. The text mode stays,
+    /// and so do the drop counts; held contexts are forgotten.
     pub fn clear(&mut self) {
+        self.settle(|_| true);
+        let mut ctx = std::mem::take(&mut self.ctx);
+        for track in ctx.values_mut() {
+            track.held = None;
+        }
         *self = Self {
             text_off: self.text_off,
             prompt_view: self.prompt_view,
+            ctx,
+            activity_newest: self.activity_newest,
             ..Self::default()
         };
+    }
+
+    /// Track one slot's context (#10).
+    fn note_ctx(&mut self, model_id: &str, slot: &LightSlot) {
+        let key = (model_id.to_owned(), slot.id);
+        if !self.ctx.contains_key(&key) && self.ctx.len() >= MAX_TRACKED_SLOTS {
+            return;
+        }
+        let used = slot
+            .ctx_prompt
+            .map(|prompt| prompt.saturating_add(slot.n_decoded));
+        let track = self.ctx.entry(key).or_default();
+        let Some(left) = track.sample(used, slot.is_processing) else {
+            return;
+        };
+        // A drop still waiting when the next one comes is decided now.
+        if let Some(old) = &track.pending {
+            let cached = old.slots_cached;
+            let displaced = self.displaced.entry(model_id.to_owned()).or_default();
+            track.decide(cached, displaced, Instant::now());
+        }
+        let prompt = if slot.n_prompt_tokens > 0 {
+            slot.n_prompt_tokens
+        } else {
+            slot.ctx_prompt.unwrap_or(0)
+        };
+        track.pending = Some(Pending {
+            left,
+            prompt,
+            slots_cached: slot.n_prompt_tokens_cache,
+            after: self.activity_newest,
+            since: None,
+        });
+    }
+
+    /// Decide now every waiting drop of the models `gone` picks, on what
+    /// `/slots` said: their slots are going away, and a drop is counted once.
+    fn settle(&mut self, gone: impl Fn(&str) -> bool) {
+        let now = Instant::now();
+        for ((model_id, _), track) in &mut self.ctx {
+            let Some(pending) = &track.pending else {
+                continue;
+            };
+            if !gone(model_id) {
+                continue;
+            }
+            let cached = pending.slots_cached;
+            let displaced = self.displaced.entry(model_id.clone()).or_default();
+            track.decide(cached, displaced, now);
+        }
+    }
+
+    /// Feed one activity read (#9): a waiting drop takes the newer row of
+    /// its model whose prompt matches its own, and one that waited
+    /// [`PENDING_TTL`] is decided on what `/slots` said, or as unknown.
+    /// A failed read passes no rows and still ages the waits.
+    pub fn note_activity(&mut self, rows: &[ActivityRow], now: Instant) {
+        if let Some(newest) = rows.iter().map(|row| row.id).max() {
+            if self.activity_newest.is_some_and(|seen| newest < seen) {
+                // llama-swap restarted: its ids start again.
+                for track in self.ctx.values_mut() {
+                    if let Some(pending) = &mut track.pending {
+                        pending.after = None;
+                    }
+                }
+            }
+            self.activity_newest = Some(newest);
+        }
+        let mut taken: HashSet<i64> = HashSet::new();
+        for ((model_id, _), track) in &mut self.ctx {
+            let Some(pending) = &mut track.pending else {
+                continue;
+            };
+            let since = *pending.since.get_or_insert(now);
+            let key = model_key(model_id);
+            let found = rows.iter().find(|row| {
+                row.model == key
+                    && pending.after.is_none_or(|after| row.id > after)
+                    && !taken.contains(&row.id)
+                    && row_matches(row, pending.prompt)
+            });
+            let cached = match found {
+                Some(row) => {
+                    taken.insert(row.id);
+                    row.cached_tokens
+                }
+                None if now.saturating_duration_since(since) >= PENDING_TTL => pending.slots_cached,
+                None => continue,
+            };
+            let displaced = self.displaced.entry(model_id.clone()).or_default();
+            track.decide(cached, displaced, now);
+        }
     }
 
     /// Ingest one model's body. A body that does not parse leaves this model
@@ -145,6 +335,7 @@ impl SlotBook {
                 .iter()
                 .map(|slot| {
                     self.note_processed(model_id, slot);
+                    self.note_ctx(model_id, slot);
                     tracked(model_id, display, slot, Vec::new(), Vec::new(), None)
                 })
                 .collect::<Vec<_>>();
@@ -173,6 +364,7 @@ impl SlotBook {
         let mut next = Vec::with_capacity(parsed.len());
         for (slot, prompt) in parsed.iter().zip(prompts) {
             self.note_processed(model_id, slot);
+            self.note_ctx(model_id, slot);
 
             let prev = self
                 .slots
@@ -230,10 +422,19 @@ impl SlotBook {
         self.last_at = Some(now);
     }
 
-    /// Drop slots whose model is no longer being polled.
+    /// Drop slots whose model is no longer being polled. Their held
+    /// context is forgotten; their drop counts stay.
     pub fn retain_models(&mut self, model_ids: &[&str]) {
         self.slots
             .retain(|row| model_ids.iter().any(|id| *id == row.model_id));
+        self.settle(|model| !model_ids.contains(&model));
+        for ((model, _), track) in &mut self.ctx {
+            if !model_ids.iter().any(|id| id == model) {
+                track.held = None;
+            }
+        }
+        self.displaced
+            .retain(|model, _| model_ids.iter().any(|id| id == model));
     }
 
     #[must_use]
@@ -252,8 +453,18 @@ impl SlotBook {
                 ctx_prompt: row.ctx_prompt,
                 input: row.input.clone(),
                 output: row.output.clone(),
+                ctx_used: self.ctx_of(row).and_then(|track| track.held),
+                resets: self
+                    .ctx_of(row)
+                    .map(|track| track.resets)
+                    .unwrap_or_default(),
+                last_reset: self.ctx_of(row).and_then(|track| track.last),
             })
             .collect()
+    }
+
+    fn ctx_of(&self, row: &Tracked) -> Option<&CtxTrack> {
+        self.ctx.get(&(row.model_id.clone(), row.id))
     }
 
     #[must_use]
@@ -296,6 +507,8 @@ struct LightSlot {
     n_decoded: u64,
     n_ctx: Option<u64>,
     ctx_prompt: Option<u64>,
+    /// `n_prompt_tokens_cache`, when the server sends it (#9 evidence).
+    n_prompt_tokens_cache: Option<u64>,
     generated: String,
 }
 
@@ -327,6 +540,7 @@ fn parse_numbers(body: &[u8]) -> Option<Vec<LightSlot>> {
                     .unwrap_or(0),
                 n_ctx: slot.n_ctx,
                 ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
+                n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
                 generated: String::new(),
             })
             .collect(),
@@ -361,6 +575,7 @@ impl From<SlotJsonLight> for LightSlot {
                 .unwrap_or(0),
             n_ctx: slot.n_ctx,
             ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
+            n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
             generated: slot.generated,
         }
     }
@@ -368,7 +583,7 @@ impl From<SlotJsonLight> for LightSlot {
 
 /// The prompt tail as IN shows it. Clean mode strips template tokens from
 /// the raw tail first; [`sanitize`] runs last either way (S12).
-fn prompt_cells(text: &str, max_chars: usize, view: PromptView) -> Vec<Cell> {
+pub(crate) fn prompt_cells(text: &str, max_chars: usize, view: PromptView) -> Vec<Cell> {
     match view {
         PromptView::Raw => tail_cells(text, max_chars),
         PromptView::Clean => {
@@ -381,7 +596,7 @@ fn prompt_cells(text: &str, max_chars: usize, view: PromptView) -> Vec<Cell> {
     }
 }
 
-fn tail_cells(text: &str, max_chars: usize) -> Vec<Cell> {
+pub(crate) fn tail_cells(text: &str, max_chars: usize) -> Vec<Cell> {
     let mut out = Vec::new();
     sanitize(tail_str(text, max_chars), &mut out);
     out
@@ -732,6 +947,212 @@ mod tests {
         assert!(book.apply("m", "Model", &body(1, prompt, "g", 1, 1), 8192, 8192));
         let input = cells(&book.slots()[0].input);
         assert_eq!(input, "-- user --\n[2Jhi31m?");
+    }
+
+    fn ctx_body(id: i64, id_task: i64, busy: bool, prompt: u64, decoded: u64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "id": id,
+            "id_task": id_task,
+            "is_processing": busy,
+            "n_ctx": 262_144,
+            "n_prompt_tokens": prompt,
+            "n_prompt_tokens_processed": prompt,
+            "next_token": [{"n_decoded": decoded}],
+            "prompt": "INVENTED-PROMPT",
+            "generated": "INVENTED-OUTPUT",
+        }]))
+        .expect("json")
+    }
+
+    fn ctx_of(book: &SlotBook, id: i64) -> (Option<u64>, u64) {
+        let slot = book
+            .slots()
+            .into_iter()
+            .find(|slot| slot.id == id)
+            .expect("slot");
+        (slot.ctx_used, slot.resets.total())
+    }
+
+    /// Let every waiting drop time out.
+    fn settle(book: &mut SlotBook) {
+        let now = Instant::now();
+        book.note_activity(&[], now);
+        book.note_activity(&[], now + PENDING_TTL);
+    }
+
+    /// #10: the held context and drop count, by the sparkline's rule, with
+    /// text on and off.
+    #[test]
+    fn slot_ctx_holds_idle_context_and_counts_drops() {
+        for mut book in [SlotBook::default(), SlotBook::without_text()] {
+            assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 500), 64, 64));
+            assert_eq!(ctx_of(&book, 0), (Some(80_500), 0));
+            // Idle reads 0: the cache is held, no drop.
+            assert!(book.apply("m", "M", &ctx_body(0, 1, false, 0, 0), 64, 64));
+            assert_eq!(ctx_of(&book, 0), (Some(80_500), 0));
+            // A small prune is not a drop; a compaction is.
+            assert!(book.apply("m", "M", &ctx_body(0, 2, true, 70_000, 0), 64, 64));
+            assert_eq!(ctx_of(&book, 0), (Some(70_000), 0));
+            assert!(book.apply("m", "M", &ctx_body(0, 3, true, 20_000, 0), 64, 64));
+            settle(&mut book);
+            assert_eq!(ctx_of(&book, 0), (Some(20_000), 1));
+            // A drop still waiting is decided when the next one comes.
+            assert!(book.apply("m", "M", &ctx_body(0, 4, true, 12_000, 0), 64, 64));
+            assert!(book.apply("m", "M", &ctx_body(0, 5, true, 1_000, 0), 64, 64));
+            assert_eq!(ctx_of(&book, 0), (Some(1_000), 2));
+            settle(&mut book);
+            assert_eq!(ctx_of(&book, 0), (Some(1_000), 3));
+        }
+    }
+
+    #[test]
+    fn slot_ctx_counts_survive_clear_and_unload_but_the_context_does_not() {
+        let mut book = SlotBook::default();
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 10_000, 0), 64, 64));
+        assert_eq!(
+            ctx_of(&book, 0),
+            (Some(10_000), 0),
+            "waiting for its reason"
+        );
+        // An unload decides the waiting drop: it is still counted once.
+        book.retain_models(&["other"]);
+        assert!(book.slots().is_empty());
+        // The model comes back: the count carries on, the context is new,
+        // and its first read is not a drop.
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 3_000, 0), 64, 64));
+        assert_eq!(ctx_of(&book, 0), (Some(3_000), 1));
+        book.clear();
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 50, 0), 64, 64));
+        assert_eq!(ctx_of(&book, 0), (Some(50), 1));
+        // Tracking is bounded.
+        for id in 0..(MAX_TRACKED_SLOTS as i64 + 10) {
+            assert!(book.apply("m", "M", &ctx_body(id, 1, true, 10, 0), 64, 64));
+        }
+        assert_eq!(book.ctx.len(), MAX_TRACKED_SLOTS);
+    }
+
+    fn row(id: i64, model: &str, input: u64, cache: Option<u64>) -> ActivityRow {
+        ActivityRow {
+            id,
+            time: String::new(),
+            source: String::new(),
+            model: model.to_owned(),
+            input_tokens: Some(input),
+            cached_tokens: cache,
+            output_tokens: Some(10),
+            prompt_tps: None,
+            gen_tps: None,
+            duration_ms: None,
+            status: Some(200),
+            captured: false,
+        }
+    }
+
+    fn reasons(book: &SlotBook, id: i64) -> (ResetCounts, Option<ResetReason>) {
+        let slot = book
+            .slots()
+            .into_iter()
+            .find(|slot| slot.id == id)
+            .expect("slot");
+        (slot.resets, slot.last_reset)
+    }
+
+    fn counts(compacted: u64, new: u64, evicted: u64, unknown: u64) -> ResetCounts {
+        ResetCounts {
+            compacted,
+            new,
+            evicted,
+            unknown,
+        }
+    }
+
+    /// #9: a synthetic multi-agent story on two slots, text off (no prompt
+    /// text is needed to decide).
+    #[test]
+    fn drops_are_classified_from_the_matching_activity_row() {
+        let mut book = SlotBook::without_text();
+        let t0 = Instant::now();
+        book.note_activity(&[row(10, "m", 5, Some(0))], t0);
+        // Agent A grows to 80k in slot 0, then compacts to 20k: 14k of the
+        // new prompt was cached.
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 0), 64, 64));
+        assert_eq!(reasons(&book, 0), (ResetCounts::default(), None));
+        // Rows that are not this request: older, another model, another size.
+        let noise = [
+            row(10, "m", 6_000, Some(14_000)),
+            row(11, "other", 6_000, Some(14_000)),
+            row(12, "m", 9_000, Some(14_000)),
+        ];
+        book.note_activity(&noise, t0);
+        assert_eq!(reasons(&book, 0).0.total(), 0);
+        book.note_activity(&[row(13, "m", 6_000, Some(14_000))], t0);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 0, 0, 0), Some(ResetReason::Compacted))
+        );
+
+        // Agent B takes slot 0 from A (20k): a new conversation, nothing
+        // cached. A's 20k is remembered as lost.
+        assert!(book.apply("m", "M", &ctx_body(0, 3, true, 22_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 3_000, 0), 64, 64));
+        book.note_activity(&[row(14, "m", 2_990, Some(10))], t0);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 1, 0, 0), Some(ResetReason::New))
+        );
+
+        // Slot 1 holds C at 60k; A comes back there at 23k with ~0 cached:
+        // its cache was lost, the whole prompt is processed again.
+        assert!(book.apply("m", "M", &ctx_body(1, 5, true, 60_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(1, 6, true, 23_000, 0), 64, 64));
+        book.note_activity(&[row(15, "m", 22_800, Some(200))], t0);
+        assert_eq!(
+            reasons(&book, 1),
+            (counts(0, 0, 1, 0), Some(ResetReason::Evicted))
+        );
+        // Slot 0 is untouched by slot 1's row.
+        assert_eq!(book.ctx[&("m".to_owned(), 0)].resets, counts(1, 1, 0, 0));
+    }
+
+    #[test]
+    fn a_drop_with_no_row_uses_slots_cache_or_is_unknown_after_the_wait() {
+        let mut book = SlotBook::default();
+        let t0 = Instant::now();
+        let with_cache = |id_task: i64, prompt: u64, cache: Option<u64>| {
+            let mut slot = serde_json::json!({
+                "id": 0, "id_task": id_task, "is_processing": true,
+                "n_ctx": 262_144, "n_prompt_tokens": prompt,
+                "n_prompt_tokens_processed": prompt,
+                "next_token": [{"n_decoded": 0}],
+                "prompt": "INVENTED", "generated": "INVENTED",
+            });
+            if let Some(cache) = cache {
+                slot["n_prompt_tokens_cache"] = cache.into();
+            }
+            serde_json::to_vec(&serde_json::json!([slot])).expect("json")
+        };
+        assert!(book.apply("m", "M", &with_cache(1, 90_000, None), 64, 64));
+        assert!(book.apply("m", "M", &with_cache(2, 30_000, Some(25_000)), 64, 64));
+        book.note_activity(&[], t0);
+        book.note_activity(&[], t0 + PENDING_TTL - Duration::from_secs(1));
+        assert_eq!(reasons(&book, 0).0.total(), 0, "still waiting");
+        book.note_activity(&[], t0 + PENDING_TTL);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 0, 0, 0), Some(ResetReason::Compacted))
+        );
+        // No cache count anywhere: unknown.
+        assert!(book.apply("m", "M", &with_cache(3, 90_000, None), 64, 64));
+        assert!(book.apply("m", "M", &with_cache(4, 1_000, None), 64, 64));
+        let t1 = t0 + PENDING_TTL * 2;
+        book.note_activity(&[], t1);
+        book.note_activity(&[], t1 + PENDING_TTL);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 0, 0, 1), Some(ResetReason::Unknown))
+        );
     }
 
     #[test]

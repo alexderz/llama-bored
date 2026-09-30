@@ -657,32 +657,139 @@ impl LcdSink for LatchLcd {
     }
 }
 
+/// `service::STREAM_RETRY_START`, private to keep S11's public surface fixed.
+const RETRY_START: Duration = Duration::from_secs(2);
+
+fn refused(step: kraken_lcd::device::Step) -> Result<(), SinkError> {
+    Err(SinkError::UploadFailed(UploadFailed::Refused(step)))
+}
+
+/// Records when each upload is attempted, then defers to the shared fake.
+#[derive(Clone)]
+struct TimedLcd {
+    inner: SharedLcd,
+    clock: Arc<Mutex<Instant>>,
+    origin: Instant,
+    attempts: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl TimedLcd {
+    fn new(clock: &FakeClock, origin: Instant) -> Self {
+        Self {
+            inner: SharedLcd::new(),
+            clock: clock.mono.clone(),
+            origin,
+            attempts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn attempts(&self) -> Vec<Duration> {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+}
+
+impl LcdSink for TimedLcd {
+    fn show(&mut self, frame: &Frame) -> Result<(), SinkError> {
+        self.show_slot(0, frame)
+    }
+    fn show_slot(&mut self, slot: u8, frame: &Frame) -> Result<(), SinkError> {
+        let now = *self.clock.lock().unwrap_or_else(|err| err.into_inner());
+        self.attempts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(now.saturating_duration_since(self.origin));
+        self.inner.show_slot(slot, frame)
+    }
+    fn restore_stock(&mut self) {
+        self.inner.restore_stock();
+    }
+    fn needs_reupload(&mut self) {
+        self.inner.needs_reupload();
+    }
+    fn tick(&mut self) -> Result<(), SinkError> {
+        self.inner.tick()
+    }
+    fn blocked(&mut self) -> bool {
+        self.inner.blocked()
+    }
+}
+
 #[test]
 fn stream_fail_limit_restores_without_the_change_interval() {
     let scratch = Scratch::new("fail");
     let config = stream_config(&scratch.0, 10, 60, 2.0);
     let (mut clock, origin) = FakeClock::new();
-    let lcd = SharedLcd::new();
-    lcd.lock()
-        .script(Err(SinkError::UploadFailed(UploadFailed::Refused(
-            kraken_lcd::device::Step::SetupBucket,
-        ))));
-    lcd.lock()
-        .script(Err(SinkError::UploadFailed(UploadFailed::Refused(
-            kraken_lcd::device::Step::SetupBucket,
-        ))));
-    lcd.lock()
-        .script(Err(SinkError::UploadFailed(UploadFailed::Refused(
-            kraken_lcd::device::Step::SetupBucket,
-        ))));
+    let lcd = TimedLcd::new(&clock, origin);
+    for _ in 0..3 {
+        lcd.inner
+            .lock()
+            .script(refused(kraken_lcd::device::Step::SetupBucket));
+    }
+    let mut log = quiet_log();
     let exit = run(
         &config,
-        6,
+        600,
         Steady {
             samples: Arc::new(Mutex::new(Vec::new())),
             origin,
-            load_of: |i| i as f32 * 20.0,
-            cpu_of: |i| i as f32 * 20.0,
+            load_of: |i| (i % 5) as f32 * 20.0,
+            cpu_of: |i| (i % 5) as f32 * 20.0,
+            fresh: true,
+            n: std::cell::Cell::new(0),
+        },
+        &mut clock,
+        lcd.clone(),
+        &mut log,
+    );
+    assert_eq!(exit, LoopExit::Restored, "persistent failures still exit");
+    assert_eq!(liquids_of(&lcd.inner), 1);
+    assert!(slots_of(&lcd.inner).is_empty(), "nothing was ever shown");
+    let attempts = lcd.attempts();
+    assert_eq!(
+        attempts.len(),
+        3,
+        "exactly fail_limit attempts: {attempts:?}"
+    );
+    assert_eq!(attempts[1] - attempts[0], RETRY_START, "{attempts:?}");
+    assert_eq!(attempts[2] - attempts[1], RETRY_START * 2, "{attempts:?}");
+    assert!(
+        clock.mono().saturating_duration_since(origin) < Duration::from_secs(60),
+        "failures are spaced by the retry backoff, not by min_interval_s"
+    );
+    let lines = log.0.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    assert!(
+        lines.iter().any(|line| line.contains("upload failed")),
+        "each failure is logged: {lines:?}"
+    );
+}
+
+/// GitHub #14: the device refuses the first uploads right after open (the
+/// previous process has just restored stock). The writer backs off, survives,
+/// and then streams, without restoring stock or exiting.
+#[test]
+fn stream_survives_failures_right_after_open_then_streams() {
+    let scratch = Scratch::new("settle");
+    let config = stream_config(&scratch.0, 10, 60, 2.0);
+    let (mut clock, origin) = FakeClock::new();
+    let lcd = TimedLcd::new(&clock, origin);
+    // fail_limit - 1 refusals in a row, the most a transient may cost.
+    lcd.inner
+        .lock()
+        .script(refused(kraken_lcd::device::Step::PreTransfer));
+    lcd.inner
+        .lock()
+        .script(refused(kraken_lcd::device::Step::DeleteBucket));
+    let exit = run(
+        &config,
+        100,
+        Steady {
+            samples: Arc::new(Mutex::new(Vec::new())),
+            origin,
+            load_of: |i| (i % 5) as f32 * 20.0,
+            cpu_of: |i| (i % 5) as f32 * 20.0,
             fresh: true,
             n: std::cell::Cell::new(0),
         },
@@ -690,11 +797,62 @@ fn stream_fail_limit_restores_without_the_change_interval() {
         lcd.clone(),
         &mut quiet_log(),
     );
-    assert_eq!(exit, LoopExit::Restored);
-    assert_eq!(liquids_of(&lcd), 1);
-    assert!(
-        clock.mono().saturating_duration_since(origin) < Duration::from_secs(2),
-        "three failures are not spaced by min_interval_s"
+    assert_eq!(exit, LoopExit::Stopped, "the writer survives");
+    assert_eq!(liquids_of(&lcd.inner), 0, "no restore to stock");
+    let attempts = lcd.attempts();
+    assert!(attempts.len() > 10, "then it streams: {attempts:?}");
+    assert_eq!(attempts[0], Duration::ZERO, "first upload right after open");
+    assert_eq!(attempts[1] - attempts[0], RETRY_START);
+    assert_eq!(attempts[2] - attempts[1], RETRY_START * 2);
+    for pair in attempts[2..].windows(2) {
+        assert_eq!(
+            pair[1] - pair[0],
+            Duration::from_millis(100),
+            "after a success, back on the frame deadline: {attempts:?}"
+        );
+    }
+    let slots = slots_of(&lcd.inner);
+    assert_eq!(&slots[..4], &[0, 1, 0, 1], "ping-pong from slot 0");
+}
+
+/// A success resets the streak and the backoff, as in change mode.
+#[test]
+fn stream_success_resets_the_fail_streak() {
+    let scratch = Scratch::new("reset");
+    let config = stream_config(&scratch.0, 10, 60, 2.0);
+    let (mut clock, origin) = FakeClock::new();
+    let lcd = TimedLcd::new(&clock, origin);
+    for script in [
+        refused(kraken_lcd::device::Step::SetupBucket),
+        refused(kraken_lcd::device::Step::SetupBucket),
+        Ok(()),
+        refused(kraken_lcd::device::Step::SetupBucket),
+        refused(kraken_lcd::device::Step::SetupBucket),
+    ] {
+        lcd.inner.lock().script(script);
+    }
+    let exit = run(
+        &config,
+        200,
+        Steady {
+            samples: Arc::new(Mutex::new(Vec::new())),
+            origin,
+            load_of: |i| (i % 5) as f32 * 20.0,
+            cpu_of: |i| (i % 5) as f32 * 20.0,
+            fresh: true,
+            n: std::cell::Cell::new(0),
+        },
+        &mut clock,
+        lcd.clone(),
+        &mut quiet_log(),
+    );
+    assert_eq!(exit, LoopExit::Stopped);
+    assert_eq!(liquids_of(&lcd.inner), 0);
+    let attempts = lcd.attempts();
+    assert_eq!(
+        attempts[4] - attempts[3],
+        RETRY_START,
+        "the backoff restarts after a success: {attempts:?}"
     );
 }
 

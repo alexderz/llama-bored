@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use llama_core::detail::{self, KV_DEFAULT, ModelDetail, NCMOE_ALL};
-use llama_core::wire::{self, AiWire, FanWire, ModelState, ModelWire, WireSnapshot};
+use llama_core::wire::{self, AiWire, FanWire, ModelState, ModelWire, SlotCtxWire, WireSnapshot};
 
 use crate::snapshot::ReadError;
 
@@ -465,7 +465,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             }
         }
     }
-    let model_families: [(&str, &str, &str, ModelValue); 7] = [
+    let model_families: [(&str, &str, &str, ModelValue); 9] = [
         (
             "llamabored_model_ctx_size_tokens",
             "gauge",
@@ -514,6 +514,18 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             "llama.cpp slots of a loaded model.",
             |m| m.slots_total.map(|n| n.to_string()),
         ),
+        (
+            "llamabored_model_prompt_tokens_total",
+            "counter",
+            "Prompt tokens of a model's finished requests since the watcher started, cached ones included.",
+            |m| m.prompt_tokens.map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_prompt_cached_tokens_total",
+            "counter",
+            "Prompt tokens served from the prompt cache since the watcher started; hit ratio = rate of this / rate of prompt_tokens_total.",
+            |m| m.prompt_cached_tokens.map(|n| n.to_string()),
+        ),
     ];
     for (name, kind, help, value) in model_families {
         let keyed = per_model(models, value);
@@ -528,6 +540,69 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             .collect();
         out.rows(name, kind, help, &rows);
     }
+
+    // Per-slot context (#10): the first model with a given (name,
+    // full_name) wins, as in `per_model`; the wire keeps slot ids unique.
+    let mut slot_rows: Vec<(ModelLabels, &SlotCtxWire)> = Vec::new();
+    let mut slot_models: BTreeSet<(String, String)> = BTreeSet::new();
+    for model in models.iter().filter(|m| !m.slot_ctx.is_empty()) {
+        let labels = ModelLabels::of(model);
+        if !slot_models.insert((labels.name.clone(), labels.full_name.clone())) {
+            continue;
+        }
+        slot_rows.extend(model.slot_ctx.iter().map(|row| (labels.clone(), row)));
+    }
+    slot_rows.sort_by(|a, b| {
+        (&a.0.name, &a.0.full_name, a.1.slot).cmp(&(&b.0.name, &b.0.full_name, b.1.slot))
+    });
+    let slot_ids: Vec<String> = slot_rows
+        .iter()
+        .map(|(_, row)| row.slot.to_string())
+        .collect();
+    let used: Vec<(Vec<(&str, &str)>, String)> = slot_rows
+        .iter()
+        .zip(&slot_ids)
+        .map(|((labels, row), slot)| {
+            (
+                vec![
+                    ("name", labels.name.as_str()),
+                    ("full_name", labels.full_name.as_str()),
+                    ("slot", slot.as_str()),
+                ],
+                row.used.to_string(),
+            )
+        })
+        .collect();
+    out.rows(
+        "llamabored_slot_ctx_used_tokens",
+        "gauge",
+        "Context tokens a llama.cpp slot holds (prompt plus decoded; an idle slot keeps its last value).",
+        &used,
+    );
+    // #9: every reason on every slot, so a rate starts from 0.
+    let resets: Vec<(Vec<(&str, &str)>, String)> = slot_rows
+        .iter()
+        .zip(&slot_ids)
+        .flat_map(|((labels, row), slot)| {
+            row.resets.entries().map(|(reason, count)| {
+                (
+                    vec![
+                        ("name", labels.name.as_str()),
+                        ("full_name", labels.full_name.as_str()),
+                        ("slot", slot.as_str()),
+                        ("reason", reason),
+                    ],
+                    count.to_string(),
+                )
+            })
+        })
+        .collect();
+    out.rows(
+        "llamabored_slot_ctx_resets_total",
+        "counter",
+        "Context drops of a llama.cpp slot since the watcher started, by best-guess reason.",
+        &resets,
+    );
 
     // Fans: the wire already refuses a repeated channel, so each label set
     // is unique; the channel is the key and the label rides along.

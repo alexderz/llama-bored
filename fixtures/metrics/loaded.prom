@@ -117,6 +117,27 @@ llamabored_slots_busy{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" 
 # HELP llamabored_slots_total llama.cpp slots of a loaded model.
 # TYPE llamabored_slots_total gauge
 llamabored_slots_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 4
+# HELP llamabored_model_prompt_tokens_total Prompt tokens of a model's finished requests since the watcher started, cached ones included.
+# TYPE llamabored_model_prompt_tokens_total counter
+llamabored_model_prompt_tokens_total{name="Bonsai 8B",full_name="Bonsai 8B"} 900
+llamabored_model_prompt_tokens_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 1622000
+# HELP llamabored_model_prompt_cached_tokens_total Prompt tokens served from the prompt cache since the watcher started; hit ratio = rate of this / rate of prompt_tokens_total.
+# TYPE llamabored_model_prompt_cached_tokens_total counter
+llamabored_model_prompt_cached_tokens_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 1500000
+# HELP llamabored_slot_ctx_used_tokens Context tokens a llama.cpp slot holds (prompt plus decoded; an idle slot keeps its last value).
+# TYPE llamabored_slot_ctx_used_tokens gauge
+llamabored_slot_ctx_used_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0"} 0
+llamabored_slot_ctx_used_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="1"} 91500
+# HELP llamabored_slot_ctx_resets_total Context drops of a llama.cpp slot since the watcher started, by best-guess reason.
+# TYPE llamabored_slot_ctx_resets_total counter
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0",reason="compacted"} 0
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0",reason="new"} 0
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0",reason="evicted"} 0
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0",reason="unknown"} 0
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="1",reason="compacted"} 3
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="1",reason="new"} 2
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="1",reason="evicted"} 1
+llamabored_slot_ctx_resets_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="1",reason="unknown"} 4
 # HELP llamabored_fan_rpm Fan speed, rpm, per configured [fans] channel.
 # TYPE llamabored_fan_rpm gauge
 llamabored_fan_rpm{channel="3",label="rad \"top\""} 1450

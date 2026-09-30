@@ -9,6 +9,10 @@
 //! tier's bucket length. Merging is `max` and `or`, never a re-bin, so a
 //! peak and a reset marker survive every rollover.
 //!
+//! A reset marker is placed when this book sees the drop, without a reason.
+//! The poller decides the reason later (#9, [`crate::resets`]); when a slot's
+//! count for a reason goes up, the newest marker still without one takes it.
+//!
 //! Tiers: 30 × 10 s, 25 × 1 min, 18 × 5 min (2 h), then 30 min buckets out to
 //! `tty.ctx_history_h`. At most [`MAX_POINTS`] buckets per slot and
 //! [`MAX_SLOTS`] slots.
@@ -16,6 +20,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use crate::resets::{ResetCounts, ResetReason};
 use crate::slots::SlotView;
 
 /// Bucket length per tier, in milliseconds. Each is a whole multiple of the
@@ -51,6 +56,9 @@ pub struct CtxPoint {
     pub max: Option<u64>,
     /// A drop or a model swap happened in this bucket.
     pub reset: bool,
+    /// Why, as [`ResetReason::bit`]s (#9). Empty for a swap or a drop whose
+    /// reason is not decided yet.
+    pub reasons: u8,
 }
 
 impl CtxPoint {
@@ -61,6 +69,13 @@ impl CtxPoint {
             (a, b) => a.or(b),
         };
         self.reset |= other.reset;
+        self.reasons |= other.reasons;
+    }
+
+    /// The reason this bucket's marker shows, when it has one.
+    #[must_use]
+    pub fn reason(&self) -> Option<ResetReason> {
+        ResetReason::strongest(self.reasons)
     }
 }
 
@@ -154,6 +169,7 @@ impl CtxHistory {
             ms: 0,
             max: value,
             reset,
+            reasons: 0,
         });
         self.held = value;
         reset
@@ -162,6 +178,34 @@ impl CtxHistory {
     /// Put a reset marker in the live bucket (a model swap).
     pub fn mark_reset(&mut self) {
         self.live.reset = true;
+    }
+
+    /// Give `reason` to the newest marker that has none yet (#9). With no
+    /// such marker the live bucket gets a marker with it.
+    pub fn label(&mut self, reason: ResetReason) {
+        let bit = reason.bit();
+        let live = std::iter::once(&mut self.live);
+        let older = self.tiers.iter_mut().flat_map(|tier| {
+            tier.items
+                .iter_mut()
+                .chain(std::iter::once(&mut tier.carry))
+        });
+        match live
+            .chain(older)
+            .find(|point| point.reset && point.reasons == 0)
+        {
+            Some(point) => point.reasons |= bit,
+            None => {
+                self.live.reset = true;
+                self.live.reasons |= bit;
+            }
+        }
+    }
+
+    /// The reason of the newest marker, when it has one (#9).
+    #[must_use]
+    pub fn last_reason(&self) -> Option<ResetReason> {
+        last_reason(&self.points())
     }
 
     /// Every bucket, newest first, carries in their place by age.
@@ -237,11 +281,21 @@ pub fn used_ctx(slot: &SlotView) -> Option<u64> {
         .map(|prompt| prompt.saturating_add(slot.n_decoded))
 }
 
+/// The reason of the newest marker in newest-first `points`, when it has
+/// one (#9). A newest marker still without a reason gives `None`.
+#[must_use]
+pub fn last_reason(points: &[CtxPoint]) -> Option<ResetReason> {
+    points.iter().find(|point| point.reset)?.reason()
+}
+
 /// Every slot's history, keyed by model display name and slot id.
 #[derive(Debug)]
 pub struct CtxBook {
     span_h: u32,
     slots: HashMap<(String, i64), CtxHistory>,
+    /// Each slot's reset counts at the last tick (#9), kept across swaps so
+    /// a new history does not relabel old drops. At most [`MAX_SLOTS`].
+    counted: HashMap<(String, i64), ResetCounts>,
     last_at: Option<Instant>,
     /// Last non-empty `/running` list, sorted.
     running: Vec<String>,
@@ -258,6 +312,7 @@ impl CtxBook {
             last_at: None,
             running: Vec::new(),
             swap_pending: false,
+            counted: HashMap::new(),
         }
     }
 
@@ -311,6 +366,19 @@ impl CtxBook {
             }
             if let Some(history) = self.slots.get_mut(&key) {
                 history.sample(used_ctx(slot), slot.is_processing);
+                if self.counted.len() < MAX_SLOTS || self.counted.contains_key(&key) {
+                    let before = self.counted.insert(key, slot.resets);
+                    for reason in ResetReason::ALL {
+                        let new = before.map_or(0, |old| {
+                            slot.resets.get(reason).saturating_sub(old.get(reason))
+                        });
+                        // A burst larger than this is one marker per reason
+                        // too many to see anyway.
+                        for _ in 0..new.min(4) {
+                            history.label(reason);
+                        }
+                    }
+                }
             }
         }
         if created {
@@ -380,7 +448,10 @@ pub fn columns(points: &[CtxPoint], width: usize, span_ms: u64) -> Vec<CtxPoint>
             };
             // A bucket wider than a column marks only its newest column, so
             // one reset is one marker.
-            col.reset |= point.reset && i == first;
+            if point.reset && i == first {
+                col.reset = true;
+                col.reasons |= point.reasons;
+            }
         }
     }
     out
@@ -403,6 +474,9 @@ mod tests {
             n_decoded: decoded,
             n_ctx: Some(262_144),
             ctx_prompt: Some(prompt),
+            ctx_used: None,
+            resets: Default::default(),
+            last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
         }
@@ -575,6 +649,62 @@ mod tests {
         assert_eq!(resets(&book.points("Bonsai", 1)), 0);
     }
 
+    /// #9: a reason decided later labels the drop's own marker, even after
+    /// it rolled into an older bucket, and a newer marker is not relabelled.
+    #[test]
+    fn a_late_reason_labels_the_newest_unlabelled_marker() {
+        let mut history = CtxHistory::new(6);
+        history.sample(Some(90_000), true);
+        history.advance(1_000);
+        assert!(history.sample(Some(20_000), true));
+        assert_eq!(history.last_reason(), None, "undecided");
+        // Two minutes pass before the request's activity row arrives.
+        for _ in 0..120 {
+            history.advance(1_000);
+            history.sample(Some(21_000), true);
+        }
+        history.label(ResetReason::Compacted);
+        let points = history.points();
+        assert_eq!(resets(&points), 1, "{points:?}");
+        let marked = points.iter().find(|point| point.reset).expect("marker");
+        assert_eq!(marked.reason(), Some(ResetReason::Compacted));
+        assert_eq!(history.last_reason(), Some(ResetReason::Compacted));
+        // A reason with no marker waiting makes one in the live bucket.
+        history.label(ResetReason::Evicted);
+        let points = history.points();
+        assert_eq!(resets(&points), 2);
+        assert_eq!(points[0].reason(), Some(ResetReason::Evicted));
+        assert_eq!(history.last_reason(), Some(ResetReason::Evicted));
+    }
+
+    #[test]
+    fn the_book_labels_markers_from_the_slot_counts() {
+        let mut book = CtxBook::new(6);
+        let t0 = Instant::now();
+        let m = vec!["M".to_owned()];
+        let mut s = slot("M", 0, true, 80_000, 0);
+        // A first sighting with counts already set is a baseline, no label.
+        s.resets.new = 5;
+        book.record(t0, &m, std::slice::from_ref(&s));
+        s.ctx_prompt = Some(10_000);
+        book.record(t0 + Duration::from_secs(1), &m, std::slice::from_ref(&s));
+        assert_eq!(resets(&book.points("M", 0)), 1);
+        assert_eq!(last_reason(&book.points("M", 0)), None);
+        s.resets.new = 6;
+        book.record(t0 + Duration::from_secs(2), &m, std::slice::from_ref(&s));
+        let points = book.points("M", 0);
+        assert_eq!(resets(&points), 1, "{points:?}");
+        assert_eq!(last_reason(&points), Some(ResetReason::New));
+        // The same counts again change nothing.
+        book.record(t0 + Duration::from_secs(3), &m, std::slice::from_ref(&s));
+        assert_eq!(resets(&book.points("M", 0)), 1);
+        // Columns keep the reason on the marker's column.
+        let cols = columns(&book.points("M", 0), 12, 120_000);
+        let marked: Vec<&CtxPoint> = cols.iter().filter(|col| col.reset).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].reason(), Some(ResetReason::New));
+    }
+
     #[test]
     fn columns_keep_the_max_and_the_marker_of_every_bucket() {
         let points = [
@@ -582,21 +712,25 @@ mod tests {
                 ms: 5_000,
                 max: Some(10),
                 reset: false,
+                reasons: 0,
             },
             CtxPoint {
                 ms: 10_000,
                 max: Some(40),
                 reset: true,
+                reasons: 0,
             },
             CtxPoint {
                 ms: 10_000,
                 max: Some(30),
                 reset: false,
+                reasons: 0,
             },
             CtxPoint {
                 ms: 60_000,
                 max: Some(20),
                 reset: false,
+                reasons: 0,
             },
         ];
         // 4 columns of 30 s.
@@ -609,6 +743,7 @@ mod tests {
             ms: 60_000,
             max: Some(7),
             reset: true,
+            reasons: 0,
         }];
         let cols = columns(&wide, 12, 120_000);
         assert_eq!(maxes(&cols[..6]), vec![Some(7); 6]);

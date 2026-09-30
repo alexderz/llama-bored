@@ -6,6 +6,42 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- Install without an NZXT Kraken Z: with none attached, the installer sets
+  up everything except kraken-lcd's unit, udev rules and state directory,
+  and says how to add it later; more than one still refuses (#6).
+- tty11 on small or mixed screens: `[tty] size = "COLSxROWS"` and
+  `[tty] font = "12x24" | "12x22"` (a second bundled Hack font), applied by
+  a root pre-step `llama-watch tty-setup` with no shell; below 48 rows the
+  layout drops IN/OUT, then FANS, then shrinks the chart instead of
+  refusing, down to 160x26 (#7).
+- SLOTS labels each context drop by best-guess reason (compacted, new,
+  evicted, unknown) from token counts, with a legend (#9).
+- llama-metrics: `llamabored_slot_ctx_used_tokens`,
+  `llamabored_slot_ctx_resets_total{reason}`,
+  `llamabored_model_prompt_tokens_total` and
+  `llamabored_model_prompt_cached_tokens_total` (#10).
+- IN/OUT for SGLang, vLLM and other servers without `/slots`: the last
+  finished exchange from llama-swap's request captures
+  (`/api/captures/<id>`, up to 2 MiB, never with `show_text = false`),
+  pinned by a new source fence (S17) (#5).
+- `scripts/demo/` and two ignored replay tests regenerate the README GIFs
+  from recorded snapshots.
+
+### Changed
+
+- tty11 RECENT: DURATION sits beside the other numbers, left of the rate
+  bar (#8).
+- `llama-watch.service` loads the console font through `llama-watch
+  tty-setup` instead of calling `setfont` directly.
+
+### Fixed
+
+- kraken-lcd stream mode backs off after a refused upload (2 s, doubling to
+  30 s) instead of retrying on the next frame, so restarting it together
+  with llama-watch no longer spends `fail_limit` in 300 ms and exits (#14).
+
 ## 0.2.1 — 2026-09-29
 
 ### Added

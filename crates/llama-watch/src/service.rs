@@ -15,8 +15,8 @@ use thiserror::Error;
 use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
-use crate::poller::{self, LlamaDetail, PollLatencies};
-use crate::publish::{Extras, PublishError, Publisher};
+use crate::poller::{self, CaptureView, LlamaDetail, PollLatencies};
+use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
 use crate::slots::{SlotView, pick_slot};
 use crate::sources::Roots;
 use crate::sources::gpu::{GpuBackend, NvidiaGpu};
@@ -430,6 +430,8 @@ impl TickState {
                 gen_tps: None,
                 prompt_tps: None,
                 latencies: PollLatencies::default(),
+                prompt_cache: Vec::new(),
+                capture: None,
             },
             heard: false,
             published: 0,
@@ -830,17 +832,29 @@ fn tty_model(
 ) -> TtyModel {
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
     let no_slots = first_without_slots(sample, watch);
+    // The header model has no `/slots`: IN and OUT from its last capture (#5).
+    let capture = tick.detail.capture.as_ref().filter(|capture| {
+        no_slots
+            && tick.detail.slots.is_empty()
+            && sample
+                .snapshot
+                .models
+                .first()
+                .is_some_and(|model| model.name == capture.model)
+    });
     // With text off the poller keeps none, and nothing here reads the slot
     // tails either, so no llama text can reach the frame (RR-LV1).
-    let text = if ctx.show_text {
+    let text = if !ctx.show_text {
+        FrameText::default()
+    } else if let Some(capture) = capture {
+        capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap)
+    } else {
         frame_text(
             &tick.detail.slots,
             &mut tick.replay,
             ctx.input_cap,
             ctx.output_cap,
         )
-    } else {
-        FrameText::default()
     };
     let mem_total = ctx.mem_total_bytes.map(gib);
     let mem_used = mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes).map(gib);
@@ -884,7 +898,8 @@ fn tty_model(
         prompt_ceiling: ctx.prompt_ceiling,
         slots: layout_slots(&tick.detail.slots, &tick.ctx_history),
         backend_lines: backend_lines(sample, watch),
-        text_note: if ctx.show_text && no_slots && tick.detail.slots.is_empty() {
+        text_note: if ctx.show_text && no_slots && tick.detail.slots.is_empty() && capture.is_none()
+        {
             NO_SLOTS_TEXT.to_owned()
         } else {
             String::new()
@@ -942,6 +957,32 @@ fn frame_text(
         replay_frame: replay.frame,
     }
 }
+
+/// IN and OUT from a llama-swap capture (#5): the last finished exchange,
+/// and the titles say so. OUT replays like a slot's does when a new
+/// capture arrives.
+fn capture_text(
+    capture: &CaptureView,
+    replay: &mut OutReplay,
+    input_cap: usize,
+    output_cap: usize,
+) -> FrameText {
+    let output = sanitised_chars(&capture.output);
+    note_output(replay, &output, output_cap);
+    let input = cap_chars(&sanitised_chars(&capture.input), input_cap);
+    FrameText {
+        in_title: CAPTURE_IN_TITLE.to_owned(),
+        out_title: CAPTURE_OUT_TITLE.to_owned(),
+        in_lines: chars_lines(&input),
+        out_lines: chars_lines(&replay.tail),
+        out_shown: replay.shown,
+        replay_frame: replay.frame,
+    }
+}
+
+/// IN and OUT titles over a capture (#5).
+const CAPTURE_IN_TITLE: &str = "IN (last request)";
+const CAPTURE_OUT_TITLE: &str = "OUT (last response)";
 
 /// The IN/OUT part of a [`TtyModel`]. Empty when `tty.show_text = false`.
 #[derive(Default)]
@@ -1365,6 +1406,23 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
         mem_used: mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes),
         mem_total: ctx.mem_total_bytes,
         slots,
+        prompt_cache: tick
+            .detail
+            .prompt_cache
+            .iter()
+            .map(|entry| (entry.model.clone(), entry.prompt, entry.cached))
+            .collect(),
+        slot_ctx: tick
+            .detail
+            .slots
+            .iter()
+            .map(|slot| SlotCtx {
+                model: slot.model.clone(),
+                slot: slot.id,
+                used: slot.ctx_used,
+                resets: slot.resets,
+            })
+            .collect(),
         fans: sample
             .fans
             .iter()
@@ -1534,6 +1592,9 @@ mod tests {
             n_decoded: 816,
             n_ctx: Some(262_144),
             ctx_prompt: Some(91_000),
+            ctx_used: None,
+            resets: Default::default(),
+            last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
         };
@@ -1554,6 +1615,9 @@ mod tests {
             n_decoded: 0,
             n_ctx: None,
             ctx_prompt: None,
+            ctx_used: None,
+            resets: Default::default(),
+            last_reset: None,
             input: secret_cells(input),
             output: secret_cells(output),
         }
@@ -1896,6 +1960,9 @@ mod tests {
                         n_decoded: 42,
                         n_ctx: Some(32_768),
                         ctx_prompt: Some(9_000),
+                        ctx_used: None,
+                        resets: Default::default(),
+                        last_reset: None,
                         input: secret_cells(SECRET_IN),
                         output: secret_cells(SECRET_OUT),
                     }],
@@ -1903,6 +1970,8 @@ mod tests {
                     gen_tps: Some(40.0),
                     prompt_tps: Some(0.0),
                     latencies: crate::poller::PollLatencies::default(),
+                    prompt_cache: Vec::new(),
+                    capture: None,
                 },
             ))
         }
@@ -2046,6 +2115,8 @@ mod tests {
                     gen_tps: None,
                     prompt_tps: None,
                     latencies: crate::poller::PollLatencies::default(),
+                    prompt_cache: Vec::new(),
+                    capture: None,
                 },
             ))
         }
@@ -2140,7 +2211,7 @@ mod tests {
             chart_glyphs: ChartGlyphs::default(),
             ctx_history_h: 6,
             started: Instant::now(),
-            host: "titan".to_owned(),
+            host: "box".to_owned(),
             cpu_cores: None,
             mem_total_bytes,
             llama_enabled,
@@ -2314,6 +2385,49 @@ mod tests {
         assert_eq!(model_detail(&sample, WatchState::Ready), "");
         assert!(backend_lines(&sample, WatchState::Ready).is_empty());
         assert!(!first_without_slots(&sample, WatchState::Ready));
+    }
+
+    /// #5: a header model without `/slots` shows its last capture, titled
+    /// as the last finished exchange; with text off, nothing.
+    #[test]
+    fn a_capture_fills_in_and_out_for_a_model_without_slots() {
+        let cells = |text: &str| -> Vec<Cell> {
+            text.chars()
+                .map(|ch| Cell::new(ch, crate::tty::C16::White, crate::tty::C16::Black))
+                .collect()
+        };
+        let sample = backend_sample(vec![served("flash", "ready", Some(sglang(Some(0))))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        assert_eq!(model.text_note, NO_SLOTS_TEXT, "no capture yet");
+        tick.detail.capture = Some(CaptureView {
+            model: "flash".to_owned(),
+            id: 4,
+            input: cells("An invented question?"),
+            output: cells("An invented answer."),
+        });
+        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        assert_eq!(model.in_title, CAPTURE_IN_TITLE);
+        assert_eq!(model.out_title, CAPTURE_OUT_TITLE);
+        assert_eq!(model.in_lines, vec!["An invented question?".to_owned()]);
+        assert_eq!(model.out_lines, vec!["An invented answer.".to_owned()]);
+        assert!(model.text_note.is_empty());
+        // A capture of another model is not this header's.
+        tick.detail.capture.as_mut().expect("capture").model = "other".to_owned();
+        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        assert_eq!(model.text_note, NO_SLOTS_TEXT);
+        assert!(model.in_lines.is_empty());
+        // Text off: nothing, whatever the detail holds.
+        tick.detail.capture.as_mut().expect("capture").model = "flash".to_owned();
+        ctx.show_text = false;
+        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        assert!(model.in_lines.is_empty() && model.out_lines.is_empty());
+        assert!(model.text_note.is_empty());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use super::grid::{C16, Cell, Grid};
 use super::sanitize::sanitize;
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
+use crate::resets::ResetReason;
 use crate::sources::fans::{FanPanel, FanReading, mode_word};
 
 /// How many of `new_chars` are visible on frame `frame` of a 10-frame second.
@@ -160,11 +161,25 @@ pub struct TtyModel {
     pub ctx_history_h: u32,
 }
 
-/// Draw one frame. Below 160×48 the grid is the single "tty too small" line.
+/// Narrowest console the dashboard draws: the RECENT columns' floor.
+pub const MIN_COLS: u16 = 160;
+/// Shortest console the dashboard draws (#7). Rows 0-14 are the header, a
+/// rule, the six meters and ACTIVITY; then a rule, the RECENT header, 4
+/// request rows, the legend and the RECENT rule; then the health rule, the
+/// health line and the blank last row: 26. Each SLOTS row past the first
+/// pushes RECENT down a row, and it shows fewer requests.
+pub const MIN_ROWS: u16 = 26;
+/// From this height the text-on layout keeps IN/OUT: the chart shrinks or
+/// hides first. Below it panels drop in order: IN/OUT, then FANS, then the
+/// chart shrinks (the text-off split of the freed rows).
+pub const FULL_ROWS: u16 = 48;
+
+/// Draw one frame. Below [`MIN_COLS`]×[`MIN_ROWS`] the grid is the single
+/// "tty too small" line.
 pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
     let mut grid = Grid::new(cols, rows);
-    if cols < 160 || rows < 48 {
-        let msg = format!("llama-watch: tty too small ({cols}x{rows}, need 160x48)");
+    if cols < MIN_COLS || rows < MIN_ROWS {
+        let msg = format!("llama-watch: tty too small ({cols}x{rows}, need {MIN_COLS}x{MIN_ROWS})");
         paint_str(&mut grid, 0, 0, &msg, C16::White, C16::Black);
         return grid;
     }
@@ -179,7 +194,7 @@ pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
     let mid_rule = stats_end + 2;
     draw_rule(&mut grid, mid_rule, g.cols);
     let req_header = mid_rule + 1;
-    if model.show_text {
+    if model.show_text && (rows >= FULL_ROWS || text_fits(model, &g, req_header)) {
         let req_rows = request_slots(rows);
         draw_requests(&mut grid, model, &g, req_header, req_rows);
         let req_rule = req_header + 1 + req_rows + 1;
@@ -190,12 +205,34 @@ pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
         }
         draw_text(&mut grid, model, &g, req_rule.saturating_add(chart_h));
     } else {
+        // Text off, or a short screen without room for IN/OUT under a
+        // full chart: the IN/OUT rows go to the chart and RECENT.
         draw_text_off(&mut grid, model, &g, req_header);
     }
     let health_rule = rows - 3;
+    // A long SLOTS list on a short screen may reach these rows. The health
+    // rule and line always draw on blank cells.
+    for row in [health_rule, rows - 2] {
+        fill_span(&mut grid, 0, cols - 2, row, ' ', C16::White, C16::Black);
+    }
     draw_rule(&mut grid, health_rule, g.cols);
     draw_health(&mut grid, model, &g, rows - 2);
     grid
+}
+
+/// Below [`FULL_ROWS`]: IN/OUT stay only while a full chart, IN and OUT
+/// with three rows each and (on a narrow screen) the FANS block all fit.
+fn text_fits(model: &TtyModel, g: &Geom, req_header: u16) -> bool {
+    let req_rule = req_header.saturating_add(request_slots(g.rows) + 2);
+    let below = g
+        .rows
+        .saturating_sub(3)
+        .saturating_sub(req_rule.saturating_add(1));
+    let fans = match &model.fans {
+        Some(panel) if g.cols < FANS_SIDE_COLS => 1 + fans_block_rows(panel),
+        _ => 0,
+    };
+    below >= CHART_PREFERRED + TEXT_FLOOR_SPAN + fans
 }
 
 struct Geom {
@@ -996,6 +1033,14 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         && !model.slots.is_empty()
     {
         draw_spark_header(grid, model, g, plan);
+        // The legend only when there is a marker to explain.
+        if model
+            .slots
+            .iter()
+            .any(|slot| slot.ctx_history.iter().any(|point| point.reset))
+        {
+            draw_reset_legend(grid, g, plan);
+        }
     }
     // The count sits in a 13-column field ending 3 columns before `decoded`,
     // and the bar keeps a 7-column gap in front of that field.
@@ -1148,6 +1193,69 @@ fn draw_spark_header(grid: &mut Grid, model: &TtyModel, g: &Geom, plan: &SparkPl
     }
 }
 
+/// The reset marker legend (#9), longest first: each is the reasons'
+/// marker letters in order (compacted, new, evicted, other drop) and a
+/// word each.
+const RESET_LEGENDS: [[&str; 4]; 2] = [
+    ["compacted", "new", "evicted", "drop"],
+    ["compact", "new", "evict", "drop"],
+];
+
+/// The legend on the SLOTS label row, right-aligned to end two columns
+/// before the sparkline, over the ctx meters: the longest that fits between
+/// `decoded` and there, or none.
+fn draw_reset_legend(grid: &mut Grid, g: &Geom, plan: &SparkPlan) {
+    let reasons = [
+        Some(ResetReason::Compacted),
+        Some(ResetReason::New),
+        Some(ResetReason::Evicted),
+        None,
+    ];
+    let start = g.prompt_x().saturating_add(7 + 2);
+    let end = plan.spark_x.saturating_sub(2);
+    let room = usize::from(end.saturating_sub(start)) + 1;
+    let Some(words) = RESET_LEGENDS.iter().find(|words| {
+        words.iter().map(|word| word.len() + 2).sum::<usize>() + words.len() - 1 <= room
+    }) else {
+        return;
+    };
+    let mut cells: Vec<(char, C16)> = Vec::new();
+    for (reason, word) in reasons.into_iter().zip(words) {
+        if !cells.is_empty() {
+            cells.push((' ', C16::BrightBlack));
+        }
+        let (mark, fg) = reset_mark(reason);
+        cells.push((mark, fg));
+        cells.extend(format!(" {word}").chars().map(|ch| (ch, C16::BrightBlack)));
+    }
+    let width = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+    let x = end.saturating_add(1).saturating_sub(width);
+    for (i, (ch, fg)) in cells.into_iter().enumerate() {
+        let Ok(offset) = u16::try_from(i) else {
+            break;
+        };
+        paint(
+            grid,
+            x.saturating_add(offset),
+            g.slot_label,
+            ch,
+            fg,
+            C16::Black,
+        );
+    }
+}
+
+/// A reset marker's glyph and colour by reason (#9). A drop with no reason
+/// yet, an unknown one and a model swap keep T53's red `v`.
+fn reset_mark(reason: Option<ResetReason>) -> (char, C16) {
+    match reason {
+        Some(ResetReason::Compacted) => ('c', C16::BrightGreen),
+        Some(ResetReason::New) => ('n', C16::BrightCyan),
+        Some(ResetReason::Evicted) => ('e', C16::BrightYellow),
+        Some(ResetReason::Unknown) | None => ('v', C16::BrightRed),
+    }
+}
+
 /// The ctx block at its fixed column, then this slot's sparkline, newest on
 /// the left. A row whose decoded count overran its field shifts right and
 /// loses its oldest columns; every column keeps the same age on every row.
@@ -1201,6 +1309,12 @@ fn paint_slot_spark(
         );
     }
 
+    // The last decided reason, between the value and the sparkline (#9).
+    if let Some(reason) = ctx_history::last_reason(&slot.ctx_history) {
+        let (ch, fg) = reset_mark(Some(reason));
+        paint(grid, value_end.saturating_add(2), row, ch, fg, C16::Black);
+    }
+
     let span_ms = u64::from(model.ctx_history_h.max(1)) * 3_600_000;
     let columns = ctx_history::columns(&slot.ctx_history, usize::from(plan.width), span_ms);
     let n_ctx = slot.n_ctx.filter(|n| *n > 0);
@@ -1214,7 +1328,8 @@ fn paint_slot_spark(
             break;
         }
         if point.reset {
-            paint(grid, col, row, 'v', C16::BrightRed, C16::Black);
+            let (ch, fg) = reset_mark(point.reason());
+            paint(grid, col, row, ch, fg, C16::Black);
             continue;
         }
         let (Some(used), Some(n_ctx)) = (point.max, n_ctx) else {
@@ -1418,8 +1533,9 @@ struct Plan {
     output: Span,
     prompt_tps: Span,
     gen_tps: Span,
-    bar: Span,
+    /// Left of the bar so a row's numbers read together (#8).
     dur: Span,
+    bar: Span,
     status: Span,
     headers: &'static [ColSpec],
 }
@@ -1601,16 +1717,16 @@ const SHORT_SPECS: [ColSpec; 12] = [
         side: Side::Right,
     },
     ColSpec {
-        header: "",
-        floor: BAR_FLOOR,
-        grow: Grow::Bar,
-        side: Side::Left,
-    },
-    ColSpec {
         header: "DUR",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
+    },
+    ColSpec {
+        header: "",
+        floor: BAR_FLOOR,
+        grow: Grow::Bar,
+        side: Side::Left,
     },
     ColSpec {
         header: "",
@@ -1676,16 +1792,16 @@ const LONG_SPECS: [ColSpec; 12] = [
         side: Side::Right,
     },
     ColSpec {
-        header: "",
-        floor: BAR_FLOOR,
-        grow: Grow::Bar,
-        side: Side::Left,
-    },
-    ColSpec {
         header: "DURATION",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
+    },
+    ColSpec {
+        header: "",
+        floor: BAR_FLOOR,
+        grow: Grow::Bar,
+        side: Side::Left,
     },
     ColSpec {
         header: "",
@@ -1753,8 +1869,8 @@ fn request_plan(cols: u16) -> Plan {
         output: spans[6],
         prompt_tps: spans[7],
         gen_tps: spans[8],
-        bar: spans[9],
-        dur: spans[10],
+        dur: spans[9],
+        bar: spans[10],
         status: spans[11],
         headers,
     }
@@ -1854,6 +1970,7 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             hot,
             C16::Black,
         );
+        paint_span_right(grid, plan.dur, row, &req.dur, plain, C16::Black);
         let frac = rate_frac(req.gen_tps, model.gen_ceiling);
         let ink = if dim {
             BarInk::Fixed(C16::BrightBlack, C16::BrightBlack)
@@ -1873,7 +1990,6 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
                 rows: 1,
             },
         );
-        paint_span_right(grid, plan.dur, row, &req.dur, plain, C16::Black);
         if req.err {
             paint_span_left(grid, plan.status, row, " ERR ", C16::Black, C16::Yellow);
         } else if req.live && !dim {
@@ -1893,8 +2009,8 @@ fn paint_request_headers(grid: &mut Grid, row: u16, plan: &Plan) {
         plan.output,
         plan.prompt_tps,
         plan.gen_tps,
-        plan.bar,
         plan.dur,
+        plan.bar,
         plan.status,
     ];
     for (spec, span) in plan.headers.iter().zip(spans) {

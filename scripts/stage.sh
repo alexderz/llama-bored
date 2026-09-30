@@ -43,7 +43,7 @@ Type=notify
 NotifyAccess=main
 User=llama-watch
 Group=llama-watch
-ExecStartPre=-+/usr/bin/setfont -C /dev/tty11 /usr/local/share/llama-bored/llama-hack-12x24.psfu
+ExecStartPre=-+/usr/local/libexec/llama-bored/llama-watch tty-setup --config /etc/llama-bored/watch.toml
 ExecStartPre=-+/usr/bin/sh -c 'exec /usr/bin/setterm --term linux --powersave powerdown </dev/tty11 >/dev/tty11'
 ExecStart=/usr/local/libexec/llama-bored/llama-watch run --config /etc/llama-bored/watch.toml
 Restart=on-failure
@@ -118,11 +118,16 @@ assert_packaging_contract() {
     exit 1
   fi
   rm -f -- "$expected"
-  # tty11 loads llama-hack-12x24 before the watcher starts. `+` runs
-  # setfont outside the sandbox (it needs /dev/tty11 and KDFONTOP); `-` keeps
-  # a missing font or a setfont failure from stopping the watcher, which then
-  # draws with whatever font tty11 has (tty.chart_glyphs = "halves" is safe).
-  local font_pre='ExecStartPre=-+/usr/bin/setfont -C /dev/tty11 /usr/local/share/llama-bored/llama-hack-12x24.psfu'
+  # tty11 gets its font and size before the watcher starts (#7). `+` runs
+  # `llama-watch tty-setup` as root outside the sandbox: it validates
+  # watch.toml, then runs /usr/bin/setfont with the bundled font `[tty] font`
+  # names and, when `[tty] size` is set, /usr/bin/stty cols/rows on
+  # /dev/tty11 (argv from an enum and two bounded integers, no shell, empty
+  # environment). setfont needs KDFONTOP and stty the resize, neither of
+  # which the sandboxed watcher may do (S13). `-` keeps a missing font or a
+  # failed step from stopping the watcher, which then draws with whatever
+  # font and size tty11 has (tty.chart_glyphs = "halves" is safe).
+  local font_pre='ExecStartPre=-+/usr/local/libexec/llama-bored/llama-watch tty-setup --config /etc/llama-bored/watch.toml'
   # The second root pre-step sets the console powersave mode (TIOCLINUX, via
   # setterm on stdin = /dev/tty11) so `[tty] sleep_min` can power the monitor
   # down. The watcher itself never calls TIOCLINUX (S13). `-` keeps a setterm
@@ -131,13 +136,16 @@ assert_packaging_contract() {
   if [[ "$(grep -c '^ExecStartPre=' "$watch")" -ne 2 ]] \
     || ! grep -F -q -x -- "$font_pre" "$watch" \
     || ! grep -F -q -x -- "$powersave_pre" "$watch"; then
-    echo "stage self-test: llama-watch.service must have exactly two ExecStartPre, the non-fatal setfont of llama-hack-12x24 and the non-fatal setterm powersave" >&2
+    echo "stage self-test: llama-watch.service must have exactly two ExecStartPre, the non-fatal root tty-setup (font and size) and the non-fatal setterm powersave" >&2
     exit 1
   fi
-  if [[ ! -f "$root/packaging/fonts/llama-hack-12x24.psfu" ]]; then
-    echo "stage self-test: missing packaging/fonts/llama-hack-12x24.psfu" >&2
-    exit 1
-  fi
+  local font
+  for font in llama-hack-12x24.psfu llama-hack-12x22.psfu; do
+    if [[ ! -f "$root/packaging/fonts/$font" ]]; then
+      echo "stage self-test: missing packaging/fonts/$font" >&2
+      exit 1
+    fi
+  done
   # The watcher reaches tty11 through the fd systemd hands it (TTYPath=)
   # and DeviceAllow=/dev/tty11 rw. A group-based fallback
   # (SupplementaryGroups=llama-tty, packaging/72-llama-watch-tty.rules and

@@ -1268,6 +1268,8 @@ fn empty_detail() -> LlamaDetail {
         gen_tps: None,
         prompt_tps: None,
         latencies: PollLatencies::default(),
+        prompt_cache: Vec::new(),
+        capture: None,
     }
 }
 
@@ -1283,6 +1285,9 @@ fn detail_output(text: &str) -> LlamaDetail {
         n_decoded: 1,
         n_ctx: None,
         ctx_prompt: None,
+        ctx_used: None,
+        resets: Default::default(),
+        last_reset: None,
         input: Vec::new(),
         output: text
             .chars()
@@ -1317,6 +1322,9 @@ fn slot_text(id: i64, text: &str, busy: bool) -> SlotView {
         n_decoded: 1,
         n_ctx: None,
         ctx_prompt: None,
+        ctx_used: None,
+        resets: Default::default(),
+        last_reset: None,
         input: Vec::new(),
         output: text
             .chars()

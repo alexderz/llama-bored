@@ -31,10 +31,15 @@ pub struct ActivityRow {
     pub duration_ms: Option<u64>,
     /// HTTP status of the upstream response.
     pub status: Option<u16>,
+    /// llama-swap kept this request's bodies (`has_capture`, #5).
+    pub captured: bool,
 }
 
 /// Rows [`parse_activity`] keeps.
 pub const ROWS: usize = 8;
+/// Rows the poller parses from one page for counting, before it keeps the
+/// newest few for RECENT. llama-swap v256 pages hold 25.
+pub const MAX_PAGE_ROWS: usize = 100;
 
 /// Parse a page. `None` means the body is not an activity object.
 ///
@@ -70,6 +75,7 @@ impl From<ActivityJson> for ActivityRow {
             prompt_tps: nonneg_f64(tokens.prompt_per_second),
             gen_tps: nonneg_f64(tokens.tokens_per_second),
             duration_ms: nonneg_u64(row.duration_ms),
+            captured: row.has_capture,
             status: row.resp_status_code.and_then(|code| {
                 if (0.0..65536.0).contains(&code) && code.fract() == 0.0 {
                     Some(code as u16)
@@ -135,6 +141,8 @@ struct ActivityJson {
     duration_ms: Option<f64>,
     #[serde(default)]
     resp_status_code: Option<f64>,
+    #[serde(default)]
+    has_capture: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -83,12 +83,16 @@ first **STOP**.
    `systemd`; record `systemctl --version | head -1`. Otherwise **STOP**:
    unsupported.
 
-2. **The cooler.** Run `lsusb -d 1e71:`.
-   - Exactly one `1e71:3008` → continue.
+2. **The cooler (optional).** Run `lsusb -d 1e71:`.
+   - Exactly one `1e71:3008` → continue with steps 3 and 4.
+   - No `1e71` device at all → fine: llama-bored installs without the LCD.
+     Record **no Kraken**, tell the human the LCD writer will be skipped, and
+     skip steps 3, 4 and 6 of this section, the cooling snapshots, and all of
+     section 5.
    - `1e71:3011` present → the cooler is in its **bootloader**. **STOP**. Tell
      the human; recovery is a full power-off (PSU switch) and is their job.
-   - No `1e71:3008`, or more than one → **STOP**: unsupported. Name the ids
-     you saw. Kraken 2023/Elite (`300c`, `300e`, `3012`, `3014`), X-series
+   - More than one `1e71:3008`, or only other `1e71` ids → **STOP**:
+     unsupported. Name the ids you saw. Kraken 2023/Elite (`300c`, `300e`, `3012`, `3014`), X-series
      (`2007`) and others use different hardware or have no LCD.
    - **Z53 vs Z63/Z73.** The Z63 and Z73 report the **same** `1e71:3008` and
      the same `z53` hwmon name, so no software check can tell them apart, and
@@ -97,7 +101,7 @@ first **STOP**.
      explicitly says to continue on untested hardware, and then stay extra
      careful in step 5.
 
-3. **The `nzxt-kraken3` driver is bound** (the writer needs it; it also
+3. **The `nzxt-kraken3` driver is bound** (Kraken only; the writer needs it; it also
    provides the cooling-guard readings):
    ```sh
    grep -lx z53 /sys/class/hwmon/hwmon*/name      # exactly one hit
@@ -108,7 +112,7 @@ first **STOP**.
    (mainline since 6.9). Do **not** load, unload, bind or unbind drivers
    yourself; tell the human.
 
-4. **Nobody else holds the device.**
+4. **Nobody else holds the device** (Kraken only).
    ```sh
    D=$(for d in /sys/bus/usb/devices/*; do [ "$(cat "$d/idVendor" 2>/dev/null)" = 1e71 ] && [ "$(cat "$d/idProduct")" = 3008 ] && basename "$d"; done)
    ls -l "/sys/bus/usb/devices/$D:1.0/driver" 2>&1   # must say: No such file or directory
@@ -353,25 +357,30 @@ installing.
    saves it to `/usr/local/libexec/llama-bored/ROLLBACK_PENDING`. Report it and
    **STOP**; do not retry blindly.
 4. The installer has created the users `kraken-lcd`, `llama-watch`,
-   `llama-light` and `llama-metrics` and the group `llama-view`. It has
-   installed the udev rules, narrowed the cooler's hidraw node to
+   `llama-light` and `llama-metrics` and the group `llama-view`. With a
+   Kraken it has installed the udev rules, narrowed the cooler's hidraw node to
    `0660 root:kraken-lcd` with no ACL, and checked that `/dev/kraken-lcd/hid`
    points at that node (the writer unit may open only that path). If the
    Aura controller is attached, its node is `0660 root:llama-light` behind
    `/dev/llama-light/aura`; if the keyboard is attached, its lighting
    interface's node (interface 1 only) is the same behind
-   `/dev/llama-light/keyboard`. It has created `/var/lib/kraken-lcd` and enabled (not
+   `/dev/llama-light/keyboard`. With a Kraken it has created
+   `/var/lib/kraken-lcd`; without one it printed `kraken-lcd was skipped` and
+   installed no LCD unit, udev rules or state directory. It has enabled (not
    started) `llama-watch`. It **never** starts or enables the LCD writer. It
    ends by printing next steps; this skill follows the same order.
 5. Start the watcher: `systemctl start llama-watch`. Its `ExecStartPre` loads
    the Hack console font on tty11. Check `systemctl status llama-watch`
    (active) and ask the human to glance at tty11 (Ctrl+Alt+F11 from a
    graphical session, Alt+F11 from another console).
-6. Cooling snapshot again **(user)** and compare with the baseline. Installing
+6. (Kraken only) Cooling snapshot again **(user)** and compare with the baseline. Installing
    runs `udevadm trigger` on the cooler, which is expected to be
    cooling-neutral. Any anomaly → rule 5.
 
 ## 5. First LCD write (root, human watching)
+
+Skip this section when there is no Kraken (the installer said
+`kraken-lcd was skipped`).
 
 Tell the human: "I will now upload one test image to the LCD."
 

@@ -58,6 +58,12 @@ pub const MAX_FAN_LABEL_CHARS: usize = 10;
 pub const MAX_FAN_RPM: u32 = 100_000;
 /// Top of a source's last poll latency, seconds.
 pub const MAX_LATENCY_S: f32 = 600.0;
+/// Most per-slot context rows one snapshot carries, across every model
+/// (#10). Keeps the worst case under [`MAX_BYTES`]; the watcher sends the
+/// first models' lowest slots and drops the rest.
+pub const MAX_SLOT_CTX: usize = 32;
+/// Top of a slot's context tokens (#10).
+pub const MAX_CTX_TOKENS: u64 = u32::MAX as u64;
 
 /// Canonical model-name width, including the trailing `…`.
 ///
@@ -95,8 +101,10 @@ pub enum WireError {
     /// A model name is empty, too long, or not canonical.
     #[error("snapshot model name is not canonical")]
     Name,
-    /// A model's `running` or `queued` is above [`MAX_REQS`], or its
-    /// `kv_fill` is non-finite or outside 0..=1.
+    /// A model's `running` or `queued` is above [`MAX_REQS`], its
+    /// `kv_fill` is non-finite or outside 0..=1, its cached prompt tokens
+    /// exceed its prompt tokens, or a slot context row is out of range,
+    /// repeated, or past [`MAX_SLOT_CTX`] (#10).
     #[error("snapshot model gauge is out of range")]
     Gauge,
     /// A full name is not canonical, or a detail token is not allowlisted.
@@ -253,6 +261,71 @@ pub struct ModelWire {
     /// llama.cpp slots the server has, at most [`MAX_SLOTS`] (#11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots_total: Option<u16>,
+    /// Prompt tokens of the model's finished requests since the watcher
+    /// started, cached ones included (#10). A counter: it restarts with the
+    /// watcher. Omitted when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    /// Of [`Self::prompt_tokens`], the tokens served from the prompt cache
+    /// (#10). Never above it, and absent without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cached_tokens: Option<u64>,
+    /// llama.cpp per-slot context (#10). At most [`MAX_SLOT_CTX`] rows in
+    /// the whole snapshot. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slot_ctx: Vec<SlotCtxWire>,
+}
+
+/// One llama.cpp slot's context (#10). Numbers only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlotCtxWire {
+    /// Slot id, below [`MAX_SLOTS`], unique within its model.
+    pub slot: u16,
+    /// Context tokens the slot holds: prompt plus decoded. An idle slot
+    /// keeps its last busy value, as its KV cache does. At most
+    /// [`MAX_CTX_TOKENS`].
+    pub used: u64,
+    /// Context drops seen since the watcher started (the SLOTS sparkline's
+    /// reset rule), by the watcher's best-guess reason (#9). Counters: they
+    /// restart with the watcher.
+    #[serde(default)]
+    pub resets: SlotResetsWire,
+}
+
+/// A slot's context drops by reason (#9). Every reason is a guess from
+/// token counts; `llama_watch::resets` states the rules. A zero is omitted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SlotResetsWire {
+    /// Same conversation, shorter prompt, mostly cached.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compacted: u64,
+    /// A different conversation took the slot.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub new: u64,
+    /// A conversation came back with its cache gone.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub evicted: u64,
+    /// Not enough evidence.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unknown: u64,
+}
+
+impl SlotResetsWire {
+    /// Every count with its label word, in export order.
+    #[must_use]
+    pub fn entries(&self) -> [(&'static str, u64); 4] {
+        [
+            ("compacted", self.compacted),
+            ("new", self.new),
+            ("evicted", self.evicted),
+            ("unknown", self.unknown),
+        ]
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Upstream model lifecycle.
@@ -437,6 +510,10 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
     if snapshot.ai.models.len() > MAX_MODELS {
         return Err(WireError::TooManyModels);
     }
+    let slot_rows: usize = snapshot.ai.models.iter().map(|m| m.slot_ctx.len()).sum();
+    if slot_rows > MAX_SLOT_CTX {
+        return Err(WireError::Gauge);
+    }
     if snapshot.ai.state != AiWire::Loaded && !snapshot.ai.models.is_empty() {
         return Err(WireError::ModelsNotLoaded);
     }
@@ -461,6 +538,22 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
             || model
                 .slots_busy
                 .is_some_and(|busy| model.slots_total.is_none_or(|total| busy > total))
+            || model
+                .prompt_cached_tokens
+                .is_some_and(|cached| model.prompt_tokens.is_none_or(|all| cached > all))
+        {
+            return Err(WireError::Gauge);
+        }
+        validate_slot_ctx(&model.slot_ctx)?;
+    }
+    Ok(())
+}
+
+fn validate_slot_ctx(rows: &[SlotCtxWire]) -> Result<(), WireError> {
+    for (i, row) in rows.iter().enumerate() {
+        if row.slot >= MAX_SLOTS
+            || row.used > MAX_CTX_TOKENS
+            || rows[..i].iter().any(|other| other.slot == row.slot)
         {
             return Err(WireError::Gauge);
         }

@@ -72,33 +72,51 @@ fn parse_psf2(bytes: &[u8]) -> Result<Psf, String> {
     })
 }
 
-fn font() -> Psf {
+/// Committed fonts and their cells (`[tty] font`).
+const FONTS: [(&str, (u32, u32)); 2] = [
+    ("llama-hack-12x24.psfu", (12, 24)),
+    ("llama-hack-12x22.psfu", (12, 22)),
+];
+
+fn font(name: &str) -> Psf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packaging/fonts/llama-hack-12x24.psfu");
+        .join("../../packaging/fonts")
+        .join(name);
     let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     parse_psf2(&bytes).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
 }
 
 #[test]
-fn committed_font_is_a_12x24_psf2_with_a_unicode_table() {
-    let psf = font();
-    assert_eq!((psf.width, psf.height), (12, 24));
-    assert_eq!(psf.glyphs, 512);
+fn committed_fonts_are_psf2_with_a_unicode_table_at_their_cell() {
+    for (name, cell) in FONTS {
+        let psf = font(name);
+        assert_eq!((psf.width, psf.height), cell, "{name}");
+        assert_eq!(psf.glyphs, 512, "{name}");
+    }
+}
+
+/// 12x22 is the same glyph set in a shorter cell: same slots, same table.
+#[test]
+fn both_fonts_map_the_same_scalars() {
+    assert_eq!(
+        font(FONTS[0].0).mapped,
+        font(FONTS[1].0).mapped,
+        "12x24 and 12x22 map different scalars"
+    );
 }
 
 /// Every printable ASCII byte, `?` (the S12 replacement) and every
 /// `term::GLYPHS` scalar must map to a glyph, or tty11 shows tofu.
 #[test]
-fn committed_font_has_every_glyph_term_may_emit() {
-    let psf = font();
-    let missing: Vec<char> = ('\u{20}'..='\u{7e}')
-        .chain(GLYPHS.iter().copied())
-        .filter(|ch| !psf.mapped.contains(ch))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "llama-hack-12x24.psfu lacks {missing:?}"
-    );
+fn committed_fonts_have_every_glyph_term_may_emit() {
+    for (name, _) in FONTS {
+        let psf = font(name);
+        let missing: Vec<char> = ('\u{20}'..='\u{7e}')
+            .chain(GLYPHS.iter().copied())
+            .filter(|ch| !psf.mapped.contains(ch))
+            .collect();
+        assert!(missing.is_empty(), "{name} lacks {missing:?}");
+    }
 }
 
 #[test]

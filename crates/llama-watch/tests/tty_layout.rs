@@ -463,10 +463,16 @@ fn recent_time_is_complete_and_columns_do_not_overlap() {
                 pair[1].2
             );
         }
-        let dur_end = spans.last().expect("dur").1;
+        // The rate bar is the last filled column (#8 moved DUR left of it).
+        let bar_end = data
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
+            .expect("bar");
         assert!(
-            dur_end > usize::from(cols) * 3 / 4,
-            "{cols}: RECENT stops at {dur_end}, short of the full width"
+            bar_end > usize::from(cols) * 3 / 4,
+            "{cols}: RECENT stops at {bar_end}, short of the full width"
         );
         assert!(
             header.contains("TIME") && header.contains("SOURCE") && header.contains("MODEL"),
@@ -611,6 +617,54 @@ fn recent_numbers_stay_right_aligned_under_their_headers() {
             assert_eq!(
                 value_end, label_end,
                 "{cols}: {value} ends at {value_end}, {label} ends at {label_end}"
+            );
+        }
+    }
+}
+
+/// #8: DURATION reads with the other numbers, left of the rate bar:
+/// `... IN CACHED OUT PROMPT GEN DUR [bar] STATUS`, in both column sets and
+/// with text on or off.
+#[test]
+fn recent_duration_sits_between_the_numbers_and_the_bar() {
+    for show_text in [true, false] {
+        for (cols, rows) in RECENT_WIDTHS {
+            let mut model = recent_model();
+            model.show_text = show_text;
+            let grid = draw(&model, cols, rows);
+            let header_row = row_with(&grid, "RECENT");
+            let header = full_row(&grid, header_row);
+            let data = full_row(&grid, header_row + 1);
+            let (gen_label, dur_label) = if cols == 160 {
+                ("GEN", "DUR")
+            } else {
+                ("GEN tok/s", "DURATION")
+            };
+            let gen_end = find_chars(&header, gen_label).expect("gen header") + gen_label.len();
+            let dur_at = find_chars(&header, dur_label).expect("dur header");
+            let dur_end = dur_at + dur_label.len();
+            let value_at = find_chars(&data, "13.2s").expect("dur value");
+            let bar_at = data
+                .chars()
+                .position(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
+                .expect("bar");
+            let bar_end = data
+                .chars()
+                .collect::<Vec<_>>()
+                .iter()
+                .rposition(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
+                .expect("bar end");
+            let after_bar: String = data.chars().skip(bar_end + 1).collect();
+            let tag = format!("{cols} text {show_text}");
+            assert!(gen_end < dur_at, "{tag}: DUR is not after GEN: {header}");
+            assert!(dur_end < bar_at, "{tag}: DUR header is not left of the bar");
+            assert!(
+                value_at + 5 < bar_at,
+                "{tag}: duration is right of the bar: {data}"
+            );
+            assert!(
+                after_bar.contains("gen"),
+                "{tag}: status is not after the bar: {data}"
             );
         }
     }
@@ -3307,4 +3361,257 @@ fn a_model_stuck_stopping_is_tagged_in_the_header() {
         let at = col_of(&grid, 0, "stopping (stuck?)");
         assert_eq!(grid.get(at, 0).unwrap().fg, C16::Yellow);
     }
+}
+
+// #7: short screens. Below 48 rows the dashboard drops panels in order
+// (IN/OUT, then FANS, then chart height) and refuses only below 160x26.
+
+/// Rows of the chart under RECENT, from its gen ceiling label to its prompt
+/// ceiling label. 0 when there is no chart.
+fn chart_rows_below_recent(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    let from = req_rule_row(grid) + 1;
+    let top = (from..grid.rows()).find(|row| row_string(grid, *row).ends_with(" 250"));
+    let bottom = (from..grid.rows()).find(|row| row_string(grid, *row).ends_with(" 1500"));
+    match (top, bottom) {
+        (Some(top), Some(bottom)) if bottom > top => bottom - top + 1,
+        _ => 0,
+    }
+}
+
+fn recent_rows_shown(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    let header = row_with(grid, "RECENT");
+    req_rule_row(grid) - header - 2
+}
+
+fn whole(grid: &llama_watch::tty::grid::Grid) -> String {
+    (0..grid.rows())
+        .map(|row| row_string(grid, row) + "\n")
+        .collect()
+}
+
+fn short_model() -> TtyModel {
+    let mut model = chart_model();
+    model.in_lines = vec!["prompt body".to_string()];
+    model.out_lines = vec!["output body".to_string()];
+    model.chart = chart_story();
+    model
+}
+
+fn assert_dashboard(grid: &llama_watch::tty::grid::Grid, at: &str) {
+    let all = whole(grid);
+    assert!(!all.contains("too small"), "{at}: refused\n{all}");
+    assert!(row_string(grid, 0).contains("GENERATING"), "{at}\n{all}");
+    assert!(
+        row_with(grid, "ACTIVITY") < row_with(grid, "RECENT"),
+        "{at}"
+    );
+    let health = grid.rows() - 2;
+    assert!(
+        row_string(grid, health).contains("snapshot"),
+        "{at}: health row\n{all}"
+    );
+    assert!(
+        is_rule_row(grid, grid.rows() - 3),
+        "{at}: health rule\n{all}"
+    );
+    assert!(!all.contains("text off"), "{at}: text is not off\n{all}");
+    assert_blank_edges(grid);
+}
+
+#[test]
+fn short_160x45_keeps_the_full_chart_and_in_out() {
+    let grid = draw(&short_model(), 160, 45);
+    assert_dashboard(&grid, "160x45");
+    let all = whole(&grid);
+    assert_eq!(recent_rows_shown(&grid), 4, "{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 9, "{all}");
+    let inn = row_with(&grid, "prompt tail");
+    let out = row_with(&grid, "OUT  live");
+    assert!(out >= inn + 4, "IN keeps 3 rows\n{all}");
+    assert!(
+        all.contains("prompt body") && all.contains("output body"),
+        "{all}"
+    );
+}
+
+#[test]
+fn short_160x40_drops_in_out_first_and_keeps_recent_and_the_chart() {
+    let grid = draw(&short_model(), 160, 40);
+    assert_dashboard(&grid, "160x40");
+    let all = whole(&grid);
+    for gone in ["prompt tail", "OUT  live", "prompt body", "output body"] {
+        assert!(!all.contains(gone), "IN/OUT still drawn: {gone}\n{all}");
+    }
+    assert!(recent_rows_shown(&grid) >= 4, "{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
+}
+
+#[test]
+fn short_screens_drop_fans_after_in_out_then_shrink_the_chart() {
+    let mut model = short_model();
+    model.fans = Some(ref_fans());
+    // 160x45: IN/OUT gone, FANS kept at the bottom, chart full.
+    let grid = draw(&model, 160, 45);
+    assert_dashboard(&grid, "160x45 fans");
+    let all = whole(&grid);
+    assert!(!all.contains("prompt tail"), "IN/OUT go before FANS\n{all}");
+    let fans = row_with(&grid, "FANS  nct6798");
+    assert_eq!(fans + 5, 45 - 3, "FANS ends on the health rule\n{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
+    // 160x40: no room for FANS under a full chart: FANS goes, chart stays.
+    let grid = draw(&model, 160, 40);
+    assert_dashboard(&grid, "160x40 fans");
+    let all = whole(&grid);
+    assert!(!all.contains("FANS"), "FANS kept over the chart\n{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
+    // Then the chart shrinks, odd heights down to 5, then hides; RECENT
+    // keeps its four rows.
+    let mut last = 13;
+    for rows in (26..40).rev() {
+        let grid = draw(&model, 160, rows);
+        let at = format!("160x{rows}");
+        assert_dashboard(&grid, &at);
+        assert!(recent_rows_shown(&grid) >= 4, "{at}\n{}", whole(&grid));
+        let h = chart_rows_below_recent(&grid);
+        assert!(h <= last, "{at}: chart grew");
+        assert!(h == 0 || (h >= 5 && h % 2 == 1), "{at}: chart {h}");
+        last = h;
+    }
+    assert_eq!(last, 0, "the chart hides at the floor");
+}
+
+#[test]
+fn floor_is_160x26_and_only_smaller_is_too_small() {
+    let grid = draw(&short_model(), 160, 26);
+    assert_dashboard(&grid, "160x26");
+    assert_eq!(recent_rows_shown(&grid), 4, "{}", whole(&grid));
+    for (cols, rows) in [(160u16, 25u16), (159, 49), (120, 30)] {
+        let grid = draw(&short_model(), cols, rows);
+        assert_eq!(
+            row_string(&grid, 0),
+            format!("llama-watch: tty too small ({cols}x{rows}, need 160x26)")
+        );
+    }
+    assert_eq!(llama_watch::tty::layout::MIN_COLS, 160);
+    assert_eq!(llama_watch::tty::layout::MIN_ROWS, 26);
+}
+
+#[test]
+fn text_off_also_draws_below_48_rows() {
+    for rows in [45u16, 40, 26] {
+        let grid = draw(&text_off_model(WatchState::Generating), 160, rows);
+        let at = format!("160x{rows} text off");
+        let all = whole(&grid);
+        assert!(!all.contains("too small"), "{at}\n{all}");
+        assert!(row_string(&grid, 0).contains("text off"), "{at}\n{all}");
+        assert!(!all.contains("LEAKED"), "{at}");
+        assert!(recent_rows_shown(&grid) >= 4, "{at}\n{all}");
+        assert_blank_edges(&grid);
+    }
+}
+
+/// Many SLOTS rows on a short screen push RECENT down; nothing spills
+/// into the health rows and nothing panics.
+#[test]
+fn many_slots_on_a_short_screen_keep_the_health_rows_clean() {
+    let mut model = short_model();
+    model.slots = (0..16)
+        .map(|id| Slot {
+            id,
+            generating: true,
+            done: 10,
+            total: 20,
+            decoded: 5,
+            ctx_prompt: None,
+            n_ctx: None,
+            ctx_history: Vec::new(),
+        })
+        .collect();
+    for rows in [26u16, 30, 40, 47] {
+        let grid = draw(&model, 160, rows);
+        let all = whole(&grid);
+        assert!(!all.contains("too small"), "160x{rows}\n{all}");
+        assert!(is_rule_row(&grid, rows - 3), "160x{rows}\n{all}");
+        let health = row_string(&grid, rows - 2);
+        assert!(health.contains("snapshot"), "160x{rows}: {health}");
+        assert!(
+            !health.contains("s1") && !health.contains("tok"),
+            "160x{rows}: {health}"
+        );
+        assert_blank_edges(&grid);
+    }
+}
+
+// ---- #9: reset reasons on the sparkline -------------------------------------
+
+use llama_watch::resets::ResetReason;
+
+/// [`ctx_story`], with the drop labelled `reason` a minute after it.
+fn labelled_story(steps: &[(u64, bool)], reason: ResetReason) -> Vec<CtxPoint> {
+    let mut history = CtxHistory::new(6);
+    let mut since: Option<usize> = None;
+    for (i, (used, busy)) in steps.iter().enumerate() {
+        history.advance(10_000);
+        if history.sample(Some(*used), *busy) {
+            since = Some(i);
+        }
+        if since.is_some_and(|at| i == at + 6) {
+            history.label(reason);
+        }
+    }
+    history.points()
+}
+
+fn labelled_model() -> TtyModel {
+    let mut model = ctx_model();
+    let mut s0 = grow(20_000, 180_000, 1_080);
+    s0.extend(grow(40_000, 96_000, 1_080));
+    let mut s1 = grow(8_000, 60_000, 1_300);
+    s1.extend(std::iter::repeat_n((0, false), 500));
+    s1.extend(grow(5_000, 120_000, 360));
+    model.slots[0].ctx_history = labelled_story(&s0, ResetReason::Compacted);
+    model.slots[1].ctx_history = labelled_story(&s1, ResetReason::Evicted);
+    model
+}
+
+#[test]
+fn reset_markers_show_their_reason_the_last_one_per_slot_and_a_legend() {
+    for (cols, rows) in [(240u16, 67u16), (286, 60), (480, 135)] {
+        let grid = draw(&labelled_model(), cols, rows);
+        assert_blank_edges(&grid);
+        let header = row_with(&grid, "ctx \u{b7} 6h");
+        let header_text = row_string(&grid, header);
+        assert!(
+            header_text.contains("c compact") && header_text.contains("e evict"),
+            "{cols}x{rows}: {header_text}"
+        );
+        for (label, mark, fg) in [
+            ("s0 gen", 'c', C16::BrightGreen),
+            ("s1 gen", 'e', C16::BrightYellow),
+        ] {
+            let row = row_with(&grid, label);
+            let (x, cells) = spark_cells(&grid, row);
+            let marks: Vec<_> = cells
+                .iter()
+                .filter(|cell| cell.ch.is_ascii_alphabetic())
+                .collect();
+            assert_eq!(marks.len(), 1, "{cols}x{rows} {label}: {marks:?}");
+            assert_eq!((marks[0].ch, marks[0].fg), (mark, fg));
+            // The last reason sits in the gap just before the sparkline.
+            let last = grid.get(x - 1, row).expect("cell");
+            assert_eq!((last.ch, last.fg), (mark, fg), "{cols}x{rows} {label}");
+            assert_eq!(grid.get(x - 2, row).expect("cell").ch, ' ');
+        }
+    }
+    // No marker, no legend and no last reason.
+    let mut quiet = ctx_model();
+    for slot in &mut quiet.slots {
+        slot.ctx_history.retain(|point| !point.reset);
+    }
+    let grid = draw(&quiet, 240, 67);
+    let header = row_with(&grid, "ctx \u{b7} 6h");
+    assert!(!row_string(&grid, header).contains("compact"));
+    let row = row_with(&grid, "s0 gen");
+    let (x, _) = spark_cells(&grid, row);
+    assert_eq!(grid.get(x - 1, row).expect("cell").ch, ' ');
 }

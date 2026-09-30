@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use llama_watch::config::{
-    ChartGlyphs, Config, ConfigError, InvalidWatchConfig, PromptView, ValidWatchConfig,
+    ChartGlyphs, Config, ConfigError, InvalidWatchConfig, PromptView, TtyFont, TtySize,
+    ValidWatchConfig,
 };
 
 fn packaging(name: &str) -> std::path::PathBuf {
@@ -70,6 +71,11 @@ fn packaged_example_parses_and_validates() {
     // T61: console blank ships as a commented example; the code default is off.
     assert!(text.contains("#blank_min = 10"), "{text}");
     assert!(text.contains("#sleep_min = 15"), "{text}");
+    // #7: the console font ships explicit; the size is a commented example.
+    assert!(text.contains("font = \"12x24\""), "{text}");
+    assert!(text.contains("#size = \"160x49\""), "{text}");
+    assert_eq!(cfg.tty.font, TtyFont::Hack12x24);
+    assert_eq!(cfg.tty.size, None);
     assert_eq!(cfg.tty.blank_min, 0);
     assert_eq!(cfg.tty.sleep_min, 0);
     assert_eq!(cfg.load.cpu_limit_w, 230.0);
@@ -283,6 +289,7 @@ enum Rule {
     CpuLimit,
     IdleWatts,
     Fans,
+    TtySize,
 }
 
 fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
@@ -315,6 +322,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::CpuLimit { .. }) => Rule::CpuLimit,
         Err(InvalidWatchConfig::IdleWatts { .. }) => Rule::IdleWatts,
         Err(InvalidWatchConfig::Fans { .. }) => Rule::Fans,
+        Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
     }
 }
 
@@ -1095,6 +1103,78 @@ fn cases() -> &'static [Case] {
             expect: Rule::SleepMin,
         },
         Case {
+            name: "tty size unset (default)",
+            nproc: 32,
+            mutate: |cfg| cfg.tty.size = None,
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "tty size at the layout floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 160,
+                    rows: 26,
+                })
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "tty size at the upper bound",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 1024,
+                    rows: 512,
+                })
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "tty size one column short of the floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 159,
+                    rows: 49,
+                })
+            },
+            expect: Rule::TtySize,
+        },
+        Case {
+            name: "tty size one row short of the floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 160,
+                    rows: 25,
+                })
+            },
+            expect: Rule::TtySize,
+        },
+        Case {
+            name: "tty size too wide",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 1025,
+                    rows: 49,
+                })
+            },
+            expect: Rule::TtySize,
+        },
+        Case {
+            name: "tty size too tall",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.tty.size = Some(TtySize {
+                    cols: 160,
+                    rows: 513,
+                })
+            },
+            expect: Rule::TtySize,
+        },
+        Case {
             name: "blank_min 60 leaves no room for sleep",
             nproc: 32,
             mutate: |cfg| {
@@ -1454,6 +1534,65 @@ fn text_off_override_clears_show_text_and_keeps_the_rest() {
     let mut back = (*off).clone();
     back.tty.show_text = true;
     assert_eq!(back, *cfg);
+}
+
+/// #7: `[tty] size = "COLSxROWS"` and `font = "12x24" | "12x22"`.
+#[test]
+fn tty_size_and_font_parse_strictly() {
+    let cfg = Config::default();
+    assert_eq!(cfg.tty.size, None);
+    assert_eq!(cfg.tty.font, TtyFont::Hack12x24);
+    let cfg = Config::from_toml("[tty]\nsize = \"160x49\"\nfont = \"12x22\"\n").expect("config");
+    assert_eq!(
+        cfg.tty.size,
+        Some(TtySize {
+            cols: 160,
+            rows: 49
+        })
+    );
+    assert_eq!(cfg.tty.font, TtyFont::Hack12x22);
+    assert!(cfg.validate(8).is_ok());
+    let cfg = Config::from_toml("[tty]\nfont = \"12x24\"\n").expect("12x24");
+    assert_eq!(cfg.tty.font, TtyFont::Hack12x24);
+    assert_eq!(TtyFont::Hack12x24.file_name(), "llama-hack-12x24.psfu");
+    assert_eq!(TtyFont::Hack12x22.file_name(), "llama-hack-12x22.psfu");
+    for bad in [
+        "\"160X49\"",
+        "\"160x\"",
+        "\"x49\"",
+        "\"160 x 49\"",
+        "\" 160x49\"",
+        "\"160x49 \"",
+        "\"+160x49\"",
+        "\"-160x49\"",
+        "\"0160x49\"",
+        "\"160x49x2\"",
+        "\"160x49; rm -rf /\"",
+        "\"65536x49\"",
+        "\"１６０x49\"",
+        "\"\"",
+        "160",
+        "[160, 49]",
+    ] {
+        let text = format!("[tty]\nsize = {bad}\n");
+        assert!(Config::from_toml(&text).is_err(), "size accepted {bad}");
+    }
+    for bad in [
+        "\"8x16\"",
+        "\"12X22\"",
+        "\"hack\"",
+        "\"/tmp/evil.psfu\"",
+        "22",
+        "\"\"",
+    ] {
+        let text = format!("[tty]\nfont = {bad}\n");
+        assert!(Config::from_toml(&text).is_err(), "font accepted {bad}");
+    }
+    let err = Config::from_toml("[tty]\nsize = \"120x30\"\n")
+        .expect("parses")
+        .validate(8)
+        .expect_err("below the layout floor");
+    assert!(err.to_string().contains("120x30"), "{err}");
 }
 
 #[test]

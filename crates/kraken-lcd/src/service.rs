@@ -397,6 +397,7 @@ where
         last_pixels: None,
         stream_slot: 0,
         guard_at: None,
+        stream_retry: None,
         phase: if input.latch_at_start {
             crit(
                 &mut input.log,
@@ -576,6 +577,9 @@ struct LoopState<S> {
     stream_slot: u8,
     /// Last stream-mode cooling check.
     guard_at: Option<Instant>,
+    /// Stream mode after `UploadFailed`: no upload before `.0`; `.1` is the
+    /// wait that set it. Cleared by a success and by a new open.
+    stream_retry: Option<(Instant, Duration)>,
     phase: Phase,
 }
 
@@ -601,6 +605,7 @@ where
             state.last_pixels = None;
             state.stream_slot = 0;
             state.guard_at = None;
+            state.stream_retry = None;
             state.sink = Some(lcd);
             state.phase = Phase::Ours;
             note_operation(state, now);
@@ -637,6 +642,23 @@ where
 
 const STREAM_GUARD: Duration = Duration::from_secs(1);
 
+/// First wait before a stream upload is retried after `UploadFailed`.
+///
+/// Doubles on each failure in a row, capped at [`STREAM_RETRY_CAP`]. Change
+/// mode needs no such wait: its policy already spaces failed attempts by
+/// `min_interval_s` (LLD Open 0f).
+const STREAM_RETRY_START: Duration = Duration::from_secs(2);
+
+/// Cap of the stream retry wait.
+const STREAM_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// The wait after one more stream `UploadFailed` in a row.
+fn next_stream_retry(last: Option<Duration>) -> Duration {
+    last.map_or(STREAM_RETRY_START, |last| {
+        last.saturating_mul(2).min(STREAM_RETRY_CAP)
+    })
+}
+
 fn stream_frame<S, Samp, Clk, Ntf, Stp, Lg, Op>(
     input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
     state: &mut LoopState<S>,
@@ -653,6 +675,9 @@ where
         return TickDev::Exit(exit);
     }
     if !matches!(state.phase, Phase::Ours) || state.watch.suppressed {
+        return TickDev::Continue;
+    }
+    if state.stream_retry.is_some_and(|(at, _)| now < at) {
         return TickDev::Continue;
     }
     let frame = render::render(view, display, input.assets);
@@ -673,9 +698,30 @@ where
             state.last_pixels = Some(frame.0.data().to_vec());
             state.policy.mark_uploaded(view, now);
             state.fail_streak = 0;
+            state.stream_retry = None;
             TickDev::Continue
         }
-        Err(SinkError::UploadFailed(_)) => count_upload_fail(state, &mut input.log, fail_limit),
+        Err(SinkError::UploadFailed(err)) => {
+            if let TickDev::Exit(exit) = count_upload_fail(state, &mut input.log, fail_limit) {
+                return TickDev::Exit(exit);
+            }
+            // Back off instead of retrying on the next frame. At 10 fps an
+            // unspaced retry spent `fail_limit` within 300 ms, so a device
+            // still settling after the previous process restored stock
+            // exited the writer (GitHub #14).
+            let wait = next_stream_retry(state.stream_retry.map(|(_, last)| last));
+            state.stream_retry = Some((now + wait, wait));
+            log::emit(
+                &mut input.log,
+                Priority::Warning,
+                &format!(
+                    "upload failed: {err}; retry in {}s ({}/{fail_limit})",
+                    wait.as_secs(),
+                    state.fail_streak
+                ),
+            );
+            TickDev::Continue
+        }
         Err(SinkError::TransferAborted) => {
             if let TickDev::Exit(exit) = count_upload_fail(state, &mut input.log, fail_limit) {
                 return TickDev::Exit(exit);
@@ -1081,6 +1127,18 @@ mod tests {
             ]
         );
         assert_eq!(next_backoff(BACKOFF_CAP), BACKOFF_CAP);
+    }
+
+    #[test]
+    fn stream_retry_doubles_until_the_cap() {
+        let mut wait = next_stream_retry(None);
+        let mut seen = vec![wait];
+        while wait < STREAM_RETRY_CAP {
+            wait = next_stream_retry(Some(wait));
+            seen.push(wait);
+        }
+        assert_eq!(seen, [2, 4, 8, 16, 30].map(Duration::from_secs));
+        assert_eq!(next_stream_retry(Some(STREAM_RETRY_CAP)), STREAM_RETRY_CAP);
     }
 
     #[test]

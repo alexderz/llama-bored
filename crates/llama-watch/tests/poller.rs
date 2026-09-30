@@ -105,6 +105,8 @@ struct World {
     slots: HashMap<String, Vec<u8>>,
     activity_status: u16,
     activity: Vec<u8>,
+    /// `/api/captures/<id>` bodies (#5).
+    captures: HashMap<String, Vec<u8>>,
     hang: bool,
 }
 
@@ -121,6 +123,7 @@ impl World {
             slots: HashMap::new(),
             activity_status: 200,
             activity: br#"{"data":[]}"#.to_vec(),
+            captures: HashMap::new(),
             hang: false,
         }
     }
@@ -262,6 +265,22 @@ fn reply(world: &mut World, path: &str) -> Action {
             reason: "OK",
             body: world.activity.clone(),
             location: None,
+        };
+    }
+    if let Some(id) = path.strip_prefix("/api/captures/") {
+        return match world.captures.get(id) {
+            Some(body) => Action::Respond {
+                status: 200,
+                reason: "OK",
+                body: body.clone(),
+                location: None,
+            },
+            None => Action::Respond {
+                status: 404,
+                reason: "Not Found",
+                body: br#"{"error":{"message":"capture not found"}}"#.to_vec(),
+                location: None,
+            },
         };
     }
     if let Some(model) = upstream_model(path, "metrics") {
@@ -879,6 +898,8 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 gen_tps: None,
                 prompt_tps: None,
                 latencies: poller::PollLatencies::default(),
+                prompt_cache: Vec::new(),
+                capture: None,
             },
         ));
     }
@@ -1328,4 +1349,377 @@ fn config_override_beats_the_launch_command() {
     thread::sleep(Duration::from_millis(600));
     let hits = server.hits();
     assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+}
+
+// ---- #10: per-model prompt and cached-prompt counters -----------------------
+
+fn cache_row(id: i64, model: &str, input: i64, cache: i64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "timestamp": format!("2026-09-29T11:00:{id:02}Z"),
+        "model": model,
+        "tokens": {"input_tokens": input, "output_tokens": 5, "cache_tokens": cache,
+                   "prompt_per_second": -1, "tokens_per_second": -1},
+        "duration_ms": 100,
+        "resp_status_code": 200
+    })
+}
+
+fn cache_page(rows: &[serde_json::Value]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "data": rows })).expect("json")
+}
+
+fn sglang_cached_metrics(prompt: u64, cached: u64) -> Vec<u8> {
+    format!(
+        "sglang:generation_tokens_total{{model_name=\"flash\"}} 10.0\n\
+sglang:prompt_tokens_total{{model_name=\"flash\"}} {prompt}.0\n\
+sglang:cached_tokens_total{{cache_source=\"device\",model_name=\"flash\"}} {cached}.0\n\
+sglang:num_running_reqs{{model_name=\"flash\"}} 0.0\n"
+    )
+    .into_bytes()
+}
+
+fn prompt_cache_of(detail: &poller::LlamaDetail, model: &str) -> Option<(u64, Option<u64>)> {
+    detail
+        .prompt_cache
+        .iter()
+        .find(|entry| entry.model == model)
+        .map(|entry| (entry.prompt, entry.cached))
+}
+
+#[test]
+fn prompt_cache_counters_come_from_activity_rows_and_sglang_metrics() {
+    let running = serde_json::to_vec(&serde_json::json!({
+        "running": [
+            {"model": "qwen", "name": "Qwen", "state": "ready", "cmd": "llama-server -m x.gguf"},
+            {"model": "flash", "state": "ready", "cmd": SGLANG_CMD}
+        ]
+    }))
+    .expect("json");
+    let mut world = World::running(running);
+    world
+        .metrics
+        .insert("qwen".to_owned(), metrics_body(100, 0.0));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_cached_metrics(10_000, 9_000));
+    // History before the watcher started is only the baseline.
+    world.activity = cache_page(&[cache_row(1, "qwen", 5_000, 0)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    // A model with no finished request yet reads 0; llama.cpp's cached
+    // counter starts with it.
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        prompt_cache_of(detail, "Qwen") == Some((0, Some(0)))
+            && prompt_cache_of(detail, "flash") == Some((0, Some(0)))
+    });
+    server.update(|world| {
+        world.activity = cache_page(&[
+            // llama.cpp timings: 69 processed plus 553 reused.
+            cache_row(4, "qwen", 69, 553),
+            // An SGLang row: /metrics counts flash, so this is skipped.
+            cache_row(3, "flash", 777, -1),
+            cache_row(2, "qwen", 1_000, 0),
+            cache_row(1, "qwen", 5_000, 0),
+        ]);
+        world
+            .metrics
+            .insert("flash".to_owned(), sglang_cached_metrics(10_500, 9_400));
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        prompt_cache_of(detail, "Qwen") == Some((1_622, Some(553)))
+            && prompt_cache_of(detail, "flash") == Some((500, Some(400)))
+    });
+    // Read again: nothing is counted twice.
+    thread::sleep(Duration::from_millis(900));
+    let (_, again) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
+    assert_eq!(prompt_cache_of(&again, "Qwen"), Some((1_622, Some(553))));
+    assert_eq!(prompt_cache_of(&again, "flash"), Some((500, Some(400))));
+    assert_eq!(detail.prompt_cache.len(), 2);
+}
+
+// ---- #9: reset reasons through the poller -----------------------------------
+
+fn ctx_slot(id_task: i64, prompt: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!([{
+        "id": 0,
+        "id_task": id_task,
+        "is_processing": true,
+        "n_ctx": 262_144,
+        "n_prompt_tokens": prompt,
+        "n_prompt_tokens_processed": prompt,
+        "next_token": [{"n_decoded": 0}],
+        "prompt": "INVENTED-SECRET-PROMPT",
+        "generated": "INVENTED-SECRET-OUTPUT"
+    }]))
+    .expect("json")
+}
+
+/// A compaction seen on `/slots`, decided by the request's activity row,
+/// with `show_text = false`: numbers only.
+#[test]
+fn a_slot_drop_is_classified_from_activity_with_text_off() {
+    let id = "qwen3.6-35b-a3b";
+    let mut world = World::running(running_model(id, "Qwen", "ready"));
+    world.metrics.insert(id.to_owned(), metrics_body(20, 1.0));
+    world.slots.insert(id.to_owned(), ctx_slot(1, 80_000));
+    world.activity = cache_page(&[cache_row(1, id, 100, 0)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(
+        server.port,
+        12,
+        4_194_304,
+        0.15,
+        "[tty]\nshow_text = false\n",
+    );
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .slots
+            .iter()
+            .any(|slot| slot.ctx_used == Some(80_000))
+    });
+    server.update(|world| {
+        world.slots.insert(id.to_owned(), ctx_slot(2, 20_000));
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .slots
+            .iter()
+            .any(|slot| slot.ctx_used == Some(20_000))
+    });
+    assert_eq!(detail.slots[0].resets.total(), 0, "waits for its row");
+    server.update(|world| {
+        world.activity = cache_page(&[cache_row(2, id, 6_000, 14_000), cache_row(1, id, 100, 0)]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail.slots.iter().any(|slot| slot.resets.total() == 1)
+    });
+    let slot = &detail.slots[0];
+    assert_eq!(slot.resets.compacted, 1);
+    assert_eq!(
+        slot.last_reset,
+        Some(llama_watch::resets::ResetReason::Compacted)
+    );
+    let kept = format!("{detail:?}{:?}", log.lines());
+    assert!(!kept.contains("SECRET"), "{kept}");
+}
+
+// ---- #5: IN/OUT from llama-swap captures ------------------------------------
+
+/// Every path the watcher may GET from llama-swap (the S17 fence, #5).
+fn allowed_path(path: &str) -> bool {
+    let upstream = path
+        .strip_prefix("/upstream/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(model, leaf)| {
+            !model.is_empty() && !model.contains("..") && matches!(leaf, "metrics" | "slots")
+        });
+    let capture = path
+        .strip_prefix("/api/captures/")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+    path == "/running" || path == "/api/metrics/activity" || upstream || capture
+}
+
+fn capture_row(id: i64, model: &str, has_capture: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "timestamp": format!("2026-09-29T12:00:{id:02}Z"),
+        "model": model,
+        "tokens": {"input_tokens": 12, "output_tokens": 5, "cache_tokens": -1,
+                   "prompt_per_second": -1, "tokens_per_second": -1},
+        "duration_ms": 100,
+        "resp_status_code": 200,
+        "has_capture": has_capture
+    })
+}
+
+fn capture_body(user: &str, response: &str) -> Vec<u8> {
+    let request = serde_json::json!({
+        "model": "flash",
+        "messages": [
+            {"role": "system", "content": "Invented system prompt."},
+            {"role": "user", "content": "An older invented question."},
+            {"role": "assistant", "content": "An older invented answer."},
+            {"role": "user", "content": user}
+        ]
+    });
+    serde_json::to_vec(&serde_json::json!({
+        "id": 1,
+        "req_path": "/v1/chat/completions",
+        "req_headers": {"X-Session-Id": "INVENTED-SESSION-HEADER"},
+        "req_body": llama_watch::capture::base64_encode(request.to_string().as_bytes()),
+        "resp_headers": {"Content-Type": "text/event-stream"},
+        "resp_body": llama_watch::capture::base64_encode(response.as_bytes()),
+    }))
+    .expect("json")
+}
+
+fn cells_text(cells: &[Cell]) -> String {
+    cells.iter().map(|cell| cell.ch).collect()
+}
+
+fn capture_hits(server: &Server) -> Vec<String> {
+    server
+        .hits()
+        .into_iter()
+        .filter(|path| path.starts_with("/api/captures/"))
+        .collect()
+}
+
+#[test]
+fn a_backend_without_slots_gets_in_and_out_from_its_newest_capture_once() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(10, 0, 0, 0.1));
+    world.activity = cache_page(&[capture_row(3, "flash", true), capture_row(2, "flash", true)]);
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Invented \"}}]}\n\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\"streamed reply\\u001b[2J.\"}}]}\n\n\
+               data: [DONE]\n\n";
+    world.captures.insert(
+        "3".to_owned(),
+        capture_body("Newest invented question?", sse),
+    );
+    world.captures.insert(
+        "2".to_owned(),
+        capture_body("Older invented question?", "{}"),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail.capture.is_some()
+    });
+    let capture = detail.capture.expect("capture");
+    assert_eq!(capture.model, "flash");
+    assert_eq!(capture.id, 3);
+    assert_eq!(cells_text(&capture.input), "Newest invented question?");
+    // The sanitiser ran: no escape byte reaches a cell.
+    assert_eq!(cells_text(&capture.output), "Invented streamed reply[2J.");
+    // The same row read again is not fetched again.
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(capture_hits(&server), vec!["/api/captures/3".to_owned()]);
+
+    // A newer row: one more GET, with a plain JSON response.
+    server.update(|world| {
+        world.activity =
+            cache_page(&[capture_row(4, "flash", true), capture_row(3, "flash", true)]);
+        world.captures.insert(
+            "4".to_owned(),
+            capture_body(
+                "Third invented question?",
+                r#"{"choices":[{"message":{"content":"A plain invented reply."}}]}"#,
+            ),
+        );
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.id == 4)
+    });
+    let capture = detail.capture.clone().expect("capture");
+    assert_eq!(cells_text(&capture.output), "A plain invented reply.");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        capture_hits(&server),
+        vec!["/api/captures/3".to_owned(), "/api/captures/4".to_owned()]
+    );
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| allowed_path(path)), "{hits:?}");
+    let kept = format!("{detail:?}{:?}", log.lines());
+    assert!(!kept.contains("INVENTED-SESSION"), "headers are never kept");
+}
+
+#[test]
+fn captures_off_oversize_and_text_off_fetch_nothing_or_keep_nothing() {
+    // No `has_capture`: llama-swap has captures off; nothing is fetched.
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(10, 0, 0, 0.1));
+    world.activity = cache_page(&[capture_row(5, "flash", false)]);
+    world.captures.insert(
+        "5".to_owned(),
+        capture_body("INVENTED-SHOULD-NOT-SHOW", "{}"),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    thread::sleep(Duration::from_millis(900));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
+    assert_eq!(detail.capture, None);
+    assert!(capture_hits(&server).is_empty());
+
+    // Oversize: read up to the cap, not parsed, logged once; nothing shown.
+    let big = format!(
+        "{{\"req_body\":\"{}\",\"resp_body\":\"\"}}",
+        "A".repeat(llama_watch::capture::CAPTURE_CAP)
+    );
+    server.update(|world| {
+        world.activity = cache_page(&[capture_row(6, "flash", true)]);
+        world.captures.insert("6".to_owned(), big.into_bytes());
+    });
+    thread::sleep(Duration::from_millis(1_200));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
+    assert_eq!(detail.capture, None);
+    assert_eq!(capture_hits(&server), vec!["/api/captures/6".to_owned()]);
+    let lines = log.lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("captures:"))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+
+    // Text off: never a capture GET, even with a fresh captured row.
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(10, 0, 0, 0.1));
+    world.activity = cache_page(&[capture_row(7, "flash", true)]);
+    world
+        .captures
+        .insert("7".to_owned(), capture_body("INVENTED-SECRET-IN", "{}"));
+    let quiet = Server::start(world);
+    let config = watch_with(
+        quiet.port,
+        12,
+        4_194_304,
+        0.15,
+        "[tty]\nshow_text = false\n",
+    );
+    let (_poller2, rx2) = spawn(&config, &log);
+    thread::sleep(Duration::from_millis(900));
+    let (_, detail) = wait_msg(&rx2, Duration::from_secs(1), |_, _| true);
+    assert_eq!(detail.capture, None);
+    assert!(capture_hits(&quiet).is_empty(), "{:?}", quiet.hits());
+}
+
+/// A llama.cpp model has `/slots`: its rows never trigger a capture GET.
+#[test]
+fn a_llamacpp_model_never_fetches_captures() {
+    let id = "qwen3.6-35b-a3b";
+    let mut world = World::running(running_model(id, "Qwen", "ready"));
+    world.metrics.insert(id.to_owned(), metrics_body(20, 0.0));
+    world.activity = cache_page(&[capture_row(9, id, true)]);
+    world
+        .captures
+        .insert("9".to_owned(), capture_body("INVENTED", "{}"));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, _rx) = spawn(&config, &log);
+    thread::sleep(Duration::from_millis(900));
+    assert!(capture_hits(&server).is_empty());
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| allowed_path(path)), "{hits:?}");
 }
