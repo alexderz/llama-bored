@@ -13,16 +13,34 @@ use llama_watch::tty::setup::{
 struct Record {
     ran: Vec<Step>,
     fail: Option<&'static str>,
+    /// setfont fails this many times, then works (the boot race).
+    font_fails: usize,
+    nudges: usize,
+    paused: std::time::Duration,
 }
 
 impl Runner for Record {
     fn run(&mut self, step: &Step) -> Result<(), String> {
         self.ran.push(step.clone());
+        if step.program == SETFONT && self.font_fails > 0 {
+            self.font_fails -= 1;
+            return Err("setfont: console not ready".to_owned());
+        }
         if self.fail == Some(step.program) {
             Err(format!("{} failed", step.program))
         } else {
             Ok(())
         }
+    }
+
+    fn nudge(&mut self) -> Result<(), String> {
+        assert!(self.ran.is_empty(), "the nudge comes before any program");
+        self.nudges += 1;
+        Ok(())
+    }
+
+    fn pause(&mut self, d: std::time::Duration) {
+        self.paused += d;
     }
 }
 
@@ -137,7 +155,13 @@ fn a_failed_font_skips_the_size_chosen_for_it() {
         ..Record::default()
     };
     assert_eq!(run_setup(&cfg.0, 8, &mut rec), 1);
-    assert_eq!(rec.ran, [setfont("llama-hack-12x24.psfu")]);
+    // #22: the font is retried until FONT_WAIT; the size never runs.
+    assert!(!rec.ran.is_empty());
+    assert!(
+        rec.ran
+            .iter()
+            .all(|s| *s == setfont("llama-hack-12x24.psfu"))
+    );
     let mut rec = Record {
         fail: Some(STTY),
         ..Record::default()
@@ -176,4 +200,35 @@ fn binary_tty_setup_usage_exits_2() {
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("llama-watch tty-setup --config PATH"), "{err}");
+}
+
+/// At boot fbcon may still defer its take-over: tty-setup nudges tty11 first,
+/// then retries the font until it loads, then sets the size.
+#[test]
+fn setup_nudges_then_retries_the_font_until_the_console_is_ready() {
+    let cfg = TempConfig::new("boot-race", "[tty]\nfont = \"12x22\"\nsize = \"160x49\"\n");
+    let mut rec = Record {
+        font_fails: 3,
+        ..Record::default()
+    };
+    assert_eq!(run_setup(&cfg.0, 8, &mut rec), 0);
+    assert_eq!(rec.nudges, 1);
+    let fonts = rec.ran.iter().filter(|s| s.program == SETFONT).count();
+    assert_eq!(fonts, 4, "three failures, then success");
+    assert_eq!(rec.ran.last().map(|s| s.program), Some(STTY));
+    assert_eq!(rec.paused, llama_watch::tty::setup::FONT_RETRY * 3);
+}
+
+/// A font that never loads gives up after FONT_WAIT and skips the size.
+#[test]
+fn setup_gives_up_on_the_font_after_the_wait_and_skips_the_size() {
+    let cfg = TempConfig::new("never", "[tty]\nfont = \"12x22\"\nsize = \"160x49\"\n");
+    let mut rec = Record {
+        fail: Some(SETFONT),
+        ..Record::default()
+    };
+    assert_eq!(run_setup(&cfg.0, 8, &mut rec), 1);
+    assert!(rec.ran.iter().all(|s| s.program == SETFONT));
+    assert!(rec.paused < llama_watch::tty::setup::FONT_WAIT);
+    assert!(rec.paused >= llama_watch::tty::setup::FONT_WAIT - llama_watch::tty::setup::FONT_RETRY);
 }

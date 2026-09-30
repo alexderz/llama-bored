@@ -10,6 +10,13 @@
 //! /usr/bin/stty -F /dev/tty11 cols <C> rows <R>     (only with tty.size)
 //! ```
 //!
+//! At boot the kernel may still be deferring the framebuffer console's
+//! take-over (`fbcon: Deferring console take-over`) until something is
+//! written to a console; `setfont` fails until then ("Unable to load such
+//! font with such kernel version"). So tty-setup first writes one space and
+//! a carriage return to tty11 (the watcher clears the screen right after),
+//! then tries the font every [`FONT_RETRY`] for up to [`FONT_WAIT`].
+//!
 //! No shell runs and no text from the file reaches an argument: the font is
 //! a fixed file name per [`TtyFont`] variant and the size is two validated
 //! integers. The environment is cleared. The watcher itself still only asks
@@ -27,6 +34,14 @@ pub const FONT_DIR: &str = "/usr/local/share/llama-bored";
 pub const SETFONT: &str = "/usr/bin/setfont";
 /// coreutils' stty.
 pub const STTY: &str = "/usr/bin/stty";
+
+/// Written to tty11 before the font: printable output ends a deferred
+/// framebuffer console take-over.
+pub const NUDGE: &[u8] = b" \r";
+/// How long the font step keeps trying after the nudge.
+pub const FONT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Pause between font attempts.
+pub const FONT_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One program and its arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +92,10 @@ fn size_step(size: TtySize) -> Step {
 pub trait Runner {
     /// `Err` carries a one-line reason for the journal.
     fn run(&mut self, step: &Step) -> Result<(), String>;
+    /// Write [`NUDGE`] to tty11. `Err` is logged; setup carries on.
+    fn nudge(&mut self) -> Result<(), String>;
+    /// Wait between font attempts.
+    fn pause(&mut self, d: std::time::Duration);
 }
 
 /// Spawns the program with an empty environment and waits for it.
@@ -95,6 +114,19 @@ impl Runner for System {
         } else {
             Err(format!("{} exited with {status}", step.program))
         }
+    }
+
+    fn nudge(&mut self) -> Result<(), String> {
+        use std::io::Write;
+        let mut tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open(TTY)
+            .map_err(|err| format!("{TTY}: {err}"))?;
+        tty.write_all(NUDGE).map_err(|err| format!("{TTY}: {err}"))
+    }
+
+    fn pause(&mut self, d: std::time::Duration) {
+        std::thread::sleep(d);
     }
 }
 
@@ -126,7 +158,27 @@ pub fn run_setup(path: &Path, nproc: u32, runner: &mut impl Runner) -> i32 {
             return 2;
         }
     };
-    for step in steps(&config.tty) {
+    if let Err(reason) = runner.nudge() {
+        eprintln!("tty-setup: nudge: {reason}");
+    }
+    let mut steps = steps(&config.tty).into_iter();
+    let Some(font) = steps.next() else { return 0 };
+    let tries = (FONT_WAIT.as_millis() / FONT_RETRY.as_millis()).max(1);
+    let mut last = Ok(());
+    for attempt in 0..tries {
+        if attempt > 0 {
+            runner.pause(FONT_RETRY);
+        }
+        last = runner.run(&font);
+        if last.is_ok() {
+            break;
+        }
+    }
+    if let Err(reason) = last {
+        eprintln!("tty-setup: {reason} (after {tries} tries)");
+        return 1;
+    }
+    for step in steps {
         if let Err(reason) = runner.run(&step) {
             eprintln!("tty-setup: {reason}");
             return 1;
