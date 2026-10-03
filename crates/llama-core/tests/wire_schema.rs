@@ -52,6 +52,7 @@ fn valid() -> WireSnapshot {
                     prompt_tokens: None,
                     prompt_cached_tokens: None,
                     slot_ctx: Vec::new(),
+                    engine: None,
                 },
                 ModelWire {
                     backend: None,
@@ -68,6 +69,7 @@ fn valid() -> WireSnapshot {
                     prompt_tokens: None,
                     prompt_cached_tokens: None,
                     slot_ctx: Vec::new(),
+                    engine: None,
                 },
             ],
         },
@@ -131,6 +133,7 @@ fn sanitize_wire_names_pass_validate() {
             prompt_tokens: None,
             prompt_cached_tokens: None,
             slot_ctx: Vec::new(),
+            engine: None,
         }];
         assert_eq!(validate(&snap), Ok(()), "raw={raw:?} name={name:?}");
         assert!(
@@ -453,6 +456,7 @@ fn model_count_and_loaded_state() {
             prompt_tokens: None,
             prompt_cached_tokens: None,
             slot_ctx: Vec::new(),
+            engine: None,
         })
         .collect();
     assert_eq!(validate(&snap), Ok(()));
@@ -472,6 +476,7 @@ fn model_count_and_loaded_state() {
         prompt_tokens: None,
         prompt_cached_tokens: None,
         slot_ctx: Vec::new(),
+        engine: None,
     });
     assert_eq!(validate(&snap), Err(WireError::TooManyModels));
 
@@ -500,6 +505,7 @@ fn name_length_and_canonical_form() {
         prompt_tokens: None,
         prompt_cached_tokens: None,
         slot_ctx: Vec::new(),
+        engine: None,
     }];
     assert_eq!(validate(&snap), Ok(()));
 
@@ -530,6 +536,8 @@ fn bonsai_detail() -> wire::ModelDetail {
         kv_v: Some("q8_0".to_owned()),
         quant: Some("PTQ1_0".to_owned()),
         fa: Some(true),
+        kv_block: None,
+        prefix_cache: None,
     }
 }
 
@@ -813,6 +821,8 @@ fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
             kv_v: Some("b".repeat(16)),
             quant: Some("c".repeat(16)),
             fa: Some(true),
+            kv_block: Some(llama_core::detail::MAX_KV_BLOCK),
+            prefix_cache: Some(false),
         }),
         backend: Some(wire::Backend::LlamaCpp),
         running: Some(wire::MAX_REQS),
@@ -824,6 +834,7 @@ fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
         prompt_tokens: None,
         prompt_cached_tokens: None,
         slot_ctx: Vec::new(),
+        engine: None,
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
     snap.host.load_pct = Some(12.345_678);
@@ -1058,6 +1069,8 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
             kv_v: Some("b".repeat(16)),
             quant: Some("c".repeat(16)),
             fa: Some(true),
+            kv_block: Some(llama_core::detail::MAX_KV_BLOCK),
+            prefix_cache: Some(false),
         }),
         backend: Some(wire::Backend::LlamaCpp),
         running: Some(wire::MAX_REQS),
@@ -1069,6 +1082,19 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
         prompt_tokens: Some(u64::MAX),
         prompt_cached_tokens: Some(u64::MAX),
         slot_ctx: Vec::new(),
+        // #31: every engine number, at its widest.
+        engine: Some(wire::EngineWire {
+            spec_accept: Some(0.123_456_7),
+            spec_len: Some(12.345_678),
+            spec_drafts: Some(u64::MAX),
+            spec_draft_tokens: Some(u64::MAX),
+            spec_accepted_tokens: Some(u64::MAX),
+            preemptions: Some(u64::MAX),
+            sleeping: Some(false),
+            ttft_s: Some(1_234.567_8),
+            itl_s: Some(0.012_345_67),
+            e2e_s: Some(3_599.123_4),
+        }),
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
     snap.ai.models[0].slot_ctx = (0..wire::MAX_SLOT_CTX as u16)
@@ -1091,4 +1117,65 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
         bytes.len()
     );
     assert!(parse_validated(&bytes).is_ok());
+}
+
+/// #31: engine numbers are optional, bounded, and an older reader's
+/// unknown key.
+#[test]
+fn engine_numbers_are_optional_and_bounded() {
+    let engine = || wire::EngineWire {
+        spec_accept: Some(0.78),
+        spec_len: Some(2.9),
+        spec_drafts: Some(100),
+        spec_draft_tokens: Some(300),
+        spec_accepted_tokens: Some(234),
+        preemptions: Some(3),
+        sleeping: Some(false),
+        ttft_s: Some(0.42),
+        itl_s: Some(0.031),
+        e2e_s: Some(12.5),
+    };
+    let mut snap = valid();
+    snap.ai.models[0].engine = Some(engine());
+    let bytes = to_json(&snap).expect("encode");
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(text.contains(r#""engine":{"spec_accept":0.78"#), "{text}");
+    assert_eq!(parse_validated(&bytes).expect("valid"), snap);
+    // Absent and empty both read as no numbers; an unknown inner key is ignored.
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","engine":{"sleeping":true,"spec_tree":[1,2]}"#,
+    );
+    let read = parse_validated(&json).expect("unknown engine key ignored");
+    assert_eq!(
+        read.ai.models[0].engine.as_ref().and_then(|e| e.sleeping),
+        Some(true)
+    );
+    let cases: [Mutate; 8] = [
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(1.01),
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(f32::NAN),
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(0.5),
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(65.0),
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_accepted_tokens = Some(301),
+        |s| s.ai.models[0].engine.as_mut().unwrap().spec_draft_tokens = None,
+        |s| s.ai.models[0].engine.as_mut().unwrap().ttft_s = Some(-0.1),
+        |s| s.ai.models[0].engine.as_mut().unwrap().e2e_s = Some(3600.5),
+    ];
+    for (i, bad) in cases.into_iter().enumerate() {
+        let mut snap = valid();
+        snap.ai.models[0].engine = Some(engine());
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+    // KV block size and prefix caching ride in the detail.
+    let mut snap = valid();
+    snap.ai.models[0].detail = Some(wire::ModelDetail {
+        kv_block: Some(16),
+        prefix_cache: Some(true),
+        ..wire::ModelDetail::default()
+    });
+    assert_eq!(validate(&snap), Ok(()));
+    snap.ai.models[0].detail.as_mut().unwrap().kv_block = Some(0);
+    assert_eq!(validate(&snap), Err(WireError::Detail));
 }

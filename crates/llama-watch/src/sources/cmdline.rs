@@ -338,6 +338,8 @@ mod tests {
                 kv_v: Some("q8_0".to_owned()),
                 quant: Some("PTQ1_0".to_owned()),
                 fa: Some(true),
+                kv_block: None,
+                prefix_cache: None,
             }
         );
         let debug = format!("{detail:?}");
@@ -483,6 +485,8 @@ mod tests {
                 kv_v: Some("fp8_e4m3".to_owned()),
                 quant: Some("exl3".to_owned()),
                 fa: None,
+                kv_block: None,
+                prefix_cache: None,
             }
         );
         let debug = format!("{detail:?}");

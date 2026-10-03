@@ -2,7 +2,10 @@
 //! configured loopback URL (`llama.url` must be a loopback IP literal):
 //! `/running`, `/upstream/<model>/metrics`, `/upstream/<model>/slots`,
 //! `/api/metrics/activity` and, since #5, `/api/captures/<id>`. A new
-//! endpoint fails this scan until it is added here on purpose.
+//! endpoint fails this scan until it is added here on purpose. #31's
+//! backend detection reuses `/upstream/<model>/metrics`: no new path.
+//! `tests/s31_ready_gate.rs` pins at runtime that no upstream path is
+//! requested for a model `/running` does not list as `ready`.
 
 use std::path::PathBuf;
 
@@ -138,4 +141,44 @@ fn the_scanner_finds_literals_in_calls() {
         call_literals(code, "upstream"),
         vec![vec!["slots".to_owned()]]
     );
+}
+
+#[test]
+fn upstream_reads_come_from_the_ready_list_only() {
+    let poller = source("src/poller.rs");
+    let body = |name: &str| -> String {
+        poller
+            .split(&format!("fn {name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name}"))
+            .split("\n    fn ")
+            .next()
+            .expect("body")
+            .to_owned()
+    };
+    // Only `ready` entries of a good `/running` read join the list.
+    let running = body("poll_running");
+    assert!(running.contains(r#"if info.state != "ready" {"#));
+    assert!(running.contains("self.ready.clear();"));
+    let fill = running.find("self.ready.push(").expect("push");
+    let gate = running
+        .find("if self.running_up {")
+        .expect("running_up gate");
+    assert!(gate < fill);
+    // #31: the probe walks that list before its one GET, at the server cap.
+    let probe = body("probe_backends");
+    let from_ready = probe
+        .find("self\n            .ready")
+        .expect("probe reads self.ready");
+    let get = probe.find("get_exact(").expect("GET");
+    assert!(from_ready < get);
+    assert!(probe.contains("SERVER_METRICS_CAP"));
+    assert!(probe.contains("upstream(&self.limits.url, &id, \"metrics\")"));
+    // Metrics and slots GETs, likewise, start from `self.ready`.
+    for name in ["poll_metrics", "poll_slots"] {
+        let text = body(name);
+        let from_ready = text.find(".ready").unwrap_or(usize::MAX);
+        let get = text.find("get_").expect("GET");
+        assert!(from_ready < get, "{name}");
+    }
 }

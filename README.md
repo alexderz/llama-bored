@@ -127,6 +127,9 @@ falls back to utilisation.
 | `llamabored_slot_ctx_resets_total` | `name`, `full_name`, `slot`, `reason` | Context drops by best-guess reason (compacted, new, evicted, unknown) |
 | `llamabored_model_prompt_tokens_total`, `_model_prompt_cached_tokens_total` | `name`, `full_name` | Prompt tokens and the cached part; hit ratio = `rate(cached) / rate(total)` |
 | `llamabored_model_requests_running`, `_requests_queued`, `_kv_cache_usage_ratio`, `_cache_hit_ratio` | `name`, `full_name` | SGLang / vLLM request and cache gauges |
+| `llamabored_model_spec_acceptance_ratio`, `_spec_accepted_length`; `_spec_drafts_total`, `_spec_draft_tokens_total`, `_spec_accepted_tokens_total` | `name`, `full_name` | Speculative decoding (vLLM, SGLang) |
+| `llamabored_model_ttft_seconds`, `_itl_seconds`, `_e2e_latency_seconds` | `name`, `full_name` | Mean time to first token, inter-token and request latency over the last window |
+| `llamabored_model_preemptions_total`, `_sleeping`, `_kv_block_size_tokens`, `_prefix_caching` | `name`, `full_name` | vLLM preemptions, engine sleep, cache config |
 | `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
 | `llamabored_source_up`, `llamabored_source_latency_seconds` | `source` | Health of each watcher source (llama-swap, running, slots, metrics, activity, gpu, hwmon, proc) |
 | `llamabored_snapshot_up`, `_snapshot_stale`, `_snapshot_age_seconds`, `_snapshot_seq` | | Snapshot freshness |
@@ -139,12 +142,16 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 |---|---|
 | llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text, the tuning line |
 | SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
-| vLLM | The same from `vllm:*` metrics; tuning line from its flags; IN/OUT from llama-swap captures |
+| vLLM | The same from `vllm:*` metrics, plus speculative-decoding acceptance (`spec 78 %`, also on the LCD), mean TTFT, inter-token and request latency, preemptions, and the KV dtype, block size and prefix caching from `cache_config_info`; IN/OUT from llama-swap captures |
 | Strata (`serve/server.py --engine strata`) | tok/s, running and queued requests (one at a time) and context from its JSON `/metrics`; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
 | Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
 
-A llama.cpp server started through a wrapper script, without `llama-server`
-in its command, needs `"model-id" = "llamacpp"` under `[llama.backends]`.
+When the launch command does not name the server (a container whose image
+starts it, or a wrapper script), llama-watch reads that model's `/metrics`
+once while it is loaded and recognises the server by its metric names
+(`vllm:`, `sglang:`, `llamacpp:`). It only ever reads models llama-swap
+reports as `ready`, so it never makes llama-swap load one.
+`[llama.backends]` overrides the detection.
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
 controller are optional; missing sources show "—".

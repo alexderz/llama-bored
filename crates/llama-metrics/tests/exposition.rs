@@ -357,7 +357,7 @@ fn model_labels_round_trip_through_the_parser() {
         .filter(|(n, _, _)| n == "llamabored_model_loaded")
         .map(|(_, l, _)| l)
         .collect();
-    assert_eq!(models.len(), 3);
+    assert_eq!(models.len(), 4);
     let qwen = models
         .iter()
         .find(|l| l[0].1 == "Qwen3-Coder\u{2026}")
@@ -386,6 +386,13 @@ fn model_labels_round_trip_through_the_parser() {
     assert_eq!(bonsai[6].1, "sglang");
     let tiny = models.iter().find(|l| l[0].1 == "tiny").expect("tiny");
     assert!(tiny[2..6].iter().all(|(_, v)| v.is_empty()), "{tiny:?}");
+    // #31: a vLLM model's KV dtype from cache_config_info is its kv label.
+    let vllm = models
+        .iter()
+        .find(|l| l[0].1 == "qwen3.8-27b")
+        .expect("vllm");
+    assert_eq!(vllm[3].1, "fp8_e4m3");
+    assert_eq!(vllm[6].1, "vllm");
 }
 
 #[test]
@@ -423,7 +430,7 @@ fn duplicate_models_export_one_series() {
         .lines()
         .filter(|l| l.starts_with("llamabored_model_loaded{"))
         .count();
-    assert_eq!(loaded, 3);
+    assert_eq!(loaded, 4);
     let ctx = text
         .lines()
         .filter(|l| l.starts_with("llamabored_model_ctx_size_tokens{"))
@@ -480,6 +487,8 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.detail.kv_v",
         "ai.models.detail.quant",
         "ai.models.detail.fa",
+        "ai.models.detail.kv_block",
+        "ai.models.detail.prefix_cache",
         "ai.models.backend",
         "ai.models.running",
         "ai.models.queued",
@@ -497,6 +506,17 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.slot_ctx.resets.new",
         "ai.models.slot_ctx.resets.evicted",
         "ai.models.slot_ctx.resets.unknown",
+        "ai.models.engine",
+        "ai.models.engine.spec_accept",
+        "ai.models.engine.spec_len",
+        "ai.models.engine.spec_drafts",
+        "ai.models.engine.spec_draft_tokens",
+        "ai.models.engine.spec_accepted_tokens",
+        "ai.models.engine.preemptions",
+        "ai.models.engine.sleeping",
+        "ai.models.engine.ttft_s",
+        "ai.models.engine.itl_s",
+        "ai.models.engine.e2e_s",
         "tokens",
         "tokens.decoded_total",
         "tokens.prompt_total",
@@ -679,6 +699,45 @@ const EXPORTED: &[(&str, &str)] = &[
     (
         "ai.models.prompt_cached_tokens",
         "llamabored_model_prompt_cached_tokens_total",
+    ),
+    (
+        "ai.models.detail.kv_block",
+        "llamabored_model_kv_block_size_tokens",
+    ),
+    (
+        "ai.models.detail.prefix_cache",
+        "llamabored_model_prefix_caching",
+    ),
+    (
+        "ai.models.engine.spec_accept",
+        "llamabored_model_spec_acceptance_ratio",
+    ),
+    (
+        "ai.models.engine.spec_len",
+        "llamabored_model_spec_accepted_length",
+    ),
+    (
+        "ai.models.engine.spec_drafts",
+        "llamabored_model_spec_drafts_total",
+    ),
+    (
+        "ai.models.engine.spec_draft_tokens",
+        "llamabored_model_spec_draft_tokens_total",
+    ),
+    (
+        "ai.models.engine.spec_accepted_tokens",
+        "llamabored_model_spec_accepted_tokens_total",
+    ),
+    (
+        "ai.models.engine.preemptions",
+        "llamabored_model_preemptions_total",
+    ),
+    ("ai.models.engine.sleeping", "llamabored_model_sleeping"),
+    ("ai.models.engine.ttft_s", "llamabored_model_ttft_seconds"),
+    ("ai.models.engine.itl_s", "llamabored_model_itl_seconds"),
+    (
+        "ai.models.engine.e2e_s",
+        "llamabored_model_e2e_latency_seconds",
     ),
     ("ai.models.slot_ctx.slot", "llamabored_slot_ctx_used_tokens"),
     ("ai.models.slot_ctx.used", "llamabored_slot_ctx_used_tokens"),

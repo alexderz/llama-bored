@@ -3309,6 +3309,43 @@ fn dump_sglang_goldens() {
     }
 }
 
+/// #31: a containerised vLLM found by its metrics: the cache facts on the
+/// tuning line, the engine numbers on its backend line in SLOTS.
+fn vllm_model() -> TtyModel {
+    let mut model = sglang_model();
+    model.model_name = "qwen3.8-27b".to_string();
+    model.model_detail = "vllm · kv fp8_e4m3 · block 16 · prefix on".to_string();
+    model.backend_lines = vec![
+        "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3"
+            .to_string(),
+    ];
+    for req in &mut model.requests {
+        req.model = "qwen3.8-27b".to_string();
+    }
+    model
+}
+
+const VLLM_GOLDENS: [(&str, u16, u16); 2] =
+    [("vllm-240.json", 240, 67), ("vllm-160.json", 160, 48)];
+
+#[test]
+fn vllm_goldens_match_character_and_colour() {
+    for (name, _, _) in VLLM_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &vllm_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #31 vLLM goldens"]
+fn dump_vllm_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in VLLM_GOLDENS {
+        let grid = draw(&vllm_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write vllm golden");
+    }
+}
+
 #[test]
 fn sglang_frame_names_the_backend_and_its_gauges() {
     let model = sglang_model();

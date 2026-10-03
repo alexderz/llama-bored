@@ -135,7 +135,14 @@ fn plan_status(view: &View, cache: &GlyphCache, geom: &LayoutGeometry) -> Status
         };
     }
     if view.models.len() == 1 {
-        return plan_model(cache, &view.models[0], view.detail.as_ref(), geom);
+        let spec = view.spec_permille.map(llama_core::backend::spec_text);
+        return plan_model(
+            cache,
+            &view.models[0],
+            view.detail.as_ref(),
+            spec.as_deref(),
+            geom,
+        );
     }
     single_line(cache, &count_label(view), geom)
 }
@@ -163,19 +170,23 @@ fn single_line(cache: &GlyphCache, text: &str, geom: &LayoutGeometry) -> Status 
 /// This is the accepted "Head & tail" design (T51 V1). The name fits one
 /// line, else the most even two-line split at a space, else `head…` over
 /// `tail`: the longest word prefix and the longest word suffix that fit.
-/// The middle is what gets dropped; the end is never cut.
+/// The middle is what gets dropped; the end is never cut. A server that
+/// reports speculative decoding adds `spec 78 %` to the detail line (#31),
+/// which then shows even without other detail.
 fn plan_model(
     cache: &GlyphCache,
     name: &str,
     detail: Option<&ModelDetail>,
+    spec: Option<&str>,
     geom: &LayoutGeometry,
 ) -> Status {
-    let (single, pair) = if detail.is_some() {
+    let has_line = detail.is_some() || spec.is_some();
+    let (single, pair) = if has_line {
         (geom.name_single_baseline, geom.name_baselines)
     } else {
         (geom.model_baseline, geom.stack_baselines)
     };
-    let px = if detail.is_some() {
+    let px = if has_line {
         geom.name_px
     } else {
         geom.model_px
@@ -194,11 +205,12 @@ fn plan_model(
         .zip(&baselines)
         .map(|(text, baseline)| text_line(text, px, *baseline, geom))
         .collect();
-    let brain = match detail {
-        Some(_) if geom.model_middle => brain_above(cache, &out, geom),
-        _ => fixed_brain(geom),
+    let brain = if has_line && geom.model_middle {
+        brain_above(cache, &out, geom)
+    } else {
+        fixed_brain(geom)
     };
-    if let Some(detail) = detail {
+    if has_line {
         let fits_detail = |text: &str| {
             line_fits_at(
                 cache,
@@ -209,7 +221,7 @@ fn plan_model(
                 geom.detail_px,
             )
         };
-        let text = llama_core::detail::fitted(detail, fits_detail);
+        let text = llama_core::detail::fitted_with(detail, spec, fits_detail);
         if !text.is_empty() {
             out.push(StatusLine {
                 text,

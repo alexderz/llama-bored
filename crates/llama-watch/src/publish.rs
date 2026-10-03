@@ -14,13 +14,14 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use llama_core::backend::EngineStats;
 use llama_core::detail::{self, MAX_FULL_NAME_CHARS};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire, SlotResetsWire, Sources,
-    Tokens, WireError, WireSnapshot,
+    self, Ai, AiWire, EngineWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire,
+    SlotResetsWire, Sources, Tokens, WireError, WireSnapshot,
 };
 
 use crate::resets::ResetCounts;
@@ -375,6 +376,7 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                         prompt_tokens,
                         prompt_cached_tokens,
                         slot_ctx,
+                        engine: gauges.and_then(|info| engine_of(&info.engine)),
                     }
                 })
                 .collect(),
@@ -418,6 +420,33 @@ fn slot_ctx_of(rows: &[SlotCtx], model: &str, left: &mut usize) -> Vec<SlotCtxWi
     out.truncate(*left);
     *left -= out.len();
     out
+}
+
+/// The wire form of a model's engine numbers (#31); `None` when it has
+/// none. Values outside the wire's ranges are left out, and accepted spec
+/// tokens never exceed drafted ones.
+fn engine_of(stats: &EngineStats) -> Option<EngineWire> {
+    let seconds = |us: Option<u32>| {
+        us.map(|us| (f64::from(us) / 1e6) as f32)
+            .filter(|s| (0.0..=wire::MAX_ENGINE_LATENCY_S as f32).contains(s))
+    };
+    let counts = stats.spec_counts;
+    let engine = EngineWire {
+        spec_accept: stats.spec_permille.and_then(ratio),
+        spec_len: stats
+            .spec_len_centi
+            .map(|centi| f32::from(centi) / 100.0)
+            .filter(|len| (1.0..=wire::MAX_SPEC_LEN as f32).contains(len)),
+        spec_drafts: counts.map(|c| c.drafts),
+        spec_draft_tokens: counts.map(|c| c.draft_tokens),
+        spec_accepted_tokens: counts.map(|c| c.accepted.min(c.draft_tokens)),
+        preemptions: stats.preemptions,
+        sleeping: stats.sleeping,
+        ttft_s: seconds(stats.ttft_us),
+        itl_s: seconds(stats.itl_us),
+        e2e_s: seconds(stats.e2e_us),
+    };
+    (engine != EngineWire::default()).then_some(engine)
 }
 
 fn ratio(permille: u16) -> Option<f32> {

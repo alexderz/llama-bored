@@ -112,6 +112,7 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
                 prompt_tokens: None,
                 prompt_cached_tokens: None,
                 slot_ctx: Vec::new(),
+                engine: None,
             }],
         },
         tokens: Tokens {
@@ -498,4 +499,41 @@ fn full_name_and_detail_are_copied_and_absent_from_an_older_watcher() {
     assert_eq!(snap.models[0].name, "Qwen 35B");
     assert_eq!(snap.models[0].full_name, None);
     assert_eq!(snap.models[0].detail, None);
+}
+
+/// #31: the LCD takes only the speculative acceptance from a model's
+/// engine numbers; everything else in them stays unread.
+#[test]
+fn spec_acceptance_is_the_only_engine_number_read() {
+    let scratch = Scratch::new("engine");
+    let mut snapshot = wire(7, 3, NOW_NS);
+    snapshot.ai.models[0].backend = Some(wire::Backend::Vllm);
+    snapshot.ai.models[0].engine = Some(wire::EngineWire {
+        spec_accept: Some(0.781),
+        spec_len: Some(2.9),
+        preemptions: Some(3),
+        ttft_s: Some(0.4),
+        ..wire::EngineWire::default()
+    });
+    write_snap(&scratch.snap(), &snapshot);
+    let snap = sample(&mut reader(&scratch, MemLog::default()));
+    let info = snap.models[0].backend.expect("spec carried");
+    assert_eq!(info.kind, wire::Backend::Vllm);
+    assert_eq!(
+        info.engine,
+        llama_core::backend::EngineStats {
+            spec_permille: Some(781),
+            ..llama_core::backend::EngineStats::default()
+        }
+    );
+    assert_eq!(info.running, None);
+
+    let none = Scratch::new("engine-none");
+    snapshot.ai.models[0].engine = Some(wire::EngineWire {
+        sleeping: Some(true),
+        ..wire::EngineWire::default()
+    });
+    write_snap(&none.snap(), &snapshot);
+    let snap = sample(&mut reader(&none, MemLog::default()));
+    assert_eq!(snap.models[0].backend, None, "no spec, no backend");
 }

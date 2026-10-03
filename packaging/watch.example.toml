@@ -31,10 +31,16 @@ output_tail_chars = 24576           # 256..=32768
 # llama.cpp has /slots (SLOTS, IN/OUT text). SGLang (start it with
 # --enable-metrics) and vLLM give tok/s, running/queued requests and KV fill
 # from /metrics; Strata gives tok/s, running/queued and ctx from its JSON
-# /metrics (not with --api-key: llama-bored keeps no keys). Without /metrics,
-# and for "openai", tokens are counted from llama-swap's activity log at the
-# end of each request. Override a wrong guess by llama-swap model id (at most
-# 32 entries; ids that are not loaded are fine):
+# /metrics (not with --api-key: llama-bored keeps no keys). vLLM also gives
+# speculative-decoding acceptance, preemptions, sleep, TTFT/ITL/request
+# latency and its KV dtype, block size and prefix caching. A command that
+# names no server (a container whose image runs vllm serve, a wrapper script)
+# gets one /metrics read per load once llama-swap lists it as ready; its
+# metric prefix (vllm:, sglang:, llamacpp:) picks the server, else it stays
+# "openai". Without /metrics, and for "openai", tokens are counted from
+# llama-swap's activity log at the end of each request. Override a wrong guess
+# by llama-swap model id (at most 32 entries; ids that are not loaded are
+# fine; "openai" here also skips the /metrics read):
 #[llama.backends]
 #"my-sglang-model" = "sglang"
 

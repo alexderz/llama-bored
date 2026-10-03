@@ -66,6 +66,33 @@
       {
         "name": "tiny",
         "state": "other"
+      },
+      {
+        "name": "qwen3.8-27b",
+        "state": "ready",
+        "backend": "vllm",
+        "running": 1,
+        "queued": 0,
+        "kv_fill": 0.5,
+        "cache_hit": 0.75,
+        "detail": {
+          "kv_k": "fp8_e4m3",
+          "kv_v": "fp8_e4m3",
+          "kv_block": 16,
+          "prefix_cache": true
+        },
+        "engine": {
+          "spec_accept": 0.75,
+          "spec_len": 3.25,
+          "spec_drafts": 1000,
+          "spec_draft_tokens": 3000,
+          "spec_accepted_tokens": 2250,
+          "preemptions": 3,
+          "sleeping": false,
+          "ttft_s": 0.5,
+          "itl_s": 0.03125,
+          "e2e_s": 12.5
+        }
       }
     ]
   },

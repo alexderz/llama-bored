@@ -1,0 +1,26 @@
+{
+  "ring_pct": 70,
+  "ring_band": "FlatOut",
+  "blocks": [
+    "FlatOut",
+    "Busy",
+    "Light"
+  ],
+  "coolant_c": 40,
+  "cpu_c": 79,
+  "gpu_c": 80,
+  "cpu_pct": 41,
+  "mem_pct": 11,
+  "ai": "Loaded",
+  "models": [
+    "qwen3.8-27b"
+  ],
+  "model_count": 1,
+  "detail": {
+    "kv_k": "fp8_e4m3",
+    "kv_v": "fp8_e4m3",
+    "kv_block": 16,
+    "prefix_cache": true
+  },
+  "spec_permille": 780
+}

@@ -80,6 +80,7 @@ llamabored_ai_state{state="loaded"} 1
 # TYPE llamabored_model_loaded gauge
 llamabored_model_loaded{name="Bonsai 8B",full_name="Bonsai 8B",quant="PTQ1_0",kv="q8_0/q4_0",ctx="131072",moe="all",backend="sglang"} 1
 llamabored_model_loaded{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",quant="UD-Q4_K_M",kv="q8_0",ctx="262144",moe="16",backend="llamacpp"} 1
+llamabored_model_loaded{name="qwen3.8-27b",full_name="qwen3.8-27b",quant="",kv="fp8_e4m3",ctx="",moe="",backend="vllm"} 1
 llamabored_model_loaded{name="tiny",full_name="tiny",quant="",kv="",ctx="",moe="",backend="llamacpp"} 1
 # HELP llamabored_model_state Lifecycle of a loaded model; the current state is 1.
 # TYPE llamabored_model_state gauge
@@ -91,6 +92,10 @@ llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\"
 llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="starting"} 0
 llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="stopping"} 0
 llamabored_model_state{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",state="other"} 0
+llamabored_model_state{name="qwen3.8-27b",full_name="qwen3.8-27b",state="ready"} 1
+llamabored_model_state{name="qwen3.8-27b",full_name="qwen3.8-27b",state="starting"} 0
+llamabored_model_state{name="qwen3.8-27b",full_name="qwen3.8-27b",state="stopping"} 0
+llamabored_model_state{name="qwen3.8-27b",full_name="qwen3.8-27b",state="other"} 0
 llamabored_model_state{name="tiny",full_name="tiny",state="ready"} 0
 llamabored_model_state{name="tiny",full_name="tiny",state="starting"} 0
 llamabored_model_state{name="tiny",full_name="tiny",state="stopping"} 0
@@ -102,15 +107,19 @@ llamabored_model_ctx_size_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30
 # HELP llamabored_model_requests_running Requests a loaded model is running now (SGLang, vLLM and other backends without slots).
 # TYPE llamabored_model_requests_running gauge
 llamabored_model_requests_running{name="Bonsai 8B",full_name="Bonsai 8B"} 0
+llamabored_model_requests_running{name="qwen3.8-27b",full_name="qwen3.8-27b"} 1
 # HELP llamabored_model_requests_queued Requests waiting for a loaded model (SGLang, vLLM and other backends without slots).
 # TYPE llamabored_model_requests_queued gauge
 llamabored_model_requests_queued{name="Bonsai 8B",full_name="Bonsai 8B"} 1
+llamabored_model_requests_queued{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0
 # HELP llamabored_model_kv_cache_usage_ratio KV cache fill of a loaded model, 0 to 1 (SGLang, vLLM and other backends without slots).
 # TYPE llamabored_model_kv_cache_usage_ratio gauge
 llamabored_model_kv_cache_usage_ratio{name="Bonsai 8B",full_name="Bonsai 8B"} 0.25
+llamabored_model_kv_cache_usage_ratio{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.5
 # HELP llamabored_model_cache_hit_ratio Prefix cache hit ratio of a loaded model, 0 to 1 (SGLang, vLLM).
 # TYPE llamabored_model_cache_hit_ratio gauge
 llamabored_model_cache_hit_ratio{name="Bonsai 8B",full_name="Bonsai 8B"} 0.75
+llamabored_model_cache_hit_ratio{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.75
 # HELP llamabored_slots_busy llama.cpp slots of a loaded model that are processing.
 # TYPE llamabored_slots_busy gauge
 llamabored_slots_busy{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 1
@@ -124,6 +133,42 @@ llamabored_model_prompt_tokens_total{name="Qwen3-Coder…",full_name="Qwen3-Code
 # HELP llamabored_model_prompt_cached_tokens_total Prompt tokens served from the prompt cache since the watcher started; hit ratio = rate of this / rate of prompt_tokens_total.
 # TYPE llamabored_model_prompt_cached_tokens_total counter
 llamabored_model_prompt_cached_tokens_total{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build"} 1500000
+# HELP llamabored_model_kv_block_size_tokens KV cache block size of a loaded model, tokens (vLLM cache_config_info).
+# TYPE llamabored_model_kv_block_size_tokens gauge
+llamabored_model_kv_block_size_tokens{name="qwen3.8-27b",full_name="qwen3.8-27b"} 16
+# HELP llamabored_model_prefix_caching 1 when a loaded model has prefix caching on, 0 when off (vLLM cache_config_info).
+# TYPE llamabored_model_prefix_caching gauge
+llamabored_model_prefix_caching{name="qwen3.8-27b",full_name="qwen3.8-27b"} 1
+# HELP llamabored_model_spec_acceptance_ratio Speculative decoding: accepted / draft tokens, 0 to 1, over the latest metrics window with drafts (vLLM; SGLang's gauge).
+# TYPE llamabored_model_spec_acceptance_ratio gauge
+llamabored_model_spec_acceptance_ratio{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.75
+# HELP llamabored_model_spec_accepted_length Speculative decoding: mean tokens per step (1 + accepted / drafts) over the same window.
+# TYPE llamabored_model_spec_accepted_length gauge
+llamabored_model_spec_accepted_length{name="qwen3.8-27b",full_name="qwen3.8-27b"} 3.25
+# HELP llamabored_model_spec_drafts_total Speculative decoding draft rounds since the watcher started (vLLM).
+# TYPE llamabored_model_spec_drafts_total counter
+llamabored_model_spec_drafts_total{name="qwen3.8-27b",full_name="qwen3.8-27b"} 1000
+# HELP llamabored_model_spec_draft_tokens_total Speculative decoding tokens drafted since the watcher started (vLLM).
+# TYPE llamabored_model_spec_draft_tokens_total counter
+llamabored_model_spec_draft_tokens_total{name="qwen3.8-27b",full_name="qwen3.8-27b"} 3000
+# HELP llamabored_model_spec_accepted_tokens_total Drafted tokens accepted since the watcher started (vLLM); acceptance = rate of this / rate of draft_tokens_total.
+# TYPE llamabored_model_spec_accepted_tokens_total counter
+llamabored_model_spec_accepted_tokens_total{name="qwen3.8-27b",full_name="qwen3.8-27b"} 2250
+# HELP llamabored_model_preemptions_total Requests a loaded model preempted since the watcher started (vLLM); a rising count means KV cache pressure.
+# TYPE llamabored_model_preemptions_total counter
+llamabored_model_preemptions_total{name="qwen3.8-27b",full_name="qwen3.8-27b"} 3
+# HELP llamabored_model_sleeping 1 when a loaded model's engine is asleep, 0 when awake (vLLM engine_sleep_state).
+# TYPE llamabored_model_sleeping gauge
+llamabored_model_sleeping{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0
+# HELP llamabored_model_ttft_seconds Mean time to first token, seconds, over the latest metrics window with requests (vLLM, SGLang).
+# TYPE llamabored_model_ttft_seconds gauge
+llamabored_model_ttft_seconds{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.5
+# HELP llamabored_model_itl_seconds Mean inter-token latency, seconds, over the latest metrics window with tokens (vLLM, SGLang).
+# TYPE llamabored_model_itl_seconds gauge
+llamabored_model_itl_seconds{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.03125
+# HELP llamabored_model_e2e_latency_seconds Mean end-to-end request latency, seconds, over the latest metrics window with finished requests (vLLM, SGLang).
+# TYPE llamabored_model_e2e_latency_seconds gauge
+llamabored_model_e2e_latency_seconds{name="qwen3.8-27b",full_name="qwen3.8-27b"} 12.5
 # HELP llamabored_slot_ctx_used_tokens Context tokens a llama.cpp slot holds (prompt plus decoded; an idle slot keeps its last value).
 # TYPE llamabored_slot_ctx_used_tokens gauge
 llamabored_slot_ctx_used_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0"} 0

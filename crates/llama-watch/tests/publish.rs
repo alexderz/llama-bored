@@ -748,6 +748,8 @@ fn full_name_and_detail_reach_the_wire_and_bad_ones_do_not() {
         kv_v: Some("q8_0".to_owned()),
         quant: Some("PTQ1_0".to_owned()),
         fa: Some(true),
+        kv_block: None,
+        prefix_cache: None,
     };
     let models = vec![
         ModelInfo {
@@ -807,6 +809,7 @@ fn backend_and_its_gauges_reach_the_wire() {
         queued: Some(0),
         kv_permille: Some(370),
         hit_permille: Some(800),
+        engine: Default::default(),
     };
     let models = vec![
         model("flash", Some(gauges)),
@@ -852,4 +855,72 @@ fn backend_and_its_gauges_reach_the_wire() {
     assert_eq!(m[0].cache_hit, Some(0.8));
     assert_eq!(m[1].cache_hit, None);
     assert!(!text.contains("max_running"), "{text}");
+}
+
+/// #31: a vLLM model's engine numbers reach the wire as seconds, ratios
+/// and counters; an empty set and llama.cpp's are left off.
+#[test]
+fn engine_numbers_reach_the_wire() {
+    use llama_core::backend::{Backend, BackendInfo, EngineStats, SpecCounts};
+
+    let dir = scratch("engine");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_millis(1);
+    let engine = EngineStats {
+        spec_permille: Some(780),
+        spec_len_centi: Some(290),
+        spec_counts: Some(SpecCounts {
+            drafts: 100,
+            draft_tokens: 300,
+            accepted: 234,
+        }),
+        preemptions: Some(3),
+        sleeping: Some(false),
+        ttft_us: Some(420_000),
+        itl_us: Some(31_000),
+        e2e_us: Some(12_500_000),
+    };
+    let model = |name: &str, kind: Backend, engine: EngineStats| ModelInfo {
+        name: name.to_owned(),
+        state: "ready".to_owned(),
+        full_name: None,
+        detail: None,
+        backend: Some(BackendInfo {
+            kind,
+            engine,
+            ..BackendInfo::default()
+        }),
+    };
+    let models = vec![
+        model("vllm", Backend::Vllm, engine),
+        model("idle", Backend::Vllm, EngineStats::default()),
+        model("llama", Backend::LlamaCpp, engine),
+    ];
+    let snap = snapshot(wall, Some(1.0), AiState::Loaded, models.clone());
+    publisher
+        .publish(&snap, &view(AiState::Loaded, models, None))
+        .expect("publish");
+    let bytes = std::fs::read(dir.join("snapshot.json")).expect("read");
+    let parsed = wire::parse_validated(&bytes).expect("parse");
+    let got = parsed.ai.models[0].engine.clone().expect("engine");
+    assert_eq!(
+        got,
+        wire::EngineWire {
+            spec_accept: Some(0.78),
+            spec_len: Some(2.9),
+            spec_drafts: Some(100),
+            spec_draft_tokens: Some(300),
+            spec_accepted_tokens: Some(234),
+            preemptions: Some(3),
+            sleeping: Some(false),
+            ttft_s: Some(0.42),
+            itl_s: Some(0.031),
+            e2e_s: Some(12.5),
+        }
+    );
+    assert_eq!(parsed.ai.models[1].engine, None);
+    assert_eq!(
+        parsed.ai.models[2].engine, None,
+        "llama.cpp keeps its slot view"
+    );
 }

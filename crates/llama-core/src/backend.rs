@@ -103,6 +103,77 @@ pub struct BackendInfo {
     pub kv_permille: Option<u16>,
     /// Prefix cache hit rate, 0..=1000.
     pub hit_permille: Option<u16>,
+    /// Engine numbers beyond the gauges: speculative decoding, preemptions,
+    /// sleep and latency means (#31). vLLM, and SGLang where its names allow.
+    pub engine: EngineStats,
+}
+
+/// Longest mean accepted length per speculative step kept.
+pub const MAX_SPEC_LEN: f64 = 64.0;
+/// Longest mean latency (TTFT, ITL, request) kept, seconds.
+pub const MAX_ENGINE_LATENCY_S: f64 = 3600.0;
+
+/// Speculative-decoding counters since the watcher started (#31).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SpecCounts {
+    /// Draft rounds (`vllm:spec_decode_num_drafts`).
+    pub drafts: u64,
+    /// Tokens drafted (`vllm:spec_decode_num_draft_tokens`).
+    pub draft_tokens: u64,
+    /// Drafted tokens accepted, never above [`Self::draft_tokens`].
+    pub accepted: u64,
+}
+
+/// Engine numbers from a server's `/metrics` (#31). Every field is `None`
+/// when the server does not report it. Window values cover the latest
+/// metrics poll window that saw any activity, so an idle server keeps its
+/// last numbers instead of reading zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineStats {
+    /// Speculative acceptance (accepted / draft tokens), 0..=1000.
+    pub spec_permille: Option<u16>,
+    /// Mean tokens per speculative step (1 + accepted / drafts), in
+    /// hundredths, 100..=[`MAX_SPEC_LEN`] × 100.
+    pub spec_len_centi: Option<u16>,
+    /// Speculative counters since the watcher started.
+    pub spec_counts: Option<SpecCounts>,
+    /// Preemptions since the watcher started; a rising count is KV pressure.
+    pub preemptions: Option<u64>,
+    /// The engine is asleep (`vllm:engine_sleep_state{sleep_state="awake"} 0`).
+    pub sleeping: Option<bool>,
+    /// Mean time to first token, microseconds.
+    pub ttft_us: Option<u32>,
+    /// Mean inter-token latency, microseconds.
+    pub itl_us: Option<u32>,
+    /// Mean end-to-end request latency, microseconds.
+    pub e2e_us: Option<u32>,
+}
+
+impl EngineStats {
+    /// True when no field is known.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Seconds as microseconds, when finite and within 0..=[`MAX_ENGINE_LATENCY_S`].
+#[must_use]
+pub fn micros(seconds: f64) -> Option<u32> {
+    (seconds.is_finite() && (0.0..=MAX_ENGINE_LATENCY_S).contains(&seconds))
+        .then(|| (seconds * 1e6).round() as u32)
+}
+
+/// A mean accepted length as hundredths, when within 1..=[`MAX_SPEC_LEN`].
+#[must_use]
+pub fn centi_len(len: f64) -> Option<u16> {
+    (len.is_finite() && (1.0..=MAX_SPEC_LEN).contains(&len)).then(|| (len * 100.0).round() as u16)
+}
+
+/// `spec 78 %`: the acceptance text the tty and the LCD draw (#31).
+#[must_use]
+pub fn spec_text(permille: u16) -> String {
+    format!("spec {} %", (u32::from(permille.min(1000)) + 5) / 10)
 }
 
 /// A request count clamped to [`MAX_REQS`]. Non-finite or negative is `None`.
@@ -196,5 +267,22 @@ mod tests {
         assert_eq!(permille(1.0), Some(1000));
         assert_eq!(permille(1.2), None);
         assert_eq!(permille(-0.1), None);
+    }
+
+    #[test]
+    fn engine_numbers_are_bounded() {
+        assert_eq!(micros(0.4215), Some(421_500));
+        assert_eq!(micros(3600.0), Some(3_600_000_000));
+        assert_eq!(micros(3600.5), None);
+        assert_eq!(micros(-0.1), None);
+        assert_eq!(micros(f64::NAN), None);
+        assert_eq!(centi_len(2.904), Some(290));
+        assert_eq!(centi_len(1.0), Some(100));
+        assert_eq!(centi_len(0.99), None);
+        assert_eq!(centi_len(65.0), None);
+        assert_eq!(spec_text(781), "spec 78 %");
+        assert_eq!(spec_text(1000), "spec 100 %");
+        assert_eq!(spec_text(4000), "spec 100 %");
+        assert!(EngineStats::default().is_empty());
     }
 }
