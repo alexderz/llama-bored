@@ -857,8 +857,8 @@ fn backend_and_its_gauges_reach_the_wire() {
     assert!(!text.contains("max_running"), "{text}");
 }
 
-/// #31: a vLLM model's engine numbers reach the wire as seconds, ratios
-/// and counters; an empty set and llama.cpp's are left off.
+/// #31: a vLLM model's engine numbers reach the wire as seconds, ratios,
+/// counters and (#35) tok/s; an empty set and llama.cpp's are left off.
 #[test]
 fn engine_numbers_reach_the_wire() {
     use llama_core::backend::{Backend, BackendInfo, EngineStats, SpecCounts};
@@ -879,6 +879,8 @@ fn engine_numbers_reach_the_wire() {
         ttft_us: Some(420_000),
         itl_us: Some(31_000),
         e2e_us: Some(12_500_000),
+        prefill_tps_tenths: Some(21_345),
+        decode_tps_tenths: Some(412),
     };
     let model = |name: &str, kind: Backend, engine: EngineStats| ModelInfo {
         name: name.to_owned(),
@@ -916,6 +918,8 @@ fn engine_numbers_reach_the_wire() {
             ttft_s: Some(0.42),
             itl_s: Some(0.031),
             e2e_s: Some(12.5),
+            prefill_tps: Some(2134.5),
+            decode_tps: Some(41.2),
         }
     );
     assert_eq!(parsed.ai.models[1].engine, None);

@@ -27,6 +27,12 @@ pub struct ActivityRow {
     pub prompt_tps: Option<f64>,
     /// Generation tok/s.
     pub gen_tps: Option<f64>,
+    /// Prefill tok/s the engine measured over the window this request
+    /// finished in (#35), when llama-swap gave no [`Self::prompt_tps`].
+    /// Never parsed: the poller fills it.
+    pub engine_prompt_tps: Option<f64>,
+    /// Decode tok/s the engine measured, when there is no [`Self::gen_tps`].
+    pub engine_gen_tps: Option<f64>,
     /// Request duration in milliseconds.
     pub duration_ms: Option<u64>,
     /// HTTP status of the upstream response.
@@ -74,6 +80,8 @@ impl From<ActivityJson> for ActivityRow {
             output_tokens: nonneg_u64(tokens.output_tokens),
             prompt_tps: nonneg_f64(tokens.prompt_per_second),
             gen_tps: nonneg_f64(tokens.tokens_per_second),
+            engine_prompt_tps: None,
+            engine_gen_tps: None,
             duration_ms: nonneg_u64(row.duration_ms),
             captured: row.has_capture,
             status: row.resp_status_code.and_then(|code| {

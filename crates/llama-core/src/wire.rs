@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::backend::{Backend, MAX_ENGINE_LATENCY_S, MAX_REQS, MAX_SPEC_LEN};
+pub use crate::backend::{Backend, MAX_ENGINE_LATENCY_S, MAX_ENGINE_TPS, MAX_REQS, MAX_SPEC_LEN};
 pub use crate::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 
 /// Wire schema version this crate reads and writes.
@@ -322,12 +322,20 @@ pub struct EngineWire {
     /// Mean end-to-end request latency, seconds.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub e2e_s: Option<f32>,
+    /// Prefill tokens per second of the requests that finished in the
+    /// latest metrics window with any (#35), 0..=[`MAX_ENGINE_TPS`].
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub prefill_tps: Option<f32>,
+    /// Decode tokens per second over the same window, 0..=[`MAX_ENGINE_TPS`].
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub decode_tps: Option<f32>,
 }
 
 impl EngineWire {
     /// True when the numbers are in range: a ratio in 0..=1, a step length
-    /// in 1..=[`MAX_SPEC_LEN`], accepted tokens not above draft tokens, and
-    /// latencies in 0..=[`MAX_ENGINE_LATENCY_S`].
+    /// in 1..=[`MAX_SPEC_LEN`], accepted tokens not above draft tokens,
+    /// latencies in 0..=[`MAX_ENGINE_LATENCY_S`], and speeds in
+    /// 0..=[`MAX_ENGINE_TPS`].
     #[must_use]
     pub fn is_valid(&self) -> bool {
         let in_range = |value: Option<f32>, low: f64, high: f64| {
@@ -338,6 +346,9 @@ impl EngineWire {
             && [self.ttft_s, self.itl_s, self.e2e_s]
                 .into_iter()
                 .all(|latency| in_range(latency, 0.0, MAX_ENGINE_LATENCY_S))
+            && [self.prefill_tps, self.decode_tps]
+                .into_iter()
+                .all(|tps| in_range(tps, 0.0, MAX_ENGINE_TPS))
             && self
                 .spec_accepted_tokens
                 .is_none_or(|accepted| self.spec_draft_tokens.is_some_and(|all| accepted <= all))

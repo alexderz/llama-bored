@@ -477,7 +477,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             }
         }
     }
-    let model_families: [(&str, &str, &str, ModelValue); 21] = [
+    let model_families: [(&str, &str, &str, ModelValue); 23] = [
         (
             "llamabored_model_ctx_size_tokens",
             "gauge",
@@ -644,6 +644,28 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             |m| {
                 engine(m)
                     .and_then(|e| e.e2e_s)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_prefill_tokens_per_second",
+            "gauge",
+            "Prefill tok/s: uncached prompt tokens over prefill time of the requests finished in the latest metrics window with any (vLLM).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.prefill_tps)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_decode_tokens_per_second",
+            "gauge",
+            "Decode tok/s: tokens after the first over decode time, spec decoding included, same requests and window (vLLM).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.decode_tps)
                     .filter(|v| v.is_finite())
                     .map(num)
             },

@@ -18,6 +18,21 @@ All notable changes to llama-bored. Versions follow
   `llama-view: <model> (<engine>) · <host>` when it fits the 40-character
   cap. The exporter is unchanged (`backend` label on
   `llamabored_model_loaded`).
+- vLLM requests in RECENT get prompt and generation speeds measured by the
+  engine (#35). llama-swap reports `-1` for them, so llama-watch reads vLLM's
+  per-request histograms (`request_prefill_time_seconds`,
+  `request_prefill_kv_computed_tokens`, `request_decode_time_seconds`,
+  `request_generation_tokens`) on each metrics poll: prefill tok/s is
+  uncached prompt tokens over prefill time, decode tok/s is generated tokens
+  after the first over decode time. A new row gets the speeds of the
+  requests that finished around it (their average if several), drawn
+  `~2,134` / `~41.3` with a `~ = engine-measured` legend note; no match
+  stays `--`, and llama.cpp rows are unchanged. SGLang has no per-request
+  phase times and gets none. Snapshot: optional `engine.prefill_tps` /
+  `engine.decode_tps` (schema 1, additive). llama-metrics:
+  `llamabored_model_prefill_tokens_per_second` and
+  `llamabored_model_decode_tokens_per_second`. tty11's backend line ends
+  `· prefill 2,134/s · decode 41.2/s` where it fits.
 
 ## 0.3.2 — 2026-10-03
 

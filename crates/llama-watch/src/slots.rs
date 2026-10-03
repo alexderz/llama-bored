@@ -1043,6 +1043,8 @@ mod tests {
             output_tokens: Some(10),
             prompt_tps: None,
             gen_tps: None,
+            engine_prompt_tps: None,
+            engine_gen_tps: None,
             duration_ms: None,
             status: Some(200),
             captured: false,

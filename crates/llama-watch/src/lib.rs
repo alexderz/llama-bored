@@ -12,4 +12,5 @@ pub mod resets;
 pub mod service;
 pub mod slots;
 pub mod sources;
+pub mod speeds;
 pub mod tty;

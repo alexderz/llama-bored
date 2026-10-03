@@ -49,6 +49,13 @@
 //! model would make llama-swap load it. A `/running` failure clears the
 //! ready list, so nothing upstream is read until llama-swap answers again.
 //!
+//! RECENT's PROMPT and GEN for a vLLM request come from the engine (#35,
+//! [`crate::speeds`]): llama-swap gives `-1` for them, so each new row of a
+//! model without `/slots` gets the prefill and decode tok/s of the requests
+//! that finished between the metrics read before the previous activity
+//! read and the first metrics read after the one that showed the row. A
+//! row llama-swap gave real speeds keeps them.
+//!
 //! The thread never touches the console or the snapshot file.
 
 use std::collections::{HashMap, HashSet};
@@ -73,6 +80,7 @@ use crate::metrics::{
 };
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
+use crate::speeds::SpeedBook;
 use crate::tty::grid::Cell;
 
 const RUNNING_CAP: usize = 64 * 1024;
@@ -386,6 +394,8 @@ struct State<L> {
     prompt_cache: PromptCache,
     /// Per-model engine numbers: spec decoding, preemptions, latency (#31).
     engines: EngineBook,
+    /// Engine-measured speeds given to RECENT rows (#35).
+    speeds: SpeedBook,
     /// Server kind `/metrics` gave each loaded model the launch command did
     /// not name (#31); `openai` when it gave none. Dropped when the model
     /// leaves `ready`, so the next load is probed again.
@@ -437,6 +447,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         prompt_box: DecodedCounter::default(),
         prompt_cache: PromptCache::default(),
         engines: EngineBook::default(),
+        speeds: SpeedBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
         running_up: false,
@@ -565,6 +576,7 @@ impl<L: Sink> State<L> {
             self.detected.retain(|id, _| ready.contains(id.as_str()));
             for id in was_ready.iter().filter(|id| !ready.contains(id.as_str())) {
                 self.engines.forget(id);
+                self.speeds.forget(id);
             }
         }
         if self
@@ -714,6 +726,7 @@ impl<L: Sink> State<L> {
                     sample.cached_total,
                 );
                 let engine = self.engines.observe(&model.id, sample);
+                self.speeds.observe(&model.id, now, sample.speeds);
                 self.gauges
                     .insert(model.id.clone(), Gauges::of(sample, engine, now));
                 if let Some(prompt) = sample.prompt_total {
@@ -892,15 +905,32 @@ impl<L: Sink> State<L> {
                 .touch(&model.id, model.backend.has_slots());
         }
         let newest = rows.iter().map(|row| row.id).max();
+        let now = Instant::now();
         let Some(seen) = self.activity_seen else {
             self.activity_seen = Some(newest.unwrap_or(-1));
+            self.speeds.activity(now, &[]);
             return;
         };
         let seen = match newest {
-            Some(newest) if newest < seen => -1,
+            Some(newest) if newest < seen => {
+                self.speeds.clear_rows();
+                -1
+            }
             _ => seen,
         };
-        let now = Instant::now();
+        // #35: new rows of a model without `/slots` that llama-swap gave
+        // no speeds wait for the engine's.
+        let mut measure: Vec<(i64, String)> = Vec::new();
+        for model in self.ready.iter().filter(|model| !model.backend.has_slots()) {
+            let key = activity::model_key(&model.id);
+            measure.extend(
+                rows.iter()
+                    .filter(|row| row.id > seen && row.model == key)
+                    .filter(|row| row.prompt_tps.is_none() || row.gen_tps.is_none())
+                    .map(|row| (row.id, model.id.clone())),
+            );
+        }
+        self.speeds.activity(now, &measure);
         for model in &self.ready {
             let key = activity::model_key(&model.id);
             for row in rows.iter().filter(|row| row.id > seen && row.model == key) {
@@ -1044,7 +1074,7 @@ impl<L: Sink> State<L> {
         };
         let detail = LlamaDetail {
             slots: self.slots.slots(),
-            activity: self.activity.clone(),
+            activity: self.measured_activity(),
             gen_tps,
             prompt_tps,
             latencies: self.latencies,
@@ -1067,6 +1097,23 @@ impl<L: Sink> State<L> {
         }
         self.tx.put((view, detail));
         Ok(())
+    }
+
+    /// RECENT rows with the engine's speeds where llama-swap gave none (#35).
+    fn measured_activity(&self) -> Vec<ActivityRow> {
+        let mut rows = self.activity.clone();
+        for row in &mut rows {
+            let Some(speeds) = self.speeds.speeds(row.id) else {
+                continue;
+            };
+            if row.prompt_tps.is_none() {
+                row.engine_prompt_tps = speeds.prefill;
+            }
+            if row.gen_tps.is_none() {
+                row.engine_gen_tps = speeds.decode;
+            }
+        }
+        rows
     }
 
     /// [`Self::models`] with each backend's fresh gauges filled in, and
