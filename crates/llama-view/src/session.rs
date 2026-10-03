@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use crate::cli::{ColorSettings, Options};
-use crate::pane::{Fit, InputEvent, InputParser, Titler, frame_period, header_model, place};
+use crate::pane::{
+    Fit, InputEvent, InputParser, Titler, frame_period, header_engine, header_model, place,
+};
 use crate::render::Renderer;
 use crate::screen::{AttrLayout, DecodeError, decode_screen_with, detect_layout};
 
@@ -77,7 +79,11 @@ impl Session {
             self.renderer.invalidate();
         }
         self.last_sizes = Some(sizes);
-        out.extend_from_slice(&self.titler.update(header_model(&screen).as_deref()));
+        out.extend_from_slice(
+            &self
+                .titler
+                .update(header_model(&screen).as_deref(), header_engine(&screen)),
+        );
         let view = place(
             &screen,
             pane.0,

@@ -13,15 +13,8 @@
   "mem_pct": 11,
   "ai": "Loaded",
   "models": [
-    "qwen3.8-27b"
+    "tabby"
   ],
   "model_count": 1,
-  "detail": {
-    "kv_k": "fp8_e4m3",
-    "kv_v": "fp8_e4m3",
-    "kv_block": 16,
-    "prefix_cache": true
-  },
-  "engine": "vllm",
-  "spec_permille": 780
+  "engine": "openai"
 }

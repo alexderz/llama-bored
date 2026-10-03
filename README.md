@@ -45,6 +45,15 @@ buffer.</sub>
 `llama-core` is the shared library: the snapshot schema and its validator, the
 name sanitiser, logging.
 
+**Engine.** tty11's header always names the inference engine serving the
+shown model, before its tuning: `llama.cpp · 256k · kv f16 · Q6_K`, or
+`SGLang`, `vLLM`, `Strata`, `OpenAI-compatible` (a llama.cpp fork is
+`llama.cpp`); with no model loaded it says `engine --`. The LCD starts the
+line under the model name with the short name (`llama.cpp`, `sglang`,
+`vllm`, `strata`, `openai`) and drops the quant first when space is short.
+The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
+`openai`) as the `backend` label on `llamabored_model_loaded`.
+
 ## Features
 
 **llama-watch and tty11** (10 fps, bundled Hack 12x24 console font)
@@ -446,8 +455,9 @@ environment, for saved SSH sessions that cannot pass flags; a flag wins.
   shows no tearing; only changed cells are sent.
 - With focus events on, it drops to 1 frame a second while its pane is
   unfocused or the client is detached, and returns to `--fps` on focus.
-- The pane title (`#T`) is `llama-view: <model> · <host>`, the model read
-  from tty11's header. `--tmux-window-name` (or
+- The pane title (`#T`) is `llama-view: <model> (<engine>) · <host>`, the
+  model and engine read from tty11's header; the engine is its short name,
+  left out when `<model> (<engine>)` would pass 40 characters. `--tmux-window-name` (or
   `LLAMA_VIEW_TMUX_WINDOW=1`) also names the tmux window after the model.
 - It never rings the bell and never captures the mouse.
 

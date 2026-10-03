@@ -13,15 +13,14 @@
   "mem_pct": 11,
   "ai": "Loaded",
   "models": [
-    "qwen3.8-27b"
+    "flash"
   ],
   "model_count": 1,
   "detail": {
+    "ctx": 204800,
     "kv_k": "fp8_e4m3",
     "kv_v": "fp8_e4m3",
-    "kv_block": 16,
-    "prefix_cache": true
+    "quant": "exl3"
   },
-  "engine": "vllm",
-  "spec_permille": 780
+  "engine": "sglang"
 }

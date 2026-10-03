@@ -42,18 +42,50 @@ impl Backend {
         }
     }
 
+    /// Display name (#33): `llama.cpp`, `SGLang`, `vLLM`, `Strata`,
+    /// `OpenAI-compatible`. A llama.cpp fork stays `llama.cpp`.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::LlamaCpp => "llama.cpp",
+            Self::SgLang => "SGLang",
+            Self::Vllm => "vLLM",
+            Self::Strata => "Strata",
+            Self::OpenAi => "OpenAI-compatible",
+        }
+    }
+
+    /// Short display name for tight spots (#33): `llama.cpp`, `sglang`,
+    /// `vllm`, `strata`, `openai`.
+    #[must_use]
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::LlamaCpp => "llama.cpp",
+            other => other.as_str(),
+        }
+    }
+
+    /// The kind whose [`Self::display_name`] is `name`; `None` otherwise.
+    #[must_use]
+    pub fn from_display_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.display_name() == name)
+    }
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::LlamaCpp,
+        Self::SgLang,
+        Self::Vllm,
+        Self::Strata,
+        Self::OpenAi,
+    ];
+
     /// The kind for a wire or config word; `None` for an unknown word.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
-        [
-            Self::LlamaCpp,
-            Self::SgLang,
-            Self::Vllm,
-            Self::Strata,
-            Self::OpenAi,
-        ]
-        .into_iter()
-        .find(|kind| kind.as_str() == word)
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
     }
 
     /// Wire read of a backend word. A word this reader does not know (a
@@ -212,6 +244,31 @@ mod tests {
         assert!(serde_json::from_str::<Backend>("\"SGLang\"").is_err());
         assert_eq!(Backend::from_word("strata"), Some(Backend::Strata));
         assert_eq!(Backend::from_word("Strata"), None);
+    }
+
+    /// #33: one long and one short display name per engine.
+    #[test]
+    fn display_names() {
+        let names: Vec<_> = Backend::ALL
+            .iter()
+            .map(|kind| (kind.display_name(), kind.short_name()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("llama.cpp", "llama.cpp"),
+                ("SGLang", "sglang"),
+                ("vLLM", "vllm"),
+                ("Strata", "strata"),
+                ("OpenAI-compatible", "openai"),
+            ]
+        );
+        assert_eq!(Backend::default().display_name(), "llama.cpp");
+        for kind in Backend::ALL {
+            assert_eq!(Backend::from_display_name(kind.display_name()), Some(kind));
+        }
+        assert_eq!(Backend::from_display_name("sglang"), None);
+        assert_eq!(Backend::from_display_name("SGLa"), None);
     }
 
     #[derive(serde::Deserialize)]

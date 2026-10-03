@@ -1831,7 +1831,12 @@ fn sample(state: WatchState) -> TtyModel {
         state,
         host: "AIBOX".to_string(),
         model_name: model_name.to_string(),
-        model_detail: String::new(),
+        // #33: the engine always leads the detail; `engine --` with no model.
+        model_detail: match state {
+            WatchState::Generating | WatchState::Ready => "llama.cpp",
+            WatchState::AiDown | WatchState::Starting | WatchState::NoLlama => "engine --",
+        }
+        .to_string(),
         model_stuck: false,
         slots_line: slots_line.to_string(),
         swap_line: swap_line.to_string(),
@@ -3270,7 +3275,7 @@ fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
 fn sglang_model() -> TtyModel {
     let mut model = sample(WatchState::Generating);
     model.model_name = "flash".to_string();
-    model.model_detail = "sglang · 200k · kv fp8_e4m3 · exl3".to_string();
+    model.model_detail = "SGLang · 200k · kv fp8_e4m3 · exl3".to_string();
     model.slots_line = "--".to_string();
     model.slots = Vec::new();
     model.backend_lines = vec!["sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %".to_string()];
@@ -3314,7 +3319,7 @@ fn dump_sglang_goldens() {
 fn vllm_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "qwen3.8-27b".to_string();
-    model.model_detail = "vllm · kv fp8_e4m3 · block 16 · prefix on".to_string();
+    model.model_detail = "vLLM · kv fp8_e4m3 · block 16 · prefix on".to_string();
     model.backend_lines = vec![
         "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3"
             .to_string(),
@@ -3346,13 +3351,92 @@ fn dump_vllm_goldens() {
     }
 }
 
+/// #33: a Strata model: one request at a time, no KV gauge.
+fn strata_model() -> TtyModel {
+    let mut model = sglang_model();
+    model.model_name = "bonsai-27b".to_string();
+    model.model_detail = "Strata · 256k · kv q8".to_string();
+    model.backend_lines = vec!["strata  running 1/1 · queued 0".to_string()];
+    for req in &mut model.requests {
+        req.model = "bonsai-27b".to_string();
+    }
+    model
+}
+
+/// #33: any other OpenAI-compatible server: no metrics, no detail.
+fn openai_model() -> TtyModel {
+    let mut model = sglang_model();
+    model.model_name = "tabby".to_string();
+    model.model_detail = "OpenAI-compatible".to_string();
+    model.backend_lines = vec!["openai  running -- · queued -- · KV --".to_string()];
+    for req in &mut model.requests {
+        req.model = "tabby".to_string();
+    }
+    model
+}
+
+/// A golden file and the frame it holds.
+type EngineGolden = (&'static str, fn() -> TtyModel);
+
+const ENGINE_GOLDENS: [EngineGolden; 2] = [
+    ("strata-240.json", strata_model),
+    ("openai-240.json", openai_model),
+];
+
+#[test]
+fn engine_goldens_match_character_and_colour() {
+    for (name, make) in ENGINE_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &make());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #33 Strata and OpenAI goldens"]
+fn dump_engine_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, make) in ENGINE_GOLDENS {
+        let grid = draw(&make(), 240, 67);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write engine golden");
+    }
+}
+
+/// #33: the header always names the engine of the shown model, in grey
+/// right after the name, and says `engine --` with no model.
+#[test]
+fn header_always_names_the_engine() {
+    let cases: [(TtyModel, &str); 7] = [
+        (sample(WatchState::Generating), "Qwen 35B  llama.cpp"),
+        (sample(WatchState::Ready), "Qwen 35B  llama.cpp"),
+        (sglang_model(), "flash  SGLang · 200k"),
+        (vllm_model(), "qwen3.8-27b  vLLM · kv fp8_e4m3"),
+        (strata_model(), "bonsai-27b  Strata · 256k"),
+        (openai_model(), "tabby  OpenAI-compatible"),
+        (sample(WatchState::AiDown), "model --  engine --"),
+    ];
+    for (model, want) in cases {
+        for cols in [160, 240] {
+            let grid = draw(&model, cols, 67);
+            let header = row_string(&grid, 0);
+            assert!(header.contains(want), "{cols}: {header}");
+            let engine = want.split("  ").nth(1).expect("engine");
+            let at = col_of(&grid, 0, engine);
+            assert_eq!(grid.get(at, 0).unwrap().fg, C16::BrightBlack, "{want}");
+        }
+    }
+    for state in [WatchState::Starting, WatchState::NoLlama] {
+        let header = row_string(&draw(&sample(state), 240, 67), 0);
+        assert!(header.contains("  engine --"), "{header}");
+    }
+}
+
 #[test]
 fn sglang_frame_names_the_backend_and_its_gauges() {
     let model = sglang_model();
     for (cols, rows) in [(160, 48), (240, 67), (480, 135)] {
         let grid = draw(&model, cols, rows);
         let header = row_string(&grid, 0);
-        assert!(header.contains("flash  sglang · 200k"), "{header}");
+        assert!(header.contains("flash  SGLang · 200k"), "{header}");
         let slots = row_with(&grid, "SLOTS");
         let line = row_string(&grid, slots + 1);
         assert!(

@@ -1445,3 +1445,36 @@ fn first_model_spec_acceptance_reaches_the_view() {
     current.models = vec![model("a", None), model("b", spec(500))];
     assert_eq!(present(&current, &history, None, &cfg).spec_permille, None);
 }
+
+/// #33: the first model's engine reaches the view; a model without a
+/// backend is llama.cpp; no model is no engine.
+#[test]
+fn first_model_engine_reaches_the_view() {
+    use llama_core::backend::{Backend, BackendInfo};
+    let cfg = Config::default();
+    let now = Instant::now();
+    let history = History::new(now);
+    let model = |name: &str, kind: Option<Backend>| ModelInfo {
+        backend: kind.map(|kind| BackendInfo {
+            kind,
+            ..BackendInfo::default()
+        }),
+        name: name.to_owned(),
+        state: "ready".to_owned(),
+        full_name: None,
+        detail: None,
+    };
+    let mut current = snapshot(now);
+    current.ai = AiState::Loaded;
+    for kind in Backend::ALL {
+        current.models = vec![model("m", Some(kind)), model("n", Some(Backend::Vllm))];
+        assert_eq!(present(&current, &history, None, &cfg).engine, Some(kind));
+    }
+    current.models = vec![model("m", None)];
+    assert_eq!(
+        present(&current, &history, None, &cfg).engine,
+        Some(Backend::LlamaCpp)
+    );
+    current.models.clear();
+    assert_eq!(present(&current, &history, None, &cfg).engine, None);
+}

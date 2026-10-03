@@ -23,5 +23,6 @@
     "kv_k": "q8_0",
     "kv_v": "q8_0"
   },
-  "variant": "a3"
+  "variant": "a3",
+  "engine": "llamacpp"
 }

@@ -10,6 +10,7 @@
 //! SIGTERM the next llama-view run (or `reset`) puts the terminal back: its
 //! restore re-enables canonical input and echo whatever state it started in.
 
+use llama_core::backend::Backend;
 use std::time::Duration;
 
 use crate::screen::{Cell, Color, Screen};
@@ -208,6 +209,33 @@ pub fn header_model(screen: &Screen) -> Option<String> {
     (!clean.is_empty()).then_some(clean)
 }
 
+/// The engine of the model on tty11's header row (#33). llama-watch always
+/// draws it first in the grey detail after the name, by its display name
+/// (`model qwen3  SGLang · 200k · …`), after the `stopping (stuck?)` tag
+/// if there is one. Only an exact display name counts, so a cut or unknown
+/// word, and the `engine --` of no model, are `None`.
+pub fn header_engine(screen: &Screen) -> Option<Backend> {
+    header_model(screen)?;
+    let width = usize::from(screen.cols);
+    let row: String = screen
+        .cells
+        .get(..width)?
+        .iter()
+        .map(|cell| cell.ch)
+        .collect();
+    let at = row.find("  model ")?;
+    let mut fields = row[at + "  model ".len()..]
+        .trim_start_matches(' ')
+        .split("  ")
+        .skip(1)
+        .filter(|field| *field != STUCK_TAG);
+    let detail = fields.next()?;
+    Backend::from_display_name(detail.split(" \u{00b7} ").next()?.trim_end())
+}
+
+/// llama-watch's header tag for a model stuck in `stopping`.
+const STUCK_TAG: &str = "stopping (stuck?)";
+
 /// Text that is safe inside an OSC or tmux string: printable ASCII only
 /// (space through `~`), anything else becomes `?`, at most `cap` chars, no
 /// leading or trailing spaces. No ESC, BEL or C1 byte can come out.
@@ -220,11 +248,17 @@ pub fn sanitize(text: &str, cap: usize) -> String {
     out.trim().to_string()
 }
 
-/// The pane title: `llama-view: <model> · <host>`, or `llama-view: <host>`.
-pub fn title_text(model: Option<&str>, host: &str) -> String {
-    match model {
-        Some(model) => format!("llama-view: {model} \u{00b7} {host}"),
-        None => format!("llama-view: {host}"),
+/// The pane title: `llama-view: <model> (<engine>) · <host>`, or
+/// `llama-view: <host>`. The engine is its short name (#33), and only when
+/// `<model> (<engine>)` fits [`MODEL_CAP`]; otherwise it is left out.
+pub fn title_text(model: Option<&str>, engine: Option<Backend>, host: &str) -> String {
+    let engine = engine.map(Backend::short_name).filter(|engine| {
+        model.is_some_and(|model| model.chars().count() + engine.len() + 3 <= MODEL_CAP)
+    });
+    match (model, engine) {
+        (Some(model), Some(engine)) => format!("llama-view: {model} ({engine}) \u{00b7} {host}"),
+        (Some(model), None) => format!("llama-view: {model} \u{00b7} {host}"),
+        (None, _) => format!("llama-view: {host}"),
     }
 }
 
@@ -250,7 +284,7 @@ pub fn tmux_window_name(name: &str) -> Vec<u8> {
 pub struct Titler {
     host: String,
     tmux_window: bool,
-    last: Option<Option<String>>,
+    last: Option<(Option<String>, Option<Backend>)>,
 }
 
 impl Titler {
@@ -270,17 +304,18 @@ impl Titler {
         }
     }
 
-    /// The bytes to send for this frame's `model`: empty when unchanged.
-    pub fn update(&mut self, model: Option<&str>) -> Vec<u8> {
+    /// The bytes to send for this frame's `model` and `engine`: empty when
+    /// both are unchanged. The tmux window name is the model alone.
+    pub fn update(&mut self, model: Option<&str>, engine: Option<Backend>) -> Vec<u8> {
         if self
             .last
             .as_ref()
-            .is_some_and(|last| last.as_deref() == model)
+            .is_some_and(|(last, kind)| last.as_deref() == model && *kind == engine)
         {
             return Vec::new();
         }
-        self.last = Some(model.map(str::to_string));
-        let mut out = osc_title(&title_text(model, &self.host));
+        self.last = Some((model.map(str::to_string), engine));
+        let mut out = osc_title(&title_text(model, engine, &self.host));
         if self.tmux_window {
             out.extend_from_slice(&tmux_window_name(model.unwrap_or("llama-view")));
         }
@@ -448,6 +483,92 @@ mod tests {
         assert_eq!(header_model(&below), None);
     }
 
+    /// #33: the engine is the first detail item after the name, by its
+    /// display name; anything else (cut, unknown, no model) is `None`.
+    #[test]
+    fn header_engine_parses_the_first_detail_item() {
+        let row = |detail: &str| {
+            format!("box  llama-bored    █ READY  model qwen3  {detail}   slots 1/4   swap ok")
+        };
+        for kind in Backend::ALL {
+            let with_detail = row(&format!("{} · 64k · kv q8", kind.display_name()));
+            assert_eq!(header_engine(&screen_of(&[&with_detail])), Some(kind));
+            let alone = row(kind.display_name());
+            assert_eq!(header_engine(&screen_of(&[&alone])), Some(kind));
+        }
+        let stuck = "box  █ GENERATING  model glm-4.5  stopping (stuck?)  vLLM · kv fp8   slots --";
+        assert_eq!(header_engine(&screen_of(&[stuck])), Some(Backend::Vllm));
+        let cut = "box  █ READY  model qwen3  SGLa";
+        assert_eq!(header_engine(&screen_of(&[cut])), None);
+        for row in [
+            "box  llama-bored  █ AI DOWN  model --  engine --   slots --",
+            "box  llama-bored  █ STARTING  model ...  engine --   slots ...",
+            "box  █ READY  model qwen3  sglang · 64k   slots 1/4",
+            "box  █ READY  model qwen3   slots 1/4",
+            "box  █ READY  model qwen3",
+            "no header",
+        ] {
+            assert_eq!(header_engine(&screen_of(&[row])), None, "{row}");
+        }
+    }
+
+    /// #33: llama-watch's own header goldens parse to their engine.
+    #[test]
+    fn header_engine_reads_the_watch_goldens() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+        for (name, want, model) in [
+            (
+                "generating-240.json",
+                Some(Backend::LlamaCpp),
+                Some("Qwen 35B"),
+            ),
+            ("idle-480.json", Some(Backend::LlamaCpp), Some("Qwen 35B")),
+            ("sglang-160.json", Some(Backend::SgLang), Some("flash")),
+            ("vllm-240.json", Some(Backend::Vllm), Some("qwen3.8-27b")),
+            ("strata-240.json", Some(Backend::Strata), Some("bonsai-27b")),
+            ("openai-240.json", Some(Backend::OpenAi), Some("tabby")),
+            ("down-240.json", None, None),
+            ("starting-240.json", None, None),
+        ] {
+            let text = std::fs::read_to_string(dir.join(name)).expect("golden");
+            // No JSON crate here: the header row is the first string of
+            // `"rows":[...]` and holds no quote or escape.
+            let start = text.find("\"rows\":[\"").expect("rows") + "\"rows\":[\"".len();
+            let row = &text[start..start + text[start..].find('"').expect("row end")];
+            assert!(!row.contains('\\'), "{name}: escaped header");
+            let screen = screen_of(&[row]);
+            assert_eq!(header_engine(&screen), want, "{name}");
+            assert_eq!(header_model(&screen).as_deref(), model, "{name}");
+        }
+    }
+
+    #[test]
+    fn title_names_the_engine_when_it_fits_the_cap() {
+        assert_eq!(
+            title_text(Some("qwen3"), Some(Backend::SgLang), "box"),
+            "llama-view: qwen3 (sglang) \u{00b7} box"
+        );
+        assert_eq!(
+            title_text(Some("qwen3"), Some(Backend::LlamaCpp), "box"),
+            "llama-view: qwen3 (llama.cpp) \u{00b7} box"
+        );
+        // 28 + " (llama.cpp)" is 40: fits; one more char does not.
+        let fits = "m".repeat(28);
+        assert_eq!(
+            title_text(Some(&fits), Some(Backend::LlamaCpp), "box"),
+            format!("llama-view: {fits} (llama.cpp) \u{00b7} box")
+        );
+        let long = "m".repeat(29);
+        assert_eq!(
+            title_text(Some(&long), Some(Backend::LlamaCpp), "box"),
+            format!("llama-view: {long} \u{00b7} box")
+        );
+        assert_eq!(
+            title_text(None, Some(Backend::Vllm), "box"),
+            "llama-view: box"
+        );
+    }
+
     #[test]
     fn sanitize_never_lets_a_control_through() {
         let dirty = "a\x1b]2;x\x07\u{9c}\u{1b}\\b";
@@ -463,12 +584,18 @@ mod tests {
     #[test]
     fn title_is_sent_on_change_only() {
         let mut titler = Titler::new("box", false);
-        let first = titler.update(Some("qwen3"));
+        let first = titler.update(Some("qwen3"), None);
         assert_eq!(first, b"\x1b]2;llama-view: qwen3 \xc2\xb7 box\x1b\\");
-        assert!(titler.update(Some("qwen3")).is_empty());
-        assert_eq!(titler.update(None), b"\x1b]2;llama-view: box\x1b\\");
-        assert!(titler.update(None).is_empty());
-        assert!(!titler.update(Some("glm")).is_empty());
+        assert!(titler.update(Some("qwen3"), None).is_empty());
+        assert_eq!(
+            titler.update(Some("qwen3"), Some(Backend::Vllm)),
+            b"\x1b]2;llama-view: qwen3 (vllm) \xc2\xb7 box\x1b\\",
+            "#33: an engine change is a title change"
+        );
+        assert!(titler.update(Some("qwen3"), Some(Backend::Vllm)).is_empty());
+        assert_eq!(titler.update(None, None), b"\x1b]2;llama-view: box\x1b\\");
+        assert!(titler.update(None, None).is_empty());
+        assert!(!titler.update(Some("glm"), None).is_empty());
         assert!(
             !first.contains(&0x07),
             "ST, not BEL: llama-view never rings the bell"
@@ -478,9 +605,12 @@ mod tests {
     #[test]
     fn a_first_title_is_sent_even_without_a_model() {
         let mut titler = Titler::new("ti\x1btan\x07", false);
-        assert_eq!(titler.update(None), b"\x1b]2;llama-view: ti?tan?\x1b\\");
         assert_eq!(
-            Titler::new("", false).update(None),
+            titler.update(None, None),
+            b"\x1b]2;llama-view: ti?tan?\x1b\\"
+        );
+        assert_eq!(
+            Titler::new("", false).update(None, None),
             b"\x1b]2;llama-view: localhost\x1b\\"
         );
     }
@@ -488,13 +618,13 @@ mod tests {
     #[test]
     fn tmux_window_name_only_when_opted_in() {
         let mut off = Titler::new("box", false);
-        let bytes = off.update(Some("qwen3"));
+        let bytes = off.update(Some("qwen3"), None);
         assert!(!bytes.windows(2).any(|w| w == b"\x1bk"), "{bytes:?}");
         let mut on = Titler::new("box", true);
-        let bytes = on.update(Some("qwen3"));
-        assert!(bytes.ends_with(b"\x1bkqwen3\x1b\\"), "{bytes:?}");
-        assert!(on.update(Some("qwen3")).is_empty());
-        assert!(on.update(None).ends_with(b"\x1bkllama-view\x1b\\"));
+        let bytes = on.update(Some("qwen3"), Some(Backend::SgLang));
+        assert!(bytes.ends_with(b"\x1bkqwen3\x1b\\"), "no engine: {bytes:?}");
+        assert!(on.update(Some("qwen3"), Some(Backend::SgLang)).is_empty());
+        assert!(on.update(None, None).ends_with(b"\x1bkllama-view\x1b\\"));
     }
 
     #[test]
