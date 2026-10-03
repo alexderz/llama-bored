@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.2 — 2026-10-03
+
 ### Added
 
 - A model whose launch command does not name its server (for example a
