@@ -22,6 +22,8 @@ use llama_core::detail::{MAX_KV_BLOCK, is_token};
 use llama_core::rate::{counter_delta, delta_per_s};
 use serde::{Deserialize, Deserializer};
 
+use crate::speeds::{self, Phase, SpeedTotals};
+
 const FRESH: Duration = Duration::from_secs(1);
 
 /// The series one backend is read for. Empty slices are never matched.
@@ -56,6 +58,13 @@ struct Names {
     ttft: &'static [&'static str],
     itl: &'static [&'static str],
     e2e: &'static [&'static str],
+    /// Per-request histograms the engine speeds come from (#35): prefill
+    /// time and its computed (uncached) prompt tokens, decode time and the
+    /// request's generated tokens.
+    prefill_time: &'static [&'static str],
+    prefill_tokens: &'static [&'static str],
+    decode_time: &'static [&'static str],
+    gen_tokens: &'static [&'static str],
     /// Info gauge whose labels carry the KV cache config.
     cache_info: &'static [&'static str],
     /// Sum across label sets. llama.cpp keeps its last value, as before T72.
@@ -84,6 +93,10 @@ const LLAMACPP: Names = Names {
     ttft: NONE,
     itl: NONE,
     e2e: NONE,
+    prefill_time: NONE,
+    prefill_tokens: NONE,
+    decode_time: NONE,
+    gen_tokens: NONE,
     cache_info: NONE,
     sum: false,
 };
@@ -108,6 +121,11 @@ const SGLANG: Names = Names {
     ttft: &["sglang:time_to_first_token_seconds"],
     itl: &["sglang:inter_token_latency_seconds"],
     e2e: &["sglang:e2e_request_latency_seconds"],
+    // SGLang has no per-request prefill or decode time (#35).
+    prefill_time: NONE,
+    prefill_tokens: NONE,
+    decode_time: NONE,
+    gen_tokens: NONE,
     cache_info: NONE,
     sum: true,
 };
@@ -143,6 +161,10 @@ const VLLM: Names = Names {
         "vllm:time_per_output_token_seconds",
     ],
     e2e: &["vllm:e2e_request_latency_seconds"],
+    prefill_time: &["vllm:request_prefill_time_seconds"],
+    prefill_tokens: &["vllm:request_prefill_kv_computed_tokens"],
+    decode_time: &["vllm:request_decode_time_seconds"],
+    gen_tokens: &["vllm:request_generation_tokens"],
     cache_info: &["vllm:cache_config_info"],
     sum: true,
 };
@@ -221,6 +243,9 @@ pub struct MetricsSample {
     pub itl: Option<Hist>,
     /// End-to-end request latency histogram.
     pub e2e: Option<Hist>,
+    /// Per-request prefill and decode histograms for the engine speeds
+    /// (#35). vLLM only.
+    pub speeds: Option<SpeedTotals>,
 }
 
 /// llama.cpp parse, the pre-T72 behaviour. See [`parse_metrics_for`].
@@ -265,7 +290,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut spec_len: Option<f64> = None;
     let mut preemptions = Acc::default();
     let mut sleeping: Option<bool> = None;
-    let mut hists: [[HistAcc; 2]; 3] = Default::default();
+    let mut hists: [[HistAcc; 2]; 7] = Default::default();
     let mut facts: Option<EngineFacts> = None;
     for line in body.lines() {
         let Some((name, value)) = metric_line(line) else {
@@ -316,7 +341,18 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         {
             spec[index].add(value, true);
         } else {
-            for (which, group) in [names.ttft, names.itl, names.e2e].iter().enumerate() {
+            for (which, group) in [
+                names.ttft,
+                names.itl,
+                names.e2e,
+                names.prefill_time,
+                names.prefill_tokens,
+                names.decode_time,
+                names.gen_tokens,
+            ]
+            .iter()
+            .enumerate()
+            {
                 if let Some((rank, part)) = hist_part(group, name) {
                     hists[which][rank].add(part, value);
                 }
@@ -349,6 +385,17 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         _ => None,
     };
     let hist = |ranks: &[HistAcc; 2]| ranks.iter().find_map(HistAcc::get);
+    let phase = |seconds: &[HistAcc; 2], tokens: &[HistAcc; 2]| {
+        Some(Phase {
+            seconds: hist(seconds)?,
+            tokens: hist(tokens)?,
+        })
+    };
+    let speeds = SpeedTotals {
+        prefill: phase(&hists[3], &hists[4]),
+        decode: phase(&hists[5], &hists[6]),
+    }
+    .reported();
     let sample = MetricsSample {
         n_decode_total: decode.0.and_then(finite_u64),
         requests_processing: running.0,
@@ -365,6 +412,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         ttft: hist(&hists[0]),
         itl: hist(&hists[1]),
         e2e: hist(&hists[2]),
+        speeds,
     };
     (sample, facts)
 }
@@ -853,6 +901,8 @@ pub const ENGINE_MODELS: usize = 64;
 ///   after a load has no window yet and uses the server's totals since it
 ///   started. A counter that went down (the server restarted) makes its
 ///   new value the window.
+/// - Prefill and decode tok/s (#35) are [`speeds::window`] over the same
+///   reads, with the same keep-the-last and restart rules.
 /// - Counters (speculative drafts, draft tokens, accepted tokens,
 ///   preemptions) count since the watcher started, like [`PromptCache`]:
 ///   the first read is the baseline, a restart adds its new value, and a
@@ -875,6 +925,9 @@ struct EngineTrack {
     spec_rate: Option<f64>,
     spec_len: Option<f64>,
     means: [Option<f64>; 3],
+    last_speeds: Option<SpeedTotals>,
+    /// Prefill and decode tok/s of the latest window with finished requests.
+    tps: [Option<f64>; 2],
 }
 
 impl EngineBook {
@@ -897,6 +950,8 @@ impl EngineBook {
             track.spec_rate = None;
             track.spec_len = None;
             track.means = [None; 3];
+            track.last_speeds = None;
+            track.tps = [None; 2];
         }
     }
 }
@@ -933,6 +988,7 @@ impl EngineTrack {
             }
             self.last_hist[index] = Some(now);
         }
+        self.observe_speeds(sample);
         EngineStats {
             spec_permille: self.spec_rate.and_then(backend::permille),
             spec_len_centi: self.spec_len.and_then(backend::centi_len),
@@ -942,7 +998,32 @@ impl EngineTrack {
             ttft_us: self.means[0].and_then(backend::micros),
             itl_us: self.means[1].and_then(backend::micros),
             e2e_us: self.means[2].and_then(backend::micros),
+            prefill_tps_tenths: self.tps[0].and_then(backend::tps_tenths),
+            decode_tps_tenths: self.tps[1].and_then(backend::tps_tenths),
         }
+    }
+
+    /// Engine speeds over the window since the last read (#35): each
+    /// phase keeps its last value through a window with no finished
+    /// request; a server without the histograms has none.
+    fn observe_speeds(&mut self, sample: &MetricsSample) {
+        let Some(now) = sample.speeds else {
+            self.last_speeds = None;
+            self.tps = [None; 2];
+            return;
+        };
+        let window = speeds::window(self.last_speeds.as_ref(), &now);
+        for (slot, (value, reported)) in self.tps.iter_mut().zip([
+            (window.prefill, now.prefill.is_some()),
+            (window.decode, now.decode.is_some()),
+        ]) {
+            if !reported {
+                *slot = None;
+            } else if value.is_some() {
+                *slot = value;
+            }
+        }
+        self.last_speeds = Some(now);
     }
 
     fn observe_spec(&mut self, sample: &MetricsSample) {
@@ -1404,6 +1485,28 @@ vllm:prefix_cache_queries_total{model_name=\"m\"} 120.0
                 prefix_cache: Some(true),
             })
         );
+        // #35: the four per-request histograms, buckets and _created ignored.
+        let speeds = sample.speeds.expect("speed histograms");
+        let hist = |sum: f64, count: f64| Hist { sum, count };
+        assert_eq!(
+            speeds.prefill,
+            Some(Phase {
+                seconds: hist(50.0, 42.0),
+                tokens: hist(125_000.0, 42.0),
+            })
+        );
+        assert_eq!(
+            speeds.decode,
+            Some(Phase {
+                seconds: hist(1000.0, 42.0),
+                tokens: hist(42_000.0, 42.0),
+            })
+        );
+        // Lifetime: 125,000 computed prompt tokens in 50 s; 41,958 tokens
+        // past the first in 1,000 s.
+        let stats = EngineBook::default().observe("m", &sample);
+        assert_eq!(stats.prefill_tps_tenths, Some(25_000));
+        assert_eq!(stats.decode_tps_tenths, Some(420));
         assert_eq!(detect_backend(VLLM_SAMPLE), Some(Backend::Vllm));
         // Read as another backend, nothing of it counts.
         assert_eq!(
@@ -1643,6 +1746,83 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
         let stats = book.observe("flash", &off);
         assert_eq!(stats.spec_permille, None);
         assert_eq!(stats.spec_len_centi, None);
+    }
+
+    fn speed_read(prefill: (f64, f64, f64), decode: (f64, f64, f64)) -> MetricsSample {
+        let phase = |(count, seconds, tokens): (f64, f64, f64)| Phase {
+            seconds: Hist {
+                sum: seconds,
+                count,
+            },
+            tokens: Hist { sum: tokens, count },
+        };
+        MetricsSample {
+            speeds: Some(SpeedTotals {
+                prefill: Some(phase(prefill)),
+                decode: Some(phase(decode)),
+            }),
+            ..MetricsSample::default()
+        }
+    }
+
+    #[test]
+    fn engine_speeds_over_the_window_keep_the_last_and_survive_a_restart() {
+        let mut book = EngineBook::default();
+        let first = book.observe(
+            "m",
+            &speed_read((10.0, 5.0, 10_000.0), (10.0, 100.0, 4_010.0)),
+        );
+        assert_eq!(first.prefill_tps_tenths, Some(20_000), "lifetime first");
+        assert_eq!(first.decode_tps_tenths, Some(400));
+        let next = book.observe(
+            "m",
+            &speed_read((11.0, 7.0, 18_000.0), (11.0, 108.0, 4_411.0)),
+        );
+        assert_eq!(next.prefill_tps_tenths, Some(40_000));
+        assert_eq!(next.decode_tps_tenths, Some(500));
+        // No finished request: the last window stays.
+        let idle = book.observe(
+            "m",
+            &speed_read((11.0, 7.0, 18_000.0), (11.0, 108.0, 4_411.0)),
+        );
+        assert_eq!(idle.prefill_tps_tenths, Some(40_000));
+        assert_eq!(idle.decode_tps_tenths, Some(500));
+        // Restart: the new totals are the window.
+        let reset = book.observe("m", &speed_read((1.0, 0.5, 1_000.0), (1.0, 2.0, 61.0)));
+        assert_eq!(reset.prefill_tps_tenths, Some(20_000));
+        assert_eq!(reset.decode_tps_tenths, Some(300));
+        // A request with no decode (one token) keeps decode's last value.
+        let short = book.observe("m", &speed_read((2.0, 1.0, 1_500.0), (2.0, 2.0, 62.0)));
+        assert_eq!(short.prefill_tps_tenths, Some(10_000));
+        assert_eq!(short.decode_tps_tenths, Some(300));
+        // Unloaded: the window is gone.
+        book.forget("m");
+        let again = book.observe("m", &speed_read((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)));
+        assert_eq!(again.prefill_tps_tenths, None);
+        assert_eq!(again.decode_tps_tenths, None);
+        // A server without the histograms has none.
+        let gone = book.observe("m", &MetricsSample::default());
+        assert_eq!(gone.prefill_tps_tenths, None);
+        // SGLang reports no per-request phase times: no speeds.
+        let sglang = parse_metrics_for(
+            Backend::SgLang,
+            "sglang:e2e_request_latency_seconds_sum 8.0\nsglang:e2e_request_latency_seconds_count 1\n",
+        );
+        assert_eq!(sglang.speeds, None);
+        // vLLM with only one phase's histograms reports that phase.
+        let half = parse_metrics_for(
+            Backend::Vllm,
+            "vllm:request_decode_time_seconds_sum{engine=\"0\"} 8.0\n\
+             vllm:request_decode_time_seconds_count{engine=\"0\"} 1\n\
+             vllm:request_generation_tokens_sum{engine=\"0\"} 401\n\
+             vllm:request_generation_tokens_count{engine=\"0\"} 1\n\
+             vllm:request_prefill_time_seconds_sum{engine=\"0\"} 2.0\n",
+        );
+        let speeds = half.speeds.expect("decode only");
+        assert_eq!(speeds.prefill, None, "prefill time without tokens");
+        let stats = EngineBook::default().observe("h", &half);
+        assert_eq!(stats.decode_tps_tenths, Some(500));
+        assert_eq!(stats.prefill_tps_tenths, None);
     }
 
     #[test]

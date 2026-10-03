@@ -169,6 +169,12 @@ llamabored_model_itl_seconds{name="qwen3.8-27b",full_name="qwen3.8-27b"} 0.03125
 # HELP llamabored_model_e2e_latency_seconds Mean end-to-end request latency, seconds, over the latest metrics window with finished requests (vLLM, SGLang).
 # TYPE llamabored_model_e2e_latency_seconds gauge
 llamabored_model_e2e_latency_seconds{name="qwen3.8-27b",full_name="qwen3.8-27b"} 12.5
+# HELP llamabored_model_prefill_tokens_per_second Prefill tok/s: uncached prompt tokens over prefill time of the requests finished in the latest metrics window with any (vLLM).
+# TYPE llamabored_model_prefill_tokens_per_second gauge
+llamabored_model_prefill_tokens_per_second{name="qwen3.8-27b",full_name="qwen3.8-27b"} 2134.5
+# HELP llamabored_model_decode_tokens_per_second Decode tok/s: tokens after the first over decode time, spec decoding included, same requests and window (vLLM).
+# TYPE llamabored_model_decode_tokens_per_second gauge
+llamabored_model_decode_tokens_per_second{name="qwen3.8-27b",full_name="qwen3.8-27b"} 41.25
 # HELP llamabored_slot_ctx_used_tokens Context tokens a llama.cpp slot holds (prompt plus decoded; an idle slot keeps its last value).
 # TYPE llamabored_slot_ctx_used_tokens gauge
 llamabored_slot_ctx_used_tokens{name="Qwen3-Coder…",full_name="Qwen3-Coder-30B \"fast\" \\ build",slot="0"} 0

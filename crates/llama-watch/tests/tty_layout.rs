@@ -2217,6 +2217,8 @@ fn activity(
         output_tok,
         prompt_tps: Some(prompt_tps),
         gen_tps: Some(gen_tps),
+        prompt_measured: false,
+        gen_measured: false,
         dur: dur.to_string(),
         err,
     }
@@ -3315,17 +3317,31 @@ fn dump_sglang_goldens() {
 }
 
 /// #31: a containerised vLLM found by its metrics: the cache facts on the
-/// tuning line, the engine numbers on its backend line in SLOTS.
+/// tuning line, the engine numbers on its backend line in SLOTS. #35: the
+/// engine-measured speeds end that line, and RECENT shows them as `~`
+/// rates; the row whose window saw no finished request stays `--`.
 fn vllm_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "qwen3.8-27b".to_string();
     model.model_detail = "vLLM · kv fp8_e4m3 · block 16 · prefix on".to_string();
     model.backend_lines = vec![
-        "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3"
+        "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
             .to_string(),
     ];
-    for req in &mut model.requests {
+    let measured = [
+        Some((2_134.4, 41.25)),
+        Some((1_987.0, 38.6)),
+        None,
+        Some((123_456.0, 1_234.0)),
+    ];
+    for (req, speeds) in model.requests.iter_mut().zip(measured) {
         req.model = "qwen3.8-27b".to_string();
+        if let Some((prompt, generated)) = speeds {
+            req.prompt_tps = Some(prompt);
+            req.gen_tps = Some(generated);
+            req.prompt_measured = true;
+            req.gen_measured = true;
+        }
     }
     model
 }
@@ -3735,4 +3751,33 @@ fn reset_markers_show_their_reason_the_last_one_per_slot_and_a_legend() {
     let row = row_with(&grid, "s0 gen");
     let (x, _) = spark_cells(&grid, row);
     assert_eq!(grid.get(x - 1, row).expect("cell").ch, ' ');
+}
+
+/// #35: RECENT's rate text. The `~` mark always fits: PROMPT is 7 wide,
+/// GEN 6.
+#[test]
+fn engine_measured_rates_are_marked_and_fit_their_columns() {
+    use llama_watch::tty::layout::{gen_rate_text, prompt_rate_text};
+    assert_eq!(prompt_rate_text(Some(1193.6), false), "1,194");
+    assert_eq!(prompt_rate_text(Some(2134.4), true), "~2,134");
+    assert_eq!(prompt_rate_text(Some(99_999.4), true), "~99,999");
+    assert_eq!(prompt_rate_text(Some(123_456.0), true), "~123k");
+    assert_eq!(prompt_rate_text(Some(1_000_000.0), true), "~1,000k");
+    assert_eq!(prompt_rate_text(None, true), "--");
+    assert_eq!(gen_rate_text(Some(50.46), false), "50.5");
+    assert_eq!(gen_rate_text(Some(41.25), true), "~41.3");
+    assert_eq!(gen_rate_text(Some(999.94), true), "~999.9");
+    assert_eq!(gen_rate_text(Some(999.95), true), "~1,000");
+    assert_eq!(gen_rate_text(Some(9_999.4), true), "~9,999");
+    assert_eq!(gen_rate_text(Some(12_345.0), true), "~12k");
+    assert_eq!(gen_rate_text(None, true), "--");
+    for tps in [0.0, 9.96, 999.9, 99_999.0, 100_000.0, 999_999.0] {
+        assert!(
+            prompt_rate_text(Some(tps), true).chars().count() <= 7,
+            "{tps}"
+        );
+    }
+    for tps in [0.0, 9.96, 999.9, 1_000.0, 9_999.0, 99_999.0, 1_000_000.0] {
+        assert!(gen_rate_text(Some(tps), true).chars().count() <= 6, "{tps}");
+    }
 }

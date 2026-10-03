@@ -91,7 +91,9 @@
           "sleeping": false,
           "ttft_s": 0.5,
           "itl_s": 0.03125,
-          "e2e_s": 12.5
+          "e2e_s": 12.5,
+          "prefill_tps": 2134.5,
+          "decode_tps": 41.25
         }
       }
     ]

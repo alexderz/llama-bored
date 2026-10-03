@@ -54,6 +54,20 @@ line under the model name with the short name (`llama.cpp`, `sglang`,
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
 `openai`) as the `backend` label on `llamabored_model_loaded`.
 
+**Speeds.** RECENT's PROMPT and GEN tok/s come from llama-swap, which has
+them only for llama.cpp. For a vLLM request they are measured by the
+engine instead and marked `~` (`~2,134`, `~41.3`): llama-watch reads vLLM's
+per-request prefill and decode time histograms on every metrics poll and
+gives a new row the speeds of the requests that finished around it —
+uncached prompt tokens over prefill time, and generated tokens after the
+first over decode time (speculative decoding included). If several
+requests finished in that window, the row shows their average; if none
+did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
+per-request prefill or decode time, so its rows keep `--`. The same window
+speeds are on the exporter as `llamabored_model_prefill_tokens_per_second`
+and `llamabored_model_decode_tokens_per_second`, and at the end of the
+model's backend line on tty11 when it fits.
+
 ## Features
 
 **llama-watch and tty11** (10 fps, bundled Hack 12x24 console font)

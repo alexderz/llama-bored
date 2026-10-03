@@ -2207,3 +2207,219 @@ fn a_llamacpp_model_never_fetches_captures() {
     let hits = server.hits();
     assert!(hits.iter().all(|path| allowed_path(path)), "{hits:?}");
 }
+
+// ---- #35: engine-measured speeds on RECENT rows ---------------------------------
+
+/// The vLLM fixture with `extra` requests finished past its 42, each of
+/// `prefill_s` / `prompt` computed tokens and `decode_s` / `generated`.
+fn vllm_finished(
+    extra: u32,
+    prefill_s: f64,
+    prompt: u64,
+    decode_s: f64,
+    generated: u64,
+) -> Vec<u8> {
+    let count = 42 + u64::from(extra);
+    let mut text = String::from_utf8(fixture("vllm-metrics.txt")).expect("utf-8");
+    for (name, sum) in [
+        ("vllm:request_prefill_time_seconds", 50.0 + prefill_s),
+        (
+            "vllm:request_prefill_kv_computed_tokens",
+            125_000.0 + prompt as f64,
+        ),
+        ("vllm:request_decode_time_seconds", 1000.0 + decode_s),
+        (
+            "vllm:request_generation_tokens",
+            42_000.0 + generated as f64,
+        ),
+    ] {
+        let labels = "{engine=\"0\",model_name=\"qwen3.8-27b\"}";
+        let old_sum = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}_sum{labels}")))
+            .expect("sum line")
+            .to_owned();
+        text = text
+            .replace(&old_sum, &format!("{name}_sum{labels} {sum:.1}"))
+            .replace(
+                &format!("{name}_count{labels} 42.0"),
+                &format!("{name}_count{labels} {count}.0"),
+            );
+    }
+    text.into_bytes()
+}
+
+/// `(id, model, prompt tok/s, gen tok/s)`; `-1` is llama-swap's unknown.
+fn speed_page(rows: &[(i64, &str, f64, f64)]) -> Vec<u8> {
+    let data: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, model, prompt, gen_tps)| {
+            serde_json::json!({
+                "id": id,
+                "timestamp": format!("2026-10-03T10:00:{id:02}Z"),
+                "model": model,
+                "tokens": {
+                    "input_tokens": 9000,
+                    "output_tokens": 401,
+                    "cache_tokens": 1000,
+                    "prompt_per_second": prompt,
+                    "tokens_per_second": gen_tps
+                },
+                "duration_ms": 10_000,
+                "resp_status_code": 200
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "data": data })).expect("json")
+}
+
+#[test]
+fn vllm_rows_get_the_engine_speeds_of_the_window_they_finished_in() {
+    let running = serde_json::to_vec(&serde_json::json!({
+        "running": [
+            {"model": "qwen3.8-27b-vllm", "state": "ready", "cmd": CONTAINER_CMD},
+            {"model": "fast", "state": "ready", "cmd": "llama-server --port 1"}
+        ]
+    }))
+    .expect("json");
+    let mut world = World::running(running);
+    world.metrics.insert(
+        "qwen3.8-27b-vllm".to_owned(),
+        vllm_finished(0, 0.0, 0, 0.0, 0),
+    );
+    world
+        .metrics
+        .insert("fast".to_owned(), metrics_body(10, 0.0));
+    world.activity = speed_page(&[(1, "qwen3.8-27b-vllm", -1.0, -1.0)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let vllm_engine = |view: &LlamaView| {
+        view.models
+            .iter()
+            .find_map(|model| {
+                model
+                    .backend
+                    .filter(|b| b.kind == llama_core::backend::Backend::Vllm)
+            })
+            .map(|info| info.engine)
+    };
+    // The baseline: the exported window is the server's lifetime so far.
+    let (view, _) = wait_msg(&rx, Duration::from_secs(3), |view, detail| {
+        detail.activity.iter().any(|row| row.id == 1)
+            && vllm_engine(view).is_some_and(|e| e.prefill_tps_tenths.is_some())
+    });
+    let engine = vllm_engine(&view).expect("vllm");
+    assert_eq!(engine.prefill_tps_tenths, Some(25_000), "125,000 in 50 s");
+    assert_eq!(engine.decode_tps_tenths, Some(420), "41,958 in 1,000 s");
+    thread::sleep(Duration::from_millis(500));
+
+    // One request finishes (8,000 computed tokens in 2 s; 401 generated,
+    // 400 decoded in 8 s) and its row appears, with a llama.cpp row that
+    // has llama-swap's own timings.
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.8-27b-vllm".to_owned(),
+            vllm_finished(1, 2.0, 8_000, 8.0, 401),
+        );
+        world.activity = speed_page(&[
+            (3, "fast", 1193.6, 50.5),
+            (2, "qwen3.8-27b-vllm", -1.0, -1.0),
+            (1, "qwen3.8-27b-vllm", -1.0, -1.0),
+        ]);
+    });
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 2 && row.engine_prompt_tps.is_some())
+    });
+    let row = |id: i64| {
+        detail
+            .activity
+            .iter()
+            .find(|row| row.id == id)
+            .expect("row")
+    };
+    let measured = row(2);
+    assert!((measured.engine_prompt_tps.unwrap() - 4_000.0).abs() < 1e-6);
+    assert!((measured.engine_gen_tps.unwrap() - 50.0).abs() < 1e-6);
+    assert_eq!((measured.prompt_tps, measured.gen_tps), (None, None));
+    let llama = row(3);
+    assert_eq!(llama.prompt_tps, Some(1193.6), "llama.cpp keeps its own");
+    assert_eq!(llama.gen_tps, Some(50.5));
+    assert_eq!(
+        (llama.engine_prompt_tps, llama.engine_gen_tps),
+        (None, None)
+    );
+    let history = row(1);
+    assert_eq!(
+        (history.engine_prompt_tps, history.engine_gen_tps),
+        (None, None),
+        "a row from before the watcher started has no window"
+    );
+    let engine = vllm_engine(&view).expect("vllm");
+    assert_eq!(engine.prefill_tps_tenths, Some(40_000));
+    assert_eq!(engine.decode_tps_tenths, Some(500));
+
+    // Two requests finish together: both rows get the window's average.
+    thread::sleep(Duration::from_millis(500));
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.8-27b-vllm".to_owned(),
+            vllm_finished(3, 4.0, 12_000, 18.0, 901),
+        );
+        world.activity = speed_page(&[
+            (5, "qwen3.8-27b-vllm", -1.0, -1.0),
+            (4, "qwen3.8-27b-vllm", -1.0, -1.0),
+            (3, "fast", 1193.6, 50.5),
+            (2, "qwen3.8-27b-vllm", -1.0, -1.0),
+        ]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .filter(|row| row.engine_gen_tps.is_some())
+            .count()
+            == 3
+    });
+    for id in [4, 5] {
+        let row = detail
+            .activity
+            .iter()
+            .find(|row| row.id == id)
+            .expect("row");
+        // 4,000 tokens in 2 s; 500 generated, 498 decoded in 10 s.
+        assert!((row.engine_prompt_tps.unwrap() - 2_000.0).abs() < 1e-6);
+        assert!((row.engine_gen_tps.unwrap() - 49.8).abs() < 1e-6);
+    }
+    let kept = detail.activity.iter().find(|row| row.id == 2).expect("row");
+    assert!((kept.engine_gen_tps.unwrap() - 50.0).abs() < 1e-6, "kept");
+
+    // A row whose window saw no finished request stays without.
+    thread::sleep(Duration::from_millis(500));
+    server.update(|world| {
+        world.activity = speed_page(&[
+            (6, "qwen3.8-27b-vllm", -1.0, -1.0),
+            (5, "qwen3.8-27b-vllm", -1.0, -1.0),
+        ]);
+    });
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.activity.iter().any(|row| row.id == 6)
+    });
+    thread::sleep(Duration::from_millis(800));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, _| true);
+    let unmatched = detail.activity.iter().find(|row| row.id == 6).expect("row");
+    assert_eq!(
+        (unmatched.engine_prompt_tps, unmatched.engine_gen_tps),
+        (None, None)
+    );
+    let hits = server.hits();
+    assert!(
+        hits.iter()
+            .all(|path| !path.contains("/upstream/qwen3.8-27b-vllm/slots")),
+        "{hits:?}"
+    );
+}

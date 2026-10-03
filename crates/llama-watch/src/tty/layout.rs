@@ -75,9 +75,14 @@ pub struct Activity {
     pub input_tok: u64,
     pub cached_tok: u64,
     pub output_tok: u64,
-    /// `None` when llama-swap reported no rate (a backend without timings).
+    /// `None` when llama-swap reported no rate (a backend without timings)
+    /// and the engine measured none either.
     pub prompt_tps: Option<f64>,
     pub gen_tps: Option<f64>,
+    /// The rate is the engine's window measure, not the request's own
+    /// timing (#35): drawn as `~1,234` / `~45.3`.
+    pub prompt_measured: bool,
+    pub gen_measured: bool,
     pub dur: String,
     pub err: bool,
 }
@@ -1492,6 +1497,8 @@ const REQUEST_GUTTER: usize = 2;
 
 const LEGEND_NARROW: &str = "PROMPT = prompt processing (prefill) · GEN = token generation (decode) · CACHED = prompt tokens reused from KV cache";
 const LEGEND_WIDE: &str = "PROMPT tok/s = prompt processing speed · GEN tok/s = generation speed";
+/// Added to the legend while a shown row has an engine-measured rate (#35).
+const LEGEND_MEASURED: &str = " · ~ = engine-measured";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Grow {
@@ -1897,7 +1904,17 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
     } else {
         LEGEND_NARROW
     };
-    paint_fixed(grid, 2, header + 1 + slots, legend, C16::BrightBlack);
+    let measured = model
+        .requests
+        .iter()
+        .take(usize::from(slots))
+        .any(|req| req.prompt_measured || req.gen_measured);
+    let legend = if measured && model.state != WatchState::Starting {
+        format!("{legend}{LEGEND_MEASURED}")
+    } else {
+        legend.to_owned()
+    };
+    paint_fixed(grid, 2, header + 1 + slots, &legend, C16::BrightBlack);
     if model.state == WatchState::Starting {
         paint_str(
             grid,
@@ -1957,8 +1974,7 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             grid,
             plan.prompt_tps,
             row,
-            &req.prompt_tps
-                .map_or_else(|| "--".to_owned(), |tps| commas(tps.round() as u64)),
+            &prompt_rate_text(req.prompt_tps, req.prompt_measured),
             plain,
             C16::Black,
         );
@@ -1966,7 +1982,7 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             grid,
             plan.gen_tps,
             row,
-            &req.gen_tps.map_or_else(|| "--".to_owned(), one_decimal),
+            &gen_rate_text(req.gen_tps, req.gen_measured),
             hot,
             C16::Black,
         );
@@ -2214,6 +2230,42 @@ fn paint_span_right(grid: &mut Grid, span: Span, row: u16, text: &str, fg: C16, 
             break;
         };
         paint(grid, span.x.saturating_add(dx), row, *ch, fg, bg);
+    }
+}
+
+/// RECENT's PROMPT: `1,234`, or `~1,234` when the engine measured it
+/// (#35), `~123k` from 100,000 so the mark fits the column; `--` unknown.
+#[must_use]
+pub fn prompt_rate_text(tps: Option<f64>, measured: bool) -> String {
+    let Some(tps) = tps else {
+        return "--".to_owned();
+    };
+    let whole = tps.round() as u64;
+    if !measured {
+        commas(whole)
+    } else if whole < 100_000 {
+        format!("~{}", commas(whole))
+    } else {
+        format!("~{}k", commas(whole / 1000))
+    }
+}
+
+/// RECENT's GEN: `45.3`, or `~45.3` when the engine measured it (#35),
+/// `~1,234` from 1,000 and `~12k` from 10,000 so the mark fits the
+/// column; `--` unknown.
+#[must_use]
+pub fn gen_rate_text(tps: Option<f64>, measured: bool) -> String {
+    let Some(tps) = tps else {
+        return "--".to_owned();
+    };
+    if !measured {
+        one_decimal(tps)
+    } else if tps < 999.95 {
+        format!("~{}", one_decimal(tps))
+    } else if tps < 9_999.5 {
+        format!("~{}", commas(tps.round() as u64))
+    } else {
+        format!("~{}k", (tps / 1000.0).round() as u64)
     }
 }
 
@@ -3014,7 +3066,7 @@ fn paint(grid: &mut Grid, col: u16, row: u16, ch: char, fg: C16, bg: C16) {
     grid.put(col, row, Cell::new(ch, fg, bg));
 }
 
-fn commas(n: u64) -> String {
+pub(crate) fn commas(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().rev().enumerate() {

@@ -517,6 +517,8 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.engine.ttft_s",
         "ai.models.engine.itl_s",
         "ai.models.engine.e2e_s",
+        "ai.models.engine.prefill_tps",
+        "ai.models.engine.decode_tps",
         "tokens",
         "tokens.decoded_total",
         "tokens.prompt_total",
@@ -738,6 +740,14 @@ const EXPORTED: &[(&str, &str)] = &[
     (
         "ai.models.engine.e2e_s",
         "llamabored_model_e2e_latency_seconds",
+    ),
+    (
+        "ai.models.engine.prefill_tps",
+        "llamabored_model_prefill_tokens_per_second",
+    ),
+    (
+        "ai.models.engine.decode_tps",
+        "llamabored_model_decode_tokens_per_second",
     ),
     ("ai.models.slot_ctx.slot", "llamabored_slot_ctx_used_tokens"),
     ("ai.models.slot_ctx.used", "llamabored_slot_ctx_used_tokens"),

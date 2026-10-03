@@ -144,6 +144,9 @@ pub struct BackendInfo {
 pub const MAX_SPEC_LEN: f64 = 64.0;
 /// Longest mean latency (TTFT, ITL, request) kept, seconds.
 pub const MAX_ENGINE_LATENCY_S: f64 = 3600.0;
+/// Fastest engine-measured prefill or decode speed kept, tokens per second
+/// (#35). Anything above is a broken read, not a speed.
+pub const MAX_ENGINE_TPS: f64 = 1_000_000.0;
 
 /// Speculative-decoding counters since the watcher started (#31).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -179,6 +182,13 @@ pub struct EngineStats {
     pub itl_us: Option<u32>,
     /// Mean end-to-end request latency, microseconds.
     pub e2e_us: Option<u32>,
+    /// Prefill speed of the requests that finished in the latest metrics
+    /// window with any (#35): computed (uncached) prompt tokens over prefill
+    /// time, in tenths of a token per second.
+    pub prefill_tps_tenths: Option<u32>,
+    /// Decode speed over the same window: tokens after the first over
+    /// decode time, speculative decoding included, in tenths.
+    pub decode_tps_tenths: Option<u32>,
 }
 
 impl EngineStats {
@@ -194,6 +204,13 @@ impl EngineStats {
 pub fn micros(seconds: f64) -> Option<u32> {
     (seconds.is_finite() && (0.0..=MAX_ENGINE_LATENCY_S).contains(&seconds))
         .then(|| (seconds * 1e6).round() as u32)
+}
+
+/// Tokens per second as tenths, when finite and within
+/// 0..=[`MAX_ENGINE_TPS`] (#35).
+#[must_use]
+pub fn tps_tenths(tps: f64) -> Option<u32> {
+    (tps.is_finite() && (0.0..=MAX_ENGINE_TPS).contains(&tps)).then(|| (tps * 10.0).round() as u32)
 }
 
 /// A mean accepted length as hundredths, when within 1..=[`MAX_SPEC_LEN`].
@@ -223,6 +240,16 @@ pub fn permille(ratio: f64) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tps_tenths_is_bounded() {
+        assert_eq!(tps_tenths(41.25), Some(413));
+        assert_eq!(tps_tenths(0.0), Some(0));
+        assert_eq!(tps_tenths(MAX_ENGINE_TPS), Some(10_000_000));
+        assert_eq!(tps_tenths(MAX_ENGINE_TPS + 1.0), None);
+        assert_eq!(tps_tenths(-0.1), None);
+        assert_eq!(tps_tenths(f64::NAN), None);
+    }
 
     #[test]
     fn words_round_trip_through_serde() {

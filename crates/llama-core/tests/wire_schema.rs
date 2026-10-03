@@ -1094,6 +1094,9 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
             ttft_s: Some(1_234.567_8),
             itl_s: Some(0.012_345_67),
             e2e_s: Some(3_599.123_4),
+            // #35: both speeds at their widest.
+            prefill_tps: Some(987_654.3),
+            decode_tps: Some(123_456.79),
         }),
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
@@ -1134,12 +1137,18 @@ fn engine_numbers_are_optional_and_bounded() {
         ttft_s: Some(0.42),
         itl_s: Some(0.031),
         e2e_s: Some(12.5),
+        prefill_tps: Some(2134.5),
+        decode_tps: Some(41.25),
     };
     let mut snap = valid();
     snap.ai.models[0].engine = Some(engine());
     let bytes = to_json(&snap).expect("encode");
     let text = std::str::from_utf8(&bytes).expect("utf8");
     assert!(text.contains(r#""engine":{"spec_accept":0.78"#), "{text}");
+    assert!(
+        text.contains(r#""prefill_tps":2134.5,"decode_tps":41.25}"#),
+        "{text}"
+    );
     assert_eq!(parse_validated(&bytes).expect("valid"), snap);
     // Absent and empty both read as no numbers; an unknown inner key is ignored.
     let json = insert_after(
@@ -1152,7 +1161,7 @@ fn engine_numbers_are_optional_and_bounded() {
         read.ai.models[0].engine.as_ref().and_then(|e| e.sleeping),
         Some(true)
     );
-    let cases: [Mutate; 8] = [
+    let cases: [Mutate; 12] = [
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(1.01),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(f32::NAN),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(0.5),
@@ -1161,6 +1170,11 @@ fn engine_numbers_are_optional_and_bounded() {
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_draft_tokens = None,
         |s| s.ai.models[0].engine.as_mut().unwrap().ttft_s = Some(-0.1),
         |s| s.ai.models[0].engine.as_mut().unwrap().e2e_s = Some(3600.5),
+        // #35: speeds are 0..=MAX_ENGINE_TPS and finite.
+        |s| s.ai.models[0].engine.as_mut().unwrap().prefill_tps = Some(-1.0),
+        |s| s.ai.models[0].engine.as_mut().unwrap().prefill_tps = Some(1_000_001.0),
+        |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(f32::INFINITY),
+        |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(-0.5),
     ];
     for (i, bad) in cases.into_iter().enumerate() {
         let mut snap = valid();

@@ -1136,8 +1136,11 @@ fn model_stuck(
 /// without `/slots`. Unknown gauges are `--`. Strata has no KV gauge:
 /// `strata  running 1/1 · queued 0`. Engine numbers follow when the server
 /// reports them (#31): `· spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms ·
-/// e2e 12.5 s · preempt 3` (preemptions only once there are some), and a
-/// sleeping engine says so first: `vllm  sleeping · running 0 · …`.
+/// e2e 12.5 s · preempt 3` (preemptions only once there are some), then
+/// the engine-measured speeds of the latest window with finished requests
+/// (#35): `· prefill 2,134/s · decode 41.2/s`. A sleeping engine says so
+/// first: `vllm  sleeping · running 0 · …`. The line is cut at the panel's
+/// edge, so the speeds show where it fits.
 fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return Vec::new();
@@ -1197,6 +1200,13 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
             }
             if let Some(n) = engine.preemptions.filter(|n| *n > 0) {
                 line.push_str(&format!("{sep}preempt {n}"));
+            }
+            if let Some(tenths) = engine.prefill_tps_tenths {
+                let whole = (u64::from(tenths) + 5) / 10;
+                line.push_str(&format!("{sep}prefill {}/s", layout::commas(whole)));
+            }
+            if let Some(tenths) = engine.decode_tps_tenths {
+                line.push_str(&format!("{sep}decode {}.{}/s", tenths / 10, tenths % 10));
             }
             line
         })
@@ -1271,8 +1281,10 @@ fn layout_requests(rows: &[ActivityRow], state: WatchState) -> Vec<Activity> {
             input_tok: row.input_tokens.unwrap_or(0),
             cached_tok: row.cached_tokens.unwrap_or(0),
             output_tok: row.output_tokens.unwrap_or(0),
-            prompt_tps: row.prompt_tps,
-            gen_tps: row.gen_tps,
+            prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
+            gen_tps: row.gen_tps.or(row.engine_gen_tps),
+            prompt_measured: row.prompt_tps.is_none() && row.engine_prompt_tps.is_some(),
+            gen_measured: row.gen_tps.is_none() && row.engine_gen_tps.is_some(),
             dur: match row.duration_ms {
                 Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
                 None => "--".to_owned(),
@@ -1638,6 +1650,41 @@ fn format_span(duration: Duration) -> String {
 mod tests {
     use super::*;
     use llama_core::backend::{Backend, BackendInfo};
+
+    /// #35: RECENT takes the engine's speeds only where llama-swap gave
+    /// none, and marks them; a llama.cpp row keeps its own.
+    #[test]
+    fn recent_rows_use_engine_speeds_only_where_llama_swap_had_none() {
+        let page = br#"{"data":[
+            {"id":3,"timestamp":"2026-10-03T10:00:03Z","model":"fast","tokens":{"prompt_per_second":1193.6,"tokens_per_second":50.5}},
+            {"id":2,"timestamp":"2026-10-03T10:00:02Z","model":"vllm","tokens":{"prompt_per_second":-1,"tokens_per_second":-1}},
+            {"id":1,"timestamp":"2026-10-03T10:00:01Z","model":"vllm","tokens":{"prompt_per_second":-1,"tokens_per_second":-1}}
+        ]}"#;
+        let mut rows = crate::activity::parse_activity(page).expect("page");
+        rows[0].engine_prompt_tps = Some(9.0);
+        rows[0].engine_gen_tps = Some(9.0);
+        rows[1].engine_prompt_tps = Some(2134.4);
+        rows[1].engine_gen_tps = Some(41.25);
+        let shown = layout_requests(&rows, WatchState::Ready);
+        assert_eq!(shown[0].prompt_tps, Some(1193.6), "llama.cpp keeps its own");
+        assert_eq!(shown[0].gen_tps, Some(50.5));
+        assert!(!shown[0].prompt_measured && !shown[0].gen_measured);
+        assert_eq!(shown[1].prompt_tps, Some(2134.4));
+        assert_eq!(shown[1].gen_tps, Some(41.25));
+        assert!(shown[1].prompt_measured && shown[1].gen_measured);
+        assert_eq!((shown[2].prompt_tps, shown[2].gen_tps), (None, None));
+        assert!(!shown[2].prompt_measured && !shown[2].gen_measured);
+        assert_eq!(
+            layout::prompt_rate_text(shown[1].prompt_tps, shown[1].prompt_measured),
+            "~2,134"
+        );
+        assert_eq!(
+            layout::gen_rate_text(shown[1].gen_tps, shown[1].gen_measured),
+            "~41.3"
+        );
+        assert_eq!(layout::prompt_rate_text(None, false), "--");
+        assert_eq!(layout::gen_rate_text(None, false), "--");
+    }
 
     #[test]
     fn layout_slots_keeps_context_fields() {
@@ -2469,6 +2516,8 @@ mod tests {
             ttft_us: Some(420_400),
             itl_us: Some(31_000),
             e2e_us: Some(12_460_000),
+            prefill_tps_tenths: Some(21_342),
+            decode_tps_tenths: Some(412),
             ..EngineStats::default()
         };
         let mut qwen = served(
@@ -2499,7 +2548,7 @@ mod tests {
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
             vec![
-                "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3"
+                "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
                     .to_owned()
             ]
         );

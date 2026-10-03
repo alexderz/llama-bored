@@ -445,8 +445,18 @@ fn engine_of(stats: &EngineStats) -> Option<EngineWire> {
         ttft_s: seconds(stats.ttft_us),
         itl_s: seconds(stats.itl_us),
         e2e_s: seconds(stats.e2e_us),
+        prefill_tps: tps(stats.prefill_tps_tenths),
+        decode_tps: tps(stats.decode_tps_tenths),
     };
     (engine != EngineWire::default()).then_some(engine)
+}
+
+/// Tenths of a token per second as the wire's tok/s, inside
+/// 0..=[`wire::MAX_ENGINE_TPS`] (#35).
+fn tps(tenths: Option<u32>) -> Option<f32> {
+    tenths
+        .map(|tenths| (f64::from(tenths) / 10.0) as f32)
+        .filter(|tps| (0.0..=wire::MAX_ENGINE_TPS as f32).contains(tps))
 }
 
 fn ratio(permille: u16) -> Option<f32> {
