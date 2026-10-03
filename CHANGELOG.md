@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- tty11: a long model name and engine detail no longer run into the clock. The header detail drops whole trailing ` · item`s to keep two blank cells before the clock (at 160 columns `vLLM · kv kvarn_k4v2_g128 · block 128`, was `… · prefix2026-10-03 21:59:44`); the `slots` and `swap` fields are left out when they would reach it (#39)
+
 ## 0.3.3 — 2026-10-03
 
 ### Added
