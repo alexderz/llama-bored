@@ -9,8 +9,20 @@
 //!
 //! The capture is JSON with base64 bodies (Go `[]byte`). Only `req_body` and
 //! `resp_body` are read; the header maps are skipped by the parse, never
-//! stored. From the request, IN is the last `user` message of an OpenAI chat
-//! body (text parts joined), or a completions `prompt`. From the response,
+//! stored. From the request, IN is what is new in an OpenAI chat body (#38),
+//! or a completions `prompt`:
+//!
+//! - the last message is `user`: that message alone (text parts joined), as
+//!   before #38;
+//! - otherwise (an agent's tool loop): the run of `user` and `tool` messages
+//!   after the last `assistant` one, in order, newest last, one per line,
+//!   tool results marked `[tool]`. With no `assistant` message at all, the
+//!   run is every message but `system` / `developer` ones. [`CaptureText::
+//!   input_note`] counts them for the IN title;
+//! - nothing after the last `assistant` (a prefill): the last `user` message.
+//!
+//! Text kept while walking the messages is cut to its last
+//! [`INPUT_CAP_CHARS`], the most IN ever shows. From the response,
 //! OUT is the assistant text: a JSON body's `message.content`, or an SSE
 //! stream's `delta.content` pieces joined; reasoning text when there is no
 //! content; tool calls appended as `[call name] arguments`. The caller keeps
@@ -29,14 +41,21 @@ use serde::{Deserialize, Deserializer};
 /// Largest capture body the poller reads.
 pub const CAPTURE_CAP: usize = 2 * 1024 * 1024;
 
+/// IN text kept from one request: the largest `llama.input_tail_chars`.
+pub const INPUT_CAP_CHARS: usize = 32_768;
+
 /// Tool calls kept from one response.
 const MAX_CALLS: usize = 16;
 
 /// The text of one finished exchange, before tail cutting and sanitising.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureText {
-    /// The last user message.
+    /// The last user message, or the user and tool messages after the last
+    /// assistant one (#38).
     pub input: String,
+    /// What a tool-loop `input` holds, for the IN title: `3 tool results`,
+    /// `user + 2 tool results`. Empty for a single user message or a prompt.
+    pub input_note: String,
     /// The assistant's answer.
     pub output: String,
 }
@@ -49,8 +68,10 @@ pub fn parse_capture(bytes: &[u8]) -> Option<CaptureText> {
     let request = base64_decode(&capture.req_body)?;
     let response = base64_decode(&capture.resp_body)?;
     drop(capture);
+    let (input, input_note) = request_text(&request);
     Some(CaptureText {
-        input: request_text(&request),
+        input,
+        input_note,
         output: response_text(&response),
     })
 }
@@ -61,22 +82,46 @@ struct CaptureJson {
     resp_body: String,
 }
 
-/// The last user message of a chat request, or a completions prompt.
-fn request_text(body: &[u8]) -> String {
+/// IN of a chat request and its title note, or a completions prompt.
+fn request_text(body: &[u8]) -> (String, String) {
     let Ok(request) = serde_json::from_slice::<RequestJson>(body) else {
-        return String::new();
+        return (String::new(), String::new());
     };
+    let prompt = |text: String| (cap_tail(text), String::new());
     match (request.messages.0, request.prompt) {
-        (Some(text), _) | (None, Some(PromptJson::One(text))) => text,
-        (None, Some(PromptJson::Many(texts))) => texts.last().cloned().unwrap_or_default(),
-        (None, _) => String::new(),
+        (Some(recent), _) => recent.finish(),
+        (None, Some(PromptJson::One(text))) => prompt(text),
+        (None, Some(PromptJson::Many(texts))) => prompt(texts.last().cloned().unwrap_or_default()),
+        (None, _) => (String::new(), String::new()),
+    }
+}
+
+/// The last [`INPUT_CAP_CHARS`] of `text`.
+fn cap_tail(mut text: String) -> String {
+    let count = text.chars().count();
+    if count > INPUT_CAP_CHARS {
+        let start = text
+            .char_indices()
+            .nth(count - INPUT_CAP_CHARS)
+            .map_or(text.len(), |(at, _)| at);
+        text.drain(..start);
+    }
+    text
+}
+
+/// Appends to a kept text, cutting its head once it is well past the cap,
+/// so a long run never grows past a few caps' worth of bytes.
+fn push_capped(buf: &mut String, text: &str) {
+    buf.push_str(text);
+    if buf.len() > 4 * INPUT_CAP_CHARS {
+        *buf = cap_tail(std::mem::take(buf));
     }
 }
 
 #[derive(Deserialize)]
 struct RequestJson {
     #[serde(default)]
-    messages: LastUser,
+    messages: Recent,
     #[serde(default)]
     prompt: Option<PromptJson>,
 }
@@ -89,30 +134,102 @@ enum PromptJson {
     Other(IgnoredAny),
 }
 
-/// The text of the last `user` message. Messages are read one at a time and
-/// dropped, so a long history is never held whole.
+/// What is new in a chat request (#38): the last `user` message, and the
+/// run of `user` / `tool` messages since the last `assistant` one. Messages
+/// are read one at a time and dropped, so a long history is never held
+/// whole; both texts keep only about [`INPUT_CAP_CHARS`].
 #[derive(Default)]
-struct LastUser(Option<String>);
+struct Recent(Option<RecentText>);
 
-impl<'de> Deserialize<'de> for LastUser {
+#[derive(Default)]
+struct RecentText {
+    /// The last `user` message.
+    last_user: String,
+    /// Whether the last message seen is a `user` one.
+    ends_with_user: bool,
+    /// User and tool messages since the last assistant one, one per line.
+    run: String,
+    users: usize,
+    tools: usize,
+    /// Any user or tool message at all; without one, a `prompt` is IN.
+    seen: bool,
+}
+
+/// Marker before each tool result in IN.
+const TOOL_MARK: &str = "[tool]";
+
+impl RecentText {
+    fn add(&mut self, message: MessageJson) {
+        let role = message.role.as_deref().unwrap_or_default();
+        let tool = matches!(role, "tool" | "function");
+        match role {
+            "assistant" => {
+                self.run.clear();
+                self.users = 0;
+                self.tools = 0;
+            }
+            "user" | "tool" | "function" => {
+                self.seen = true;
+                let text = message.content.map(ContentJson::text).unwrap_or_default();
+                if !self.run.is_empty() {
+                    push_capped(&mut self.run, "\n");
+                }
+                if tool {
+                    self.tools += 1;
+                    push_capped(&mut self.run, TOOL_MARK);
+                    if !text.is_empty() {
+                        push_capped(&mut self.run, " ");
+                    }
+                } else {
+                    self.users += 1;
+                }
+                push_capped(&mut self.run, &text);
+                if !tool {
+                    self.last_user = cap_tail(text);
+                }
+            }
+            // `system`, `developer`, unknown roles: not part of IN.
+            _ => return,
+        }
+        self.ends_with_user = role == "user";
+    }
+
+    /// IN and its title note.
+    fn finish(self) -> (String, String) {
+        if self.ends_with_user || self.tools == 0 {
+            return (self.last_user, String::new());
+        }
+        let results = if self.tools == 1 {
+            "1 tool result".to_owned()
+        } else {
+            format!("{} tool results", self.tools)
+        };
+        let note = match self.users {
+            0 => results,
+            1 => format!("user + {results}"),
+            n => format!("{n} user + {results}"),
+        };
+        (cap_tail(self.run), note)
+    }
+}
+
+impl<'de> Deserialize<'de> for Recent {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Walk;
         impl<'de> Visitor<'de> for Walk {
-            type Value = LastUser;
+            type Value = Recent;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a message list")
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<LastUser, A::Error> {
-                let mut last = None;
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Recent, A::Error> {
+                let mut recent = RecentText::default();
                 while let Some(message) = seq.next_element::<MessageJson>()? {
-                    if message.role.as_deref() == Some("user") {
-                        last = Some(message.content.map(ContentJson::text).unwrap_or_default());
-                    }
+                    recent.add(message);
                 }
-                Ok(LastUser(last))
+                Ok(Recent(recent.seen.then_some(recent)))
             }
-            fn visit_unit<E: de::Error>(self) -> Result<LastUser, E> {
-                Ok(LastUser(None))
+            fn visit_unit<E: de::Error>(self) -> Result<Recent, E> {
+                Ok(Recent(None))
             }
         }
         deserializer.deserialize_any(Walk)
@@ -442,5 +559,126 @@ mod tests {
             None,
             "a body that is not base64"
         );
+    }
+
+    fn input_of(req: &str) -> (String, String) {
+        let text = parse_capture(&capture(req, "{}")).expect("capture");
+        (text.input, text.input_note)
+    }
+
+    /// #38: an agent's tool loop never sends a new user message; IN is the
+    /// tool results after the last assistant message, newest last.
+    #[test]
+    fn a_tool_loop_shows_the_tool_results_after_the_last_assistant_message() {
+        let req = r#"{"messages":[
+            {"role":"system","content":"You are an invented agent."},
+            {"role":"user","content":"Invented task: tidy the fixture."},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"ls","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"a","content":"invented listing"},
+            {"role":"assistant","content":"Reading three files.","tool_calls":[]},
+            {"role":"tool","tool_call_id":"b","content":"invented file one"},
+            {"role":"tool","tool_call_id":"c","content":[{"type":"text","text":"invented file"},{"type":"text","text":"two"}]},
+            {"role":"tool","tool_call_id":"d","content":""}
+        ]}"#;
+        assert_eq!(
+            input_of(req),
+            (
+                "[tool] invented file one\n[tool] invented file\ntwo\n[tool]".to_owned(),
+                "3 tool results".to_owned()
+            )
+        );
+        let one = r#"{"messages":[{"role":"user","content":"Invented task."},
+            {"role":"assistant","content":"ok"},{"role":"tool","content":"invented result"}]}"#;
+        assert_eq!(
+            input_of(one),
+            (
+                "[tool] invented result".to_owned(),
+                "1 tool result".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn user_text_and_tool_results_after_an_assistant_message_are_joined_in_order() {
+        let req = r#"{"messages":[
+            {"role":"user","content":"Invented first task."},
+            {"role":"assistant","content":"Invented plan."},
+            {"role":"user","content":[{"type":"text","text":"Invented nudge."}]},
+            {"role":"tool","content":"invented result A"},
+            {"role":"tool","content":"invented result B"}
+        ]}"#;
+        assert_eq!(
+            input_of(req),
+            (
+                "Invented nudge.\n[tool] invented result A\n[tool] invented result B".to_owned(),
+                "user + 2 tool results".to_owned()
+            )
+        );
+    }
+
+    /// A plain chat (last message `user`) is unchanged by #38: that message
+    /// alone, no note, even after tool results.
+    #[test]
+    fn a_plain_chat_shows_only_the_last_user_message() {
+        let req = r#"{"messages":[
+            {"role":"system","content":"Invented system."},
+            {"role":"user","content":"Invented hello."},
+            {"role":"assistant","content":"Invented hi."},
+            {"role":"user","content":"Invented follow-up?"}
+        ]}"#;
+        assert_eq!(
+            input_of(req),
+            ("Invented follow-up?".to_owned(), String::new())
+        );
+        // A prefill (last message assistant) keeps the last user message.
+        let req = r#"{"messages":[{"role":"user","content":"Invented ask."},
+            {"role":"tool","content":"invented result"},
+            {"role":"assistant","content":"Invented prefix"}]}"#;
+        assert_eq!(input_of(req), ("Invented ask.".to_owned(), String::new()));
+        // Messages without a user or tool one fall back to the prompt.
+        let req = r#"{"messages":[{"role":"system","content":"x"}],"prompt":"invented prompt"}"#;
+        assert_eq!(input_of(req), ("invented prompt".to_owned(), String::new()));
+    }
+
+    /// With no assistant message, the run is every message but the system
+    /// (and developer) ones.
+    #[test]
+    fn without_an_assistant_message_everything_after_the_system_message_is_the_run() {
+        let req = r#"{"messages":[
+            {"role":"system","content":"Invented system."},
+            {"role":"developer","content":"Invented developer note."},
+            {"role":"user","content":"Invented task."},
+            {"role":"tool","content":"invented result"}
+        ]}"#;
+        assert_eq!(
+            input_of(req),
+            (
+                "Invented task.\n[tool] invented result".to_owned(),
+                "user + 1 tool result".to_owned()
+            )
+        );
+    }
+
+    /// A long run keeps its newest text, at most [`INPUT_CAP_CHARS`].
+    #[test]
+    fn a_long_tool_run_keeps_its_tail() {
+        let big = "x".repeat(INPUT_CAP_CHARS * 3);
+        let req = serde_json::json!({"messages": [
+            {"role": "assistant", "content": "Invented."},
+            {"role": "tool", "content": big},
+            {"role": "tool", "content": big},
+            {"role": "tool", "content": "INVENTED-NEWEST"},
+        ]})
+        .to_string();
+        let (input, note) = input_of(&req);
+        assert_eq!(note, "3 tool results");
+        assert_eq!(input.chars().count(), INPUT_CAP_CHARS);
+        assert!(
+            input.ends_with("x\n[tool] INVENTED-NEWEST"),
+            "{}",
+            &input[input.len() - 40..]
+        );
+        let req = serde_json::json!({"messages": [{"role": "user", "content": big}]}).to_string();
+        assert_eq!(input_of(&req).0.chars().count(), INPUT_CAP_CHARS);
     }
 }

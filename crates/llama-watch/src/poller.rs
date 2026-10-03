@@ -136,8 +136,12 @@ pub struct CaptureView {
     pub model: String,
     /// The activity row id it belongs to.
     pub id: i64,
-    /// The last user message, as IN shows it (`tty.prompt_view`).
+    /// The last user message, or a tool loop's newest user and tool
+    /// messages (#38), as IN shows it (`tty.prompt_view`).
     pub input: Vec<Cell>,
+    /// What a tool-loop IN holds (`3 tool results`), for its title; empty
+    /// for a single user message. Built by llama-watch, never request text.
+    pub input_note: String,
     /// The answer.
     pub output: Vec<Cell>,
 }
@@ -998,6 +1002,7 @@ impl<L: Sink> State<L> {
                             self.limits.input_tail,
                             self.limits.prompt_view,
                         ),
+                        input_note: text.input_note,
                         output: tail_cells(&text.output, self.limits.output_tail),
                     };
                     self.capture = Some((model.id.clone(), view));
