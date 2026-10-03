@@ -6,6 +6,18 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- A model whose launch command does not name its server (for example a
+  container image that runs `vllm serve` itself) is recognised by its
+  `/metrics` names, read once per load and only while llama-swap reports it
+  `ready` (#31).
+- vLLM: speculative-decoding acceptance rate and mean accepted length (tty11,
+  the LCD and the exporter), mean TTFT, inter-token and request latency,
+  preemptions, engine sleep, and the KV dtype, block size and prefix caching
+  from `cache_config_info` for the tuning line. SGLang's spec-decode gauges
+  and latency histograms are read too (#31).
+
 ## 0.3.1 — 2026-10-03
 
 ### Added

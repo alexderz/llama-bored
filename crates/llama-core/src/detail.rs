@@ -18,6 +18,8 @@ pub const NCMOE_ALL: u16 = u16::MAX;
 pub const KV_DEFAULT: &str = "f16";
 /// Separator between detail items on the LCD and the tty.
 pub const SEPARATOR: &str = " \u{00B7} ";
+/// Largest KV cache block size kept, tokens.
+pub const MAX_KV_BLOCK: u32 = 1 << 20;
 
 /// Tuning numbers and tokens for one model. Every field is optional.
 ///
@@ -43,6 +45,13 @@ pub struct ModelDetail {
     /// Flash attention on or off. Absent is `auto` or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fa: Option<bool>,
+    /// KV cache block size in tokens, 1..=[`MAX_KV_BLOCK`] (vLLM's
+    /// `cache_config_info` `block_size`, #31). The tty draws it; the LCD does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_block: Option<u32>,
+    /// Prefix caching on or off (vLLM's `enable_prefix_caching`, #31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_cache: Option<bool>,
 }
 
 /// True for a token made only of `[A-Za-z0-9_.+-]`, 1..=[`MAX_TOKEN_CHARS`] long.
@@ -55,13 +64,91 @@ pub fn is_token(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'))
 }
 
-/// True when every token field passes [`is_token`].
+/// True when every token field passes [`is_token`] and the KV block size
+/// is within 1..=[`MAX_KV_BLOCK`].
 #[must_use]
 pub fn is_valid(detail: &ModelDetail) -> bool {
     [&detail.kv_k, &detail.kv_v, &detail.quant]
         .into_iter()
         .flatten()
         .all(|token| is_token(token))
+        && detail
+            .kv_block
+            .is_none_or(|block| (1..=MAX_KV_BLOCK).contains(&block))
+}
+
+/// The engine's own cache facts for the tty (#31): `block 16`, `prefix on`.
+/// Empty when the server reported none. Not part of [`line`] or the LCD.
+#[must_use]
+pub fn engine_items(detail: &ModelDetail) -> Vec<String> {
+    let mut items = Vec::new();
+    if let Some(block) = detail
+        .kv_block
+        .filter(|block| (1..=MAX_KV_BLOCK).contains(block))
+    {
+        items.push(format!("block {block}"));
+    }
+    if let Some(on) = detail.prefix_cache {
+        items.push(if on { "prefix on" } else { "prefix off" }.to_owned());
+    }
+    items
+}
+
+/// [`fitted`] with `tail` (the LCD's `spec 78 %`, #31) kept at the end.
+///
+/// The detail items drop in [`fitted`]'s order while `tail` stays; when
+/// even the shortest detail with `tail` is too wide, `tail` goes and the
+/// detail is fitted alone. No detail at all draws `tail` alone, cut with
+/// `…` if it must be.
+#[must_use]
+pub fn fitted_with(
+    detail: Option<&ModelDetail>,
+    tail: Option<&str>,
+    fits: impl Fn(&str) -> bool,
+) -> String {
+    let Some(tail) = tail.filter(|tail| !tail.is_empty()) else {
+        return detail
+            .map(|detail| fitted(detail, &fits))
+            .unwrap_or_default();
+    };
+    let Some(detail) = detail else {
+        return cut(tail, &fits);
+    };
+    let quant = detail.quant.as_deref().filter(|q| is_token(q));
+    let stripped = quant.map(|q| q.strip_prefix("UD-").unwrap_or(q));
+    let steps = [
+        build(detail, quant, true),
+        build(detail, stripped, true),
+        build(detail, None, true),
+        build(detail, None, false),
+    ];
+    for text in &steps {
+        let text = if text.is_empty() {
+            tail.to_owned()
+        } else {
+            format!("{text}{SEPARATOR}{tail}")
+        };
+        if fits(&text) {
+            return text;
+        }
+    }
+    fitted(detail, fits)
+}
+
+/// `text`, or its longest prefix plus `…` that `fits` accepts.
+fn cut(text: &str, fits: &impl Fn(&str) -> bool) -> String {
+    if fits(text) {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    loop {
+        let text = format!("{}\u{2026}", chars[..keep].iter().collect::<String>());
+        if keep <= 1 || fits(&text) {
+            return text;
+        }
+        keep -= 1;
+    }
 }
 
 /// The whole detail line: `{ctx} · kv {kv} · {quant} · moe {n}`.
@@ -171,6 +258,8 @@ mod tests {
             kv_v: Some("q8_0".to_owned()),
             quant: Some("PTQ1_0".to_owned()),
             fa: Some(true),
+            kv_block: None,
+            prefix_cache: None,
         }
     }
 
@@ -231,6 +320,62 @@ mod tests {
         assert_eq!(by_len(15), "256k · moe 16");
         assert_eq!(by_len(8), "256k · …");
         assert_eq!(by_len(0), "2…");
+    }
+
+    #[test]
+    fn a_spec_tail_stays_while_the_detail_drops() {
+        let detail = qwen();
+        let tail = Some("spec 78 %");
+        let by_len = |max: usize| {
+            fitted_with(Some(&detail), tail, |text: &str| {
+                text.chars().count() <= max
+            })
+        };
+        assert_eq!(by_len(99), "256k · kv q8 · UD-Q4_K_M · moe 16 · spec 78 %");
+        assert_eq!(by_len(42), "256k · kv q8 · Q4_K_M · moe 16 · spec 78 %");
+        assert_eq!(by_len(33), "256k · kv q8 · moe 16 · spec 78 %");
+        assert_eq!(by_len(25), "256k · moe 16 · spec 78 %");
+        // Too narrow for the tail: the detail alone, as before.
+        assert_eq!(by_len(24), "256k · kv q8 · moe 16");
+        assert_eq!(
+            fitted_with(Some(&detail), None, |t: &str| t.chars().count() <= 99),
+            line(&detail)
+        );
+        // No detail: the tail alone, cut if it must be.
+        assert_eq!(fitted_with(None, tail, |_: &str| true), "spec 78 %");
+        assert_eq!(
+            fitted_with(None, tail, |t: &str| t.chars().count() <= 5),
+            "spec…"
+        );
+        assert_eq!(fitted_with(None, None, |_: &str| true), "");
+        // vLLM with only a KV dtype from cache_config_info.
+        let vllm = ModelDetail {
+            kv_k: Some("fp8_e4m3".to_owned()),
+            kv_v: Some("fp8_e4m3".to_owned()),
+            ..ModelDetail::default()
+        };
+        assert_eq!(
+            fitted_with(Some(&vllm), tail, |_: &str| true),
+            "kv fp8_e4m3 · spec 78 %"
+        );
+    }
+
+    #[test]
+    fn engine_items_are_block_and_prefix_only() {
+        let mut detail = ModelDetail::default();
+        assert!(engine_items(&detail).is_empty());
+        detail.kv_block = Some(16);
+        detail.prefix_cache = Some(true);
+        assert_eq!(engine_items(&detail), ["block 16", "prefix on"]);
+        assert_eq!(line(&detail), "kv f16", "not on the shared line");
+        detail.prefix_cache = Some(false);
+        assert_eq!(engine_items(&detail), ["block 16", "prefix off"]);
+        assert!(is_valid(&detail));
+        detail.kv_block = Some(0);
+        assert!(!is_valid(&detail));
+        assert_eq!(engine_items(&detail), ["prefix off"]);
+        detail.kv_block = Some(MAX_KV_BLOCK + 1);
+        assert!(!is_valid(&detail));
     }
 
     #[test]

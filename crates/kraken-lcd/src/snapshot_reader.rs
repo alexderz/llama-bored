@@ -264,8 +264,9 @@ fn fresh_snapshot(
                 state: model_state(model.state).to_owned(),
                 full_name: model.full_name.clone(),
                 detail: model.detail.clone(),
-                // The LCD draws no backend gauges.
-                backend: None,
+                // The LCD draws no backend gauges, only the speculative
+                // acceptance on the detail line (#31).
+                backend: spec_only(model),
             })
             .collect(),
         tokens: Some(TokenReading {
@@ -276,6 +277,21 @@ fn fresh_snapshot(
         }),
         errors: std::collections::BTreeSet::new(),
     }
+}
+
+/// The model's speculative acceptance as the only backend number, or
+/// `None` when the snapshot has none. Validation already bounded it to 0..=1.
+fn spec_only(model: &llama_core::wire::ModelWire) -> Option<llama_core::backend::BackendInfo> {
+    let accept = model.engine.as_ref()?.spec_accept?;
+    let permille = llama_core::backend::permille(f64::from(accept))?;
+    Some(llama_core::backend::BackendInfo {
+        kind: model.backend.unwrap_or_default(),
+        engine: llama_core::backend::EngineStats {
+            spec_permille: Some(permille),
+            ..llama_core::backend::EngineStats::default()
+        },
+        ..llama_core::backend::BackendInfo::default()
+    })
 }
 
 fn blank_snapshot(mono: Instant, wall: SystemTime, coolant: Option<f32>) -> Snapshot {

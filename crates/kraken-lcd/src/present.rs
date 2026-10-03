@@ -229,6 +229,10 @@ pub struct View {
     /// Tuning detail of the first model. `None` from an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ModelDetail>,
+    /// The first model's speculative acceptance, 0..=1000, drawn at the end
+    /// of the detail line as `spec 78 %` (#31). `None` when not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_permille: Option<u16>,
     /// 24 dial bars, newest at 12 o'clock: mean activity (0..=125) over each
     /// bar's window. `None` is no data. No hysteresis.
     #[serde(default = "no_data_dial")]
@@ -262,6 +266,7 @@ impl Default for View {
             models: Vec::new(),
             model_count: 0,
             detail: None,
+            spec_permille: None,
             dial: no_data_dial(),
             scale: default_scale(),
             tokens: Vec::new(),
@@ -339,6 +344,13 @@ pub fn present(
         .models
         .first()
         .and_then(|model| model.detail.clone());
+    // Whole percents, so the frame key only moves when the text does.
+    let spec_permille = snapshot
+        .models
+        .first()
+        .and_then(|model| model.backend)
+        .and_then(|info| info.engine.spec_permille)
+        .map(|permille| (permille.min(1000) + 5) / 10 * 10);
     let mut memory = match previous {
         Some(view) => view.dial_state.clone(),
         None => DialMemory(Memory::new(&config.dial)),
@@ -459,6 +471,7 @@ pub fn present(
         model_count: u8::try_from(models.len()).unwrap_or(u8::MAX),
         models,
         detail,
+        spec_permille,
         dial,
         scale,
         tokens,

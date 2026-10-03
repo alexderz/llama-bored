@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::backend::{Backend, MAX_REQS};
+pub use crate::backend::{Backend, MAX_ENGINE_LATENCY_S, MAX_REQS, MAX_SPEC_LEN};
 pub use crate::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 
 /// Wire schema version this crate reads and writes.
@@ -102,7 +102,8 @@ pub enum WireError {
     #[error("snapshot model name is not canonical")]
     Name,
     /// A model's `running` or `queued` is above [`MAX_REQS`], its
-    /// `kv_fill` is non-finite or outside 0..=1, its cached prompt tokens
+    /// `kv_fill` is non-finite or outside 0..=1, its engine numbers are out
+    /// of range ([`EngineWire::is_valid`]), its cached prompt tokens
     /// exceed its prompt tokens, or a slot context row is out of range,
     /// repeated, or past [`MAX_SLOT_CTX`] (#10).
     #[error("snapshot model gauge is out of range")]
@@ -280,6 +281,67 @@ pub struct ModelWire {
     /// the whole snapshot. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slot_ctx: Vec<SlotCtxWire>,
+    /// Engine numbers from a backend without `/slots` (#31): speculative
+    /// decoding, preemptions, sleep, latency means. Omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<EngineWire>,
+}
+
+/// A server's own engine numbers (#31). Every field is optional. Window
+/// means cover the latest metrics poll window that saw activity; counters
+/// count since the watcher started.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineWire {
+    /// Speculative acceptance, accepted / draft tokens, 0..=1.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub spec_accept: Option<f32>,
+    /// Mean tokens per speculative step, 1..=[`MAX_SPEC_LEN`].
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub spec_len: Option<f32>,
+    /// Speculative draft rounds since the watcher started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_drafts: Option<u64>,
+    /// Tokens drafted since the watcher started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_draft_tokens: Option<u64>,
+    /// Of [`Self::spec_draft_tokens`], those accepted. Never above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_accepted_tokens: Option<u64>,
+    /// Preemptions since the watcher started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemptions: Option<u64>,
+    /// The engine is asleep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleeping: Option<bool>,
+    /// Mean time to first token, seconds, 0..=[`MAX_ENGINE_LATENCY_S`].
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub ttft_s: Option<f32>,
+    /// Mean inter-token latency, seconds.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub itl_s: Option<f32>,
+    /// Mean end-to-end request latency, seconds.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub e2e_s: Option<f32>,
+}
+
+impl EngineWire {
+    /// True when the numbers are in range: a ratio in 0..=1, a step length
+    /// in 1..=[`MAX_SPEC_LEN`], accepted tokens not above draft tokens, and
+    /// latencies in 0..=[`MAX_ENGINE_LATENCY_S`].
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let in_range = |value: Option<f32>, low: f64, high: f64| {
+            value.is_none_or(|v| v.is_finite() && (low..=high).contains(&f64::from(v)))
+        };
+        in_range(self.spec_accept, 0.0, 1.0)
+            && in_range(self.spec_len, 1.0, MAX_SPEC_LEN)
+            && [self.ttft_s, self.itl_s, self.e2e_s]
+                .into_iter()
+                .all(|latency| in_range(latency, 0.0, MAX_ENGINE_LATENCY_S))
+            && self
+                .spec_accepted_tokens
+                .is_none_or(|accepted| self.spec_draft_tokens.is_some_and(|all| accepted <= all))
+    }
 }
 
 /// One llama.cpp slot's context (#10). Numbers only.
@@ -547,6 +609,13 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
             || model
                 .prompt_cached_tokens
                 .is_some_and(|cached| model.prompt_tokens.is_none_or(|all| cached > all))
+        {
+            return Err(WireError::Gauge);
+        }
+        if model
+            .engine
+            .as_ref()
+            .is_some_and(|engine| !engine.is_valid())
         {
             return Err(WireError::Gauge);
         }

@@ -51,6 +51,8 @@ fn sample() -> WireSnapshot {
                     kv_v: Some("q4_0".to_owned()),
                     quant: Some("UD-Q4_K_M".to_owned()),
                     fa: Some(true),
+                    kv_block: None,
+                    prefix_cache: None,
                 }),
                 cache_hit: None,
                 slots_busy: None,
@@ -58,6 +60,7 @@ fn sample() -> WireSnapshot {
                 prompt_tokens: None,
                 prompt_cached_tokens: None,
                 slot_ctx: Vec::new(),
+                engine: None,
             }],
         },
         tokens: Tokens {

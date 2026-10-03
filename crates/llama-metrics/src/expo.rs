@@ -15,7 +15,9 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use llama_core::detail::{self, KV_DEFAULT, ModelDetail, NCMOE_ALL};
-use llama_core::wire::{self, AiWire, FanWire, ModelState, ModelWire, SlotCtxWire, WireSnapshot};
+use llama_core::wire::{
+    self, AiWire, EngineWire, FanWire, ModelState, ModelWire, SlotCtxWire, WireSnapshot,
+};
 
 use crate::snapshot::ReadError;
 
@@ -137,6 +139,16 @@ impl Out {
 /// An `f32` sample value, printed like [`Out::gauge_opt`] prints one.
 fn num(value: f32) -> String {
     format!("{value}")
+}
+
+/// `1` or `0`.
+fn flag(on: bool) -> String {
+    if on { "1" } else { "0" }.to_owned()
+}
+
+/// A model's engine numbers (#31), when the watcher sent any.
+fn engine(model: &ModelWire) -> Option<&EngineWire> {
+    model.engine.as_ref()
 }
 
 /// Picks one model's value for a per-model family.
@@ -465,7 +477,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             }
         }
     }
-    let model_families: [(&str, &str, &str, ModelValue); 9] = [
+    let model_families: [(&str, &str, &str, ModelValue); 21] = [
         (
             "llamabored_model_ctx_size_tokens",
             "gauge",
@@ -525,6 +537,116 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             "counter",
             "Prompt tokens served from the prompt cache since the watcher started; hit ratio = rate of this / rate of prompt_tokens_total.",
             |m| m.prompt_cached_tokens.map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_kv_block_size_tokens",
+            "gauge",
+            "KV cache block size of a loaded model, tokens (vLLM cache_config_info).",
+            |m| {
+                m.detail
+                    .as_ref()
+                    .and_then(|d| d.kv_block)
+                    .map(|n| n.to_string())
+            },
+        ),
+        (
+            "llamabored_model_prefix_caching",
+            "gauge",
+            "1 when a loaded model has prefix caching on, 0 when off (vLLM cache_config_info).",
+            |m| m.detail.as_ref().and_then(|d| d.prefix_cache).map(flag),
+        ),
+        (
+            "llamabored_model_spec_acceptance_ratio",
+            "gauge",
+            "Speculative decoding: accepted / draft tokens, 0 to 1, over the latest metrics window with drafts (vLLM; SGLang's gauge).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.spec_accept)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_spec_accepted_length",
+            "gauge",
+            "Speculative decoding: mean tokens per step (1 + accepted / drafts) over the same window.",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.spec_len)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_spec_drafts_total",
+            "counter",
+            "Speculative decoding draft rounds since the watcher started (vLLM).",
+            |m| engine(m).and_then(|e| e.spec_drafts).map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_spec_draft_tokens_total",
+            "counter",
+            "Speculative decoding tokens drafted since the watcher started (vLLM).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.spec_draft_tokens)
+                    .map(|n| n.to_string())
+            },
+        ),
+        (
+            "llamabored_model_spec_accepted_tokens_total",
+            "counter",
+            "Drafted tokens accepted since the watcher started (vLLM); acceptance = rate of this / rate of draft_tokens_total.",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.spec_accepted_tokens)
+                    .map(|n| n.to_string())
+            },
+        ),
+        (
+            "llamabored_model_preemptions_total",
+            "counter",
+            "Requests a loaded model preempted since the watcher started (vLLM); a rising count means KV cache pressure.",
+            |m| engine(m).and_then(|e| e.preemptions).map(|n| n.to_string()),
+        ),
+        (
+            "llamabored_model_sleeping",
+            "gauge",
+            "1 when a loaded model's engine is asleep, 0 when awake (vLLM engine_sleep_state).",
+            |m| engine(m).and_then(|e| e.sleeping).map(flag),
+        ),
+        (
+            "llamabored_model_ttft_seconds",
+            "gauge",
+            "Mean time to first token, seconds, over the latest metrics window with requests (vLLM, SGLang).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.ttft_s)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_itl_seconds",
+            "gauge",
+            "Mean inter-token latency, seconds, over the latest metrics window with tokens (vLLM, SGLang).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.itl_s)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_e2e_latency_seconds",
+            "gauge",
+            "Mean end-to-end request latency, seconds, over the latest metrics window with finished requests (vLLM, SGLang).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.e2e_s)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
         ),
     ];
     for (name, kind, help, value) in model_families {

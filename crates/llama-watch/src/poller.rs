@@ -36,6 +36,19 @@
 //! cannot give. A 401 or 403 (Strata started with an API key; llama-bored
 //! keeps no secrets) falls back like any missing `/metrics`.
 //!
+//! A model whose launch command names no server (`openai`: a container
+//! whose image runs `vllm serve`, a wrapper script around llama-server) and
+//! that `[llama.backends]` does not name gets one `/upstream/<id>/metrics`
+//! GET per load, with the usual cap and timeout (#31). The first sample's
+//! metric prefix decides: `vllm:`, `sglang:` or `llamacpp:` (which then also
+//! gets `/slots`); anything else, or no `/metrics`, stays `openai`. Each
+//! outcome is logged once.
+//!
+//! Every `/upstream/<id>/…` GET, the probe included, is for a model the last
+//! good `/running` read listed as `ready`: an upstream request for any other
+//! model would make llama-swap load it. A `/running` failure clears the
+//! ready list, so nothing upstream is read until llama-swap answers again.
+//!
 //! The thread never touches the console or the snapshot file.
 
 use std::collections::{HashMap, HashSet};
@@ -45,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use llama_core::backend::{self, Backend, BackendInfo};
+use llama_core::backend::{self, Backend, BackendInfo, EngineStats};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::names::sanitize;
 use llama_core::sample::{AiState, LlamaView, ModelInfo};
@@ -55,7 +68,8 @@ use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
 use crate::metrics::{
-    DecodedCounter, EngineFacts, GenRate, MetricsSample, PromptCache, parse_metrics_full,
+    DecodedCounter, EngineBook, EngineFacts, GenRate, MetricsSample, PromptCache, detect_backend,
+    parse_metrics_full,
 };
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
@@ -302,6 +316,9 @@ struct ReadyModel {
     id: String,
     name: String,
     backend: Backend,
+    /// The launch command named no server and `[llama.backends]` has no
+    /// entry: `/metrics` decides, once per load (#31).
+    probe: bool,
 }
 
 /// Live gauges from one backend `/metrics` read.
@@ -311,16 +328,18 @@ struct Gauges {
     queued: Option<u16>,
     kv_permille: Option<u16>,
     hit_permille: Option<u16>,
+    engine: EngineStats,
     at: Instant,
 }
 
 impl Gauges {
-    fn of(sample: &MetricsSample, at: Instant) -> Self {
+    fn of(sample: &MetricsSample, engine: EngineStats, at: Instant) -> Self {
         Self {
             running: sample.requests_processing.and_then(backend::reqs),
             queued: sample.queued.and_then(backend::reqs),
             kv_permille: sample.kv_fill.and_then(backend::permille),
             hit_permille: sample.cache_hit.and_then(backend::permille),
+            engine,
             at,
         }
     }
@@ -365,6 +384,14 @@ struct State<L> {
     prompt_box: DecodedCounter,
     /// Per-model prompt and cached-prompt counters (#10).
     prompt_cache: PromptCache,
+    /// Per-model engine numbers: spec decoding, preemptions, latency (#31).
+    engines: EngineBook,
+    /// Server kind `/metrics` gave each loaded model the launch command did
+    /// not name (#31); `openai` when it gave none. Dropped when the model
+    /// leaves `ready`, so the next load is probed again.
+    detected: HashMap<String, Backend>,
+    /// `id:kind` probe outcomes already logged this run.
+    detect_logged: HashSet<String>,
     running_up: bool,
     unmetered: bool,
     latencies: PollLatencies,
@@ -409,6 +436,9 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         prompt_rate: GenRate::default(),
         prompt_box: DecodedCounter::default(),
         prompt_cache: PromptCache::default(),
+        engines: EngineBook::default(),
+        detected: HashMap::new(),
+        detect_logged: HashSet::new(),
         running_up: false,
         unmetered: false,
         latencies: PollLatencies::default(),
@@ -507,6 +537,7 @@ impl<L: Sink> State<L> {
             .collect();
         self.model_ids = models.iter().map(|info| info.id.clone()).collect();
 
+        let was_ready: Vec<String> = self.ready.iter().map(|model| model.id.clone()).collect();
         self.ready.clear();
         self.unmetered = false;
         if self.running_up {
@@ -520,12 +551,22 @@ impl<L: Sink> State<L> {
                         id,
                         name,
                         backend: self.backend_of(info),
+                        probe: self.probes(info),
                     }),
                     None => self.unmetered = true,
                 }
             }
         }
         let ready: HashSet<&str> = self.ready.iter().map(|model| model.id.as_str()).collect();
+        // A model that left `ready` in a good read was unloaded (or is
+        // loading again): its next load is probed afresh and its engine
+        // windows start over. A failed read keeps both.
+        if self.running_up {
+            self.detected.retain(|id, _| ready.contains(id.as_str()));
+            for id in was_ready.iter().filter(|id| !ready.contains(id.as_str())) {
+                self.engines.forget(id);
+            }
+        }
         if self
             .capture
             .as_ref()
@@ -551,16 +592,84 @@ impl<L: Sink> State<L> {
         self.latencies.running = Some(started.elapsed());
     }
 
-    /// `[llama.backends]` first, then the launch command.
+    /// `[llama.backends]` first, then the launch command, then what this
+    /// load's `/metrics` probe found (#31).
     fn backend_of(&self, info: &llamaswap::RunningModel) -> Backend {
-        self.limits
-            .backends
-            .get(&info.id)
-            .copied()
-            .unwrap_or(info.backend)
+        if let Some(kind) = self.limits.backends.get(&info.id) {
+            return *kind;
+        }
+        if self.probes(info) {
+            return self
+                .detected
+                .get(&info.id)
+                .copied()
+                .unwrap_or(Backend::OpenAi);
+        }
+        info.backend
+    }
+
+    /// The launch command named no server and the config does not either.
+    fn probes(&self, info: &llamaswap::RunningModel) -> bool {
+        info.backend == Backend::OpenAi && !self.limits.backends.contains_key(&info.id)
+    }
+
+    /// One `/metrics` GET for each ready model that still needs a probe
+    /// this load (#31). Only models in `self.ready`, the last good
+    /// `/running` read's `ready` list, are probed.
+    fn probe_backends(&mut self) {
+        let todo: Vec<String> = self
+            .ready
+            .iter()
+            .filter(|model| model.probe && !self.detected.contains_key(&model.id))
+            .map(|model| model.id.clone())
+            .collect();
+        for id in todo {
+            let url = upstream(&self.limits.url, &id, "metrics");
+            let read = get_exact(
+                &self.agent,
+                &url,
+                self.limits.metrics_timeout,
+                SERVER_METRICS_CAP,
+            )
+            .map_err(TapError::label)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
+            let (kind, note) = match read.as_deref().map(detect_backend) {
+                Ok(Some(kind)) => (kind, format!("/metrics says {}", kind.as_str())),
+                Ok(None) => (
+                    Backend::OpenAi,
+                    "no known metric names; staying openai".to_owned(),
+                ),
+                Err(label) => (
+                    Backend::OpenAi,
+                    format!("no /metrics ({label}); staying openai"),
+                ),
+            };
+            self.detected.insert(id.clone(), kind);
+            if self.detect_logged.insert(format!("{id}:{}", kind.as_str())) {
+                log::emit(
+                    &mut self.log,
+                    Priority::Info,
+                    &format!("{id}: launch command names no server; {note}"),
+                );
+            }
+            for model in self.ready.iter_mut().filter(|model| model.id == id) {
+                model.backend = kind;
+            }
+            for (model, model_id) in self.models.iter_mut().zip(&self.model_ids) {
+                if *model_id == id
+                    && let Some(info) = model.backend.as_mut()
+                {
+                    info.kind = kind;
+                }
+            }
+            if kind.has_metrics() {
+                self.fallback.remove(&id);
+            }
+        }
     }
 
     fn poll_metrics(&mut self) {
+        self.probe_backends();
         let ready: Vec<ReadyModel> = self
             .ready
             .iter()
@@ -604,8 +713,9 @@ impl<L: Sink> State<L> {
                     sample.prompt_total,
                     sample.cached_total,
                 );
+                let engine = self.engines.observe(&model.id, sample);
                 self.gauges
-                    .insert(model.id.clone(), Gauges::of(sample, now));
+                    .insert(model.id.clone(), Gauges::of(sample, engine, now));
                 if let Some(prompt) = sample.prompt_total {
                     self.prompt_counter.observe(&model.id, prompt, None, now);
                 }
@@ -982,6 +1092,7 @@ impl<L: Sink> State<L> {
             info.queued = gauges.queued;
             info.kv_permille = gauges.kv_permille;
             info.hit_permille = gauges.hit_permille;
+            info.engine = gauges.engine;
         }
         models
     }
@@ -1058,15 +1169,22 @@ impl TapError {
     }
 }
 
-/// Fill `detail`'s ctx when the launch command gave none, and its KV when
-/// it is unknown or `auto`, from the server's own report.
+/// Fill `detail`'s ctx when the launch command gave none, its KV when it
+/// is unknown or `auto`, and the KV block size and prefix caching (#31),
+/// from the server's own report.
 fn with_facts(detail: &mut Option<llama_core::detail::ModelDetail>, facts: &EngineFacts) {
-    if facts.ctx.is_none() && facts.kv.is_none() {
+    if *facts == EngineFacts::default() {
         return;
     }
     let detail = detail.get_or_insert_with(Default::default);
     if detail.ctx.is_none() {
         detail.ctx = facts.ctx;
+    }
+    if detail.kv_block.is_none() {
+        detail.kv_block = facts.kv_block;
+    }
+    if detail.prefix_cache.is_none() {
+        detail.prefix_cache = facts.prefix_cache;
     }
     if let Some(kv) = &facts.kv {
         for side in [&mut detail.kv_k, &mut detail.kv_v] {

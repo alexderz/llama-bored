@@ -1312,12 +1312,286 @@ fn openai_server_gets_no_metrics_or_slots_and_counts_activity() {
     wait_msg(&rx, Duration::from_secs(2), |view, _| {
         view.decoded_total == Some(40)
     });
+    // #31: one /metrics probe for this load (no known names: stays
+    // openai), logged once; never /slots.
+    let hits = server.hits();
+    let upstream: Vec<&String> = hits
+        .iter()
+        .filter(|path| path.contains("/upstream/"))
+        .collect();
+    assert_eq!(upstream, ["/upstream/tabby/metrics"], "{hits:?}");
+    let lines = log.lines();
+    let notes: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("metric"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{lines:?}");
+    assert!(
+        notes[0].contains(
+            "tabby: launch command names no server; no known metric names; staying openai"
+        ),
+        "{lines:?}"
+    );
+}
+
+// ---- #31: detection by metric prefix, vLLM engine numbers ----------------------
+
+/// HyperQwen's llama-swap command: a podman wrapper whose image runs
+/// `vllm serve` itself, so the command names no server (generic names).
+const CONTAINER_CMD: &str = "podman run --rm --name hyperqwen --network llama --device nvidia.com/gpu=all ghcr.io/example/hyperqwen single";
+
+/// The vLLM fixture with the spec-decode and decode counters moved on.
+fn vllm_metrics(generated: u64, drafts: u64, draft_tokens: u64, accepted: u64) -> Vec<u8> {
+    String::from_utf8(fixture("vllm-metrics.txt"))
+        .expect("utf-8")
+        .replace(
+            "vllm:generation_tokens_total{engine=\"0\",model_name=\"qwen3.8-27b\"} 42000.0",
+            &format!("vllm:generation_tokens_total{{engine=\"0\",model_name=\"qwen3.8-27b\"}} {generated}.0"),
+        )
+        .replace(
+            "vllm:spec_decode_num_drafts_total{engine=\"0\",model_name=\"qwen3.8-27b\"} 20000.0",
+            &format!("vllm:spec_decode_num_drafts_total{{engine=\"0\",model_name=\"qwen3.8-27b\"}} {drafts}.0"),
+        )
+        .replace(
+            "vllm:spec_decode_num_draft_tokens_total{engine=\"0\",model_name=\"qwen3.8-27b\"} 60000.0",
+            &format!("vllm:spec_decode_num_draft_tokens_total{{engine=\"0\",model_name=\"qwen3.8-27b\"}} {draft_tokens}.0"),
+        )
+        .replace(
+            "vllm:spec_decode_num_accepted_tokens_total{engine=\"0\",model_name=\"qwen3.8-27b\"} 38000.0",
+            &format!("vllm:spec_decode_num_accepted_tokens_total{{engine=\"0\",model_name=\"qwen3.8-27b\"}} {accepted}.0"),
+        )
+        .into_bytes()
+}
+
+#[test]
+fn a_container_vllm_is_found_by_its_metrics_and_reads_engine_numbers() {
+    let mut world = World::running(running_cmd("qwen3.8-27b-vllm", CONTAINER_CMD));
+    world.metrics.insert(
+        "qwen3.8-27b-vllm".to_owned(),
+        vllm_metrics(42_000, 20_000, 60_000, 38_000),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.engine.spec_permille.is_some())
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kind, llama_core::backend::Backend::Vllm);
+    assert_eq!(info.running, Some(1));
+    assert_eq!(info.queued, Some(2));
+    assert_eq!(info.kv_permille, Some(413));
+    // The first read: the server's totals since start (38k of 60k drafted).
+    assert_eq!(info.engine.spec_permille, Some(633));
+    assert_eq!(info.engine.spec_len_centi, Some(290));
+    assert_eq!(info.engine.sleeping, Some(false));
+    assert_eq!(info.engine.preemptions, Some(0));
+    assert_eq!(info.engine.ttft_us, Some(750_000));
+    assert_eq!(info.engine.e2e_us, Some(25_000_000));
+    assert_eq!(info.engine.itl_us, Some(24_000));
+    let tuning = view.models[0]
+        .detail
+        .as_ref()
+        .expect("detail from cache_config_info");
+    assert_eq!(tuning.kv_k.as_deref(), Some("fp8_e4m3"));
+    assert_eq!(tuning.kv_block, Some(16));
+    assert_eq!(tuning.prefix_cache, Some(true));
+    assert_eq!(tuning.ctx, None);
+    // prompt_tokens_cached is the cached counter; it starts at its baseline.
+    assert_eq!(
+        detail
+            .prompt_cache
+            .iter()
+            .find(|row| row.model.starts_with("qwen3.8"))
+            .map(|row| (row.prompt, row.cached)),
+        Some((0, Some(0)))
+    );
+
+    // 100 drafts of 3, 240 accepted: 80 % and 3.4 per step over the window.
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.8-27b-vllm".to_owned(),
+            vllm_metrics(42_340, 20_100, 60_300, 38_240),
+        );
+    });
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(340)
+    });
+    let engine = view.models[0].backend.expect("backend").engine;
+    assert_eq!(engine.spec_permille, Some(800));
+    assert_eq!(engine.spec_len_centi, Some(340));
+    assert_eq!(
+        engine.spec_counts,
+        Some(llama_core::backend::SpecCounts {
+            drafts: 100,
+            draft_tokens: 300,
+            accepted: 240,
+        })
+    );
+    thread::sleep(Duration::from_millis(500));
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+    let lines = log.lines();
+    let notes: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("names no server"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{lines:?}");
+    assert!(
+        notes[0].contains("qwen3.8-27b-vllm: launch command names no server; /metrics says vllm"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("no /metrics")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_wrapped_llama_server_is_found_by_its_metrics_and_gets_slots() {
+    let mut world = World::running(running_cmd("wrapped", "/opt/bin/start-model.sh fast"));
+    world
+        .metrics
+        .insert("wrapped".to_owned(), metrics_body(10, 1.0));
+    world
+        .slots
+        .insert("wrapped".to_owned(), fixture("slots-sample.json"));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, detail| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.kind == llama_core::backend::Backend::LlamaCpp)
+            && !detail.slots.is_empty()
+    });
+    assert_eq!(view.decoded_total, Some(0));
+    let hits = server.hits();
+    assert!(
+        hits.iter().any(|path| path == "/upstream/wrapped/slots"),
+        "{hits:?}"
+    );
+    assert!(
+        log.lines()
+            .iter()
+            .any(|line| line
+                .contains("wrapped: launch command names no server; /metrics says llamacpp")),
+        "{:?}",
+        log.lines()
+    );
+}
+
+#[test]
+fn a_wrapped_sglang_is_found_by_its_metrics() {
+    let mut world = World::running(running_cmd("flash", "/opt/bin/start-flash.sh"));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(1000, 1, 2, 0.37));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.running == Some(1))
+    });
+    assert_eq!(
+        view.models[0].backend.expect("backend").kind,
+        llama_core::backend::Backend::SgLang
+    );
+    thread::sleep(Duration::from_millis(400));
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+}
+
+#[test]
+fn the_config_beats_detection_and_openai_there_means_no_probe() {
+    let mut world = World::running(running_cmd("qwen3.8-27b-vllm", CONTAINER_CMD));
+    world.metrics.insert(
+        "qwen3.8-27b-vllm".to_owned(),
+        vllm_metrics(42_000, 20_000, 60_000, 38_000),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(
+        server.port,
+        12,
+        4_194_304,
+        0.15,
+        "[llama.backends]\n\"qwen3.8-27b-vllm\" = \"openai\"\n",
+    );
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    assert_eq!(
+        view.models[0].backend.expect("backend").kind,
+        llama_core::backend::Backend::OpenAi
+    );
+    thread::sleep(Duration::from_millis(600));
     let hits = server.hits();
     assert!(
         hits.iter().all(|path| !path.contains("/upstream/")),
         "{hits:?}"
     );
-    assert!(log.lines().iter().all(|line| !line.contains("metrics")));
+    assert!(
+        log.lines()
+            .iter()
+            .all(|line| !line.contains("names no server"))
+    );
+}
+
+#[test]
+fn each_load_is_probed_once() {
+    let tabby = |state: &str| -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "running": [{"model": "tabby", "state": state, "cmd": "python3 main.py"}]
+        }))
+        .expect("json")
+    };
+    let server = Server::start(World::running(tabby("ready")));
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    let probes = |server: &Server| {
+        server
+            .hits()
+            .iter()
+            .filter(|path| *path == "/upstream/tabby/metrics")
+            .count()
+    };
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(probes(&server), 1, "{:?}", server.hits());
+    // Unload and load again: one more probe, and still one log line.
+    server.update(|world| world.running = tabby("starting"));
+    server.update(|world| world.running_after = Some(tabby("starting")));
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(
+        probes(&server),
+        1,
+        "not while starting: {:?}",
+        server.hits()
+    );
+    server.update(|world| world.running_after = Some(tabby("ready")));
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(probes(&server), 2, "{:?}", server.hits());
+    let notes = log
+        .lines()
+        .iter()
+        .filter(|line| line.contains("names no server"))
+        .count();
+    assert_eq!(notes, 1);
 }
 
 #[test]

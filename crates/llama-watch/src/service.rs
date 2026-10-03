@@ -27,7 +27,7 @@ use crate::tty::grid::Cell;
 use crate::tty::layout::{self, Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState};
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{ConsoleBlank, Term};
-use llama_core::backend::Backend;
+use llama_core::backend::{self, Backend};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
 use llama_core::wire::{SourceWire, Sources};
@@ -1065,6 +1065,7 @@ fn model_name(sample: &WatchSample, state: WatchState) -> String {
 
 /// Detail line of the first model, the same string the LCD fits. A
 /// backend other than llama.cpp leads it: `sglang · 200k · kv fp8_e4m3`.
+/// The engine's own cache facts close it (#31): `· block 16 · prefix on`.
 fn model_detail(sample: &WatchSample, state: WatchState) -> String {
     match state {
         WatchState::Generating | WatchState::Ready => {
@@ -1074,7 +1075,12 @@ fn model_detail(sample: &WatchSample, state: WatchState) -> String {
             let line = model
                 .detail
                 .as_ref()
-                .map(llama_core::detail::line)
+                .map(|detail| {
+                    std::iter::once(llama_core::detail::line(detail))
+                        .chain(llama_core::detail::engine_items(detail))
+                        .collect::<Vec<_>>()
+                        .join(llama_core::detail::SEPARATOR)
+                })
                 .unwrap_or_default();
             match model.backend.map(|info| info.kind) {
                 Some(kind) if kind != Backend::LlamaCpp => {
@@ -1137,7 +1143,10 @@ fn model_stuck(
 
 /// `sglang  running 1/4 · queued 0 · KV 37 % · hit 80 %` for each ready model
 /// without `/slots`. Unknown gauges are `--`. Strata has no KV gauge:
-/// `strata  running 1/1 · queued 0`.
+/// `strata  running 1/1 · queued 0`. Engine numbers follow when the server
+/// reports them (#31): `· spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms ·
+/// e2e 12.5 s · preempt 3` (preemptions only once there are some), and a
+/// sleeping engine says so first: `vllm  sleeping · running 0 · …`.
 fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return Vec::new();
@@ -1162,8 +1171,14 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
                 (Some(n), Some(max)) => format!("{n}/{max}"),
                 (running, _) => num(running),
             };
+            let engine = &info.engine;
+            let asleep = if engine.sleeping == Some(true) {
+                format!("sleeping{sep}")
+            } else {
+                String::new()
+            };
             let mut line = format!(
-                "{}  running {running}{sep}queued {}",
+                "{}  {asleep}running {running}{sep}queued {}",
                 info.kind.as_str(),
                 num(info.queued),
             );
@@ -1173,9 +1188,40 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
             if info.hit_permille.is_some() {
                 line.push_str(&format!("{sep}hit {}", pct(info.hit_permille)));
             }
+            if let Some(permille) = engine.spec_permille {
+                line.push_str(&format!("{sep}{}", backend::spec_text(permille)));
+            }
+            if let Some(centi) = engine.spec_len_centi {
+                let tenths = (u32::from(centi) + 5) / 10;
+                line.push_str(&format!("{sep}{}.{}/step", tenths / 10, tenths % 10));
+            }
+            for (label, us) in [
+                ("ttft", engine.ttft_us),
+                ("itl", engine.itl_us),
+                ("e2e", engine.e2e_us),
+            ] {
+                if let Some(us) = us {
+                    line.push_str(&format!("{sep}{label} {}", latency_text(us)));
+                }
+            }
+            if let Some(n) = engine.preemptions.filter(|n| *n > 0) {
+                line.push_str(&format!("{sep}preempt {n}"));
+            }
             line
         })
         .collect()
+}
+
+/// `420 ms` below a second, `12.5 s` below 100 s, else whole seconds.
+fn latency_text(us: u32) -> String {
+    if us < 999_500 {
+        format!("{} ms", (us + 500) / 1000)
+    } else if us < 99_950_000 {
+        let tenths = (us + 50_000) / 100_000;
+        format!("{}.{} s", tenths / 10, tenths % 10)
+    } else {
+        format!("{} s", (us + 500_000) / 1_000_000)
+    }
 }
 
 fn slots_line(detail: &LlamaDetail, state: WatchState) -> String {
@@ -2220,6 +2266,7 @@ mod tests {
             queued: Some(0),
             kv_permille: Some(372),
             hit_permille: None,
+            engine: Default::default(),
         }
     }
 
@@ -2407,6 +2454,82 @@ mod tests {
         assert_eq!(model_detail(&sample, WatchState::Ready), "");
         assert!(backend_lines(&sample, WatchState::Ready).is_empty());
         assert!(!first_without_slots(&sample, WatchState::Ready));
+    }
+
+    /// #31: a vLLM model found by its metrics: its cache facts close the
+    /// tuning line and its engine numbers follow the gauges.
+    #[test]
+    fn vllm_engine_numbers_on_the_backend_line() {
+        use llama_core::backend::EngineStats;
+        let engine = EngineStats {
+            spec_permille: Some(781),
+            spec_len_centi: Some(294),
+            preemptions: Some(3),
+            sleeping: Some(false),
+            ttft_us: Some(420_400),
+            itl_us: Some(31_000),
+            e2e_us: Some(12_460_000),
+            ..EngineStats::default()
+        };
+        let mut qwen = served(
+            "qwen3.8-27b…",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::Vllm,
+                running: Some(1),
+                queued: Some(0),
+                kv_permille: Some(413),
+                hit_permille: Some(750),
+                engine,
+                ..BackendInfo::default()
+            }),
+        );
+        qwen.detail = Some(llama_core::detail::ModelDetail {
+            kv_k: Some("fp8_e4m3".to_owned()),
+            kv_v: Some("fp8_e4m3".to_owned()),
+            kv_block: Some(16),
+            prefix_cache: Some(true),
+            ..llama_core::detail::ModelDetail::default()
+        });
+        let sample = backend_sample(vec![qwen.clone()]);
+        assert_eq!(
+            model_detail(&sample, WatchState::Ready),
+            "vllm · kv fp8_e4m3 · block 16 · prefix on"
+        );
+        assert_eq!(
+            backend_lines(&sample, WatchState::Ready),
+            vec![
+                "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3"
+                    .to_owned()
+            ]
+        );
+        // Asleep, no preemptions yet, no spec: the line says so and stops short.
+        let info = qwen.backend.as_mut().expect("backend");
+        info.engine = EngineStats {
+            sleeping: Some(true),
+            preemptions: Some(0),
+            e2e_us: Some(250_000_000),
+            ..EngineStats::default()
+        };
+        let sample = backend_sample(vec![qwen]);
+        assert_eq!(
+            backend_lines(&sample, WatchState::Ready),
+            vec![
+                "vllm  sleeping · running 1 · queued 0 · KV 41 % · hit 75 % · e2e 250 s".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn latency_text_units() {
+        assert_eq!(latency_text(0), "0 ms");
+        assert_eq!(latency_text(31_499), "31 ms");
+        assert_eq!(latency_text(999_499), "999 ms");
+        assert_eq!(latency_text(999_500), "1.0 s");
+        assert_eq!(latency_text(12_460_000), "12.5 s");
+        assert_eq!(latency_text(99_940_000), "99.9 s");
+        assert_eq!(latency_text(100_000_000), "100 s");
+        assert_eq!(latency_text(3_600_000_000), "3600 s");
     }
 
     #[test]

@@ -1407,3 +1407,41 @@ fn full_name_and_first_model_detail_reach_the_view() {
     assert_eq!(view.models, ["Qwen 35B"]);
     assert_eq!(view.detail, None, "an older watcher sends no detail");
 }
+
+/// #31: the first model's speculative acceptance reaches the view in whole
+/// percents; a second model's does not.
+#[test]
+fn first_model_spec_acceptance_reaches_the_view() {
+    let cfg = Config::default();
+    let now = Instant::now();
+    let history = History::new(now);
+    let spec = |permille: u16| {
+        Some(llama_core::backend::BackendInfo {
+            kind: llama_core::backend::Backend::Vllm,
+            engine: llama_core::backend::EngineStats {
+                spec_permille: Some(permille),
+                ..llama_core::backend::EngineStats::default()
+            },
+            ..llama_core::backend::BackendInfo::default()
+        })
+    };
+    let model = |name: &str, backend| ModelInfo {
+        backend,
+        name: name.to_owned(),
+        state: "ready".to_owned(),
+        full_name: None,
+        detail: None,
+    };
+    let mut current = snapshot(now);
+    current.ai = AiState::Loaded;
+    current.models = vec![model("qwen3.8-27b", spec(784))];
+    let view = present(&current, &history, None, &cfg);
+    assert_eq!(view.spec_permille, Some(780));
+    current.models = vec![model("qwen3.8-27b", spec(785))];
+    assert_eq!(
+        present(&current, &history, None, &cfg).spec_permille,
+        Some(790)
+    );
+    current.models = vec![model("a", None), model("b", spec(500))];
+    assert_eq!(present(&current, &history, None, &cfg).spec_permille, None);
+}

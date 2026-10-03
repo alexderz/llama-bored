@@ -358,6 +358,7 @@ const STATES: &[&str] = &[
     "qwen-detail",
     "nemotron-detail",
     "a3-bonsai-detail",
+    "vllm-spec",
 ];
 
 #[test]
@@ -494,6 +495,8 @@ fn q8(ctx: u32, quant: &str, ncmoe: Option<u16>) -> ModelDetail {
         kv_v: Some("q8_0".to_owned()),
         quant: Some(quant.to_owned()),
         fa: Some(true),
+        kv_block: None,
+        prefix_cache: None,
     }
 }
 
@@ -631,6 +634,74 @@ fn name_and_detail_stay_inside_r_114_and_off_the_temps() {
             }
             assert_eq!(outside, 0, "{variant:?} {name}: drew outside r 114");
             assert_eq!(temps, 0, "{variant:?} {name}: overlapped the temperatures");
+        }
+    }
+}
+
+/// #31: a vLLM model with speculative decoding: `spec 78 %` closes the
+/// detail line and stays while the other items drop; with no other detail
+/// it is the whole line; two models still draw no detail.
+#[test]
+fn spec_acceptance_rides_on_the_detail_line() {
+    let mut assets = Assets::load().expect("assets");
+    let vllm = ModelDetail {
+        kv_k: Some("fp8_e4m3".to_owned()),
+        kv_v: Some("fp8_e4m3".to_owned()),
+        kv_block: Some(16),
+        prefix_cache: Some(true),
+        ..ModelDetail::default()
+    };
+    for variant in [Variant::A1, Variant::A3] {
+        let mut view = with_detail("qwen3.8-27b", vllm.clone(), variant);
+        view.spec_permille = Some(780);
+        assert_eq!(
+            render::layout_a::status_text(&view, &mut assets),
+            ["qwen3.8-27b", "kv fp8_e4m3 · spec 78 %"],
+            "{variant:?}: block and prefix are tty-only"
+        );
+        // A full llama.cpp-style detail: the quant drops before the tail.
+        let mut wide = with_detail(
+            "Nemotron 3 Super 120B-A12B",
+            q8(262_144, "UD-Q4_K_M", Some(88)),
+            variant,
+        );
+        wide.spec_permille = Some(780);
+        let lines = render::layout_a::status_text(&wide, &mut assets);
+        let last = lines.last().expect("detail line");
+        assert!(last.ends_with("spec 78 %"), "{variant:?}: {lines:?}");
+        assert!(last.starts_with("256k"), "{variant:?}: {lines:?}");
+        // Spec but no detail: the tail alone.
+        let mut bare = loaded(&["qwen3.8-27b"]);
+        bare.variant = variant;
+        bare.spec_permille = Some(1000);
+        assert_eq!(
+            render::layout_a::status_text(&bare, &mut assets),
+            ["qwen3.8-27b", "spec 100 %"]
+        );
+    }
+    let mut two = loaded(&["Qwen3.6 27B", "qwen3.8-27b"]);
+    two.spec_permille = Some(780);
+    assert_eq!(
+        render::layout_a::status_text(&two, &mut assets),
+        ["Qwen3.6 27B", "qwen3.8-27b"]
+    );
+    // It stays inside r 114 and off the temperatures, like any detail.
+    for variant in [Variant::A1, Variant::A3] {
+        let mut short = loaded(&["Q"]);
+        short.variant = variant;
+        let reference = paint(&short, &mut assets);
+        let temps_top: u32 = if variant == Variant::A1 { 113 } else { 139 };
+        let mut view = with_detail(STRESS, q8(1_048_576, "UD-Q4_K_XL", Some(88)), variant);
+        view.spec_permille = Some(1000);
+        let frame = paint(&view, &mut assets);
+        for y in 0..320 {
+            for x in 0..320 {
+                let (a, b) = (rgb(&frame, x, y), rgb(&reference, x, y));
+                if a.0.abs_diff(b.0) > 8 || a.1.abs_diff(b.1) > 8 || a.2.abs_diff(b.2) > 8 {
+                    assert!(!outside_radius(x, y, 114.0), "{variant:?}: outside r 114");
+                    assert!(y < temps_top, "{variant:?}: over the temperatures");
+                }
+            }
         }
     }
 }
