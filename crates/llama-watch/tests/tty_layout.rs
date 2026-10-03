@@ -3781,3 +3781,45 @@ fn engine_measured_rates_are_marked_and_fit_their_columns() {
         assert!(gen_rate_text(Some(tps), true).chars().count() <= 6, "{tps}");
     }
 }
+
+/// #39: a long model name and a long engine detail at 160 columns. The
+/// detail drops whole trailing ` · item`s so a gap stays before the clock.
+#[test]
+fn long_model_detail_drops_whole_items_before_the_clock() {
+    let mut model = sample(WatchState::Generating);
+    model.model_name = "Qwen3.8-27B on vLLM (HyperQwen, DFlash2, 240k KVarN)".to_string();
+    model.model_detail = "vLLM · kv kvarn_k4v2_g128 · block 128 · prefix on".to_string();
+    let grid = draw(&model, 160, 48);
+    let header = row_string(&grid, 0);
+    let clock = find_chars(&header, "2026-09-23").expect("clock drawn");
+    let before: String = header.chars().take(clock).collect();
+    assert!(
+        before.ends_with("  ")
+            && before
+                .trim_end()
+                .ends_with("vLLM · kv kvarn_k4v2_g128 · block 128"),
+        "detail not cut at a whole item with a gap: {header}"
+    );
+    assert!(!header.contains("prefix"), "a cut item is drawn: {header}");
+    // Every header field left of the clock keeps the gap, at any width.
+    for cols in [160u16, 180, 200, 240, 320] {
+        let grid = draw(&model, cols, 67);
+        let header = row_string(&grid, 0);
+        let clock = find_chars(&header, "2026-09-23").expect("clock drawn");
+        let at = if cols >= 200 {
+            find_chars(&header, "COOL").expect("temps drawn")
+        } else {
+            clock
+        };
+        let gap: String = header.chars().skip(at - 2).take(2).collect();
+        assert_eq!(gap, "  ", "no gap before the clock at {cols}: {header}");
+        assert!(
+            !header.contains("prefix o") || header.contains("prefix on"),
+            "detail cut mid-item at {cols}: {header}"
+        );
+    }
+    // A short detail is left whole.
+    model.model_detail = "vLLM · kv q8".to_string();
+    let header = row_string(&draw(&model, 160, 48), 0);
+    assert!(header.contains("KV  vLLM · kv q8"), "{header}");
+}

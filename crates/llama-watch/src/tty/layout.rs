@@ -339,9 +339,6 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
             .saturating_add(word.chars().count())
             .saturating_add(gap),
     );
-    x = paint_model(grid, x, model);
-    x = paint_field(grid, x, 0, "slots", &model.slots_line, name_fg(model));
-    let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model));
     let temps = if g.cols >= 200 {
         format!(
             "COOL {}   CPU {}   GPU {}     {}",
@@ -361,6 +358,19 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     let end = usize::from(g.cols.saturating_sub(2));
     let len = temps.chars().count();
     let start = col_u16(end.saturating_add(1).saturating_sub(len));
+    // #39: header text left of the clock ends two cells before it.
+    let limit = usize::from(start).saturating_sub(CLOCK_GAP);
+    x = paint_model(grid, x, model, limit);
+    x = paint_field(
+        grid,
+        x,
+        0,
+        "slots",
+        &model.slots_line,
+        name_fg(model),
+        limit,
+    );
+    let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
     paint_str(grid, start, 0, &temps, fg, C16::Black);
     if !model.show_text {
         let tag_end = usize::from(tag_at).saturating_add(TEXT_OFF_TAG.chars().count());
@@ -395,8 +405,12 @@ const MODEL_DETAIL_CAP: usize = 48;
 /// Header tag for a model stuck in llama-swap `stopping`.
 const STUCK_TAG: &str = "stopping (stuck?)";
 
-/// `model <full name>  <detail>`, the detail in grey.
-fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel) -> u16 {
+/// Cells kept blank between the header text and the clock (#39).
+const CLOCK_GAP: usize = 2;
+
+/// `model <full name>  <detail>`, the detail in grey. The detail ends by
+/// column `limit` (exclusive), dropping whole trailing ` · item`s (#39).
+fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
     let label = "model";
     let label_len = label.chars().count();
     paint_fit(grid, x, 0, label, C16::BrightBlack, C16::Black, label_len);
@@ -419,8 +433,16 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel) -> u16 {
     }
     if !model.model_detail.is_empty() {
         let dx = end.saturating_add(2);
-        let shown = paint_detail(grid, dx, 0, &model.model_detail, MODEL_DETAIL_CAP);
-        end = dx.saturating_add(shown);
+        let room = limit.saturating_sub(dx).min(MODEL_DETAIL_CAP);
+        // One item longer than the room is cut at the room, as before.
+        let detail = match fit_items(&model.model_detail, room) {
+            "" => model.model_detail.as_str(),
+            items => items,
+        };
+        let shown = paint_detail(grid, dx, 0, detail, room);
+        if shown > 0 {
+            end = dx.saturating_add(shown);
+        }
     }
     col_u16(end.saturating_add(3))
 }
@@ -448,8 +470,43 @@ fn paint_detail(grid: &mut Grid, col: usize, row: usize, text: &str, cap: usize)
     drawn
 }
 
-fn paint_field(grid: &mut Grid, x: u16, row: u16, label: &str, value: &str, value_fg: C16) -> u16 {
+/// The longest run of whole leading ` · `-separated items of `text` that
+/// fits in `room` cells. Empty when not even the first item fits.
+fn fit_items(text: &str, room: usize) -> &str {
+    const SEP: &str = " \u{00B7} ";
+    let mut fit = "";
+    let mut from = 0;
+    loop {
+        let cut = text[from..].find(SEP).map_or(text.len(), |at| from + at);
+        if text[..cut].chars().count() > room {
+            return fit;
+        }
+        fit = &text[..cut];
+        if cut == text.len() {
+            return fit;
+        }
+        from = cut + SEP.len();
+    }
+}
+
+/// `label value`, skipped when it would end past column `limit` (#39).
+fn paint_field(
+    grid: &mut Grid,
+    x: u16,
+    row: u16,
+    label: &str,
+    value: &str,
+    value_fg: C16,
+    limit: usize,
+) -> u16 {
     let label_len = label.chars().count();
+    let field_end = usize::from(x)
+        .saturating_add(label_len)
+        .saturating_add(1)
+        .saturating_add(value.chars().count().min(32));
+    if field_end > limit {
+        return x;
+    }
     paint_fit(grid, x, row, label, C16::BrightBlack, C16::Black, label_len);
     let vx = usize::from(x).saturating_add(label_len).saturating_add(1);
     let drawn = value.chars().count().min(32);
