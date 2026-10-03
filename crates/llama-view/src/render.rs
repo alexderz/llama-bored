@@ -2,13 +2,28 @@
 
 use std::io::{self, Write};
 
+use llama_core::palette::Palette;
+
+use crate::color::{ColorMode, SgrTable};
 use crate::screen::{Cell, Color, Screen};
 
 /// Enter the alternate screen and hide the cursor.
 pub const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l";
 
-/// Reset colours, show the cursor, and leave the alternate screen.
-pub const RESTORE: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+/// End any synchronized update, stop focus reporting, reset colours, show
+/// the cursor, and leave the alternate screen. Mouse reporting is never
+/// turned on, so there is none to turn off.
+pub const RESTORE: &[u8] = b"\x1b[?2026l\x1b[?1004l\x1b[0m\x1b[?25h\x1b[?1049l";
+
+/// Focus reporting on (`ESC [ I` / `ESC [ O` arrive on stdin). Sent only
+/// when llama-view reads stdin; [`RESTORE`] turns it off.
+pub const FOCUS_ON: &[u8] = b"\x1b[?1004h";
+
+/// Synchronized output (mode 2026): the terminal shows the frame at once
+/// at [`SYNC_END`]. tmux 3.4+ and most terminals honour it; others ignore it.
+pub const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+/// End of a synchronized frame.
+pub const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 /// Writes [`ENTER`] on creation and [`RESTORE`] on drop, including unwind.
 pub struct TermGuard<W: Write> {
@@ -79,6 +94,8 @@ pub struct Renderer {
     buf: Vec<u8>,
     fg: Option<Color>,
     bg: Option<Color>,
+    sgr: SgrTable,
+    sync: bool,
 }
 
 struct Grid {
@@ -88,13 +105,33 @@ struct Grid {
 }
 
 impl Renderer {
+    /// The terminal's own 16 colours (`--colors 16`).
     pub fn new() -> Self {
+        Self::with_colors(ColorMode::Ansi16, Palette::Llama)
+    }
+
+    /// Paint colour indices as `mode` with `palette`'s RGB (#25).
+    pub fn with_colors(mode: ColorMode, palette: Palette) -> Self {
         Self {
             prev: None,
             buf: Vec::new(),
             fg: None,
             bg: None,
+            sgr: SgrTable::new(mode, palette),
+            sync: false,
         }
+    }
+
+    /// Wrap every non-empty frame in [`SYNC_BEGIN`] .. [`SYNC_END`] (#27).
+    pub fn synchronized(mut self, on: bool) -> Self {
+        self.sync = on;
+        self
+    }
+
+    /// Forget the last view: the next frame is a full repaint (a size change
+    /// of the pane or of the console).
+    pub fn invalidate(&mut self) {
+        self.prev = None;
     }
 
     /// Paint `cells` (`cols * rows` long, row-major).
@@ -112,6 +149,9 @@ impl Renderer {
         }
 
         self.buf.clear();
+        if self.sync {
+            self.buf.extend_from_slice(SYNC_BEGIN);
+        }
         let full = self
             .prev
             .as_ref()
@@ -120,19 +160,24 @@ impl Renderer {
             self.buf.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
             self.fg = None;
             self.bg = None;
-            emit_all(&mut self.buf, cols, rows, cells, &mut self.fg, &mut self.bg);
+            let mut pen = Pen {
+                sgr: &self.sgr,
+                fg: &mut self.fg,
+                bg: &mut self.bg,
+            };
+            emit_all(&mut self.buf, cols, rows, cells, &mut pen);
         } else if let Some(prev) = self.prev.as_ref() {
-            emit_diff(
-                &mut self.buf,
-                cols,
-                rows,
-                cells,
-                &prev.cells,
-                &mut self.fg,
-                &mut self.bg,
-            );
+            let mut pen = Pen {
+                sgr: &self.sgr,
+                fg: &mut self.fg,
+                bg: &mut self.bg,
+            };
+            emit_diff(&mut self.buf, cols, rows, cells, &prev.cells, &mut pen);
         }
 
+        if self.sync {
+            self.buf.extend_from_slice(SYNC_END);
+        }
         match &mut self.prev {
             Some(prev)
                 if prev.cols == cols && prev.rows == rows && prev.cells.len() == cells.len() =>
@@ -157,14 +202,14 @@ impl Default for Renderer {
     }
 }
 
-fn emit_all(
-    out: &mut Vec<u8>,
-    cols: u16,
-    rows: u16,
-    cells: &[Cell],
-    fg: &mut Option<Color>,
-    bg: &mut Option<Color>,
-) {
+/// The colour state of the terminal while a frame is built.
+struct Pen<'a> {
+    sgr: &'a SgrTable,
+    fg: &'a mut Option<Color>,
+    bg: &'a mut Option<Color>,
+}
+
+fn emit_all(out: &mut Vec<u8>, cols: u16, rows: u16, cells: &[Cell], pen: &mut Pen<'_>) {
     let width = usize::from(cols);
     if width == 0 {
         return;
@@ -176,7 +221,7 @@ fn emit_all(
         };
         cup(out, row, 0);
         for cell in line {
-            emit_sgr(out, *cell, fg, bg);
+            emit_sgr(out, *cell, pen);
             emit_char(out, cell.ch);
         }
     }
@@ -188,8 +233,7 @@ fn emit_diff(
     rows: u16,
     cells: &[Cell],
     prev: &[Cell],
-    fg: &mut Option<Color>,
-    bg: &mut Option<Color>,
+    pen: &mut Pen<'_>,
 ) {
     let width = usize::from(cols);
     if width == 0 {
@@ -215,21 +259,21 @@ fn emit_diff(
                 run = true;
                 run_row = row;
             }
-            emit_sgr(out, *cell, fg, bg);
+            emit_sgr(out, *cell, pen);
             emit_char(out, cell.ch);
             expect_col = col.saturating_add(1);
         }
     }
 }
 
-fn emit_sgr(out: &mut Vec<u8>, cell: Cell, fg: &mut Option<Color>, bg: &mut Option<Color>) {
-    if *fg != Some(cell.fg) {
-        sgr(out, cell.fg.fg_sgr());
-        *fg = Some(cell.fg);
+fn emit_sgr(out: &mut Vec<u8>, cell: Cell, pen: &mut Pen<'_>) {
+    if *pen.fg != Some(cell.fg) {
+        out.extend_from_slice(pen.sgr.fg(cell.fg));
+        *pen.fg = Some(cell.fg);
     }
-    if *bg != Some(cell.bg) {
-        sgr(out, cell.bg.bg_sgr());
-        *bg = Some(cell.bg);
+    if *pen.bg != Some(cell.bg) {
+        out.extend_from_slice(pen.sgr.bg(cell.bg));
+        *pen.bg = Some(cell.bg);
     }
 }
 
@@ -244,12 +288,6 @@ fn cup(out: &mut Vec<u8>, row: u16, col: u16) {
     out.push(b';');
     push_u16(out, col.saturating_add(1));
     out.push(b'H');
-}
-
-fn sgr(out: &mut Vec<u8>, code: u8) {
-    out.extend_from_slice(b"\x1b[");
-    push_u16(out, u16::from(code));
-    out.push(b'm');
 }
 
 fn push_u16(out: &mut Vec<u8>, mut n: u16) {
@@ -301,6 +339,63 @@ mod tests {
         assert!(
             buf.ends_with(RESTORE),
             "panic left the terminal unrestored: {buf:?}"
+        );
+    }
+
+    #[test]
+    fn synchronized_frames_are_wrapped_and_empty_frames_stay_empty() {
+        let mut renderer = Renderer::new().synchronized(true);
+        let first = renderer.render(2, 1, &row("AB")).to_vec();
+        assert!(first.starts_with(SYNC_BEGIN), "{first:?}");
+        assert!(first.ends_with(SYNC_END), "{first:?}");
+        assert_eq!(
+            renderer.render(2, 1, &row("AB")),
+            b"",
+            "no change, no bytes"
+        );
+        let diff = renderer.render(2, 1, &row("AC")).to_vec();
+        assert!(diff.starts_with(SYNC_BEGIN) && diff.ends_with(SYNC_END));
+        assert_eq!(
+            diff.windows(SYNC_BEGIN.len())
+                .filter(|w| *w == SYNC_BEGIN)
+                .count(),
+            1
+        );
+        let plain = Renderer::new().render(2, 1, &row("AB")).to_vec();
+        assert!(!plain.windows(SYNC_BEGIN.len()).any(|w| w == SYNC_BEGIN));
+    }
+
+    #[test]
+    fn invalidate_forces_a_full_repaint() {
+        let mut renderer = Renderer::new();
+        renderer.render(2, 1, &row("AB"));
+        renderer.invalidate();
+        let again = renderer.render(2, 1, &row("AB")).to_vec();
+        assert!(again.starts_with(b"\x1b[0m\x1b[2J\x1b[H"), "{again:?}");
+    }
+
+    #[test]
+    fn output_never_rings_the_bell_or_asks_for_the_mouse() {
+        let mut renderer = Renderer::new().synchronized(true);
+        let screen = crate::decode_screen(
+            &vcsa_bytes(1, 3, &[(0x07, 0x07), (b'o', 0x07), (b'k', 0x07)]),
+            None,
+            None,
+        )
+        .expect("decode");
+        let out = renderer
+            .render(screen.cols, screen.rows, &screen.cells)
+            .to_vec();
+        assert!(!out.contains(&0x07), "BEL reached the output: {out:?}");
+        for seq in [ENTER, RESTORE, FOCUS_ON, SYNC_BEGIN, SYNC_END] {
+            assert!(!seq.contains(&0x07));
+            for mouse in [&b"?1000"[..], b"?1002", b"?1003", b"?1006"] {
+                assert!(!seq.windows(mouse.len()).any(|w| w == mouse));
+            }
+        }
+        assert!(
+            RESTORE.windows(8).any(|w| w == b"\x1b[?1004l"),
+            "focus off on restore"
         );
     }
 

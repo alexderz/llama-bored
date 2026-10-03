@@ -5,7 +5,7 @@ mod common;
 use std::net::Ipv4Addr;
 
 use llama_cast::acl::CidrError;
-use llama_cast::config::{Config, ConfigError, Font};
+use llama_cast::config::{Config, ConfigError, Font, Palette};
 use llama_cast::service::{Command, parse_args};
 
 const GOOD: &str = r#"
@@ -17,6 +17,7 @@ fps = 2
 max_clients = 2
 ffmpeg = "/usr/bin/ffmpeg"
 font = "12x24"
+palette = "llama"
 "#;
 
 fn with(from: &str, to: &str) -> Result<Config, ConfigError> {
@@ -35,6 +36,7 @@ fn the_documented_config_parses() {
     assert_eq!(cfg.max_clients, 2);
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
     assert_eq!(cfg.font, Font::Hack12x24);
+    assert_eq!(cfg.palette, Palette::Llama);
     assert_eq!(cfg.base_url(), "http://192.168.1.20:19478");
 }
 
@@ -50,6 +52,31 @@ fn defaults_fill_everything_but_listen_and_allow() {
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
     assert_eq!(cfg.font, Font::Hack12x24);
     assert_eq!(cfg.font.file_name(), "llama-hack-12x24.psfu");
+    assert_eq!(
+        cfg.palette,
+        Palette::Llama,
+        "matches the [tty] palette default"
+    );
+}
+
+/// #26: `palette` names tty11's colours, the same words as `[tty] palette`.
+#[test]
+fn palette_parses_llama_and_vga_only() {
+    assert_eq!(
+        with("palette = \"llama\"", "palette = \"vga\"")
+            .unwrap()
+            .palette,
+        Palette::Vga
+    );
+    for bad in ["\"xterm\"", "\"VGA\"", "1"] {
+        assert!(
+            matches!(
+                with("palette = \"llama\"", &format!("palette = {bad}")),
+                Err(ConfigError::Parse(_))
+            ),
+            "accepted {bad}"
+        );
+    }
 }
 
 #[test]

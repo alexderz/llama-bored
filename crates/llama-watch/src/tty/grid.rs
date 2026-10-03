@@ -26,6 +26,11 @@ pub enum C16 {
 }
 
 impl C16 {
+    /// ANSI slot number, 0..=15: the index into `llama_core::palette`.
+    pub const fn index(self) -> u8 {
+        self as u8
+    }
+
     pub(crate) fn fg_param(self) -> u8 {
         match self {
             Self::Black => 30,

@@ -39,6 +39,17 @@ fn watcher_source_only_reads_the_window_size() {
         if !term {
             hits.extend(stdout_emitter_hits(&rel, &text));
         }
+        // #26: the console palette (`ESC ] P n rrggbb`, `ESC ] R`) is the one
+        // addition to the tty output since S13 was written. The bytes come
+        // from `llama_core::palette` and only the emitter may write them; no
+        // ioctl (PIO_CMAP) is used for it.
+        if !term
+            && (code.contains("console_load")
+                || code.contains("CONSOLE_RESET")
+                || code.contains("\\x1b]"))
+        {
+            hits.push(format!("{rel} emits a console palette sequence"));
+        }
         if code.contains("termios") && !term {
             hits.push(format!("{rel} mentions termios"));
         }

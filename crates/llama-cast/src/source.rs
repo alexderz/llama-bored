@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use llama_core::palette::Palette;
 use rustix::fs::{Mode, OFlags};
 
 use crate::config::Font;
@@ -74,16 +75,21 @@ pub trait FrameSource: Send + Sync + 'static {
     fn frame(&self, frame: &mut [u8]) -> io::Result<()>;
 }
 
-/// A vcsa file rendered with a console font.
+/// A vcsa file rendered with a console font and palette.
 pub struct VcsaSource {
     path: PathBuf,
     font: Psf2,
+    palette: Palette,
 }
 
 impl VcsaSource {
     #[must_use]
-    pub fn new(path: PathBuf, font: Psf2) -> Self {
-        Self { path, font }
+    pub fn new(path: PathBuf, font: Psf2, palette: Palette) -> Self {
+        Self {
+            path,
+            font,
+            palette,
+        }
     }
 }
 
@@ -92,7 +98,7 @@ impl FrameSource for VcsaSource {
         let bytes = read_capped(&self.path, MAX_VCSA_BYTES)?;
         let screen =
             Screen::parse(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        render::render_into(&screen, &self.font, frame);
+        render::render_into(&screen, &self.font, self.palette, frame);
         Ok(())
     }
 }

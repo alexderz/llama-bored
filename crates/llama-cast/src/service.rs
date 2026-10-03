@@ -101,7 +101,7 @@ fn summary(config: &Config) -> String {
         .map(ToString::to_string)
         .collect();
     format!(
-        "listen {} allow [{}] interface_addr {} name {:?} fps {} max_clients {} ffmpeg {} font {}",
+        "listen {} allow [{}] interface_addr {} name {:?} fps {} max_clients {} ffmpeg {} font {} palette {}",
         config.listen,
         nets.join(", "),
         config.interface_addr,
@@ -110,6 +110,7 @@ fn summary(config: &Config) -> String {
         config.max_clients,
         config.ffmpeg.display(),
         config.font.label(),
+        config.palette.label(),
     )
 }
 
@@ -184,8 +185,11 @@ fn run(config: &Config) -> i32 {
             return 1;
         }
     };
-    let screen: Arc<dyn FrameSource> =
-        Arc::new(VcsaSource::new(PathBuf::from(source::VCSA_PATH), font));
+    let screen: Arc<dyn FrameSource> = Arc::new(VcsaSource::new(
+        PathBuf::from(source::VCSA_PATH),
+        font,
+        config.palette,
+    ));
     // A missing or unreadable tty11 is logged, not fatal: each stream
     // retries, and ends at once while it stays unreadable.
     let mut probe = vec![0_u8; FRAME_BYTES];

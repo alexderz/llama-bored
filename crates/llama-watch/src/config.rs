@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use llama_core::backend::Backend;
+pub use llama_core::palette::Palette;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -470,6 +471,12 @@ pub struct Tty {
     /// `None` (default) to keep the size the kernel picked. `"COLSxROWS"`.
     #[serde(default)]
     pub size: Option<TtySize>,
+    /// The 16 colours tty11 shows (#26). `"llama"` (default) loads
+    /// llama-bored's heat palette (`llama_core::palette::LLAMA`) with
+    /// `ESC ] P` at start and on every full redraw; `"vga"` leaves the
+    /// kernel's colours (one `ESC ] R` at start).
+    #[serde(default)]
+    pub palette: Palette,
 }
 
 /// `tty.font`: which bundled Hack console font tty11 loads. Both have the
@@ -877,6 +884,7 @@ impl Default for Tty {
             sleep_min: 0,
             font: TtyFont::default(),
             size: None,
+            palette: Palette::default(),
         }
     }
 }

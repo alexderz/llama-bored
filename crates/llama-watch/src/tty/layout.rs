@@ -3032,6 +3032,30 @@ fn comma_pair(done: u64, total: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// #26: the layout's colour roles sit on the slots the palette module
+    /// documents, so the llama palette paints them as designed.
+    #[test]
+    fn colour_roles_match_the_palette_role_map() {
+        use llama_core::palette::{LLAMA, role};
+        let steps: Vec<u8> = STEPS.iter().map(|c| c.index()).collect();
+        assert_eq!(steps, role::SPECTRUM);
+        assert_eq!(digit_colours(5), (C16::BrightWhite, C16::BrightRed));
+        assert_eq!(C16::BrightWhite.index(), role::BRIGHT);
+        assert_eq!(C16::BrightRed.index(), role::LIVE);
+        assert_eq!(status_colour(HealthStatus::Ok).0.index(), role::OK);
+        assert_eq!(status_colour(HealthStatus::Down).1.index(), role::WARN);
+        assert_eq!(band(150.0).1.index(), role::ERROR);
+        assert_eq!(C16::White.index(), role::TEXT);
+        assert_eq!(C16::BrightBlack.index(), role::DIM);
+        assert_eq!(C16::Black.index(), role::BACKGROUND);
+        // The spectrum climbs the ramp: red channel never falls step to step.
+        let reds: Vec<u8> = STEPS
+            .iter()
+            .map(|c| LLAMA[usize::from(c.index())].r)
+            .collect();
+        assert!(reds.windows(2).all(|w| w[0] <= w[1]), "{reds:?}");
+    }
     use super::*;
 
     #[test]

@@ -89,6 +89,12 @@ pub trait PublishStep {
 pub trait RenderStep {
     /// Diff `model` to the console. An unchanged frame writes no bytes.
     fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()>;
+
+    /// Clean exit: undo what drawing changed on the console beyond the
+    /// cells (the llama palette, #26). Called once when the loop stops.
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<B, L> SampleStep for WatchCollector<'_, B, L>
@@ -116,6 +122,10 @@ impl<W: Write> RenderStep for Term<W> {
     fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()> {
         let grid = layout::layout(model, self.cols(), self.rows());
         self.render(&grid, now)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.restore_palette()
     }
 }
 
@@ -376,6 +386,13 @@ where
     loop {
         if input.stop.requested() {
             input.notify.stopping();
+            if let Err(err) = input.render.finish() {
+                log::emit(
+                    &mut input.log,
+                    Priority::Warning,
+                    &format!("console restore failed: {err}"),
+                );
+            }
             return LoopExit::Stopped;
         }
         let mono = input.clock.mono();
@@ -775,10 +792,12 @@ pub fn run(args: &RunArgs) -> i32 {
     }
     let now = Instant::now();
     let term = match Term::for_stdout(Duration::from_secs(prepared.config.tty.full_redraw_s), now) {
-        Ok(term) => term.with_console_blank(ConsoleBlank::from_minutes(
-            prepared.config.tty.blank_min,
-            prepared.config.tty.sleep_min,
-        )),
+        Ok(term) => term
+            .with_console_blank(ConsoleBlank::from_minutes(
+                prepared.config.tty.blank_min,
+                prepared.config.tty.sleep_min,
+            ))
+            .with_palette(prepared.config.tty.palette),
         Err(err) => {
             eprintln!("console: {err}");
             return 1;
