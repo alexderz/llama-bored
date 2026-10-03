@@ -2940,11 +2940,11 @@ fn paint_line(grid: &mut Grid, row: u16, text: &str, fg: C16) {
 }
 
 fn paint_title(grid: &mut Grid, row: u16, title: &str) {
-    let text = one_line(title);
+    let text = title_line(title);
     let chars: Vec<char> = text.chars().collect();
     let key = if has_word(&chars, "OUT") { "OUT" } else { "IN" };
     let Some(at) = find_word(&chars, key) else {
-        paint_str(grid, 0, row, &text, C16::BrightBlack, C16::Black);
+        paint_detail(grid, 0, usize::from(row), &text, usize::MAX);
         return;
     };
     paint_str(grid, at as u16, row, key, C16::White, C16::Black);
@@ -2954,15 +2954,19 @@ fn paint_title(grid: &mut Grid, row: u16, title: &str) {
     }
     if rest < chars.len() {
         let subtitle: String = chars[rest..].iter().collect();
-        paint_str(
-            grid,
-            rest as u16,
-            row,
-            &subtitle,
-            C16::BrightBlack,
-            C16::Black,
-        );
+        paint_detail(grid, rest, usize::from(row), &subtitle, usize::MAX);
     }
+}
+
+/// A panel title's first line, sanitised, keeping the `·` separator of
+/// `IN (last request · 3 tool results)` (#38).
+fn title_line(title: &str) -> String {
+    let first = title.split(['\n', '\r']).next().unwrap_or_default();
+    first
+        .split('\u{00B7}')
+        .map(one_line)
+        .collect::<Vec<_>>()
+        .join("\u{00B7}")
 }
 
 fn has_word(chars: &[char], word: &str) -> bool {

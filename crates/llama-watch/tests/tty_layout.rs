@@ -3823,3 +3823,33 @@ fn long_model_detail_drops_whole_items_before_the_clock() {
     let header = row_string(&draw(&model, 160, 48), 0);
     assert!(header.contains("KV  vLLM · kv q8"), "{header}");
 }
+
+/// #38: a tool loop's IN, titled with what it holds. The panel is a few
+/// rows, so the newest tool result is what stays visible.
+#[test]
+fn a_tool_loop_in_panel_shows_the_newest_result_under_its_title() {
+    let mut model = sample(WatchState::Ready);
+    model.in_title = "IN (last request · 3 tool results)".to_string();
+    model.out_title = "OUT (last response)".to_string();
+    let older = "invented older line ".repeat(60);
+    model.in_lines = vec![format!(
+        "[tool] {older}\n[tool] invented middle result\n[tool] INVENTED-NEWEST result"
+    )];
+    let grid = draw(&model, 160, 48);
+    let title = row_with(&grid, "IN (last request · 3 tool results)");
+    let out = (title + 1..grid.rows())
+        .find(|row| row_string(&grid, *row).trim_start().starts_with("OUT"))
+        .expect("OUT title");
+    let rows: Vec<String> = (title..out).map(|row| row_string(&grid, row)).collect();
+    let last = rows
+        .iter()
+        .rev()
+        .find(|row| !row.trim().is_empty() && !row.trim().chars().all(|ch| ch == '-'))
+        .expect("IN text");
+    assert!(last.contains("[tool] INVENTED-NEWEST result"), "{rows:#?}");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("[tool] invented middle result")),
+        "{rows:#?}"
+    );
+}

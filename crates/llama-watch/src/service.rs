@@ -990,7 +990,7 @@ fn capture_text(
     note_output(replay, &output, output_cap);
     let input = cap_chars(&sanitised_chars(&capture.input), input_cap);
     FrameText {
-        in_title: CAPTURE_IN_TITLE.to_owned(),
+        in_title: capture_in_title(&capture.input_note),
         out_title: CAPTURE_OUT_TITLE.to_owned(),
         in_lines: chars_lines(&input),
         out_lines: chars_lines(&replay.tail),
@@ -1001,6 +1001,16 @@ fn capture_text(
 
 /// IN and OUT titles over a capture (#5).
 const CAPTURE_IN_TITLE: &str = "IN (last request)";
+
+/// `IN (last request)`, or `IN (last request · 3 tool results)` for a tool
+/// loop (#38).
+fn capture_in_title(note: &str) -> String {
+    if note.is_empty() {
+        CAPTURE_IN_TITLE.to_owned()
+    } else {
+        format!("IN (last request \u{00B7} {note})")
+    }
+}
 const CAPTURE_OUT_TITLE: &str = "OUT (last response)";
 
 /// The IN/OUT part of a [`TtyModel`]. Empty when `tty.show_text = false`.
@@ -2638,12 +2648,18 @@ mod tests {
             model: "flash".to_owned(),
             id: 4,
             input: cells("An invented question?"),
+            input_note: String::new(),
             output: cells("An invented answer."),
         });
         let model = tty_model(&sample, &mut tick, now, wall, &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
         assert_eq!(model.out_title, CAPTURE_OUT_TITLE);
         assert_eq!(model.in_lines, vec!["An invented question?".to_owned()]);
+        // #38: a tool loop's IN says what it holds.
+        tick.detail.capture.as_mut().expect("capture").input_note = "3 tool results".to_owned();
+        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        assert_eq!(model.in_title, "IN (last request \u{00B7} 3 tool results)");
+        tick.detail.capture.as_mut().expect("capture").input_note = String::new();
         assert_eq!(model.out_lines, vec!["An invented answer.".to_owned()]);
         assert!(model.text_note.is_empty());
         // A capture of another model is not this header's.
