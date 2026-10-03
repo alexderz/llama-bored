@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.3 — 2026-10-03
+
 ### Added
 
 - The active inference engine is always named (#33). tty11's header detail
