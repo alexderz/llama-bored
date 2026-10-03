@@ -109,6 +109,13 @@ prompt_view = "clean"
 # which llama-watch.service sets with a root setterm pre-step.
 #blank_min = 10
 #sleep_min = 15
+# tty11's 16 colours. "llama" (default) loads llama-bored's heat palette
+# (deep blue -> violet -> magenta -> red, blackbody gold for warnings, greys
+# for text) into tty11 with ESC ] P at start and on every full redraw, and
+# puts the kernel's colours back (ESC ] R) when the watcher stops. "vga"
+# keeps the kernel's VGA colours. Set the same value as `palette` in
+# cast.toml.
+palette = "llama"
 
 # Read-only fan panel on tty11 (off by default). The watcher reads
 # fanN_input, pwmN and pwmN_enable from the hwmon whose `name` matches

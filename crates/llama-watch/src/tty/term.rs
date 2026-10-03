@@ -7,6 +7,8 @@ use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
+use llama_core::palette::{self, Palette};
+
 use super::grid::{C16, Cell, Grid};
 
 /// How often the window size is read. Not the full-repaint interval.
@@ -108,6 +110,10 @@ pub struct Term<W> {
     buf: Vec<u8>,
     blank: ConsoleBlank,
     blank_sent: bool,
+    palette: Palette,
+    /// [`Self::with_palette`] was called. A bare `Term` writes no palette
+    /// bytes at all, which keeps older byte-exact tests unchanged.
+    palette_set: bool,
 }
 
 impl<W: Write> Term<W> {
@@ -137,7 +143,33 @@ impl<W: Write> Term<W> {
             buf: Vec::new(),
             blank: ConsoleBlank::OFF,
             blank_sent: false,
+            palette: Palette::Vga,
+            palette_set: false,
         })
+    }
+
+    /// The console palette (#26, `[tty] palette`). [`Palette::Llama`] loads
+    /// `llama_core::palette::LLAMA` with `ESC ] P n rrggbb` on every full
+    /// repaint, so a console reset or a VT switch that dropped it is healed
+    /// within `full_redraw`. [`Palette::Vga`] sends one `ESC ] R` with the
+    /// first frame, undoing a palette an earlier run left, and nothing after.
+    /// Without this call no palette bytes are written at all.
+    pub fn with_palette(mut self, palette: Palette) -> Self {
+        self.palette = palette;
+        self.palette_set = true;
+        self
+    }
+
+    /// Clean exit: `ESC ] R` when this terminal loaded the llama palette, so
+    /// a later login on the console sees the kernel's colours. Nothing for
+    /// `vga`. The next [`Self::render`] repaints in full (and reloads).
+    pub fn restore_palette(&mut self) -> io::Result<()> {
+        if !(self.palette_set && self.palette == Palette::Llama) {
+            return Ok(());
+        }
+        self.force_full = true;
+        Write::write_all(&mut self.out, palette::CONSOLE_RESET)?;
+        self.out.flush()
     }
 
     /// Send `blank` with the first frame. Later frames, including full
@@ -177,7 +209,14 @@ impl<W: Write> Term<W> {
                 buf.truncate(mark);
             }
         } else {
-            emit_full(&mut buf, grid, &mut active, view_cols, view_rows);
+            let load = match (self.palette_set, self.palette) {
+                (false, _) => None,
+                (true, Palette::Llama) => Some(PaletteBytes::Load(self.palette.slots())),
+                // Once: `blank_sent` is also the first-full-frame latch.
+                (true, Palette::Vga) if !self.blank_sent => Some(PaletteBytes::Reset),
+                (true, Palette::Vga) => None,
+            };
+            emit_full(&mut buf, grid, &mut active, view_cols, view_rows, load);
             if !self.blank_sent {
                 emit_console_blank(&mut buf, self.blank);
             }
@@ -266,6 +305,16 @@ impl Term<io::Stdout> {
     }
 }
 
+/// `llama-watch tty-reset` (the unit's `ExecStopPost=`): write `ESC ] R` to
+/// stdout, which systemd points at tty11, so a watcher that was killed
+/// (SIGTERM keeps its default action) still leaves the kernel's colours.
+/// Harmless when the palette is `vga`.
+pub fn reset_palette_on_stdout() -> io::Result<()> {
+    let mut out = io::stdout();
+    Write::write_all(&mut out, palette::CONSOLE_RESET)?;
+    out.flush()
+}
+
 impl Term<Vec<u8>> {
     /// Bytes written so far. Only a `Vec<u8>` sink exposes this; a live
     /// console handle cannot be read back or written past the allowlist.
@@ -297,10 +346,32 @@ pub fn window_size<Fd: AsFd>(fd: Fd) -> io::Result<Size> {
     })
 }
 
-fn emit_full(out: &mut Vec<u8>, grid: &Grid, active: &mut Active, cols: u16, rows: u16) {
+/// The palette bytes of one full repaint.
+#[derive(Clone, Copy)]
+enum PaletteBytes {
+    /// `ESC ] P n rrggbb` for all 16 slots.
+    Load(&'static [llama_core::color::Rgb; 16]),
+    /// `ESC ] R`.
+    Reset,
+}
+
+fn emit_full(
+    out: &mut Vec<u8>,
+    grid: &Grid,
+    active: &mut Active,
+    cols: u16,
+    rows: u16,
+    palette: Option<PaletteBytes>,
+) {
     esc_utf8(out);
     esc_hide_cursor(out);
     esc_reset(out);
+    // Before the clear, so the erased screen is already the new black.
+    match palette {
+        Some(PaletteBytes::Load(slots)) => out.extend_from_slice(&palette::console_load(slots)),
+        Some(PaletteBytes::Reset) => out.extend_from_slice(palette::CONSOLE_RESET),
+        None => {}
+    }
     esc_ed2(out);
     esc_home(out);
     *active = Active { fg: None, bg: None };

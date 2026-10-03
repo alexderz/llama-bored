@@ -290,6 +290,7 @@ required. Check a file without starting anything:
 | `[tty] blank_min`, `sleep_min` | Burn-in guard for the tty11 monitor: blank after N min without a keypress, power down at M (0 = off) |
 | `[tty] show_text`, `prompt_view` | Show the live prompt/output (`true`) and strip chat templates (`"clean"`) or not (`"raw"`) |
 | `[tty] gen_ceiling_tps`, `prompt_ceiling_tps` | Tops of the tok/s scales (250, 1500) |
+| `[tty] palette` | `"llama"` (default): load llama-bored's 16 heat colours on tty11; `"vga"`: the kernel's colours |
 | `[tty] font`, `size` | `"12x24"` (default) or `"12x22"`; `size = "COLSxROWS"` (160x26 to 1024x512) sizes tty11 at start. See below |
 | `[tty] chart_glyphs`, `ctx_history_h` | `"eighths"` (bundled font) or `"halves"`; SLOTS history hours (1–24) |
 | `[fans] enabled`, `hwmon`, `channels`, `labels` | Off by default. `hwmon` is a **name** from `cat /sys/class/hwmon/*/name` |
@@ -384,6 +385,82 @@ validated values; restart the unit after a change. Under 48 rows the
 dashboard drops panels to fit (IN/OUT first, then FANS, then the chart
 shrinks) and shows `tty too small` only below 160x26.
 
+**tty11 colours** (`watch.toml`, `[tty]`): the console has 16 colour slots,
+and llama-watch loads its own palette into them, built from the same heat
+ramp as the LCD and the RGB (deep blue through violet and magenta to red,
+blackbody gold for warnings, greys for text, black background):
+
+```toml
+[tty]
+palette = "llama"  # default; "vga" keeps the kernel's VGA colours
+```
+
+The watcher sends the palette (`ESC ] P`) at start and with every full
+redraw, and the unit's stop step (`llama-watch tty-reset`) puts the kernel's
+colours back (`ESC ] R`), so a later login on tty11 is unaffected. Other
+consoles are never touched. Set `palette` in `cast.toml` to the same value;
+llama-view takes `--palette` (default `llama`).
+
+
+## Watch tty11 over SSH or in tmux
+
+`llama-view` mirrors tty11 read-only in any terminal. Its user needs the
+`llama-view` group (`sudo usermod -aG llama-view $USER`, then log in again).
+
+```sh
+llama-view            # tty11, 10 fps; q or Ctrl-C quits
+```
+
+**Colours.** By default llama-view sends the exact colours tty11 shows, so
+the terminal's colour theme does not repaint the dashboard:
+
+- `--colors auto` (default): truecolor when `COLORTERM` is `truecolor` or
+  `24bit`, else the nearest xterm-256 colour (indices 16-255, which themes
+  leave alone).
+- `--colors truecolor`: 24-bit SGR with tty11's RGB. SSH does not forward
+  `COLORTERM`, so pass this (or set `LLAMA_VIEW_COLORS=truecolor`) when your
+  terminal supports 24-bit colour.
+- `--colors 256`, `--colors 16`: 256 colours, or the terminal's own 16
+  (through its theme).
+- `--palette llama|vga`: match `[tty] palette` in `watch.toml` (default
+  `llama`).
+
+`LLAMA_VIEW_COLORS` and `LLAMA_VIEW_PALETTE` set the same from the
+environment, for saved SSH sessions that cannot pass flags; a flag wins.
+
+**In tmux.** llama-view is made to live in a pane:
+
+- It follows the pane's size and tty11's (which `[tty] size` or the font can
+  change) every frame and repaints in full on any change. A pane smaller
+  than tty11 shows the top-left corner (header, meters, RECENT) and a last
+  line naming both sizes; `--fit center` shows the middle instead, and
+  `--offset-x` / `--offset-y` pan.
+- Each frame is one synchronized update (`ESC [ ? 2026 h`/`l`), so tmux 3.4+
+  shows no tearing; only changed cells are sent.
+- With focus events on, it drops to 1 frame a second while its pane is
+  unfocused or the client is detached, and returns to `--fps` on focus.
+- The pane title (`#T`) is `llama-view: <model> · <host>`, the model read
+  from tty11's header. `--tmux-window-name` (or
+  `LLAMA_VIEW_TMUX_WINDOW=1`) also names the tmux window after the model.
+- It never rings the bell and never captures the mouse.
+
+```tmux
+# ~/.tmux.conf
+set -g focus-events on                 # 1 fps while the pane is unfocused
+set -as terminal-features ',*:RGB'     # tmux 3.2+: pass truecolor through
+set -g allow-rename on                 # only for --tmux-window-name
+set -g pane-border-status top          # optional: show #T on the pane border
+```
+
+Without the `RGB` feature tmux turns 24-bit colour into 256 colours itself
+(`auto` picks 256 inside tmux anyway unless `COLORTERM` says truecolor).
+
+`q`, `Ctrl-C` and `Ctrl-\` quit and restore the terminal. llama-view installs no
+signal handlers (no `unsafe`): SIGWINCH is not needed (the size is polled),
+and SIGTERM or SIGHUP end it without a restore. After a SIGTERM run `reset`,
+or just start llama-view again: its exit turns canonical input and echo back
+on whatever state it found.
+
 ## Watch tty11 on a TV
 
 `llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players
@@ -398,7 +475,8 @@ nothing. The installer installs it but never enables it.
 
 1. Edit `/etc/llama-bored/cast.toml`: set `listen` and `interface_addr` to
    this host's LAN address, narrow `allow` to your LAN or to the TVs, and
-   set `font` to the same value as `[tty] font` in `watch.toml`.
+   set `font` and `palette` to the same values as `[tty] font` and
+   `[tty] palette` in `watch.toml`.
 2. Keep `llama-cast.service` in step with the config. `IPAddressAllow=`
    must be `allow` plus `239.255.255.250/32`, and `SocketBindAllow=` must be
    `tcp:<listen port>` and `udp:1900`. Use a drop-in, as the unit's comments
@@ -464,7 +542,7 @@ sudo rm -rf /etc/systemd/system/llama-metrics.service.d   # the IPAddressAllow= 
 sudo systemctl daemon-reload && sudo udevadm control --reload
 sudo udevadm trigger --action=change --subsystem-match=hidraw
 sudo udevadm trigger --action=change --attr-match=idVendor=1e71 --attr-match=idProduct=3008
-for u in kraken-lcd llama-watch llama-light llama-metrics; do sudo userdel "$u"; done; sudo groupdel llama-view
+for u in kraken-lcd llama-watch llama-light llama-metrics llama-cast; do sudo userdel "$u"; done; sudo groupdel llama-view
 ```
 
 Close the firewall port if you opened it. Nothing on the devices needs

@@ -78,6 +78,9 @@ fn packaged_example_parses_and_validates() {
     assert_eq!(cfg.tty.size, None);
     assert_eq!(cfg.tty.blank_min, 0);
     assert_eq!(cfg.tty.sleep_min, 0);
+    // #26: the llama palette ships explicit, same as the code default.
+    assert!(text.contains("palette = \"llama\""), "{text}");
+    assert_eq!(cfg.tty.palette, llama_watch::config::Palette::Llama);
     assert_eq!(cfg.load.cpu_limit_w, 230.0);
     assert_eq!(cfg.load.idle, llama_watch::config::IdleMode::Auto);
     assert_eq!(cfg.load.gpu_idle_w, 30.0);
@@ -124,6 +127,21 @@ fn chart_glyphs_default_to_halves_and_parse_both_modes() {
     assert_eq!(cfg.tty.chart_glyphs, ChartGlyphs::Halves);
     for bad in ["\"quarters\"", "\"Eighths\"", "8", "true"] {
         let text = format!("[tty]\nchart_glyphs = {bad}\n");
+        assert!(Config::from_toml(&text).is_err(), "accepted {bad}");
+    }
+}
+
+/// #26: `[tty] palette`.
+#[test]
+fn palette_defaults_to_llama_and_parses_both() {
+    use llama_watch::config::Palette;
+    assert_eq!(Config::default().tty.palette, Palette::Llama);
+    let cfg = Config::from_toml("[tty]\npalette = \"vga\"\n").expect("vga");
+    assert_eq!(cfg.tty.palette, Palette::Vga);
+    let cfg = Config::from_toml("[tty]\npalette = \"llama\"\n").expect("llama");
+    assert_eq!(cfg.tty.palette, Palette::Llama);
+    for bad in ["\"xterm\"", "\"Llama\"", "1", "true"] {
+        let text = format!("[tty]\npalette = {bad}\n");
         assert!(Config::from_toml(&text).is_err(), "accepted {bad}");
     }
 }

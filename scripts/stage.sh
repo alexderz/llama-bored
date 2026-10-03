@@ -46,6 +46,7 @@ Group=llama-watch
 ExecStartPre=-+/usr/local/libexec/llama-bored/llama-watch tty-setup --config /etc/llama-bored/watch.toml
 ExecStartPre=-+/usr/bin/sh -c 'exec /usr/bin/setterm --term linux --powersave powerdown </dev/tty11 >/dev/tty11'
 ExecStart=/usr/local/libexec/llama-bored/llama-watch run --config /etc/llama-bored/watch.toml
+ExecStopPost=-/usr/local/libexec/llama-bored/llama-watch tty-reset
 Restart=on-failure
 RestartSec=5
 WatchdogSec=10
@@ -137,6 +138,15 @@ assert_packaging_contract() {
     || ! grep -F -q -x -- "$font_pre" "$watch" \
     || ! grep -F -q -x -- "$powersave_pre" "$watch"; then
     echo "stage self-test: llama-watch.service must have exactly two ExecStartPre, the non-fatal root tty-setup (font and size) and the non-fatal setterm powersave" >&2
+    exit 1
+  fi
+  # #26: the watcher loads llama-bored's palette into tty11 (ESC ] P) and
+  # SIGTERM keeps its default action, so the stop step puts the kernel's
+  # colours back: `llama-watch tty-reset` writes ESC ] R to stdout (tty11),
+  # sandboxed as the watcher, reading nothing. `-` keeps a failure harmless.
+  if [[ "$(grep -c '^ExecStopPost=' "$watch")" -ne 1 ]] \
+    || ! grep -F -q -x -- 'ExecStopPost=-/usr/local/libexec/llama-bored/llama-watch tty-reset' "$watch"; then
+    echo "stage self-test: llama-watch.service must have exactly one ExecStopPost, the non-fatal tty-reset (palette)" >&2
     exit 1
   fi
   local font

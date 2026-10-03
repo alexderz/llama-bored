@@ -4,7 +4,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use llama_view::{ENTER, RESTORE};
+use llama_view::{ENTER, FOCUS_ON, RESTORE, SYNC_BEGIN, SYNC_END};
 
 #[test]
 fn once_restores_the_terminal_on_exit() {
@@ -21,6 +21,7 @@ fn once_restores_the_terminal_on_exit() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_llama-view"))
         .args(["--device", vcsa.to_str().expect("utf-8 path"), "--once"])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -55,6 +56,15 @@ fn once_restores_the_terminal_on_exit() {
     let restore_at = find_last(&out, RESTORE);
     assert!(enter_at < restore_at, "restore was not after enter");
     assert!(!out.contains(&0x7F), "DEL reached stdout");
+    // #27: the frame is synchronized, the pane gets a title (ST, no BEL),
+    // and focus reporting stays off when stdin is not a terminal.
+    assert!(find(&out, SYNC_BEGIN) < find_last(&out, SYNC_END));
+    assert!(
+        out.windows(9).any(|w| w == b"\x1b]2;llama"),
+        "title: {out:?}"
+    );
+    assert!(!out.contains(&0x07), "no bell");
+    assert!(!out.windows(FOCUS_ON.len()).any(|w| w == FOCUS_ON));
     assert!(
         !out.windows(2).any(|pair| pair == [0xC2, 0x9B]),
         "C1 CSI encoding reached stdout: {out:?}"

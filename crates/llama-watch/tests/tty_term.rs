@@ -626,3 +626,95 @@ fn console_blank_is_retried_when_the_first_write_fails() {
     assert_eq!(count(&bytes, b"\x1b[9;10]"), 1, "{bytes:?}");
     assert_eq!(count(&bytes, b"\x1b[14;5]"), 1, "{bytes:?}");
 }
+
+/// #26: `[tty] palette = "llama"` loads all 16 slots on every full repaint,
+/// before the clear, and never on a diff frame.
+#[test]
+fn llama_palette_is_loaded_on_every_full_repaint() {
+    use llama_core::palette::{CONSOLE_RESET, LLAMA, Palette, console_load};
+    let t0 = Instant::now();
+    let mut term = start(4, 1, Duration::from_secs(5), t0).with_palette(Palette::Llama);
+    let load = console_load(&LLAMA);
+    let mut grid = Grid::blank(4, 1);
+    let first = paint(&mut term, &grid, t0);
+    assert_eq!(count(&first, &load), 1, "{first:?}");
+    let at = first.windows(load.len()).position(|w| w == load).unwrap();
+    let clear = first.windows(4).position(|w| w == b"\x1b[2J").unwrap();
+    assert!(at < clear, "palette before the clear");
+    assert!(first.starts_with(b"\x1b%G\x1b[?25l\x1b[0m\x1b]P0000000\x1b]P1ff2a14"));
+    assert_eq!(count(&first, CONSOLE_RESET), 0);
+
+    grid.put(0, 0, Cell::new('x', C16::White, C16::Black));
+    let diff = paint(&mut term, &grid, t0 + Duration::from_secs(1));
+    assert!(!diff.is_empty());
+    assert_eq!(count(&diff, b"\x1b]P"), 0, "diff frames carry no palette");
+
+    let full = paint(&mut term, &grid, t0 + Duration::from_secs(6));
+    assert_eq!(
+        count(&full, &load),
+        1,
+        "the scheduled full redraw reloads it"
+    );
+}
+
+/// `vga` writes `ESC ] R` with the first frame only, and never `ESC ] P`.
+#[test]
+fn vga_palette_resets_once_and_loads_nothing() {
+    use llama_core::palette::{CONSOLE_RESET, Palette};
+    let t0 = Instant::now();
+    let mut term = start(4, 1, Duration::from_secs(5), t0).with_palette(Palette::Vga);
+    let grid = Grid::blank(4, 1);
+    let first = paint(&mut term, &grid, t0);
+    assert_eq!(count(&first, CONSOLE_RESET), 1);
+    assert_eq!(count(&first, b"\x1b]P"), 0);
+    let full = paint(&mut term, &grid, t0 + Duration::from_secs(6));
+    assert!(!full.is_empty());
+    assert_eq!(count(&full, b"\x1b]"), 0, "{full:?}");
+    term.out_mut().clear();
+    term.restore_palette().unwrap();
+    assert!(term.out().is_empty(), "vga has nothing to restore");
+}
+
+/// Clean exit puts the kernel palette back, and a later frame reloads ours.
+#[test]
+fn llama_palette_is_reset_on_restore() {
+    use llama_core::palette::{CONSOLE_RESET, LLAMA, Palette, console_load};
+    let t0 = Instant::now();
+    let mut term = start(4, 1, Duration::from_secs(30), t0).with_palette(Palette::Llama);
+    let grid = Grid::blank(4, 1);
+    paint(&mut term, &grid, t0);
+    term.out_mut().clear();
+    term.restore_palette().unwrap();
+    assert_eq!(term.out(), CONSOLE_RESET);
+    let again = paint(&mut term, &grid, t0 + Duration::from_millis(100));
+    assert_eq!(count(&again, &console_load(&LLAMA)), 1);
+}
+
+/// A `Term` built without `with_palette` writes no palette bytes (the
+/// older byte-exact tests depend on it).
+#[test]
+fn no_palette_bytes_unless_configured() {
+    let t0 = Instant::now();
+    let mut term = start(4, 1, Duration::from_secs(30), t0);
+    let first = paint(&mut term, &Grid::blank(4, 1), t0);
+    assert_eq!(count(&first, b"\x1b]"), 0);
+    term.restore_palette().unwrap();
+}
+
+/// #26: `llama-watch tty-reset` (the unit's ExecStopPost) writes exactly
+/// `ESC ] R` to stdout and reads no config.
+#[test]
+fn tty_reset_writes_only_the_palette_reset() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_llama-watch"))
+        .arg("tty-reset")
+        .output()
+        .expect("run tty-reset");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"\x1b]R");
+    let bad = std::process::Command::new(env!("CARGO_BIN_EXE_llama-watch"))
+        .args(["tty-reset", "--config", "/nonexistent"])
+        .output()
+        .expect("run tty-reset");
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(bad.stdout.is_empty());
+}

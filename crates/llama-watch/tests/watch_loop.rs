@@ -181,6 +181,61 @@ fn too_small_window_draws_only_the_banner() {
     assert!(bytes > 0, "the too-small path still paints its one line");
 }
 
+/// #26: a stop request ends with `ESC ] R` after the last frame, so the
+/// console gets the kernel palette back on a clean exit.
+#[test]
+fn a_clean_stop_resets_the_llama_palette() {
+    let fx = Fixture::new("palette");
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let term = Term::new(
+        ByteWrite {
+            bytes: Arc::clone(&bytes),
+        },
+        || {
+            Ok(Size {
+                cols: 160,
+                rows: 48,
+            })
+        },
+        Duration::from_secs(5),
+        Instant::now(),
+    )
+    .expect("term")
+    .with_palette(llama_watch::config::Palette::Llama);
+    let exit = fx.drive(
+        Queue::default(),
+        fx.collector(),
+        OkPublish,
+        term,
+        RecNotify::default(),
+        StopAfter::new(2),
+        MemLog::new(),
+    );
+    assert_eq!(exit, service::LoopExit::Stopped);
+    let bytes = bytes.lock().expect("bytes").clone();
+    let load = llama_core::palette::console_load(&llama_core::palette::LLAMA);
+    assert!(
+        bytes.windows(load.len()).any(|w| w == load),
+        "palette loaded"
+    );
+    assert!(bytes.ends_with(b"\x1b]R"), "reset last");
+}
+
+struct ByteWrite {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for ByteWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes.lock().expect("bytes").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn an_unchanged_full_frame_writes_zero_bytes() {
     let fx = Fixture::new("frame");

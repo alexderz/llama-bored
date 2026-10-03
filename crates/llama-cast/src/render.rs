@@ -5,11 +5,15 @@
 //! (character, attribute) byte pair per cell. With a 512-glyph font the
 //! kernel shifts the attribute left one bit and bit 0 carries glyph bit 8:
 //! foreground `(attr >> 1) & 0xf`, background `(attr >> 5) & 7`. Colours are
-//! in VGA order (bit 0 blue) and map to the standard 16-colour palette.
+//! in VGA order (bit 0 blue) and map to the console palette tty11 shows
+//! (`llama_core::palette`, cast.toml `palette`, matching `[tty] palette`).
+//! The kernel does not expose the loaded palette through vcsa, so the config
+//! names it (#26).
 //!
 //! The console image is centred on the frame when smaller and cropped from
 //! the top-left when larger, the same corner a smaller monitor shows.
 
+use llama_core::palette::Palette;
 use thiserror::Error;
 
 use crate::font::Psf2;
@@ -24,25 +28,12 @@ pub const MAX_ROWS: usize = 512;
 /// Largest vcsa read: header plus every cell of the largest console.
 pub const MAX_VCSA_BYTES: usize = 4 + 2 * MAX_COLS * MAX_ROWS;
 
-/// The 16 console colours, ANSI order (0 black, 1 red, ...).
-pub const PALETTE: [[u8; 3]; 16] = [
-    [0x00, 0x00, 0x00],
-    [0xaa, 0x00, 0x00],
-    [0x00, 0xaa, 0x00],
-    [0xaa, 0x55, 0x00],
-    [0x00, 0x00, 0xaa],
-    [0xaa, 0x00, 0xaa],
-    [0x00, 0xaa, 0xaa],
-    [0xaa, 0xaa, 0xaa],
-    [0x55, 0x55, 0x55],
-    [0xff, 0x55, 0x55],
-    [0x55, 0xff, 0x55],
-    [0xff, 0xff, 0x55],
-    [0x55, 0x55, 0xff],
-    [0xff, 0x55, 0xff],
-    [0x55, 0xff, 0xff],
-    [0xff, 0xff, 0xff],
-];
+/// The 16 colours of `palette` as RGB24 triples, ANSI order (0 black, 1
+/// red, ...).
+#[must_use]
+pub fn rgb24(palette: Palette) -> [[u8; 3]; 16] {
+    palette.slots().map(|c| [c.r, c.g, c.b])
+}
 
 /// Why a vcsa dump was refused.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -132,8 +123,11 @@ pub fn decode_cell(ch: u8, attr: u8, hi512: bool) -> (usize, u8, u8) {
     }
 }
 
-/// Render `screen` with `font` into `frame` (`FRAME_BYTES` long, RGB24).
-pub fn render_into(screen: &Screen<'_>, font: &Psf2, frame: &mut [u8]) {
+/// Render `screen` with `font` and `palette` into `frame` (`FRAME_BYTES`
+/// long, RGB24). Outside the console image is black (slot 0 in both
+/// palettes).
+pub fn render_into(screen: &Screen<'_>, font: &Psf2, palette: Palette, frame: &mut [u8]) {
+    let colours = rgb24(palette);
     frame.fill(0);
     let (gw, gh) = (font.width(), font.height());
     let hi512 = font.count() >= 512;
@@ -153,8 +147,8 @@ pub fn render_into(screen: &Screen<'_>, font: &Psf2, frame: &mut [u8]) {
             }
             let (ch, attr) = screen.cell(row, col);
             let (glyph, fg, bg) = decode_cell(ch, attr, hi512);
-            let fg = PALETTE[usize::from(fg)];
-            let bg = PALETTE[usize::from(bg)];
+            let fg = colours[usize::from(fg)];
+            let bg = colours[usize::from(bg)];
             for gy in 0..gh {
                 let y = y0 + gy;
                 if y >= FRAME_HEIGHT {
@@ -177,8 +171,8 @@ pub fn render_into(screen: &Screen<'_>, font: &Psf2, frame: &mut [u8]) {
 
 /// Render into a new frame.
 #[must_use]
-pub fn render(screen: &Screen<'_>, font: &Psf2) -> Vec<u8> {
+pub fn render(screen: &Screen<'_>, font: &Psf2, palette: Palette) -> Vec<u8> {
     let mut frame = vec![0_u8; FRAME_BYTES];
-    render_into(screen, font, &mut frame);
+    render_into(screen, font, palette, &mut frame);
     frame
 }

@@ -130,7 +130,11 @@ fn real_ffmpeg_encodes_mpeg_ts_when_installed() {
     }
     let font =
         load_font(&common::workspace_root().join("packaging/fonts/llama-hack-12x24.psfu")).unwrap();
-    let source = Arc::new(VcsaSource::new(fixture("synthetic.vcsa"), font));
+    let source = Arc::new(VcsaSource::new(
+        fixture("synthetic.vcsa"),
+        font,
+        llama_cast::config::Palette::Llama,
+    ));
     let mut probe = vec![0_u8; FRAME_BYTES];
     source.frame(&mut probe).unwrap();
     let mut enc = Encoder::start(ffmpeg, 2, source).unwrap();

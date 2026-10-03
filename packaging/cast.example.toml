@@ -50,3 +50,7 @@ ffmpeg = "/usr/bin/ffmpeg"
 # tty11's console font: "12x24" (default) or "12x22". Must match
 # `[tty] font` in watch.toml, or the picture is garbled.
 font = "12x24"
+
+# tty11's colours: "llama" (default) or "vga". Match `[tty] palette` in
+# watch.toml, so the TV shows the colours tty11 shows.
+palette = "llama"

@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use common::fixture;
 use llama_cast::font::{FontError, Psf2};
 use llama_cast::render::{
-    self, FRAME_BYTES, FRAME_HEIGHT, FRAME_WIDTH, PALETTE, Screen, VcsaError, decode_cell,
+    self, FRAME_BYTES, FRAME_HEIGHT, FRAME_WIDTH, Screen, VcsaError, decode_cell, rgb24,
     vga_to_ansi,
 };
 use llama_cast::source::{FrameSource, VcsaSource, load_font, read_capped};
+use llama_core::palette::Palette;
 
 fn shipped_font(size: &str) -> PathBuf {
     common::workspace_root().join(format!("packaging/fonts/llama-hack-{size}.psfu"))
@@ -105,18 +106,25 @@ fn vcsa_geometry() {
 #[test]
 fn synthetic_screen_matches_the_golden_png() {
     let font = load_font(&shipped_font("12x24")).unwrap();
-    let source = VcsaSource::new(fixture("synthetic.vcsa"), font);
+    // The default palette (cast.toml `palette = "llama"`, #26).
+    let source = VcsaSource::new(fixture("synthetic.vcsa"), font, Palette::Llama);
     let mut frame = vec![0_u8; FRAME_BYTES];
     source.frame(&mut frame).unwrap();
+    let palette = rgb24(Palette::Llama);
+    assert_eq!(
+        palette[4],
+        [0x14, 0x28, 0xd8],
+        "blue is L1 of the heat ramp"
+    );
     // 40x10 cells of 12x24 = 480x240, centred: origin (720, 420).
     assert_eq!(pixel(&frame, 719, 420), [0, 0, 0]);
     assert_eq!(
         pixel(&frame, 720, 420),
-        PALETTE[4],
+        palette[4],
         "row 0 has a blue background"
     );
     // The X at row 9, col 39 has a red background.
-    assert_eq!(pixel(&frame, 720 + 39 * 12, 420 + 9 * 24), PALETTE[1]);
+    assert_eq!(pixel(&frame, 720 + 39 * 12, 420 + 9 * 24), palette[1]);
     assert_eq!(pixel(&frame, 1200, 660), [0, 0, 0]);
 
     let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/synthetic-12x24.png");
@@ -166,14 +174,11 @@ fn a_larger_console_is_cropped_from_the_top_left() {
         }
     }
     let screen = Screen::parse(&dump).unwrap();
-    let frame = render::render(&screen, &font);
-    assert_eq!(pixel(&frame, 0, 0), PALETTE[4]);
-    assert_eq!(pixel(&frame, 1919, 1077), PALETTE[4]);
-    assert_eq!(
-        pixel(&frame, 1919, 1078),
-        PALETTE[1],
-        "row 49 starts at y 1078"
-    );
+    let frame = render::render(&screen, &font, Palette::Vga);
+    let vga = rgb24(Palette::Vga);
+    assert_eq!(pixel(&frame, 0, 0), vga[4]);
+    assert_eq!(pixel(&frame, 1919, 1077), vga[4]);
+    assert_eq!(pixel(&frame, 1919, 1078), vga[1], "row 49 starts at y 1078");
 }
 
 #[test]
@@ -187,4 +192,43 @@ fn reads_are_capped() {
     let link = dir.join("link");
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert!(read_capped(&link, 100).is_err());
+}
+
+/// #26: the same cells in each palette take exactly that palette's RGB.
+#[test]
+fn every_attribute_colour_renders_with_the_configured_palette() {
+    let font = load_font(&shipped_font("12x24")).unwrap();
+    // One row: 8 blank cells with background VGA 0..=7, then 16 cells of '#'
+    // with foreground VGA 0..=15 on black (512-glyph attribute layout).
+    let mut dump = vec![1_u8, 24, 0, 0];
+    for bg in 0..8_u8 {
+        dump.extend_from_slice(&[b' ', bg << 5]);
+    }
+    for fg in 0..16_u8 {
+        dump.extend_from_slice(&[b'#', fg << 1]);
+    }
+    let screen = Screen::parse(&dump).unwrap();
+    for palette in [Palette::Llama, Palette::Vga] {
+        let colours = rgb24(palette);
+        let frame = render::render(&screen, &font, palette);
+        // 24 cells of 12 px = 288 px wide, centred: x 816, y 528.
+        for bg in 0..8_usize {
+            let ansi = usize::from(vga_to_ansi(bg as u8));
+            assert_eq!(
+                pixel(&frame, 816 + bg * 12, 528),
+                colours[ansi],
+                "{palette:?} bg {bg}"
+            );
+        }
+        // A lit pixel of '#' shows the foreground.
+        let (gx, gy) = (0..12)
+            .flat_map(|x| (0..24).map(move |y| (x, y)))
+            .find(|&(x, y)| font.pixel(usize::from(b'#'), x, y))
+            .unwrap();
+        for fg in 0..16_usize {
+            let ansi = usize::from(vga_to_ansi(fg as u8));
+            let at = pixel(&frame, 816 + (8 + fg) * 12 + gx, 528 + gy);
+            assert_eq!(at, colours[ansi], "{palette:?} fg {fg}");
+        }
+    }
 }

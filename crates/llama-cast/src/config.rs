@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+pub use llama_core::palette::Palette;
+
 use crate::acl::{Allowlist, Cidr, CidrError};
 
 /// Largest config file read.
@@ -117,6 +119,8 @@ struct Raw {
     ffmpeg: String,
     #[serde(default)]
     font: Font,
+    #[serde(default)]
+    palette: Palette,
 }
 
 fn default_name() -> String {
@@ -155,6 +159,8 @@ pub struct Config {
     pub ffmpeg: PathBuf,
     /// The tty11 console font.
     pub font: Font,
+    /// The colours tty11 shows; must match `[tty] palette` in watch.toml.
+    pub palette: Palette,
 }
 
 impl Config {
@@ -208,6 +214,7 @@ impl Config {
             max_clients: raw.max_clients,
             ffmpeg,
             font: raw.font,
+            palette: raw.palette,
         })
     }
 

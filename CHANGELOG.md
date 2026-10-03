@@ -6,8 +6,29 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- tty11 loads llama-bored's own 16-colour palette, built from the heat ramp
+  the LCD and RGB use (`[tty] palette = "llama"`, the default; `"vga"`
+  keeps the kernel's colours). Only tty11 changes; `llama-watch tty-reset`
+  restores the console palette when the unit stops. llama-cast renders with
+  the same palette (`palette` in `cast.toml`) (#26).
+- llama-view sends exact colours instead of the terminal theme's 16:
+  `--colors auto|truecolor|256|16` (`LLAMA_VIEW_COLORS`) and
+  `--palette llama|vga` (`LLAMA_VIEW_PALETTE`); `auto` uses truecolor when
+  `COLORTERM` says so, else the nearest fixed xterm-256 colour (#25).
+- llama-view is a better tmux resident: it follows the pane's and tty11's
+  size (`--fit crop|center`, `--offset-x/-y`, a hint line when the pane is
+  smaller), draws each frame as one synchronized update, drops to 1 fps
+  while its pane is unfocused, sets the pane title to
+  `llama-view: <model> · <host>` (and, opt-in, the tmux window name with
+  `--tmux-window-name`), restores the terminal on `q`/Ctrl-C, and never
+  rings the bell or captures the mouse (#27).
+
 ### Fixed
 
+- llama-view decodes tty11's colours correctly with a 512-glyph console font
+  (the bundled fonts); `--font-glyphs auto|256|512` overrides the detection (#28).
 - The configured tty11 `[tty] font` and `size` now survive a reboot: at boot
   the framebuffer console's take-over can still be deferred, so
   `llama-watch tty-setup` writes one space to tty11 first and retries

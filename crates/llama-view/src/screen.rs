@@ -35,7 +35,13 @@ impl Color {
         if n < 8 { 40 + n } else { 100 + (n - 8) }
     }
 
-    fn from_ansi(index: u8) -> Self {
+    /// ANSI index, 0..=15: the slot in `llama_core::palette`.
+    pub fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// The colour of ANSI slot `index` (only the low four bits count).
+    pub fn from_ansi(index: u8) -> Self {
         match index {
             0 => Self::Black,
             1 => Self::Red,
@@ -66,6 +72,67 @@ pub fn vga_attr(attr: u8) -> (Color, Color) {
     let fg = ansi_from_vga(attr & 0x07, attr & 0x08 != 0);
     let bg = ansi_from_vga((attr >> 4) & 0x07, false);
     (fg, bg)
+}
+
+/// [`vga_attr`] for a console with a 512-glyph font, such as tty11 with
+/// llama-hack: the kernel shifts the attribute left one bit and bit 0 is
+/// glyph bit 8. Foreground `(attr >> 1) & 0xf`, background `(attr >> 5) & 7`,
+/// still VGA order. There is no blink bit.
+pub fn vga_attr_512(attr: u8) -> (Color, Color) {
+    let fg_nibble = (attr >> 1) & 0x0f;
+    let fg = ansi_from_vga(fg_nibble & 0x07, fg_nibble & 0x08 != 0);
+    let bg = ansi_from_vga((attr >> 5) & 0x07, false);
+    (fg, bg)
+}
+
+/// How a vcsa attribute byte is laid out. It depends on the console font,
+/// which a reader of vcsa cannot ask the kernel for (that is an ioctl), so it
+/// is either given (`--font-glyphs`) or inferred with [`detect_layout`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AttrLayout {
+    /// A 256-glyph font: [`vga_attr`].
+    #[default]
+    Glyphs256,
+    /// A 512-glyph font: [`vga_attr_512`].
+    Glyphs512,
+}
+
+/// Infer the attribute layout from blank cells.
+///
+/// A space is glyph 0x20 in every console font, so with a 512-glyph font its
+/// attribute has bit 0 (glyph bit 8) clear. With a 256-glyph font bit 0 is
+/// the foreground's blue bit, set for the default white (and for every white,
+/// cyan, magenta or blue foreground). So: any space with bit 0 set means
+/// 256 glyphs; spaces that all have it clear mean 512. Only cells whose vcsa
+/// glyph byte is 0x20 count, and, when `vcsu` is readable, only those whose
+/// Unicode is U+0020 too. `None` when the screen has no such cell; the caller
+/// keeps its previous answer.
+///
+/// A 256-glyph console whose every space has a black, green, red or yellow
+/// foreground would read as 512; tty11 (llama-watch fills blank cells with
+/// a white foreground) never does. `--font-glyphs` overrides the guess.
+pub fn detect_layout(vcsa: &[u8], vcsu: Option<&[u8]>) -> Option<AttrLayout> {
+    let cells = vcsa.get(4..)?;
+    let mut spaces = 0usize;
+    for (i, pair) in cells.as_chunks::<2>().0.iter().enumerate() {
+        if pair[0] != b' ' {
+            continue;
+        }
+        if let Some(bytes) = vcsu {
+            let start = i.saturating_mul(4);
+            if let Some(chunk) = bytes.get(start..start + 4) {
+                let cp = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if cp != 0x20 {
+                    continue;
+                }
+            }
+        }
+        if pair[1] & 1 == 1 {
+            return Some(AttrLayout::Glyphs256);
+        }
+        spaces += 1;
+    }
+    (spaces > 0).then_some(AttrLayout::Glyphs512)
 }
 
 /// Glyphs the tty11 font actually draws. Same set `llama-watch` emits
@@ -144,23 +211,64 @@ pub enum DecodeError {
     Truncated,
 }
 
-/// Decode a `vcsa` image.
+/// Largest console (`[tty] size` tops out at 1024x512).
+pub const MAX_COLS: u16 = 1024;
+/// Largest console rows.
+pub const MAX_ROWS: u16 = 512;
+/// Largest vcsa image: header plus every cell of the largest console.
+pub const MAX_VCSA_BYTES: usize = 4 + 2 * MAX_COLS as usize * MAX_ROWS as usize;
+
+/// Rows and columns of a whole vcsa read. The kernel truncates both header
+/// bytes to 8 bits, so a console wider than 255 columns (tty11 can be up to
+/// 1024x512) reads as `cols % 256`; the cell count gives the real size back,
+/// the same way llama-cast does. A read longer than the header's size with no
+/// wider match keeps the header's size (trailing bytes ignored).
+pub fn vcsa_geometry(vcsa: &[u8]) -> Option<(u16, u16)> {
+    let header = vcsa.get(..4)?;
+    let (rows_lo, cols_lo) = (u16::from(header[0]), u16::from(header[1]));
+    let body = vcsa.len() - 4;
+    let cells = body / 2;
+    if body.is_multiple_of(2) {
+        let mut rows = rows_lo;
+        while rows <= MAX_ROWS {
+            let mut cols = cols_lo;
+            while cols <= MAX_COLS {
+                if usize::from(rows) * usize::from(cols) == cells {
+                    return Some((rows, cols));
+                }
+                cols += 256;
+            }
+            rows += 256;
+        }
+    }
+    (usize::from(rows_lo) * usize::from(cols_lo) <= cells).then_some((rows_lo, cols_lo))
+}
+
+/// Decode a `vcsa` image, inferring the attribute layout with
+/// [`detect_layout`] (256 glyphs when it cannot tell).
+pub fn decode_screen(
+    vcsa: &[u8],
+    vcs: Option<&[u8]>,
+    vcsu: Option<&[u8]>,
+) -> Result<Screen, DecodeError> {
+    let layout = detect_layout(vcsa, vcsu).unwrap_or_default();
+    decode_screen_with(vcsa, vcs, vcsu, layout)
+}
+
+/// Decode a `vcsa` image whose attributes have `layout`.
 ///
 /// The header is four bytes: rows, columns, cursor column, cursor row.
 /// Each cell is a host-endian pair, glyph then attribute. When `vcsu` has a
 /// native-endian `u32` for the cell, that code point wins. Otherwise a `vcs`
 /// byte wins over the glyph. The chosen character then passes through
 /// [`screen_char`].
-pub fn decode_screen(
+pub fn decode_screen_with(
     vcsa: &[u8],
     vcs: Option<&[u8]>,
     vcsu: Option<&[u8]>,
+    layout: AttrLayout,
 ) -> Result<Screen, DecodeError> {
-    if vcsa.len() < 4 {
-        return Err(DecodeError::Truncated);
-    }
-    let rows = u16::from(vcsa[0]);
-    let cols = u16::from(vcsa[1]);
+    let (rows, cols) = vcsa_geometry(vcsa).ok_or(DecodeError::Truncated)?;
     let cursor_x = u16::from(vcsa[2]);
     let cursor_y = u16::from(vcsa[3]);
     let n = usize::from(rows).saturating_mul(usize::from(cols));
@@ -172,7 +280,11 @@ pub fn decode_screen(
     for i in 0..n {
         let glyph = char::from(vcsa[4 + i * 2]);
         let ch = screen_char(char_at(glyph, vcs, vcsu, i));
-        let (fg, bg) = vga_attr(vcsa[5 + i * 2]);
+        let attr = vcsa[5 + i * 2];
+        let (fg, bg) = match layout {
+            AttrLayout::Glyphs256 => vga_attr(attr),
+            AttrLayout::Glyphs512 => vga_attr_512(attr),
+        };
         cells.push(Cell::new(ch, fg, bg));
     }
     Ok(Screen {
@@ -255,6 +367,63 @@ mod tests {
             assert_eq!(got_fg.fg_sgr(), fg_sgr, "attr {attr:#04x} fg sgr");
             assert_eq!(got_bg.bg_sgr(), bg_sgr, "attr {attr:#04x} bg sgr");
         }
+    }
+
+    #[test]
+    fn maps_512_glyph_attributes_like_llama_cast() {
+        // fg bits 1-4, bg bits 5-7, bit 0 is glyph bit 8 and changes nothing.
+        for vga_fg in 0..16u8 {
+            for vga_bg in 0..8u8 {
+                let attr = (vga_bg << 5) | (vga_fg << 1);
+                let want = vga_attr((vga_bg << 4) | vga_fg);
+                assert_eq!(vga_attr_512(attr), want, "fg {vga_fg} bg {vga_bg}");
+                assert_eq!(vga_attr_512(attr | 1), want);
+            }
+        }
+        // tty11's default: white on black is 0x0e with a 512-glyph font.
+        assert_eq!(vga_attr_512(0x0e), (Color::White, Color::Black));
+        // VGA bright red (12) on VGA blue (1).
+        assert_eq!(
+            vga_attr_512((1 << 5) | (12 << 1) | 1),
+            (Color::BrightRed, Color::Blue)
+        );
+    }
+
+    #[test]
+    fn detects_the_attribute_layout_from_spaces() {
+        let white_256 = vcsa(1, 3, 0, 0, &[(b' ', 0x07), (b'A', 0x02), (b' ', 0x07)]);
+        assert_eq!(detect_layout(&white_256, None), Some(AttrLayout::Glyphs256));
+        let white_512 = vcsa(1, 3, 0, 0, &[(b' ', 0x0e), (b'A', 0x1e), (b' ', 0x0e)]);
+        assert_eq!(detect_layout(&white_512, None), Some(AttrLayout::Glyphs512));
+        let no_space = vcsa(1, 2, 0, 0, &[(b'A', 0x07), (b'B', 0x07)]);
+        assert_eq!(detect_layout(&no_space, None), None);
+        // A glyph-0x120 cell (low byte 0x20) that vcsu says is not a space
+        // does not count.
+        let hi = vcsa(1, 2, 0, 0, &[(b' ', 0x0f), (b' ', 0x0e)]);
+        let vcsu = u32s(&[0x2588, 0x20]);
+        assert_eq!(detect_layout(&hi, Some(&vcsu)), Some(AttrLayout::Glyphs512));
+        assert_eq!(detect_layout(&hi, None), Some(AttrLayout::Glyphs256));
+        // decode_screen uses the detected layout.
+        let screen = decode_screen(&white_512, None, None).expect("decode");
+        assert!(screen.cells.iter().all(|c| c.bg == Color::Black));
+        assert_eq!(screen.cells[0].fg, Color::White);
+        assert_eq!(screen.cells[1].fg, Color::BrightWhite);
+    }
+
+    #[test]
+    fn wide_consoles_get_their_real_size_back() {
+        // 49 x 320 reads as 49 x 64 in the header.
+        let mut wide = vec![49u8, 64, 0, 0];
+        wide.resize(4 + 2 * 49 * 320, 0);
+        assert_eq!(vcsa_geometry(&wide), Some((49, 320)));
+        let screen = decode_screen(&wide, None, None).expect("wide");
+        assert_eq!((screen.rows, screen.cols), (49, 320));
+        assert_eq!(screen.cells.len(), 49 * 320);
+        // An exact small read and a short one.
+        let small = vcsa(2, 3, 0, 0, &[(b'a', 7); 6]);
+        assert_eq!(vcsa_geometry(&small), Some((2, 3)));
+        assert_eq!(vcsa_geometry(&small[..small.len() - 2]), None);
+        assert_eq!(vcsa_geometry(&small[..3]), None);
     }
 
     #[test]
