@@ -229,6 +229,10 @@ pub struct View {
     /// Tuning detail of the first model. `None` from an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ModelDetail>,
+    /// The first model's engine, drawn first on the detail line by its short
+    /// name (#33). `None` with no model, or in a view from an older writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<llama_core::backend::Backend>,
     /// The first model's speculative acceptance, 0..=1000, drawn at the end
     /// of the detail line as `spec 78 %` (#31). `None` when not reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +270,7 @@ impl Default for View {
             models: Vec::new(),
             model_count: 0,
             detail: None,
+            engine: None,
             spec_permille: None,
             dial: no_data_dial(),
             scale: default_scale(),
@@ -344,6 +349,11 @@ pub fn present(
         .models
         .first()
         .and_then(|model| model.detail.clone());
+    // A model without a backend is llama.cpp (#33).
+    let engine = snapshot
+        .models
+        .first()
+        .map(|model| model.backend.map(|info| info.kind).unwrap_or_default());
     // Whole percents, so the frame key only moves when the text does.
     let spec_permille = snapshot
         .models
@@ -471,6 +481,7 @@ pub fn present(
         model_count: u8::try_from(models.len()).unwrap_or(u8::MAX),
         models,
         detail,
+        engine,
         spec_permille,
         dial,
         scale,

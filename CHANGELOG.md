@@ -6,6 +6,19 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- The active inference engine is always named (#33). tty11's header detail
+  starts with the shown model's engine (`llama.cpp · 256k · kv f16 · Q6_K`;
+  `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`; a llama.cpp fork stays
+  `llama.cpp`) and says `engine --` with no model. The LCD leads the detail
+  line under a single model's name with the short name (`llama.cpp`,
+  `sglang`, `vllm`, `strata`, `openai`), kept while quant, kv and
+  `spec 78 %` drop for width. llama-view's pane title is
+  `llama-view: <model> (<engine>) · <host>` when it fits the 40-character
+  cap. The exporter is unchanged (`backend` label on
+  `llamabored_model_loaded`).
+
 ## 0.3.2 — 2026-10-03
 
 ### Added

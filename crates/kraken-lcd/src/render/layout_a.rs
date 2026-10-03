@@ -136,11 +136,15 @@ fn plan_status(view: &View, cache: &GlyphCache, geom: &LayoutGeometry) -> Status
     }
     if view.models.len() == 1 {
         let spec = view.spec_permille.map(llama_core::backend::spec_text);
+        let engine = view.engine.map(llama_core::backend::Backend::short_name);
         return plan_model(
             cache,
             &view.models[0],
-            view.detail.as_ref(),
-            spec.as_deref(),
+            DetailLine {
+                engine,
+                detail: view.detail.as_ref(),
+                spec: spec.as_deref(),
+            },
             geom,
         );
     }
@@ -165,6 +169,17 @@ fn single_line(cache: &GlyphCache, text: &str, geom: &LayoutGeometry) -> Status 
     }
 }
 
+/// What the detail line under a single model's name is made of.
+#[derive(Clone, Copy)]
+struct DetailLine<'a> {
+    /// The engine's short name, kept first (#33).
+    engine: Option<&'a str>,
+    /// Tuning detail, dropped item by item for width.
+    detail: Option<&'a ModelDetail>,
+    /// `spec 78 %`, kept last while it fits (#31).
+    spec: Option<&'a str>,
+}
+
 /// One loaded model: the name on one or two lines, then the detail line.
 ///
 /// This is the accepted "Head & tail" design (T51 V1). The name fits one
@@ -172,15 +187,20 @@ fn single_line(cache: &GlyphCache, text: &str, geom: &LayoutGeometry) -> Status 
 /// `tail`: the longest word prefix and the longest word suffix that fit.
 /// The middle is what gets dropped; the end is never cut. A server that
 /// reports speculative decoding adds `spec 78 %` to the detail line (#31),
-/// which then shows even without other detail.
+/// and the engine's short name leads it (#33); either shows even without
+/// other detail.
 fn plan_model(
     cache: &GlyphCache,
     name: &str,
-    detail: Option<&ModelDetail>,
-    spec: Option<&str>,
+    line: DetailLine<'_>,
     geom: &LayoutGeometry,
 ) -> Status {
-    let has_line = detail.is_some() || spec.is_some();
+    let DetailLine {
+        engine,
+        detail,
+        spec,
+    } = line;
+    let has_line = engine.is_some() || detail.is_some() || spec.is_some();
     let (single, pair) = if has_line {
         (geom.name_single_baseline, geom.name_baselines)
     } else {
@@ -221,7 +241,7 @@ fn plan_model(
                 geom.detail_px,
             )
         };
-        let text = llama_core::detail::fitted_with(detail, spec, fits_detail);
+        let text = llama_core::detail::fitted_with(engine, detail, spec, fits_detail);
         if !text.is_empty() {
             out.push(StatusLine {
                 text,

@@ -17,8 +17,8 @@ pub use color::{ColorChoice, ColorMode, SgrTable, nearest_xterm256, xterm256_rgb
 pub use input::{RawInput, Wait, raw, restored, wait_input};
 pub use llama_core::palette::Palette;
 pub use pane::{
-    Fit, HOST_CAP, InputEvent, InputParser, MODEL_CAP, Titler, frame_period, header_model,
-    osc_title, place, sanitize, title_text, tmux_window_name,
+    Fit, HOST_CAP, InputEvent, InputParser, MODEL_CAP, Titler, frame_period, header_engine,
+    header_model, osc_title, place, sanitize, title_text, tmux_window_name,
 };
 pub use render::{ENTER, FOCUS_ON, RESTORE, Renderer, SYNC_BEGIN, SYNC_END, TermGuard, crop};
 pub use screen::{

@@ -27,7 +27,7 @@ use crate::tty::grid::Cell;
 use crate::tty::layout::{self, Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState};
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{ConsoleBlank, Term};
-use llama_core::backend::{self, Backend};
+use llama_core::backend;
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
 use llama_core::wire::{SourceWire, Sources};
@@ -1063,40 +1063,31 @@ fn model_name(sample: &WatchSample, state: WatchState) -> String {
     }
 }
 
-/// Detail line of the first model, the same string the LCD fits. A
-/// backend other than llama.cpp leads it: `sglang · 200k · kv fp8_e4m3`.
+/// Detail line of the first model. Its engine always leads it (#33),
+/// llama.cpp when the snapshot names none: `SGLang · 200k · kv fp8_e4m3`.
 /// The engine's own cache facts close it (#31): `· block 16 · prefix on`.
+/// With no model shown it is [`NO_ENGINE`].
 fn model_detail(sample: &WatchSample, state: WatchState) -> String {
-    match state {
-        WatchState::Generating | WatchState::Ready => {
-            let Some(model) = sample.snapshot.models.first() else {
-                return String::new();
-            };
-            let line = model
-                .detail
-                .as_ref()
-                .map(|detail| {
-                    std::iter::once(llama_core::detail::line(detail))
-                        .chain(llama_core::detail::engine_items(detail))
-                        .collect::<Vec<_>>()
-                        .join(llama_core::detail::SEPARATOR)
-                })
-                .unwrap_or_default();
-            match model.backend.map(|info| info.kind) {
-                Some(kind) if kind != Backend::LlamaCpp => {
-                    if line.is_empty() {
-                        kind.as_str().to_owned()
-                    } else {
-                        format!("{}{}{line}", kind.as_str(), llama_core::detail::SEPARATOR)
-                    }
-                }
-                _ => line,
-            }
-        }
-        WatchState::Starting | WatchState::AiDown | WatchState::NoLlama => String::new(),
-    }
+    let model = match state {
+        WatchState::Generating | WatchState::Ready => sample.snapshot.models.first(),
+        WatchState::Starting | WatchState::AiDown | WatchState::NoLlama => None,
+    };
+    let Some(model) = model else {
+        return NO_ENGINE.to_owned();
+    };
+    let engine = model.backend.map(|info| info.kind).unwrap_or_default();
+    std::iter::once(engine.display_name().to_owned())
+        .chain(model.detail.as_ref().into_iter().flat_map(|detail| {
+            std::iter::once(llama_core::detail::line(detail))
+                .chain(llama_core::detail::engine_items(detail))
+        }))
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join(llama_core::detail::SEPARATOR)
 }
 
+/// The header's engine item with no model shown (#33).
+const NO_ENGINE: &str = "engine --";
 /// IN and OUT while the header model has no `/slots` to take text from.
 const NO_SLOTS_TEXT: &str = "text needs llama.cpp /slots";
 /// How long a model may sit in `stopping` before the header calls it stuck.
@@ -1646,7 +1637,7 @@ fn format_span(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llama_core::backend::BackendInfo;
+    use llama_core::backend::{Backend, BackendInfo};
 
     #[test]
     fn layout_slots_keeps_context_fields() {
@@ -2222,14 +2213,20 @@ mod tests {
         );
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "256k · kv q8 · PTQ1_0"
+            "llama.cpp · 256k · kv q8 · PTQ1_0",
+            "#33: no backend reads as llama.cpp"
         );
-        assert_eq!(model_detail(&sample, WatchState::AiDown), "");
+        assert_eq!(model_detail(&sample, WatchState::AiDown), "engine --");
+        assert_eq!(model_detail(&sample, WatchState::Starting), "engine --");
+        assert_eq!(model_detail(&sample, WatchState::NoLlama), "engine --");
         // An older snapshot: the canonical name and no detail.
         sample.snapshot.models[0].full_name = None;
         sample.snapshot.models[0].detail = None;
         assert_eq!(model_name(&sample, WatchState::Ready), "Ternary Bon…");
-        assert_eq!(model_detail(&sample, WatchState::Ready), "");
+        assert_eq!(model_detail(&sample, WatchState::Ready), "llama.cpp");
+        // #33: no model loaded.
+        sample.snapshot.models.clear();
+        assert_eq!(model_detail(&sample, WatchState::Ready), "engine --");
     }
 
     fn backend_sample(models: Vec<ModelInfo>) -> WatchSample {
@@ -2419,7 +2416,7 @@ mod tests {
         let sample = backend_sample(vec![flash, tabby.clone()]);
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "sglang · 200k · kv fp8_e4m3 · exl3"
+            "SGLang · 200k · kv fp8_e4m3 · exl3"
         );
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
@@ -2441,8 +2438,11 @@ mod tests {
             WatchState::Ready
         );
         let sample = backend_sample(vec![tabby]);
-        assert_eq!(model_detail(&sample, WatchState::Ready), "openai");
-        // llama.cpp and an older snapshot: no backend word, no line.
+        assert_eq!(
+            model_detail(&sample, WatchState::Ready),
+            "OpenAI-compatible"
+        );
+        // llama.cpp and an older snapshot: llama.cpp leads (#33), no line.
         let llama = BackendInfo {
             kind: Backend::LlamaCpp,
             ..sglang(Some(1))
@@ -2451,7 +2451,7 @@ mod tests {
             served("q", "ready", Some(llama)),
             served("o", "ready", None),
         ]);
-        assert_eq!(model_detail(&sample, WatchState::Ready), "");
+        assert_eq!(model_detail(&sample, WatchState::Ready), "llama.cpp");
         assert!(backend_lines(&sample, WatchState::Ready).is_empty());
         assert!(!first_without_slots(&sample, WatchState::Ready));
     }
@@ -2494,7 +2494,7 @@ mod tests {
         let sample = backend_sample(vec![qwen.clone()]);
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "vllm · kv fp8_e4m3 · block 16 · prefix on"
+            "vLLM · kv fp8_e4m3 · block 16 · prefix on"
         );
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
@@ -2554,7 +2554,7 @@ mod tests {
         let sample = backend_sample(vec![flash]);
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "strata · 256k · kv q8"
+            "Strata · 256k · kv q8"
         );
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),

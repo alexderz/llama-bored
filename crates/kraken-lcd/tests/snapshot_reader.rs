@@ -535,5 +535,20 @@ fn spec_acceptance_is_the_only_engine_number_read() {
     });
     write_snap(&none.snap(), &snapshot);
     let snap = sample(&mut reader(&none, MemLog::default()));
-    assert_eq!(snap.models[0].backend, None, "no spec, no backend");
+    let info = snap.models[0]
+        .backend
+        .expect("#33: the engine is always carried");
+    assert_eq!(info.kind, wire::Backend::Vllm);
+    assert!(info.engine.is_empty(), "no spec, no engine numbers");
+
+    // #33: an absent backend reads as llama.cpp.
+    let old = Scratch::new("engine-absent");
+    snapshot.ai.models[0].backend = None;
+    snapshot.ai.models[0].engine = None;
+    write_snap(&old.snap(), &snapshot);
+    let snap = sample(&mut reader(&old, MemLog::default()));
+    assert_eq!(
+        snap.models[0].backend.map(|info| info.kind),
+        Some(wire::Backend::LlamaCpp)
+    );
 }

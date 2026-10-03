@@ -264,9 +264,9 @@ fn fresh_snapshot(
                 state: model_state(model.state).to_owned(),
                 full_name: model.full_name.clone(),
                 detail: model.detail.clone(),
-                // The LCD draws no backend gauges, only the speculative
-                // acceptance on the detail line (#31).
-                backend: spec_only(model),
+                // The LCD draws no backend gauges, only the engine (#33)
+                // and the speculative acceptance (#31) on the detail line.
+                backend: Some(engine_and_spec(model)),
             })
             .collect(),
         tokens: Some(TokenReading {
@@ -279,19 +279,23 @@ fn fresh_snapshot(
     }
 }
 
-/// The model's speculative acceptance as the only backend number, or
-/// `None` when the snapshot has none. Validation already bounded it to 0..=1.
-fn spec_only(model: &llama_core::wire::ModelWire) -> Option<llama_core::backend::BackendInfo> {
-    let accept = model.engine.as_ref()?.spec_accept?;
-    let permille = llama_core::backend::permille(f64::from(accept))?;
-    Some(llama_core::backend::BackendInfo {
+/// The model's engine (absent is llama.cpp, #33) with its speculative
+/// acceptance as the only number, when the snapshot has one. Validation
+/// already bounded it to 0..=1.
+fn engine_and_spec(model: &llama_core::wire::ModelWire) -> llama_core::backend::BackendInfo {
+    let spec_permille = model
+        .engine
+        .as_ref()
+        .and_then(|engine| engine.spec_accept)
+        .and_then(|accept| llama_core::backend::permille(f64::from(accept)));
+    llama_core::backend::BackendInfo {
         kind: model.backend.unwrap_or_default(),
         engine: llama_core::backend::EngineStats {
-            spec_permille: Some(permille),
+            spec_permille,
             ..llama_core::backend::EngineStats::default()
         },
         ..llama_core::backend::BackendInfo::default()
-    })
+    }
 }
 
 fn blank_snapshot(mono: Instant, wall: SystemTime, coolant: Option<f32>) -> Snapshot {

@@ -94,45 +94,67 @@ pub fn engine_items(detail: &ModelDetail) -> Vec<String> {
     items
 }
 
-/// [`fitted`] with `tail` (the LCD's `spec 78 %`, #31) kept at the end.
+/// [`fitted`] with `head` (the LCD's engine, #33) kept first and `tail`
+/// (the LCD's `spec 78 %`, #31) kept at the end.
 ///
-/// The detail items drop in [`fitted`]'s order while `tail` stays; when
-/// even the shortest detail with `tail` is too wide, `tail` goes and the
-/// detail is fitted alone. No detail at all draws `tail` alone, cut with
-/// `…` if it must be.
+/// The detail items drop in [`fitted`]'s order while `head` and `tail`
+/// stay; when even the shortest detail with `tail` is too wide, `tail` goes
+/// and the detail is fitted after `head` alone. Only then is the end cut
+/// with `…`. With no detail, `head` and `tail` are drawn alone, cut if
+/// they must be. An empty `head` or `tail` is absent.
 #[must_use]
 pub fn fitted_with(
+    head: Option<&str>,
     detail: Option<&ModelDetail>,
     tail: Option<&str>,
     fits: impl Fn(&str) -> bool,
 ) -> String {
-    let Some(tail) = tail.filter(|tail| !tail.is_empty()) else {
-        return detail
-            .map(|detail| fitted(detail, &fits))
-            .unwrap_or_default();
+    let head = head.unwrap_or("");
+    let tail = tail.unwrap_or("");
+    let steps: Vec<String> = match detail {
+        Some(detail) => {
+            let quant = detail.quant.as_deref().filter(|q| is_token(q));
+            let stripped = quant.map(|q| q.strip_prefix("UD-").unwrap_or(q));
+            vec![
+                build(detail, quant, true),
+                build(detail, stripped, true),
+                build(detail, None, true),
+                build(detail, None, false),
+            ]
+        }
+        None => vec![String::new()],
     };
-    let Some(detail) = detail else {
-        return cut(tail, &fits);
+    let join = |parts: [&str; 3]| {
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(SEPARATOR)
     };
-    let quant = detail.quant.as_deref().filter(|q| is_token(q));
-    let stripped = quant.map(|q| q.strip_prefix("UD-").unwrap_or(q));
-    let steps = [
-        build(detail, quant, true),
-        build(detail, stripped, true),
-        build(detail, None, true),
-        build(detail, None, false),
-    ];
-    for text in &steps {
-        let text = if text.is_empty() {
-            tail.to_owned()
-        } else {
-            format!("{text}{SEPARATOR}{tail}")
-        };
-        if fits(&text) {
+    if !tail.is_empty() {
+        for step in &steps {
+            let text = join([head, step, tail]);
+            if fits(&text) {
+                return text;
+            }
+        }
+    }
+    for step in &steps {
+        let text = join([head, step, ""]);
+        if !text.is_empty() && fits(&text) {
             return text;
         }
     }
-    fitted(detail, fits)
+    let last = join([head, steps.last().map_or("", String::as_str), ""]);
+    let last = if last.is_empty() {
+        tail.to_owned()
+    } else {
+        last
+    };
+    if last.is_empty() {
+        return last;
+    }
+    cut(&last, &fits)
 }
 
 /// `text`, or its longest prefix plus `…` that `fits` accepts.
@@ -327,7 +349,7 @@ mod tests {
         let detail = qwen();
         let tail = Some("spec 78 %");
         let by_len = |max: usize| {
-            fitted_with(Some(&detail), tail, |text: &str| {
+            fitted_with(None, Some(&detail), tail, |text: &str| {
                 text.chars().count() <= max
             })
         };
@@ -338,16 +360,16 @@ mod tests {
         // Too narrow for the tail: the detail alone, as before.
         assert_eq!(by_len(24), "256k · kv q8 · moe 16");
         assert_eq!(
-            fitted_with(Some(&detail), None, |t: &str| t.chars().count() <= 99),
+            fitted_with(None, Some(&detail), None, |t: &str| t.chars().count() <= 99),
             line(&detail)
         );
         // No detail: the tail alone, cut if it must be.
-        assert_eq!(fitted_with(None, tail, |_: &str| true), "spec 78 %");
+        assert_eq!(fitted_with(None, None, tail, |_: &str| true), "spec 78 %");
         assert_eq!(
-            fitted_with(None, tail, |t: &str| t.chars().count() <= 5),
+            fitted_with(None, None, tail, |t: &str| t.chars().count() <= 5),
             "spec…"
         );
-        assert_eq!(fitted_with(None, None, |_: &str| true), "");
+        assert_eq!(fitted_with(None, None, None, |_: &str| true), "");
         // vLLM with only a KV dtype from cache_config_info.
         let vllm = ModelDetail {
             kv_k: Some("fp8_e4m3".to_owned()),
@@ -355,9 +377,59 @@ mod tests {
             ..ModelDetail::default()
         };
         assert_eq!(
-            fitted_with(Some(&vllm), tail, |_: &str| true),
+            fitted_with(None, Some(&vllm), tail, |_: &str| true),
             "kv fp8_e4m3 · spec 78 %"
         );
+    }
+
+    /// #33: the engine leads the LCD line and stays; quant drops first,
+    /// then the spec tail, and only then is the line cut.
+    #[test]
+    fn an_engine_head_stays_first_while_the_rest_drops() {
+        let detail = qwen();
+        let tail = Some("spec 78 %");
+        let head = Some("llama.cpp");
+        let by_len = |max: usize, tail: Option<&str>| {
+            fitted_with(head, Some(&detail), tail, |text: &str| {
+                text.chars().count() <= max
+            })
+        };
+        assert_eq!(
+            by_len(99, None),
+            "llama.cpp · 256k · kv q8 · UD-Q4_K_M · moe 16"
+        );
+        assert_eq!(
+            by_len(42, None),
+            "llama.cpp · 256k · kv q8 · Q4_K_M · moe 16"
+        );
+        assert_eq!(by_len(33, None), "llama.cpp · 256k · kv q8 · moe 16");
+        assert_eq!(by_len(25, None), "llama.cpp · 256k · moe 16");
+        assert_eq!(by_len(14, None), "llama.cpp · 2…");
+        assert_eq!(
+            by_len(99, tail),
+            "llama.cpp · 256k · kv q8 · UD-Q4_K_M · moe 16 · spec 78 %"
+        );
+        assert_eq!(
+            by_len(45, tail),
+            "llama.cpp · 256k · kv q8 · moe 16 · spec 78 %"
+        );
+        assert_eq!(by_len(37, tail), "llama.cpp · 256k · moe 16 · spec 78 %");
+        assert_eq!(by_len(36, tail), "llama.cpp · 256k · kv q8 · moe 16");
+        // No detail: the engine, then the tail.
+        assert_eq!(
+            fitted_with(Some("sglang"), None, tail, |_: &str| true),
+            "sglang · spec 78 %"
+        );
+        assert_eq!(
+            fitted_with(Some("sglang"), None, tail, |t: &str| t.chars().count()
+                <= 10),
+            "sglang"
+        );
+        assert_eq!(
+            fitted_with(Some("sglang"), None, None, |t: &str| t.chars().count() <= 4),
+            "sgl…"
+        );
+        assert_eq!(fitted_with(Some(""), None, None, |_: &str| true), "");
     }
 
     #[test]

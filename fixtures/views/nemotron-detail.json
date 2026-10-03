@@ -22,5 +22,6 @@
     "quant": "UD-Q4_K_M",
     "kv_k": "q8_0",
     "kv_v": "q8_0"
-  }
+  },
+  "engine": "llamacpp"
 }

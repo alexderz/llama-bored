@@ -359,6 +359,9 @@ const STATES: &[&str] = &[
     "nemotron-detail",
     "a3-bonsai-detail",
     "vllm-spec",
+    "sglang-engine",
+    "strata-engine",
+    "openai-engine",
 ];
 
 #[test]
@@ -577,6 +580,84 @@ fn an_old_snapshot_draws_the_name_alone() {
     assert_eq!(
         render::layout_a::status_text(&view, &mut assets),
         ["Ternary Bon\u{2026}"]
+    );
+}
+
+/// #33: the engine's short name leads the detail line for every engine,
+/// stays while quant and kv drop for width, and draws alone without
+/// detail. No model, or two, draw no engine.
+#[test]
+fn the_engine_leads_the_detail_line() {
+    use llama_core::backend::Backend;
+    let mut assets = Assets::load().expect("assets");
+    for variant in [Variant::A1, Variant::A3] {
+        for kind in Backend::ALL {
+            let mut view = with_detail("Qwen 35B", q8(262_144, "Q6_K", None), variant);
+            view.engine = Some(kind);
+            let lines = render::layout_a::status_text(&view, &mut assets);
+            assert_eq!(
+                lines,
+                [
+                    "Qwen 35B".to_owned(),
+                    format!("{} · 256k · kv q8 · Q6_K", kind.short_name())
+                ],
+                "{variant:?}"
+            );
+            let mut bare = loaded(&["tabby"]);
+            bare.variant = variant;
+            bare.engine = Some(kind);
+            assert_eq!(
+                render::layout_a::status_text(&bare, &mut assets),
+                ["tabby", kind.short_name()],
+                "{variant:?}: the engine alone"
+            );
+        }
+        // Too wide for everything: the quant drops, the engine stays.
+        let mut wide = with_detail(
+            "Nemotron 3 Super 120B-A12B",
+            q8(262_144, "UD-Q4_K_M", Some(88)),
+            variant,
+        );
+        wide.engine = Some(Backend::LlamaCpp);
+        let lines = render::layout_a::status_text(&wide, &mut assets);
+        let last = lines.last().expect("detail line");
+        assert!(
+            last.starts_with("llama.cpp · 256k"),
+            "{variant:?}: {lines:?}"
+        );
+        assert!(
+            !last.contains("Q4_K_M"),
+            "{variant:?}: quant first: {lines:?}"
+        );
+        // vLLM with spec decoding: engine first, spec last.
+        let mut spec = with_detail(
+            "qwen3.8-27b",
+            ModelDetail {
+                kv_k: Some("fp8_e4m3".to_owned()),
+                kv_v: Some("fp8_e4m3".to_owned()),
+                ..ModelDetail::default()
+            },
+            variant,
+        );
+        spec.engine = Some(Backend::Vllm);
+        spec.spec_permille = Some(780);
+        assert_eq!(
+            render::layout_a::status_text(&spec, &mut assets),
+            ["qwen3.8-27b", "vllm · kv fp8_e4m3 · spec 78 %"]
+        );
+    }
+    let mut none = loaded(&[]);
+    none.ai = Ai::Idle;
+    none.engine = Some(Backend::Vllm);
+    assert_eq!(
+        render::layout_a::status_text(&none, &mut assets),
+        ["no model"]
+    );
+    let mut two = loaded(&["Qwen3.6 27B", "qwen3.8-27b"]);
+    two.engine = Some(Backend::SgLang);
+    assert_eq!(
+        render::layout_a::status_text(&two, &mut assets),
+        ["Qwen3.6 27B", "qwen3.8-27b"]
     );
 }
 
