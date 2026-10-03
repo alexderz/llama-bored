@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.1 — 2026-10-03
+
 ### Added
 
 - tty11 loads llama-bored's own 16-colour palette, built from the heat ramp
