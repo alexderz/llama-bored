@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.4 — 2026-10-03
+
 ### Fixed
 
 - tty11's IN no longer sticks on the first user message during an agent's tool loop (#38). For a llama-swap capture whose last message is not `user`, IN shows the `user` and `tool` messages after the last `assistant` one, in order, newest last, tool results marked `[tool]`, and the title says what they are: `IN (last request · 3 tool results)`, `IN (last request · user + 2 tool results)`. With no `assistant` message the run is every message but `system` / `developer`. A plain chat (last message `user`) and a completions prompt look as before. The walk still streams one message at a time and keeps at most 32,768 characters (the largest `llama.input_tail_chars`) of IN text; panel titles now draw the `·` separator. No golden changed
