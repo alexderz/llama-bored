@@ -122,11 +122,18 @@ fn a_capture_is_fetched_only_with_text_on_and_for_a_captured_row() {
         .expect("body");
     let text_gate = body.find("if !self.limits.show_text").expect("text gate");
     let captured_gate = body.find("!row.captured").expect("has_capture gate");
-    let seen_gate = body
-        .find("self.capture_seen == Some(row.id)")
-        .expect("dedupe");
+    let seen_gate = body.find("self.capture_seen == Some(key)").expect("dedupe");
+    // #44: a row is (llama-swap generation, id), and the rows offered are
+    // the page just read, never RECENT's older rows.
+    let key = body
+        .find("let key = (self.recent.generation(), row.id);")
+        .expect("generation key");
+    assert!(
+        body.contains("let Some((row, model)) = rows"),
+        "the page's rows"
+    );
     let get = body.find("get_limited(").expect("GET");
-    assert!(text_gate < get && captured_gate < get && seen_gate < get);
+    assert!(text_gate < get && captured_gate < get && seen_gate < get && key < seen_gate);
     assert!(body.contains("CAPTURE_CAP"), "the read is capped");
 }
 

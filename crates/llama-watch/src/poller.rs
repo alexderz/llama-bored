@@ -56,6 +56,14 @@
 //! read and the first metrics read after the one that showed the row. A
 //! row llama-swap gave real speeds keeps them.
 //!
+//! RECENT is llama-watch's own ring of rows ([`crate::recent`], #44), not a
+//! copy of llama-swap's in-memory list: a llama-swap restart keeps it, and
+//! a restart that reuses row ids (told by a lower top id, an empty list, a
+//! changed fingerprint, or `/running` having been down) starts a new
+//! generation whose rows are all new. Per-row state is keyed by the ring's
+//! row number, and a capture is only fetched for a row of the page just
+//! read.
+//!
 //! The thread never touches the console or the snapshot file.
 
 use std::collections::{HashMap, HashSet};
@@ -78,6 +86,7 @@ use crate::metrics::{
     DecodedCounter, EngineBook, EngineFacts, GenRate, MetricsSample, PromptCache, detect_backend,
     parse_metrics_full,
 };
+use crate::recent::{Merged, Recent};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
@@ -114,7 +123,9 @@ pub struct PollLatencies {
 pub struct LlamaDetail {
     /// Per-slot numbers and sanitised tails.
     pub slots: Vec<SlotView>,
-    /// Newest eight activity rows.
+    /// RECENT: the newest activity rows llama-watch kept, newest first,
+    /// across llama-swap restarts (#44). Eight with the text panels, up to
+    /// [`crate::recent::RING`] without.
     pub activity: Vec<ActivityRow>,
     /// Generation tok/s from `decoded_total` over the last second.
     pub gen_tps: Option<f64>,
@@ -372,7 +383,8 @@ struct State<L> {
     counter: DecodedCounter,
     gen_rate: GenRate,
     slots: SlotBook,
-    activity: Vec<ActivityRow>,
+    /// RECENT's own rows across llama-swap restarts (#44).
+    recent: Recent,
     ai: AiState,
     models: Vec<ModelInfo>,
     /// Raw id of each entry of `models`, in the same order.
@@ -389,8 +401,6 @@ struct State<L> {
     fallback: HashSet<String>,
     /// Model ids whose missing `/metrics` was logged this run.
     no_metrics_logged: HashSet<String>,
-    /// Newest activity row id already seen. `None` before the first read.
-    activity_seen: Option<i64>,
     /// SGLang/vLLM prompt-token counter, for prompt tok/s without `/slots`.
     prompt_counter: DecodedCounter,
     prompt_rate: GenRate,
@@ -417,8 +427,9 @@ struct State<L> {
     metrics_failed: bool,
     slots_failed: bool,
     activity_failed: bool,
-    /// Newest activity row id a capture was considered for (#5).
-    capture_seen: Option<i64>,
+    /// The `(llama-swap generation, id)` of the newest activity row a
+    /// capture was considered for (#5, #44).
+    capture_seen: Option<(u32, i64)>,
     /// The capture shown, with the raw id of its model.
     capture: Option<(String, CaptureView)>,
     capture_failed: bool,
@@ -439,7 +450,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         counter: DecodedCounter::default(),
         gen_rate: GenRate::default(),
         slots,
-        activity: Vec::new(),
+        recent: Recent::default(),
         ai: AiState::Down,
         models: Vec::new(),
         model_ids: Vec::new(),
@@ -449,7 +460,6 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         engine_facts: HashMap::new(),
         fallback: HashSet::new(),
         no_metrics_logged: HashSet::new(),
-        activity_seen: None,
         prompt_counter: DecodedCounter::default(),
         prompt_rate: GenRate::default(),
         prompt_box: DecodedCounter::default(),
@@ -535,6 +545,9 @@ impl<L: Sink> State<L> {
         self.note_reach(down);
         self.ai = ai;
         self.running_up = down.is_none();
+        if !self.running_up {
+            self.recent.note_down();
+        }
         let models: &[llamaswap::RunningModel] = if self.running_up {
             &reading.models
         } else {
@@ -923,12 +936,18 @@ impl<L: Sink> State<L> {
             ACTIVITY_CAP,
         ) {
             Ok(bytes) => match activity::parse_activity_rows(&bytes, activity::MAX_PAGE_ROWS) {
-                Some(mut rows) => {
-                    self.count_activity(&rows);
-                    self.slots.note_activity(&rows, Instant::now());
-                    page = rows.clone();
-                    rows.truncate(self.activity_rows());
-                    self.activity = rows;
+                Some(rows) => {
+                    let merged = self.recent.merge(rows);
+                    if merged.restarted {
+                        log::emit(
+                            &mut self.log,
+                            Priority::Info,
+                            "activity: llama-swap restarted; its row ids start again",
+                        );
+                    }
+                    self.count_activity(&merged);
+                    self.slots.note_activity(&merged.page, Instant::now());
+                    page = merged.page;
                     None
                 }
                 None => Some("malformed"),
@@ -955,45 +974,38 @@ impl<L: Sink> State<L> {
     /// Add each new row's `output_tokens` to its fallback model, once, and
     /// every ready model's prompt and cached tokens to its counters (#10).
     ///
-    /// Rows are deduped by id. The first read only sets the baseline, so
-    /// history from before the watcher started is not back-filled. A newest
-    /// id below the baseline means llama-swap restarted: every row counts.
-    /// Each fallback model is then fresh until the next activity read is due.
-    fn count_activity(&mut self, rows: &[ActivityRow]) {
+    /// New rows are the ones [`Recent::merge`] saw for the first time, so a
+    /// llama-swap restart that reuses ids is counted in full (#44). The
+    /// first read only sets the baseline, so history from before the
+    /// watcher started is not back-filled. Each fallback model is then
+    /// fresh until the next activity read is due.
+    fn count_activity(&mut self, merged: &Merged) {
         for model in &self.ready {
             self.prompt_cache
                 .touch(&model.id, model.backend.has_slots());
         }
-        let newest = rows.iter().map(|row| row.id).max();
         let now = Instant::now();
-        let Some(seen) = self.activity_seen else {
-            self.activity_seen = Some(newest.unwrap_or(-1));
+        if merged.baseline {
             self.speeds.activity(now, &[]);
             return;
-        };
-        let seen = match newest {
-            Some(newest) if newest < seen => {
-                self.speeds.clear_rows();
-                -1
-            }
-            _ => seen,
-        };
+        }
+        let rows = &merged.new;
         // #35: new rows of a model without `/slots` that llama-swap gave
         // no speeds wait for the engine's.
-        let mut measure: Vec<(i64, String)> = Vec::new();
+        let mut measure: Vec<(u64, String)> = Vec::new();
         for model in self.ready.iter().filter(|model| !model.backend.has_slots()) {
             let key = activity::model_key(&model.id);
             measure.extend(
                 rows.iter()
-                    .filter(|row| row.id > seen && row.model == key)
+                    .filter(|row| row.model == key)
                     .filter(|row| row.prompt_tps.is_none() || row.gen_tps.is_none())
-                    .map(|row| (row.id, model.id.clone())),
+                    .map(|row| (row.seq, model.id.clone())),
             );
         }
         self.speeds.activity(now, &measure);
         for model in &self.ready {
             let key = activity::model_key(&model.id);
-            for row in rows.iter().filter(|row| row.id > seen && row.model == key) {
+            for row in rows.iter().filter(|row| row.model == key) {
                 self.prompt_cache
                     .add_row(&model.id, row.input_tokens, row.cached_tokens);
             }
@@ -1002,7 +1014,7 @@ impl<L: Sink> State<L> {
         let fallback: Vec<String> = self.fallback.iter().cloned().collect();
         for id in &fallback {
             let key = activity::model_key(id);
-            let new_rows = || rows.iter().filter(|row| row.id > seen && row.model == key);
+            let new_rows = || rows.iter().filter(|row| row.model == key);
             let tokens = new_rows()
                 .filter_map(|row| row.output_tokens)
                 .fold(0u64, u64::saturating_add);
@@ -1012,13 +1024,17 @@ impl<L: Sink> State<L> {
                 .fold(0u64, u64::saturating_add);
             self.prompt_box.add(id, prompt, now, window);
         }
-        self.activity_seen = Some(newest.map_or(seen, |newest| newest.max(seen)));
     }
 
     /// Fetch the capture of the newest finished row of a ready model
-    /// without `/slots`, once per row id (#5). Nothing with text off; a
-    /// row without `has_capture` (captures off, or already evicted from
+    /// without `/slots`, once per row (#5). Nothing with text off; a row
+    /// without `has_capture` (captures off, or already evicted from
     /// llama-swap's buffer) keeps what is shown.
+    ///
+    /// `rows` is the page just read, so every id in it is the current
+    /// llama-swap's: a row RECENT keeps from before a restart is never
+    /// fetched, as its id may now name another request (#44). A row is
+    /// `(generation, id)`, so a reused id is fetched for its new request.
     fn poll_capture(&mut self, rows: &[ActivityRow]) {
         if !self.limits.show_text {
             return;
@@ -1039,10 +1055,11 @@ impl<L: Sink> State<L> {
         else {
             return;
         };
-        if self.capture_seen == Some(row.id) {
+        let key = (self.recent.generation(), row.id);
+        if self.capture_seen == Some(key) {
             return;
         }
-        self.capture_seen = Some(row.id);
+        self.capture_seen = Some(key);
         if !row.captured || row.id < 0 {
             return;
         }
@@ -1160,11 +1177,12 @@ impl<L: Sink> State<L> {
         Ok(())
     }
 
-    /// RECENT rows with the engine's speeds where llama-swap gave none (#35).
+    /// RECENT rows, newest first from llama-watch's own ring (#44), with
+    /// the engine's speeds where llama-swap gave none (#35).
     fn measured_activity(&self) -> Vec<ActivityRow> {
-        let mut rows = self.activity.clone();
+        let mut rows = self.recent.rows(self.activity_rows());
         for row in &mut rows {
-            let Some(speeds) = self.speeds.speeds(row.id) else {
+            let Some(speeds) = self.speeds.speeds(row.seq) else {
                 continue;
             };
             if row.prompt_tps.is_none() {

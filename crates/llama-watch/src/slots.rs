@@ -105,9 +105,11 @@ struct Pending {
     prompt: u64,
     /// `/slots` `n_prompt_tokens_cache` at the drop, when the server sent it.
     slots_cached: Option<u64>,
-    /// Newest activity row id when the drop was seen. The request's own row
-    /// appears after it, when the request finishes.
-    after: Option<i64>,
+    /// Newest activity row number ([`ActivityRow::seq`]) when the drop was
+    /// seen. The request's own row appears after it, when the request
+    /// finishes, and llama-watch numbers it higher even if llama-swap
+    /// restarted and reuses its ids (#44).
+    after: Option<u64>,
     /// When an activity read first saw it waiting; [`PENDING_TTL`] runs from here.
     since: Option<Instant>,
 }
@@ -175,8 +177,8 @@ pub struct SlotBook {
     ctx: HashMap<(String, i64), CtxTrack>,
     /// Conversations each model's slots lost, by model id (#9).
     displaced: HashMap<String, Displaced>,
-    /// Newest llama-swap activity row id seen (#9).
-    activity_newest: Option<i64>,
+    /// Newest activity row number seen (#9, #44).
+    activity_newest: Option<u64>,
 }
 
 impl SlotBook {
@@ -275,34 +277,30 @@ impl SlotBook {
     /// its model whose prompt matches its own, and one that waited
     /// [`PENDING_TTL`] is decided on what `/slots` said, or as unknown.
     /// A failed read passes no rows and still ages the waits.
+    ///
+    /// Rows are matched by [`ActivityRow::seq`], llama-watch's own number,
+    /// so a llama-swap restart that reuses ids cannot match an old row.
     pub fn note_activity(&mut self, rows: &[ActivityRow], now: Instant) {
-        if let Some(newest) = rows.iter().map(|row| row.id).max() {
-            if self.activity_newest.is_some_and(|seen| newest < seen) {
-                // llama-swap restarted: its ids start again.
-                for track in self.ctx.values_mut() {
-                    if let Some(pending) = &mut track.pending {
-                        pending.after = None;
-                    }
-                }
-            }
-            self.activity_newest = Some(newest);
+        if let Some(newest) = rows.iter().map(|row| row.seq).max() {
+            self.activity_newest =
+                Some(self.activity_newest.map_or(newest, |seen| seen.max(newest)));
         }
-        let mut taken: HashSet<i64> = HashSet::new();
+        let mut taken: HashSet<usize> = HashSet::new();
         for ((model_id, _), track) in &mut self.ctx {
             let Some(pending) = &mut track.pending else {
                 continue;
             };
             let since = *pending.since.get_or_insert(now);
             let key = model_key(model_id);
-            let found = rows.iter().find(|row| {
+            let found = rows.iter().enumerate().find(|(index, row)| {
                 row.model == key
-                    && pending.after.is_none_or(|after| row.id > after)
-                    && !taken.contains(&row.id)
+                    && pending.after.is_none_or(|after| row.seq > after)
+                    && !taken.contains(index)
                     && row_matches(row, pending.prompt)
             });
             let cached = match found {
-                Some(row) => {
-                    taken.insert(row.id);
+                Some((index, row)) => {
+                    taken.insert(index);
                     row.cached_tokens
                 }
                 None if now.saturating_duration_since(since) >= PENDING_TTL => pending.slots_cached,
@@ -1035,6 +1033,7 @@ mod tests {
     fn row(id: i64, model: &str, input: u64, cache: Option<u64>) -> ActivityRow {
         ActivityRow {
             id,
+            seq: u64::try_from(id).unwrap_or(0),
             time: String::new(),
             source: String::new(),
             model: model.to_owned(),
@@ -1116,6 +1115,31 @@ mod tests {
         );
         // Slot 0 is untouched by slot 1's row.
         assert_eq!(book.ctx[&("m".to_owned(), 0)].resets, counts(1, 1, 0, 0));
+    }
+
+    /// #44: rows are matched by llama-watch's row number, so after a
+    /// llama-swap restart a new row with a low id still matches, and an old
+    /// row with a high id never does.
+    #[test]
+    fn drops_match_rows_by_row_number_not_llama_swap_id() {
+        let mut book = SlotBook::without_text();
+        let t0 = Instant::now();
+        let numbered = |id: i64, seq: u64, input: u64, cache: u64| ActivityRow {
+            seq,
+            ..row(id, "m", input, Some(cache))
+        };
+        book.note_activity(&[numbered(40, 7, 5, 0)], t0);
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 0), 64, 64));
+        // An old-generation row with a matching prompt but an older number.
+        book.note_activity(&[numbered(41, 6, 6_000, 14_000)], t0);
+        assert_eq!(reasons(&book, 0).0.total(), 0);
+        // The restarted llama-swap's row 0, numbered after the drop.
+        book.note_activity(&[numbered(0, 8, 6_000, 14_000)], t0);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 0, 0, 0), Some(ResetReason::Compacted))
+        );
     }
 
     #[test]

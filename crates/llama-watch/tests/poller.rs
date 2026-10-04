@@ -2559,3 +2559,279 @@ fn prompt_cache_follows_an_engine_change() {
         prompt_cache_of(detail, "flash") == Some((1_122, Some(953)))
     });
 }
+
+// ---- #44: RECENT's own rows across llama-swap restarts ----------------------
+
+/// One activity row of llama-swap generation `hour` (its timestamp hour),
+/// so a reused id has a different fingerprint.
+fn gen_row(id: i64, model: &str, hour: u32, output: i64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "timestamp": format!("2026-09-29T{hour:02}:00:{id:02}Z"),
+        "model": model,
+        "tokens": {"input_tokens": 10, "output_tokens": output, "cache_tokens": -1,
+                   "prompt_per_second": -1, "tokens_per_second": -1},
+        "duration_ms": 1000,
+        "resp_status_code": 200
+    })
+}
+
+fn recent_of(detail: &LlamaDetail) -> Vec<(i64, Option<u64>)> {
+    detail
+        .activity
+        .iter()
+        .map(|row| (row.id, row.output_tokens))
+        .collect()
+}
+
+/// llama-swap restarts and numbers its rows from 0 again, once through an
+/// empty list and once straight to a top id at or above the old one: the
+/// old rows stay in RECENT, the new ones go on top, and every new row is
+/// counted once.
+#[test]
+fn a_llama_swap_restart_keeps_recent_and_counts_every_reused_id() {
+    let mut world = World::running(running_cmd("tabby", "python3 main.py --port 5000"));
+    world.activity = cache_page(&[gen_row(0, "tabby", 10, 3)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    server.update(|world| {
+        world.activity = cache_page(&[gen_row(1, "tabby", 10, 40), gen_row(0, "tabby", 10, 3)]);
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(40)
+    });
+
+    // Restart: the list comes back empty. RECENT keeps its rows.
+    server.update(|world| world.activity = br#"{"data":[]}"#.to_vec());
+    thread::sleep(Duration::from_millis(900));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(1), |_, _| true);
+    assert_eq!(recent_of(&detail), vec![(1, Some(40)), (0, Some(3))]);
+    // The new llama-swap's first rows reuse ids 0 and 1.
+    server.update(|world| {
+        world.activity = cache_page(&[gen_row(1, "tabby", 11, 7), gen_row(0, "tabby", 11, 5)]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(52)
+    });
+    assert_eq!(
+        recent_of(&detail),
+        vec![(1, Some(7)), (0, Some(5)), (1, Some(40)), (0, Some(3))]
+    );
+
+    // Restart again, straight to a page whose top id (2) is above the
+    // newest seen (1): told apart by the rows' fingerprints, not skipped.
+    server.update(|world| {
+        world.activity = cache_page(&[
+            gen_row(2, "tabby", 12, 11),
+            gen_row(1, "tabby", 12, 13),
+            gen_row(0, "tabby", 12, 17),
+        ]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(93)
+    });
+    assert_eq!(
+        recent_of(&detail),
+        vec![
+            (2, Some(11)),
+            (1, Some(13)),
+            (0, Some(17)),
+            (1, Some(7)),
+            (0, Some(5)),
+            (1, Some(40)),
+            (0, Some(3)),
+        ]
+    );
+    // Read again: nothing is counted twice.
+    thread::sleep(Duration::from_millis(900));
+    let (view, _) = wait_msg(&rx, Duration::from_secs(1), |view, _| {
+        view.decoded_total.is_some()
+    });
+    assert_eq!(view.decoded_total, Some(93));
+    let restarts = log
+        .lines()
+        .iter()
+        .filter(|line| line.contains("llama-swap restarted"))
+        .count();
+    assert_eq!(restarts, 2, "{:?}", log.lines());
+}
+
+/// A new row that reuses an old row's id gets no speeds from the old one,
+/// and the old row keeps its own.
+#[test]
+fn a_reused_id_gets_no_stale_engine_speeds() {
+    let vllm = "qwen3.8-27b-vllm";
+    let mut world = World::running(running_cmd(vllm, CONTAINER_CMD));
+    world
+        .metrics
+        .insert(vllm.to_owned(), vllm_finished(0, 0.0, 0, 0.0, 0));
+    world.activity = cache_page(&[gen_row(1, vllm, 10, 401)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(3), |view, detail| {
+        !detail.activity.is_empty()
+            && view
+                .models
+                .first()
+                .and_then(|model| model.backend)
+                .is_some_and(|info| info.kind == llama_core::backend::Backend::Vllm)
+    });
+    thread::sleep(Duration::from_millis(500));
+    // One request finishes and its row, id 2, appears.
+    server.update(|world| {
+        world
+            .metrics
+            .insert(vllm.to_owned(), vllm_finished(1, 2.0, 8_000, 8.0, 401));
+        world.activity = cache_page(&[gen_row(2, vllm, 10, 401), gen_row(1, vllm, 10, 401)]);
+    });
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 2 && row.engine_prompt_tps.is_some())
+    });
+    // llama-swap restarts; its new rows reuse ids 0..=2 and no request
+    // finished on the engine in their window.
+    thread::sleep(Duration::from_millis(500));
+    server.update(|world| {
+        world.activity = cache_page(&[
+            gen_row(2, vllm, 11, 9),
+            gen_row(1, vllm, 11, 9),
+            gen_row(0, vllm, 11, 9),
+        ]);
+    });
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.activity.len() == 5
+    });
+    thread::sleep(Duration::from_millis(800));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, _| true);
+    let shown: Vec<(i64, Option<u64>, Option<f64>)> = detail
+        .activity
+        .iter()
+        .map(|row| (row.id, row.output_tokens, row.engine_prompt_tps))
+        .collect();
+    assert_eq!(
+        shown.iter().map(|row| (row.0, row.1)).collect::<Vec<_>>(),
+        vec![
+            (2, Some(9)),
+            (1, Some(9)),
+            (0, Some(9)),
+            (2, Some(401)),
+            (1, Some(401))
+        ]
+    );
+    for row in &detail.activity[..3] {
+        assert_eq!(
+            (row.engine_prompt_tps, row.engine_gen_tps),
+            (None, None),
+            "new id {} has no stale speeds",
+            row.id
+        );
+    }
+    let old = &detail.activity[3];
+    assert!(
+        (old.engine_prompt_tps.unwrap() - 4_000.0).abs() < 1e-6,
+        "kept"
+    );
+    assert!((old.engine_gen_tps.unwrap() - 50.0).abs() < 1e-6, "kept");
+}
+
+fn restamp(mut row: serde_json::Value, hour: u32) -> serde_json::Value {
+    let id = row["id"].as_i64().expect("id");
+    row["timestamp"] = format!("2026-09-29T{hour:02}:00:{id:02}Z").into();
+    row
+}
+
+/// After a restart, RECENT still shows the old rows, but no capture is
+/// fetched for them: their ids may now name another request. A reused id
+/// is fetched once for its new request.
+#[test]
+fn no_capture_is_fetched_for_an_old_generation_row() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_metrics(10, 0, 0, 0.1));
+    world.activity = cache_page(&[capture_row(5, "flash", true), capture_row(4, "flash", true)]);
+    world
+        .captures
+        .insert("5".to_owned(), capture_body("Old fifth question?", "{}"));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.id == 5)
+    });
+
+    // Restart: ids 1 and 0 of the new llama-swap. Its capture 5 is gone.
+    server.update(|world| {
+        world.activity = cache_page(&[
+            restamp(capture_row(1, "flash", true), 13),
+            restamp(capture_row(0, "flash", true), 13),
+        ]);
+        world.captures.clear();
+        world
+            .captures
+            .insert("1".to_owned(), capture_body("New first question?", "{}"));
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.id == 1)
+    });
+    assert_eq!(
+        cells_text(&detail.capture.expect("capture").input),
+        "New first question?"
+    );
+    let ids: Vec<i64> = detail.activity.iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![1, 0, 5, 4], "old rows stay in RECENT");
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(
+        capture_hits(&server),
+        vec!["/api/captures/5".to_owned(), "/api/captures/1".to_owned()],
+        "nothing fetched for the old rows 5 and 4"
+    );
+
+    // The new llama-swap reaches id 5: that is a new request, fetched once.
+    server.update(|world| {
+        world.activity = cache_page(&[
+            restamp(capture_row(5, "flash", true), 13),
+            restamp(capture_row(4, "flash", true), 13),
+            restamp(capture_row(3, "flash", true), 13),
+            restamp(capture_row(2, "flash", true), 13),
+            restamp(capture_row(1, "flash", true), 13),
+            restamp(capture_row(0, "flash", true), 13),
+        ]);
+        world
+            .captures
+            .insert("5".to_owned(), capture_body("New fifth question?", "{}"));
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .capture
+            .as_ref()
+            .is_some_and(|capture| cells_text(&capture.input) == "New fifth question?")
+    });
+    let ids: Vec<i64> = detail.activity.iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![5, 4, 3, 2, 1, 0, 5, 4], "eight rows with text on");
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(
+        capture_hits(&server),
+        vec![
+            "/api/captures/5".to_owned(),
+            "/api/captures/1".to_owned(),
+            "/api/captures/5".to_owned()
+        ]
+    );
+}

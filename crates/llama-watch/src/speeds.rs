@@ -130,7 +130,8 @@ pub const PENDING_FOR: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct Pending {
-    row: i64,
+    /// The row's [`crate::activity::ActivityRow::seq`].
+    row: u64,
     model: String,
     /// The activity read before the one that showed the row.
     after: Instant,
@@ -138,7 +139,9 @@ struct Pending {
     seen: Instant,
 }
 
-/// Engine speeds attributed to activity rows, keyed by row id.
+/// Engine speeds attributed to activity rows, keyed by llama-watch's row
+/// number ([`crate::activity::ActivityRow::seq`], #44), never llama-swap's
+/// id: a restarted llama-swap reuses ids, and an old row keeps its speeds.
 ///
 /// Feed it every metrics read of a model without `/slots`
 /// ([`Self::observe`]) and every activity read with the rows it showed
@@ -152,7 +155,7 @@ pub struct SpeedBook {
     reads: HashMap<String, VecDeque<(Instant, SpeedTotals)>>,
     activity_at: Option<Instant>,
     pending: Vec<Pending>,
-    rows: BTreeMap<i64, Speeds>,
+    rows: BTreeMap<u64, Speeds>,
 }
 
 impl SpeedBook {
@@ -196,9 +199,10 @@ impl SpeedBook {
         }
     }
 
-    /// An activity read at `at`, with the `(row id, model id)` of each row
-    /// it showed for the first time. The first call only sets the baseline.
-    pub fn activity(&mut self, at: Instant, new_rows: &[(i64, String)]) {
+    /// An activity read at `at`, with the `(row number, model id)` of each
+    /// row it showed for the first time. The first call only sets the
+    /// baseline.
+    pub fn activity(&mut self, at: Instant, new_rows: &[(u64, String)]) {
         if let Some(after) = self.activity_at {
             for (row, model) in new_rows {
                 if self.pending.len() >= MAX_PENDING {
@@ -244,9 +248,9 @@ impl SpeedBook {
         }
     }
 
-    /// The speeds attributed to activity row `row`.
+    /// The speeds attributed to the activity row numbered `row`.
     #[must_use]
-    pub fn speeds(&self, row: i64) -> Option<Speeds> {
+    pub fn speeds(&self, row: u64) -> Option<Speeds> {
         self.rows.get(&row).copied()
     }
 
@@ -255,12 +259,6 @@ impl SpeedBook {
     pub fn forget(&mut self, model: &str) {
         self.reads.remove(model);
         self.pending.retain(|p| p.model != model);
-    }
-
-    /// llama-swap restarted and reuses row ids: drop every row's speeds.
-    pub fn clear_rows(&mut self) {
-        self.rows.clear();
-        self.pending.clear();
     }
 }
 
@@ -481,7 +479,7 @@ mod tests {
         book.observe("m", clock.at(0), Some(cum));
         book.activity(clock.at(1), &[]);
         let mut t = 1;
-        for row in 0..(MAX_ROWS as i64 + 10) {
+        for row in 0..(MAX_ROWS as u64 + 10) {
             let p = cum.prefill.as_mut().unwrap();
             p.seconds.count += 1.0;
             p.seconds.sum += 1.0;
@@ -494,19 +492,16 @@ mod tests {
         }
         assert_eq!(book.rows.len(), MAX_ROWS);
         assert_eq!(book.speeds(0), None);
-        close(book.speeds(MAX_ROWS as i64 + 9).unwrap().prefill, 100.0);
+        close(book.speeds(MAX_ROWS as u64 + 9).unwrap().prefill, 100.0);
         // Pending is capped.
         let mut book = SpeedBook::default();
         book.observe("m", clock.at(0), Some(idle));
         book.activity(clock.at(1), &[]);
-        let many: Vec<(i64, String)> = (0..100).map(|i| (i, "m".to_owned())).collect();
+        let many: Vec<(u64, String)> = (0..100).map(|i| (i, "m".to_owned())).collect();
         book.activity(clock.at(2), &many);
         assert_eq!(book.pending.len(), MAX_PENDING);
-        // Unload drops reads and waits; llama-swap restart drops rows.
+        // Unload drops reads and waits.
         book.forget("m");
         assert!(book.pending.is_empty() && !book.reads.contains_key("m"));
-        book.rows.insert(1, Speeds::default());
-        book.clear_rows();
-        assert!(book.rows.is_empty());
     }
 }
