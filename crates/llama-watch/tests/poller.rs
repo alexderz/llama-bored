@@ -2423,3 +2423,139 @@ fn vllm_rows_get_the_engine_speeds_of_the_window_they_finished_in() {
         "{hits:?}"
     );
 }
+
+// ---- #46: engine and counter state across restarts and engine changes ------
+
+/// A failed `/running` read forgets the engines' windows: the old
+/// process's acceptance does not outlive it.
+#[test]
+fn engine_windows_are_forgotten_across_a_down_and_up() {
+    let mut world = World::running(running_cmd("qwen3.8-27b-vllm", CONTAINER_CMD));
+    world.metrics.insert(
+        "qwen3.8-27b-vllm".to_owned(),
+        vllm_metrics(42_000, 20_000, 60_000, 38_000),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let spec = |view: &LlamaView| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .and_then(|info| info.engine.spec_permille)
+    };
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        spec(view) == Some(633)
+    });
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.8-27b-vllm".to_owned(),
+            vllm_metrics(42_340, 20_100, 60_300, 38_240),
+        );
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        spec(view) == Some(800)
+    });
+    server.update(|world| world.running_status = 500);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.ai == AiState::Down
+    });
+    server.update(|world| world.running_status = 200);
+    // The first read after the gap starts over: the server's totals since
+    // start, not the old window's 80 % kept because nothing moved.
+    let (view, _) = wait_msg(&rx, Duration::from_secs(3), |view, _| spec(view).is_some());
+    assert_eq!(spec(&view), Some(634));
+}
+
+/// An unloaded model's decode counter starts from 0 when it is loaded
+/// again, so a new process already past the old value is counted in full.
+#[test]
+fn a_reloaded_process_is_counted_from_zero() {
+    let id = "qwen3.6-35b-a3b";
+    let mut world = World::running(running_model(id, "Qwen", "ready"));
+    world
+        .metrics
+        .insert(id.to_owned(), metrics_body(1_000, 0.0));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    server.update(|world| {
+        world
+            .metrics
+            .insert(id.to_owned(), metrics_body(1_200, 0.0));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(200)
+    });
+    server.update(|world| world.running = running_model(id, "Qwen", "starting"));
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .is_some_and(|model| model.state == "starting")
+    });
+    server.update(|world| {
+        world.running = running_model(id, "Qwen", "ready");
+        world
+            .metrics
+            .insert(id.to_owned(), metrics_body(1_500, 0.0));
+    });
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .is_some_and(|model| model.state == "ready")
+            && view.decoded_total.is_some_and(|total| total != 200)
+    });
+    assert_eq!(view.decoded_total, Some(1_700), "200 + the new 1,500");
+}
+
+/// One llama-swap id that moves from SGLang to llama.cpp goes back to
+/// counting its prompt tokens from activity rows.
+#[test]
+fn prompt_cache_follows_an_engine_change() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world
+        .metrics
+        .insert("flash".to_owned(), sglang_cached_metrics(10_000, 9_000));
+    world.activity = cache_page(&[cache_row(1, "flash", 5_000, 0)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        prompt_cache_of(detail, "flash") == Some((0, Some(0)))
+    });
+    server.update(|world| {
+        world
+            .metrics
+            .insert("flash".to_owned(), sglang_cached_metrics(10_500, 9_400));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        prompt_cache_of(detail, "flash") == Some((500, Some(400)))
+    });
+    server.update(|world| {
+        world.running = running_cmd("flash", "llama-server -m x.gguf");
+        world
+            .metrics
+            .insert("flash".to_owned(), metrics_body(10, 0.0));
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.kind == llama_core::backend::Backend::LlamaCpp)
+    });
+    server.update(|world| {
+        world.activity = cache_page(&[
+            cache_row(2, "flash", 69, 553),
+            cache_row(1, "flash", 5_000, 0),
+        ]);
+    });
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        prompt_cache_of(detail, "flash") == Some((1_122, Some(953)))
+    });
+}

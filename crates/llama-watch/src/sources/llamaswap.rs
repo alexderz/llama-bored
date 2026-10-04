@@ -129,6 +129,10 @@ fn down_reading(reason: &'static str) -> Reading {
     }
 }
 
+/// The [`RunningStatus::Down`] reason when nothing listens: llama-swap is
+/// gone (stopped or restarting), and so is every server it started.
+pub const REFUSED: &str = "connection refused";
+
 fn running_endpoint(url: &str) -> String {
     format!("{}/running", url.trim_end_matches('/'))
 }
@@ -136,7 +140,7 @@ fn running_endpoint(url: &str) -> String {
 fn transport_reason(err: &ureq::Error) -> &'static str {
     match err {
         ureq::Error::Timeout(_) => "timeout",
-        ureq::Error::ConnectionFailed => "connection refused",
+        ureq::Error::ConnectionFailed => REFUSED,
         ureq::Error::Io(io) => io_reason(io),
         _ => "request failed",
     }
@@ -153,7 +157,7 @@ fn body_reason(err: &ureq::Error) -> &'static str {
 
 fn io_reason(err: &std::io::Error) -> &'static str {
     match err.kind() {
-        std::io::ErrorKind::ConnectionRefused => "connection refused",
+        std::io::ErrorKind::ConnectionRefused => REFUSED,
         std::io::ErrorKind::TimedOut => "timeout",
         _ => "request failed",
     }
