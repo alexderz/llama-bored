@@ -10,7 +10,7 @@ use serde::de::IgnoredAny;
 
 use crate::activity::{ActivityRow, model_key};
 use crate::config::PromptView;
-use crate::resets::{Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
+use crate::resets::{DISPLACED_MODELS, Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
 use crate::tty::chat_template::clean;
 use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, is_drop};
 use crate::tty::grid::Cell;
@@ -146,6 +146,35 @@ impl CtxTrack {
     }
 }
 
+/// `model`'s lost conversations. A new model past [`DISPLACED_MODELS`]
+/// first drops expired ones, then the model whose newest loss is oldest.
+fn displaced_of<'a>(
+    displaced: &'a mut HashMap<String, Displaced>,
+    model: &str,
+    now: Instant,
+) -> &'a mut Displaced {
+    if !displaced.contains_key(model) && displaced.len() >= DISPLACED_MODELS {
+        prune_displaced(displaced, now);
+        if displaced.len() >= DISPLACED_MODELS
+            && let Some(oldest) = displaced
+                .iter()
+                .min_by_key(|(_, lost)| lost.newest())
+                .map(|(id, _)| id.clone())
+        {
+            displaced.remove(&oldest);
+        }
+    }
+    displaced.entry(model.to_owned()).or_default()
+}
+
+/// Forget expired lost conversations, and models left with none.
+fn prune_displaced(displaced: &mut HashMap<String, Displaced>, now: Instant) {
+    for lost in displaced.values_mut() {
+        lost.prune(now);
+    }
+    displaced.retain(|_, lost| !lost.is_empty());
+}
+
 /// True when an activity row's prompt (`input + cache`, llama.cpp timings)
 /// is `prompt`, give or take 0.5 % (at least 8 tokens).
 fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
@@ -175,7 +204,10 @@ pub struct SlotBook {
     /// forget the held context but keep the counts, so a counter only
     /// restarts with the watcher.
     ctx: HashMap<(String, i64), CtxTrack>,
-    /// Conversations each model's slots lost, by model id (#9).
+    /// Conversations each model's slots lost, by model id (#9). Kept across
+    /// unloads, [`Self::clear`] and llama-swap restarts, each for its own
+    /// [`crate::resets::DISPLACED_TTL`], for at most [`DISPLACED_MODELS`]
+    /// models (#45).
     displaced: HashMap<String, Displaced>,
     /// Newest activity row number seen (#9, #44).
     activity_newest: Option<u64>,
@@ -207,17 +239,21 @@ impl SlotBook {
     }
 
     /// Drop every slot, tail, and prompt-rate baseline. The text mode stays,
-    /// and so do the drop counts; held contexts are forgotten.
+    /// and so do the drop counts and the lost conversations (#45); held
+    /// contexts are forgotten.
     pub fn clear(&mut self) {
         self.settle(|_| true);
         let mut ctx = std::mem::take(&mut self.ctx);
         for track in ctx.values_mut() {
             track.held = None;
         }
+        let mut displaced = std::mem::take(&mut self.displaced);
+        prune_displaced(&mut displaced, Instant::now());
         *self = Self {
             text_off: self.text_off,
             prompt_view: self.prompt_view,
             ctx,
+            displaced,
             activity_newest: self.activity_newest,
             ..Self::default()
         };
@@ -239,8 +275,9 @@ impl SlotBook {
         // A drop still waiting when the next one comes is decided now.
         if let Some(old) = &track.pending {
             let cached = old.slots_cached;
-            let displaced = self.displaced.entry(model_id.to_owned()).or_default();
-            track.decide(cached, displaced, Instant::now());
+            let now = Instant::now();
+            let displaced = displaced_of(&mut self.displaced, model_id, now);
+            track.decide(cached, displaced, now);
         }
         let prompt = if slot.n_prompt_tokens > 0 {
             slot.n_prompt_tokens
@@ -268,7 +305,7 @@ impl SlotBook {
                 continue;
             }
             let cached = pending.slots_cached;
-            let displaced = self.displaced.entry(model_id.clone()).or_default();
+            let displaced = displaced_of(&mut self.displaced, model_id, now);
             track.decide(cached, displaced, now);
         }
     }
@@ -306,7 +343,7 @@ impl SlotBook {
                 None if now.saturating_duration_since(since) >= PENDING_TTL => pending.slots_cached,
                 None => continue,
             };
-            let displaced = self.displaced.entry(model_id.clone()).or_default();
+            let displaced = displaced_of(&mut self.displaced, model_id, now);
             track.decide(cached, displaced, now);
         }
     }
@@ -421,7 +458,9 @@ impl SlotBook {
     }
 
     /// Drop slots whose model is no longer being polled. Their held
-    /// context is forgotten; their drop counts stay.
+    /// context is forgotten; their drop counts stay, and so do the
+    /// conversations they lost, for their own TTL (#45): a conversation
+    /// evicted by a swap can be told when it comes back.
     pub fn retain_models(&mut self, model_ids: &[&str]) {
         self.slots
             .retain(|row| model_ids.iter().any(|id| *id == row.model_id));
@@ -431,8 +470,7 @@ impl SlotBook {
                 track.held = None;
             }
         }
-        self.displaced
-            .retain(|model, _| model_ids.iter().any(|id| id == model));
+        prune_displaced(&mut self.displaced, Instant::now());
     }
 
     #[must_use]
@@ -1140,6 +1178,53 @@ mod tests {
             reasons(&book, 0),
             (counts(1, 0, 0, 0), Some(ResetReason::Compacted))
         );
+    }
+
+    /// #45: a conversation lost before an unload and a llama-swap restart
+    /// is still recognised as evicted when it comes back after them.
+    #[test]
+    fn lost_conversations_outlive_an_unload_and_a_clear() {
+        let mut book = SlotBook::without_text();
+        let t0 = Instant::now();
+        book.note_activity(&[row(1, "m", 5, Some(0))], t0);
+        // B takes slot 0 from A's 80k conversation: a new one.
+        assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 3_000, 0), 64, 64));
+        book.note_activity(&[row(2, "m", 2_990, Some(10))], t0);
+        assert_eq!(reasons(&book, 0).1, Some(ResetReason::New));
+        assert_eq!(book.displaced["m"].len(), 1);
+        // m is unloaded, then llama-swap goes away.
+        book.retain_models(&[]);
+        book.clear();
+        assert_eq!(book.displaced["m"].len(), 1, "kept for its own TTL");
+        // m is back; slot 0 drops from 120k to A's 79k, nothing cached.
+        assert!(book.apply("m", "M", &ctx_body(0, 3, true, 120_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 79_000, 0), 64, 64));
+        book.note_activity(&[row(3, "m", 79_000, Some(0))], t0);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(0, 1, 1, 0), Some(ResetReason::Evicted))
+        );
+    }
+
+    #[test]
+    fn lost_conversations_are_capped_by_model() {
+        let t0 = Instant::now();
+        let mut lost: HashMap<String, Displaced> = HashMap::new();
+        for i in 0..DISPLACED_MODELS {
+            let at = t0 + std::time::Duration::from_secs(i as u64);
+            displaced_of(&mut lost, &format!("m{i}"), at).push(1_000, at);
+        }
+        let late = t0 + std::time::Duration::from_secs(100);
+        displaced_of(&mut lost, "new", late).push(1_000, late);
+        assert_eq!(lost.len(), DISPLACED_MODELS);
+        assert!(!lost.contains_key("m0"), "the oldest loss goes first");
+        assert!(lost.contains_key("new") && lost.contains_key("m1"));
+        // Expired ones go before any live one.
+        let much_later = t0 + crate::resets::DISPLACED_TTL + std::time::Duration::from_secs(50);
+        displaced_of(&mut lost, "newer", much_later).push(1_000, much_later);
+        assert!(lost.len() < DISPLACED_MODELS);
+        assert!(lost.contains_key("new") && lost.contains_key("newer"));
     }
 
     #[test]

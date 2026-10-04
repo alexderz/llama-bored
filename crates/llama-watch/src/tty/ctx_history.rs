@@ -16,9 +16,15 @@
 //! Tiers: 30 × 10 s, 25 × 1 min, 18 × 5 min (2 h), then 30 min buckets out to
 //! `tty.ctx_history_h`. At most [`MAX_POINTS`] buckets per slot and
 //! [`MAX_SLOTS`] slots.
+//!
+//! A history belongs to a (model display name, slot) and outlives a model
+//! swap (#45): it is dropped only when its slot has been away for
+//! [`KEEP_UNSEEN_MS`] (or the span, if shorter), or to make room at
+//! [`MAX_SLOTS`]. A slot that comes back after the model set changed gets
+//! the swap marker.
 
-use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::resets::{ResetCounts, ResetReason};
 use crate::slots::SlotView;
@@ -180,6 +186,13 @@ impl CtxHistory {
         self.live.reset = true;
     }
 
+    /// The slot is back after a model swap (#45): mark it, and forget the
+    /// held context, which the reloaded model no longer caches.
+    pub fn resume_after_swap(&mut self) {
+        self.mark_reset();
+        self.held = None;
+    }
+
     /// Give `reason` to the newest marker that has none yet (#9). With no
     /// such marker the live bucket gets a marker with it.
     pub fn label(&mut self, reason: ResetReason) {
@@ -288,18 +301,43 @@ pub fn last_reason(points: &[CtxPoint]) -> Option<ResetReason> {
     points.iter().find(|point| point.reset)?.reason()
 }
 
+/// How long a slot's history is kept after its slot was last seen, at
+/// most (#45): a model swapped out and back within this keeps its line.
+pub const KEEP_UNSEEN_MS: u64 = 1_800_000;
+
+/// One slot's history and when its slot was last on `/slots`.
+#[derive(Debug)]
+struct Kept {
+    history: CtxHistory,
+    last_seen: Instant,
+    /// On the last tick's `slots`.
+    present: bool,
+    /// [`CtxBook::swaps`] when it was last present.
+    swaps: u64,
+}
+
 /// Every slot's history, keyed by model display name and slot id.
+///
+/// A history is kept while its slot is away (#45): a model swap (A→B→A, or
+/// A→A+B) does not clear the others. Every history advances with time, so
+/// an absent slot's line shows the gap; a slot that comes back after the
+/// set of `/running` models changed gets the swap marker, and its held
+/// context is dropped (the model was reloaded; its cache is gone). A
+/// history whose slot has not been seen for [`Self::keep_ms`] is dropped.
+/// Only the slots on `/slots` are drawn; the book is asked for those.
 #[derive(Debug)]
 pub struct CtxBook {
     span_h: u32,
-    slots: HashMap<(String, i64), CtxHistory>,
+    slots: HashMap<(String, i64), Kept>,
     /// Each slot's reset counts at the last tick (#9), kept across swaps so
     /// a new history does not relabel old drops. At most [`MAX_SLOTS`].
     counted: HashMap<(String, i64), ResetCounts>,
     last_at: Option<Instant>,
     /// Last non-empty `/running` list, sorted.
     running: Vec<String>,
-    /// A swap cleared the book; the next new histories carry a marker.
+    /// Changes of that list seen so far.
+    swaps: u64,
+    /// The list changed; the next new histories carry a marker.
     swap_pending: bool,
 }
 
@@ -311,6 +349,7 @@ impl CtxBook {
             slots: HashMap::new(),
             last_at: None,
             running: Vec::new(),
+            swaps: 0,
             swap_pending: false,
             counted: HashMap::new(),
         }
@@ -322,20 +361,27 @@ impl CtxBook {
         self.span_h
     }
 
+    /// How long a history outlives its slot: the sparkline's span or
+    /// [`KEEP_UNSEEN_MS`], whichever is less.
+    #[must_use]
+    pub fn keep_ms(&self) -> u64 {
+        (u64::from(self.span_h) * 3_600_000).min(KEEP_UNSEEN_MS)
+    }
+
     /// One tick: advance every history to `now`, then record each slot.
     ///
     /// `running` is the model names on `/running`. An empty list (llama down,
     /// or nothing loaded) changes nothing. A non-empty list that differs from
-    /// the last one is a swap: every history is dropped and the next ones
-    /// start with a reset marker. Histories of slots that are gone from a
-    /// non-empty `slots` are dropped too.
+    /// the last one is a swap: new histories start with a reset marker, and
+    /// so does a kept history whose slot comes back after it. A history
+    /// whose slot was not seen for [`Self::keep_ms`] is dropped.
     pub fn record(&mut self, now: Instant, running: &[String], slots: &[SlotView]) {
         let mut names = running.to_vec();
         names.sort();
         names.dedup();
         if !names.is_empty() {
             if !self.running.is_empty() && self.running != names {
-                self.slots.clear();
+                self.swaps += 1;
                 self.swap_pending = true;
             }
             self.running = names;
@@ -344,53 +390,86 @@ impl CtxBook {
             u64::try_from(now.saturating_duration_since(then).as_millis()).unwrap_or(u64::MAX)
         });
         self.last_at = Some(now);
-        for history in self.slots.values_mut() {
-            history.advance(ms);
+        for kept in self.slots.values_mut() {
+            kept.history.advance(ms);
         }
+        let keep = Duration::from_millis(self.keep_ms());
+        self.slots
+            .retain(|_, kept| now.saturating_duration_since(kept.last_seen) <= keep);
         let mut created = false;
+        let mut seen: HashSet<(String, i64)> = HashSet::new();
         for slot in slots {
             if !self.running.is_empty() && !self.running.contains(&slot.model) {
                 continue;
             }
             let key = (slot.model.clone(), slot.id);
             if !self.slots.contains_key(&key) {
-                if self.slots.len() >= MAX_SLOTS {
+                if self.slots.len() >= MAX_SLOTS && !self.evict_one(&seen) {
                     continue;
                 }
                 let mut fresh = CtxHistory::new(self.span_h);
                 if self.swap_pending {
                     fresh.mark_reset();
                 }
-                self.slots.insert(key.clone(), fresh);
+                self.slots.insert(
+                    key.clone(),
+                    Kept {
+                        history: fresh,
+                        last_seen: now,
+                        present: true,
+                        swaps: self.swaps,
+                    },
+                );
                 created = true;
             }
-            if let Some(history) = self.slots.get_mut(&key) {
-                history.sample(used_ctx(slot), slot.is_processing);
-                if self.counted.len() < MAX_SLOTS || self.counted.contains_key(&key) {
-                    let before = self.counted.insert(key, slot.resets);
-                    for reason in ResetReason::ALL {
-                        let new = before.map_or(0, |old| {
-                            slot.resets.get(reason).saturating_sub(old.get(reason))
-                        });
-                        // A burst larger than this is one marker per reason
-                        // too many to see anyway.
-                        for _ in 0..new.min(4) {
-                            history.label(reason);
-                        }
+            let Some(kept) = self.slots.get_mut(&key) else {
+                continue;
+            };
+            if !kept.present && kept.swaps != self.swaps {
+                kept.history.resume_after_swap();
+            }
+            kept.present = true;
+            kept.last_seen = now;
+            kept.swaps = self.swaps;
+            let history = &mut kept.history;
+            history.sample(used_ctx(slot), slot.is_processing);
+            if self.counted.len() < MAX_SLOTS || self.counted.contains_key(&key) {
+                let before = self.counted.insert(key.clone(), slot.resets);
+                for reason in ResetReason::ALL {
+                    let new = before.map_or(0, |old| {
+                        slot.resets.get(reason).saturating_sub(old.get(reason))
+                    });
+                    // A burst larger than this is one marker per reason
+                    // too many to see anyway.
+                    for _ in 0..new.min(4) {
+                        history.label(reason);
                     }
                 }
             }
+            seen.insert(key);
+        }
+        for (key, kept) in &mut self.slots {
+            kept.present = seen.contains(key);
         }
         if created {
             self.swap_pending = false;
         }
-        if !slots.is_empty() {
-            self.slots.retain(|(model, id), _| {
-                slots
-                    .iter()
-                    .any(|slot| slot.id == *id && slot.model == *model)
-            });
-        }
+    }
+
+    /// Make room for a new slot at [`MAX_SLOTS`]: drop the history whose
+    /// slot has been away longest. False when every one is on this tick.
+    fn evict_one(&mut self, seen: &HashSet<(String, i64)>) -> bool {
+        let Some(key) = self
+            .slots
+            .iter()
+            .filter(|(key, _)| !seen.contains(*key))
+            .min_by_key(|(_, kept)| kept.last_seen)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        self.slots.remove(&key);
+        true
     }
 
     /// Newest-first buckets for one slot. Empty when it has no history.
@@ -398,11 +477,11 @@ impl CtxBook {
     pub fn points(&self, model: &str, id: i64) -> Vec<CtxPoint> {
         self.slots
             .get(&(model.to_owned(), id))
-            .map(CtxHistory::points)
+            .map(|kept| kept.history.points())
             .unwrap_or_default()
     }
 
-    /// Slots tracked.
+    /// Slots tracked, present or not.
     #[must_use]
     pub fn len(&self) -> usize {
         self.slots.len()
@@ -608,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_swap_resets_every_history_with_a_marker() {
+    fn a_model_swap_keeps_old_histories_and_marks_new_ones() {
         let mut book = CtxBook::new(6);
         let t0 = Instant::now();
         let a = vec!["Qwen".to_owned()];
@@ -631,7 +710,9 @@ mod tests {
             &b,
             &[slot("Bonsai", 0, true, 70_000, 0)],
         );
-        assert!(book.points("Qwen", 0).is_empty());
+        // Qwen's history is kept (not drawn: its slot is not on /slots).
+        assert_eq!(resets(&book.points("Qwen", 0)), 0);
+        assert_eq!(book.len(), 2);
         let points = book.points("Bonsai", 0);
         assert_eq!(points.len(), 1, "{points:?}");
         assert!(points[0].reset);
@@ -647,6 +728,118 @@ mod tests {
         );
         assert_eq!(resets(&book.points("Bonsai", 0)), 1);
         assert_eq!(resets(&book.points("Bonsai", 1)), 0);
+    }
+
+    /// #45: A→A+B keeps A's line as it was; B's new lines start marked.
+    #[test]
+    fn a_second_model_loading_leaves_the_first_alone() {
+        let mut book = CtxBook::new(6);
+        let t0 = Instant::now();
+        let a = vec!["A".to_owned()];
+        for step in 0..30u64 {
+            book.record(
+                t0 + Duration::from_secs(step),
+                &a,
+                &[slot("A", 0, true, 40_000 + step * 100, 0)],
+            );
+        }
+        let both = vec!["A".to_owned(), "B".to_owned()];
+        book.record(
+            t0 + Duration::from_secs(30),
+            &both,
+            &[slot("A", 0, true, 43_000, 0), slot("B", 0, true, 1_000, 0)],
+        );
+        let after = book.points("A", 0);
+        assert_eq!(resets(&after), 0, "{after:?}");
+        let covered: u64 = after.iter().map(|point| point.ms).sum();
+        assert_eq!(covered, 30_000, "the same line, not a new one");
+        assert_eq!(after[0].max, Some(43_000));
+        assert!(after[1..].iter().any(|point| point.max == Some(42_900)));
+        assert_eq!(resets(&book.points("B", 0)), 1);
+    }
+
+    /// #45: A→B→A within the keep time: A's line resumes with one marker,
+    /// the gap in between, and no held context from before the swap.
+    #[test]
+    fn a_model_swapped_out_and_back_resumes_its_history() {
+        let mut book = CtxBook::new(6);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let a = vec!["A".to_owned()];
+        let b = vec!["B".to_owned()];
+        book.record(at(0), &a, &[slot("A", 0, true, 80_000, 0)]);
+        book.record(at(1), &a, &[slot("A", 0, false, 0, 0)]);
+        assert_eq!(book.points("A", 0)[0].max, Some(80_000), "held while idle");
+        book.record(at(2), &b, &[slot("B", 0, true, 5_000, 0)]);
+        for s in 3..300 {
+            book.record(at(s), &b, &[slot("B", 0, true, 5_000, 0)]);
+        }
+        // A is back, idle: a fresh process holds nothing yet.
+        book.record(at(300), &a, &[slot("A", 0, false, 0, 0)]);
+        let points = book.points("A", 0);
+        assert_eq!(resets(&points), 1, "{points:?}");
+        assert!(points[0].reset, "the marker is where A came back");
+        assert_eq!(points[0].max, Some(0), "no held 80k after the reload");
+        assert!(
+            points.iter().any(|point| point.max == Some(80_000)),
+            "the line from before the swap is still there: {points:?}"
+        );
+        let gap: u64 = points
+            .iter()
+            .filter(|point| point.max.is_none())
+            .map(|point| point.ms)
+            .sum();
+        assert!(gap >= 290_000, "the time away is a gap: {gap} ms");
+        // Its next sample is just a sample: one marker still.
+        book.record(at(301), &a, &[slot("A", 0, true, 10_000, 0)]);
+        assert_eq!(resets(&book.points("A", 0)), 1);
+        // B, away now, keeps its line too.
+        assert!(!book.points("B", 0).is_empty());
+    }
+
+    /// #45: a slot away longer than the keep time loses its history, and
+    /// a full book makes room by dropping the one away longest.
+    #[test]
+    fn absent_histories_age_out_and_give_way_at_the_cap() {
+        let mut book = CtxBook::new(6);
+        assert_eq!(book.keep_ms(), KEEP_UNSEEN_MS);
+        let t0 = Instant::now();
+        let a = vec!["A".to_owned()];
+        let b = vec!["B".to_owned()];
+        book.record(t0, &a, &[slot("A", 0, true, 9_000, 0)]);
+        book.record(t0, &b, &[slot("B", 0, true, 9_000, 0)]);
+        let keep = Duration::from_millis(KEEP_UNSEEN_MS);
+        book.record(t0 + keep, &b, &[slot("B", 0, true, 9_000, 0)]);
+        assert!(!book.points("A", 0).is_empty(), "exactly the keep time");
+        book.record(
+            t0 + keep + Duration::from_secs(1),
+            &b,
+            &[slot("B", 0, true, 9_000, 0)],
+        );
+        assert!(book.points("A", 0).is_empty(), "aged out");
+        assert_eq!(book.len(), 1);
+
+        // Cap: 64 slots of model C, then 64 of model D replace them.
+        let mut book = CtxBook::new(6);
+        let c: Vec<SlotView> = (0..MAX_SLOTS as i64)
+            .map(|id| slot("C", id, true, 10, 0))
+            .collect();
+        book.record(t0, &["C".to_owned()], &c);
+        assert_eq!(book.len(), MAX_SLOTS);
+        let d: Vec<SlotView> = (0..MAX_SLOTS as i64)
+            .map(|id| slot("D", id, true, 10, 0))
+            .collect();
+        book.record(t0 + Duration::from_secs(1), &["D".to_owned()], &d);
+        assert_eq!(book.len(), MAX_SLOTS);
+        assert!(book.points("C", 0).is_empty());
+        assert!(!book.points("D", 63).is_empty());
+        // A present slot is never dropped for a newcomer.
+        let more: Vec<SlotView> = (0..MAX_SLOTS as i64 + 1)
+            .map(|id| slot("D", id, true, 10, 0))
+            .collect();
+        book.record(t0 + Duration::from_secs(2), &["D".to_owned()], &more);
+        assert_eq!(book.len(), MAX_SLOTS);
+        assert!(book.points("D", MAX_SLOTS as i64).is_empty());
     }
 
     /// #9: a reason decided later labels the drop's own marker, even after
