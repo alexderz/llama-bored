@@ -1,4 +1,4 @@
-//! `/api/metrics/activity`: the last eight requests. Unknown fields are dropped.
+//! `/api/metrics/activity`: llama-swap's newest requests. Unknown fields are dropped.
 
 use llama_core::names::sanitize;
 use serde::Deserialize;
@@ -9,8 +9,13 @@ use serde::Deserialize;
 /// llama-swap v256) is `None`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActivityRow {
-    /// Activity id.
+    /// Activity id: llama-swap's, which starts again at 0 when llama-swap
+    /// restarts. Shown, and used for its capture; never a key across reads.
     pub id: i64,
+    /// llama-watch's own row number (#44): unique and increasing for the
+    /// whole run, across llama-swap restarts. 0 until
+    /// [`crate::recent::Recent`] numbers the row; never parsed.
+    pub seq: u64,
     /// Timestamp text, sanitised.
     pub time: String,
     /// Client label, sanitised. Empty when the field is absent.
@@ -72,6 +77,7 @@ impl From<ActivityJson> for ActivityRow {
         let tokens = row.tokens.unwrap_or_default();
         Self {
             id: row.id,
+            seq: 0,
             time: sanitize(row.timestamp.as_deref().unwrap_or(""), 40),
             source: sanitize(row.src.as_deref().unwrap_or(""), 64),
             model,

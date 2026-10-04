@@ -8,6 +8,7 @@ mod load;
 pub mod metrics;
 pub mod poller;
 pub mod publish;
+pub mod recent;
 pub mod resets;
 pub mod service;
 pub mod slots;
