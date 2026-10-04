@@ -718,3 +718,55 @@ fn tty_reset_writes_only_the_palette_reset() {
     assert_eq!(bad.status.code(), Some(2));
     assert!(bad.stdout.is_empty());
 }
+
+/// #42: tty11 as found on Titan (`ixon isig icanon echo`, plus the usual
+/// `icrnl` and `echoe`). Flow control, echo, canonical mode and signal keys
+/// go; every other flag stays as it was.
+#[test]
+fn quiet_modes_clear_flow_control_echo_canonical_and_signals_only() {
+    use rustix::termios::{InputModes, LocalModes};
+    let input = InputModes::IXON | InputModes::IXOFF | InputModes::ICRNL | InputModes::IUTF8;
+    let local = LocalModes::ISIG
+        | LocalModes::ICANON
+        | LocalModes::ECHO
+        | LocalModes::ECHOE
+        | LocalModes::IEXTEN;
+    assert_eq!(
+        llama_watch::tty::term::quiet_input(input),
+        InputModes::ICRNL | InputModes::IUTF8
+    );
+    assert_eq!(
+        llama_watch::tty::term::quiet_local(local),
+        LocalModes::ECHOE | LocalModes::IEXTEN
+    );
+    // Already quiet: unchanged.
+    assert_eq!(
+        llama_watch::tty::term::quiet_input(InputModes::ICRNL),
+        InputModes::ICRNL
+    );
+    assert_eq!(
+        llama_watch::tty::term::quiet_local(LocalModes::empty()),
+        LocalModes::empty()
+    );
+}
+
+/// #42: `tty-reset` puts back the kernel console defaults for exactly the
+/// flags the watcher clears, and undoes a quiet tty.
+#[test]
+fn console_defaults_undo_the_quiet_flags() {
+    use rustix::termios::{InputModes, LocalModes};
+    let input = InputModes::ICRNL | InputModes::IXOFF;
+    let local = LocalModes::ECHOE;
+    let (input, local) = llama_watch::tty::term::console_defaults(input, local);
+    assert_eq!(input, InputModes::ICRNL | InputModes::IXON);
+    assert_eq!(
+        local,
+        LocalModes::ECHOE | LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG
+    );
+    let quiet_in = llama_watch::tty::term::quiet_input(input);
+    let quiet_local = llama_watch::tty::term::quiet_local(local);
+    assert_eq!(
+        llama_watch::tty::term::console_defaults(quiet_in, quiet_local),
+        (input, local)
+    );
+}

@@ -90,15 +90,17 @@ struct Active {
 
 /// Writes allowlisted bytes to `W`. Remembers the last grid that was written.
 ///
-/// `Term` is `!Send`: the size callback is a `Box<dyn FnMut>`, which cannot
-/// cross threads. T22 keeps the value on the render thread.
+/// `Term` is `Send` (#42): the size callback is a `Box<dyn FnMut + Send>`,
+/// so the watcher can hand the whole terminal to its tty writer thread
+/// ([`super::writer::FrameWriter`]) and never write the console from the
+/// tick loop.
 ///
 /// Cells are clipped to `min(grid, terminal)` on both axes. Phase B builds
 /// each grid from [`Term::cols`] and [`Term::rows`]. A stale grid that is
 /// still the old, larger size must not wrap the console after a shrink.
 pub struct Term<W> {
     out: W,
-    winsize: Box<dyn FnMut() -> io::Result<Size>>,
+    winsize: Box<dyn FnMut() -> io::Result<Size> + Send>,
     cols: u16,
     rows: u16,
     full_redraw: Duration,
@@ -114,6 +116,9 @@ pub struct Term<W> {
     /// [`Self::with_palette`] was called. A bare `Term` writes no palette
     /// bytes at all, which keeps older byte-exact tests unchanged.
     palette_set: bool,
+    /// tty11's line settings from before [`quiet_stdout`], put back by
+    /// [`Self::restore_console`].
+    modes: Option<SavedModes>,
 }
 
 impl<W: Write> Term<W> {
@@ -124,7 +129,7 @@ impl<W: Write> Term<W> {
     /// grid even when the cells have not changed.
     pub fn new(
         out: W,
-        mut winsize: impl FnMut() -> io::Result<Size> + 'static,
+        mut winsize: impl FnMut() -> io::Result<Size> + Send + 'static,
         full_redraw: Duration,
         now: Instant,
     ) -> io::Result<Self> {
@@ -145,6 +150,7 @@ impl<W: Write> Term<W> {
             blank_sent: false,
             palette: Palette::Vga,
             palette_set: false,
+            modes: None,
         })
     }
 
@@ -172,6 +178,32 @@ impl<W: Write> Term<W> {
         self.out.flush()
     }
 
+    /// Make the next [`Self::render`] a full repaint (`ED 2` and every
+    /// cell). The tty writer calls it after a stalled write (#42), so a
+    /// frame the console only partly showed, or anything it drew while
+    /// paused, does not stay on screen.
+    pub fn force_repaint(&mut self) {
+        self.force_full = true;
+    }
+
+    /// Keep `modes` so [`Self::restore_console`] puts them back on a clean
+    /// exit (#42).
+    pub fn with_saved_modes(mut self, modes: Option<SavedModes>) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    /// Clean exit: [`Self::restore_palette`], then the saved line settings.
+    /// Both are tried; the first error is returned.
+    pub fn restore_console(&mut self) -> io::Result<()> {
+        let palette = self.restore_palette();
+        let modes = match &self.modes {
+            Some(modes) => modes.restore_on_stdout(),
+            None => Ok(()),
+        };
+        palette.and(modes)
+    }
+
     /// Send `blank` with the first frame. Later frames, including full
     /// repaints, never send it again (see [`ConsoleBlank`]).
     pub fn with_console_blank(mut self, blank: ConsoleBlank) -> Self {
@@ -180,7 +212,7 @@ impl<W: Write> Term<W> {
     }
 
     /// [`Self::new`] with the size read from `fd` via [`window_size`].
-    pub fn from_fd<Fd: AsFd + 'static>(
+    pub fn from_fd<Fd: AsFd + Send + 'static>(
         out: W,
         fd: Fd,
         full_redraw: Duration,
@@ -336,14 +368,118 @@ fn clamp_size(size: Size) -> Size {
 }
 
 /// Read the terminal window size.
-///
-/// This is the only `rustix::termios` call in the watcher.
 pub fn window_size<Fd: AsFd>(fd: Fd) -> io::Result<Size> {
     let ws = rustix::termios::tcgetwinsize(fd)?;
     Ok(Size {
         cols: ws.ws_col,
         rows: ws.ws_row,
     })
+}
+
+/// The input flags the watcher clears on tty11 (#42): no XON/XOFF flow
+/// control, so Ctrl+S cannot stop output.
+#[must_use]
+pub fn quiet_input(input: rustix::termios::InputModes) -> rustix::termios::InputModes {
+    use rustix::termios::InputModes;
+    input - (InputModes::IXON | InputModes::IXOFF)
+}
+
+/// The local flags the watcher clears on tty11 (#42): no echo (keys would
+/// draw on the dashboard), no canonical line editing and no signal keys.
+#[must_use]
+pub fn quiet_local(local: rustix::termios::LocalModes) -> rustix::termios::LocalModes {
+    use rustix::termios::LocalModes;
+    local - (LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG)
+}
+
+/// What `llama-watch tty-reset` puts back when the watcher could not:
+/// the kernel console defaults for the flags [`quiet_input`] and
+/// [`quiet_local`] clear (`ixon echo icanon isig`, `ixoff` stays off).
+#[must_use]
+pub fn console_defaults(
+    input: rustix::termios::InputModes,
+    local: rustix::termios::LocalModes,
+) -> (rustix::termios::InputModes, rustix::termios::LocalModes) {
+    use rustix::termios::{InputModes, LocalModes};
+    (
+        (input | InputModes::IXON) - InputModes::IXOFF,
+        local | LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG,
+    )
+}
+
+/// tty11's line settings from before [`quiet_stdout`], for a clean exit.
+pub struct SavedModes {
+    saved: rustix::termios::Termios,
+}
+
+impl SavedModes {
+    /// Put the saved settings back on stdout (`TCSANOW`, never drains
+    /// output). Nothing when stdout is no longer tty11.
+    pub fn restore_on_stdout(&self) -> io::Result<()> {
+        let out = io::stdout();
+        if !is_configured_tty(&out)? {
+            return Ok(());
+        }
+        rustix::termios::tcsetattr(&out, rustix::termios::OptionalActions::Now, &self.saved)?;
+        Ok(())
+    }
+}
+
+/// Harden the console on stdout so the keyboard cannot pause or draw on the
+/// dashboard (#42): clear `ixon ixoff echo icanon isig` (`TCSANOW`, so
+/// nothing waits for output) and flush pending input.
+///
+/// Only when stdout is the configured console ([`super::setup::TTY`],
+/// compared by device number); any other stdout (a terminal someone ran
+/// `llama-watch run` in, a pipe, a file) is left alone and `Ok(None)` comes
+/// back. Scroll Lock (VT hold) still stops output whatever the flags say;
+/// the tty writer thread is what keeps the tick loop running then.
+pub fn quiet_stdout() -> io::Result<Option<SavedModes>> {
+    use rustix::termios::{OptionalActions, QueueSelector, tcflush, tcgetattr, tcsetattr};
+    let out = io::stdout();
+    if !is_configured_tty(&out)? {
+        return Ok(None);
+    }
+    let saved = tcgetattr(&out)?;
+    let mut quiet = saved.clone();
+    quiet.input_modes = quiet_input(quiet.input_modes);
+    quiet.local_modes = quiet_local(quiet.local_modes);
+    tcsetattr(&out, OptionalActions::Now, &quiet)?;
+    tcflush(&out, QueueSelector::IFlush)?;
+    Ok(Some(SavedModes { saved }))
+}
+
+/// `llama-watch tty-reset`: [`console_defaults`] on stdout, only when it is
+/// the configured console. `TCSANOW`, so a held console cannot block it.
+pub fn console_defaults_on_stdout() -> io::Result<()> {
+    use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+    let out = io::stdout();
+    if !is_configured_tty(&out)? {
+        return Ok(());
+    }
+    let mut modes = tcgetattr(&out)?;
+    let (input, local) = console_defaults(modes.input_modes, modes.local_modes);
+    modes.input_modes = input;
+    modes.local_modes = local;
+    tcsetattr(&out, OptionalActions::Now, &modes)?;
+    Ok(())
+}
+
+/// `fd` is the character device at [`super::setup::TTY`].
+fn is_configured_tty<Fd: AsFd>(fd: Fd) -> io::Result<bool> {
+    use rustix::fs::FileType;
+    let have = rustix::fs::fstat(fd)?;
+    if FileType::from_raw_mode(have.st_mode) != FileType::CharacterDevice {
+        return Ok(false);
+    }
+    let want = match rustix::fs::stat(super::setup::TTY) {
+        Ok(want) => want,
+        Err(_) => return Ok(false),
+    };
+    Ok(
+        FileType::from_raw_mode(want.st_mode) == FileType::CharacterDevice
+            && want.st_rdev == have.st_rdev,
+    )
 }
 
 /// The palette bytes of one full repaint.

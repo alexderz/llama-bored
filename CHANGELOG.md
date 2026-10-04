@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- llama-watch is no longer killed by its watchdog when a write to tty11 blocks (#42). The likely trigger on Titan was waking the blanked console with a key (Space, no XOFF): `con_write` waits on the console lock while fbcon and nvidia-drm unblank and modeset the monitor, 1 s to over 10 s, and the frame was written on the thread that publishes the snapshot and pings the watchdog (kraken-lcd and llama-light logged `snapshot stale` first). Frames now go to a `tty-writer` thread through a one-frame slot: the newest frame replaces a waiting one, publish and `WATCHDOG=1` never wait, a draw that took 1 s or more is followed by a full repaint, `tty: output stalled` / `tty: output resumed` are logged once each, and a clean stop waits at most 500 ms for a stuck writer. tty11 is also quietened at start: `ixon ixoff echo icanon isig` cleared and input flushed, only when stdout is `/dev/tty11` (Ctrl+S cannot pause it, keys do not echo onto it); a clean stop puts the saved flags back and `tty-reset` restores the console defaults before the palette. Scroll Lock still holds output (the dashboard freezes, then repaints); S13 allows `tcgetattr` / `tcsetattr` / `tcflush` in `term.rs`
+
 ## 0.3.4 — 2026-10-03
 
 ### Fixed
