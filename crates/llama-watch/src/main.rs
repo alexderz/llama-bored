@@ -6,13 +6,18 @@ fn main() {
     if let Some(("tty-setup", rest)) = args.split_first().map(|(cmd, rest)| (cmd.as_str(), rest)) {
         std::process::exit(llama_watch::tty::setup::main(rest));
     }
-    // The unit's `ExecStopPost=` (#26): `ESC ] R` on tty11, reads nothing.
+    // The unit's `ExecStopPost=` (#26, #42): `ESC ] R` and the console's
+    // default line settings on tty11, reads nothing.
     if args.first().map(String::as_str) == Some("tty-reset") {
         if args.len() != 1 {
             eprintln!("usage: llama-watch tty-reset");
             std::process::exit(2);
         }
-        let code = match llama_watch::tty::term::reset_palette_on_stdout() {
+        // Line settings first (#42): `TCSANOW` cannot block, while the
+        // palette write can when the console is held.
+        let modes = llama_watch::tty::term::console_defaults_on_stdout();
+        let palette = llama_watch::tty::term::reset_palette_on_stdout();
+        let code = match modes.and(palette) {
             Ok(()) => 0,
             Err(err) => {
                 eprintln!("tty-reset: {err}");

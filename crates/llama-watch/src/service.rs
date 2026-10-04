@@ -3,6 +3,10 @@
 //! `READY=1` is sent after start-up. `WATCHDOG=1` is sent only when the four
 //! tick steps return. `STOPPING=1` is sent when [`Stop::requested`] becomes
 //! true, which is how a test stands in for SIGINT or SIGTERM.
+//!
+//! In [`run`] the draw step is a [`FrameWriter`]: it hands the frame to the
+//! tty writer thread and returns, so a console write that blocks (unblank,
+//! Scroll Lock) never holds back publish or the watchdog (#42).
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -26,7 +30,8 @@ use crate::tty::ctx_history::CtxBook;
 use crate::tty::grid::Cell;
 use crate::tty::layout::{self, Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState};
 use crate::tty::sanitize::sanitize;
-use crate::tty::term::{ConsoleBlank, Term};
+use crate::tty::term::{self, ConsoleBlank, Term};
+use crate::tty::writer::FrameWriter;
 use llama_core::backend;
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
@@ -95,6 +100,10 @@ pub trait RenderStep {
     fn finish(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Make the next [`Self::draw`] a full repaint. The tty writer calls it
+    /// after a stalled write (#42).
+    fn repaint(&mut self) {}
 }
 
 impl<B, L> SampleStep for WatchCollector<'_, B, L>
@@ -125,7 +134,11 @@ impl<W: Write> RenderStep for Term<W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        self.restore_palette()
+        self.restore_console()
+    }
+
+    fn repaint(&mut self) {
+        self.force_repaint();
     }
 }
 
@@ -791,15 +804,38 @@ pub fn run(args: &RunArgs) -> i32 {
         prepared.config = prepared.config.with_text_off();
     }
     let now = Instant::now();
+    // #42: keys on tty11 must not pause or draw on the dashboard. Only acts
+    // when stdout is tty11; a failure is logged and the watcher carries on.
+    let modes = match term::quiet_stdout() {
+        Ok(modes) => modes,
+        Err(err) => {
+            log::emit(
+                &mut log::Stderr,
+                Priority::Warning,
+                &format!("console: line settings unchanged: {err}"),
+            );
+            None
+        }
+    };
     let term = match Term::for_stdout(Duration::from_secs(prepared.config.tty.full_redraw_s), now) {
         Ok(term) => term
             .with_console_blank(ConsoleBlank::from_minutes(
                 prepared.config.tty.blank_min,
                 prepared.config.tty.sleep_min,
             ))
-            .with_palette(prepared.config.tty.palette),
+            .with_palette(prepared.config.tty.palette)
+            .with_saved_modes(modes),
         Err(err) => {
             eprintln!("console: {err}");
+            return 1;
+        }
+    };
+    // #42: the console is written only by the tty writer thread, so a
+    // blocked write (unblank, VT hold) never stops publish or the watchdog.
+    let render = match FrameWriter::spawn(term, log::Stderr) {
+        Ok(render) => render,
+        Err(err) => {
+            eprintln!("console: tty writer: {err}");
             return 1;
         }
     };
@@ -830,7 +866,7 @@ pub fn run(args: &RunArgs) -> i32 {
         feed,
         sampler: collector,
         publisher: prepared.publisher,
-        render: term,
+        render,
         clock: RealClock,
         notify: SdNotify,
         stop: NeverStop,
