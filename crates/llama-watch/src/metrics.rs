@@ -747,6 +747,16 @@ impl DecodedCounter {
         self.window.insert(model.to_owned(), window.max(FRESH));
     }
 
+    /// `model`'s process is gone (unloaded, or llama-swap went away, #46):
+    /// the next process counts from 0, so its first read adds all it has.
+    /// A model with no baseline keeps none.
+    pub fn forget(&mut self, model: &str) {
+        if let Some(last) = self.last.get_mut(model) {
+            *last = 0;
+        }
+        self.processing.remove(model);
+    }
+
     /// Running sum when `/running` is up and every ready model was read
     /// within the last second. Zero ready models is a measured total.
     #[must_use]
@@ -873,6 +883,17 @@ impl PromptCache {
             .saturating_add(input.saturating_add(cache.unwrap_or(0)));
         if let Some(cache) = cache {
             totals.cached = Some(totals.cached.unwrap_or(0).saturating_add(cache));
+        }
+    }
+
+    /// `model` was unloaded or its server changed (#46): it goes back to
+    /// activity rows until a `/metrics` read with both counters takes over
+    /// again, from a fresh baseline. Its counters stay.
+    pub fn forget(&mut self, model: &str) {
+        if let Some(totals) = self.models.get_mut(model) {
+            totals.from_metrics = false;
+            totals.last_prompt = None;
+            totals.last_cached = None;
         }
     }
 
@@ -1898,6 +1919,47 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
         cache.observe_metrics("flash", Some(100), Some(90));
         cache.observe_metrics("flash", Some(100), Some(95));
         assert_eq!(cache.get("flash"), Some((557, Some(415))));
+    }
+
+    /// #46: a model that moved from vLLM/SGLang to llama.cpp is counted
+    /// from its activity rows again once it is forgotten.
+    #[test]
+    fn prompt_cache_forget_goes_back_to_rows_from_a_fresh_baseline() {
+        let mut cache = PromptCache::default();
+        cache.observe_metrics("m", Some(1_000), Some(100));
+        cache.observe_metrics("m", Some(1_500), Some(300));
+        cache.add_row("m", Some(50), Some(5));
+        assert_eq!(cache.get("m"), Some((500, Some(200))), "rows ignored");
+        cache.forget("m");
+        cache.add_row("m", Some(50), Some(5));
+        assert_eq!(cache.get("m"), Some((555, Some(205))), "rows count again");
+        // A later metrics read is a new baseline, not a restart delta.
+        cache.observe_metrics("m", Some(40), Some(4));
+        assert_eq!(cache.get("m"), Some((555, Some(205))));
+        cache.observe_metrics("m", Some(60), Some(10));
+        assert_eq!(cache.get("m"), Some((575, Some(211))));
+        cache.forget("unknown");
+        assert_eq!(cache.get("unknown"), None);
+    }
+
+    /// #46: a reloaded process whose first read is above the old one's last
+    /// value is counted in full, not short by that value.
+    #[test]
+    fn decoded_counter_forget_counts_a_reload_from_zero() {
+        let t0 = Instant::now();
+        let mut counter = DecodedCounter::default();
+        counter.observe("m", 1_000, Some(1.0), t0);
+        counter.observe("m", 1_200, Some(1.0), t0);
+        assert_eq!(counter.total(), 200);
+        counter.forget("m");
+        assert_eq!(counter.requests_processing("m", t0), None);
+        // The new process decoded 1,500 tokens before its first read.
+        counter.observe("m", 1_500, Some(0.0), t0);
+        assert_eq!(counter.total(), 1_700);
+        // Without a baseline, forgetting does not invent one.
+        counter.forget("other");
+        counter.observe("other", 900, None, t0);
+        assert_eq!(counter.total(), 1_700);
     }
 
     #[test]

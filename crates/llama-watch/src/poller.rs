@@ -378,6 +378,9 @@ struct State<L> {
     /// Raw id of each entry of `models`, in the same order.
     model_ids: Vec<String>,
     ready: Vec<ReadyModel>,
+    /// While `/running` fails: the models ready at the last good read and
+    /// their servers, for the first good read after it (#46).
+    down_ready: Vec<(String, Backend)>,
     /// Gauges per model id from the last backend `/metrics` read.
     gauges: HashMap<String, Gauges>,
     /// Engine facts per ready model id from its last `/metrics` read (Strata).
@@ -441,6 +444,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         models: Vec::new(),
         model_ids: Vec::new(),
         ready: Vec::new(),
+        down_ready: Vec::new(),
         gauges: HashMap::new(),
         engine_facts: HashMap::new(),
         fallback: HashSet::new(),
@@ -552,7 +556,15 @@ impl<L: Sink> State<L> {
             .collect();
         self.model_ids = models.iter().map(|info| info.id.clone()).collect();
 
-        let was_ready: Vec<String> = self.ready.iter().map(|model| model.id.clone()).collect();
+        // The models ready at the last good read, with their servers. A
+        // failed read clears `ready` but keeps them in `down_ready`, so the
+        // first good read after it still sees what left (#46).
+        let mut was_ready: Vec<(String, Backend)> = std::mem::take(&mut self.down_ready);
+        for model in &self.ready {
+            if !was_ready.iter().any(|(id, _)| *id == model.id) {
+                was_ready.push((model.id.clone(), model.backend));
+            }
+        }
         self.ready.clear();
         self.unmetered = false;
         if self.running_up {
@@ -572,16 +584,44 @@ impl<L: Sink> State<L> {
                 }
             }
         }
-        let ready: HashSet<&str> = self.ready.iter().map(|model| model.id.as_str()).collect();
-        // A model that left `ready` in a good read was unloaded (or is
-        // loading again): its next load is probed afresh and its engine
-        // windows start over. A failed read keeps both.
+        let ready: HashSet<String> = self.ready.iter().map(|model| model.id.clone()).collect();
         if self.running_up {
-            self.detected.retain(|id, _| ready.contains(id.as_str()));
-            for id in was_ready.iter().filter(|id| !ready.contains(id.as_str())) {
-                self.engines.forget(id);
-                self.speeds.forget(id);
+            // A model that left `ready` in a good read was unloaded (or is
+            // loading again), and one whose server changed is a new
+            // process: its next load is probed afresh, its engine windows
+            // start over, its counters count the next process from 0 and
+            // its prompt counters go back to activity rows until `/metrics`
+            // takes over again (#46).
+            self.detected.retain(|id, _| ready.contains(id));
+            let gone: Vec<String> = was_ready
+                .iter()
+                .filter(|(id, backend)| {
+                    !self
+                        .ready
+                        .iter()
+                        .any(|model| model.id == *id && model.backend == *backend)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &gone {
+                self.forget_engine(id);
+                self.forget_process(id);
             }
+        } else {
+            // llama-swap is not answering. Its engines' windows go now, so
+            // the old process's numbers do not outlive it (#46). A refused
+            // connection means llama-swap itself is gone, and with it every
+            // server it started: their counters count the next process from
+            // 0. A timeout may be a busy but live llama-swap, whose servers
+            // still run, so their baselines stay until a good read says
+            // whether each is still ready.
+            for (id, _) in &was_ready {
+                self.forget_engine(id);
+                if down == Some(llamaswap::REFUSED) {
+                    self.forget_process(id);
+                }
+            }
+            self.down_ready = was_ready;
         }
         if self
             .capture
@@ -606,6 +646,22 @@ impl<L: Sink> State<L> {
             self.slots.retain_models(&ids);
         }
         self.latencies.running = Some(started.elapsed());
+    }
+
+    /// Drop `id`'s engine windows and attributed-speed reads (#31, #35).
+    fn forget_engine(&mut self, id: &str) {
+        self.engines.forget(id);
+        self.speeds.forget(id);
+    }
+
+    /// `id`'s process is gone: the next one starts its counters at 0 and
+    /// its prompt counters come from activity rows until `/metrics` gives
+    /// both again (#46).
+    fn forget_process(&mut self, id: &str) {
+        self.counter.forget(id);
+        self.prompt_counter.forget(id);
+        self.prompt_box.forget(id);
+        self.prompt_cache.forget(id);
     }
 
     /// `[llama.backends]` first, then the launch command, then what this
