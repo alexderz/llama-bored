@@ -1545,3 +1545,408 @@ fn blank_sample(mono: Instant, wall: SystemTime) -> WatchSample {
         fans: None,
     }
 }
+
+// #42: the console is written by the tty writer thread. A write that blocks
+// (unblank holding the console lock, Scroll Lock) must not stop publish or
+// the watchdog, and the newest frame is drawn, in full, once it unblocks.
+
+/// Open or shut. Shut blocks every [`Gate::pass`] until it opens.
+#[derive(Default)]
+struct Gate {
+    shut: Mutex<bool>,
+    cv: Condvar,
+    /// Calls to [`Gate::pass`] so far, blocked or not.
+    entered: AtomicU64,
+}
+
+impl Gate {
+    fn shut() -> Arc<Self> {
+        let gate = Arc::new(Self::default());
+        gate.set_shut(true);
+        gate
+    }
+
+    fn set_shut(&self, shut: bool) {
+        *self.shut.lock().expect("gate") = shut;
+        self.cv.notify_all();
+    }
+
+    fn pass(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let mut shut = self.shut.lock().expect("gate");
+        while *shut {
+            shut = self.cv.wait(shut).expect("gate");
+        }
+    }
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out: {what}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Drew {
+    Frame(Instant),
+    Repaint,
+}
+
+/// The console: records each frame by its tick time and blocks in `draw`
+/// while the gate is shut, like a `write` to a held tty11.
+struct GateRender {
+    gate: Arc<Gate>,
+    drew: Arc<Mutex<Vec<Drew>>>,
+}
+
+impl service::RenderStep for GateRender {
+    fn draw(&mut self, _model: &TtyModel, now: Instant) -> io::Result<()> {
+        self.gate.pass();
+        self.drew.lock().expect("drew").push(Drew::Frame(now));
+        Ok(())
+    }
+
+    fn repaint(&mut self) {
+        self.drew.lock().expect("drew").push(Drew::Repaint);
+    }
+}
+
+/// Records the tick time of every frame the loop hands on, then forwards it.
+struct Sent<R> {
+    inner: R,
+    sent: Arc<Mutex<Vec<Instant>>>,
+}
+
+impl<R: service::RenderStep> service::RenderStep for Sent<R> {
+    fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()> {
+        self.sent.lock().expect("sent").push(now);
+        self.inner.draw(model, now)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.inner.finish()
+    }
+}
+
+/// Counts publishes; blocks while `pause` is shut so the test can hold the
+/// loop still between two ticks.
+struct GatePublish {
+    count: Arc<AtomicU64>,
+    pause: Arc<Gate>,
+}
+
+impl service::PublishStep for GatePublish {
+    fn publish(
+        &mut self,
+        _snapshot: &Snapshot,
+        _llama: &LlamaView,
+        _extras: &llama_watch::publish::Extras,
+    ) -> Result<(), PublishError> {
+        self.pause.pass();
+        self.count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn watchdogs(events: &Mutex<Vec<&'static str>>) -> usize {
+    events
+        .lock()
+        .expect("events")
+        .iter()
+        .filter(|ev| **ev == "WATCHDOG")
+        .count()
+}
+
+#[test]
+fn a_blocked_console_write_keeps_publish_and_watchdog_going_then_draws_the_latest_frame() {
+    use llama_watch::tty::writer::FrameWriter;
+    let fx = Fixture::new("tty-stall");
+    let console = Gate::shut();
+    let pause = Arc::new(Gate::default());
+    let drew = Arc::new(Mutex::new(Vec::new()));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::new(AtomicU64::new(0));
+    let notify = RecNotify::default();
+    let events = Arc::clone(&notify.events);
+    let writer_log = MemLog::new();
+    let writer_lines = writer_log.lines_handle();
+    let writer = FrameWriter::with_timing(
+        GateRender {
+            gate: Arc::clone(&console),
+            drew: Arc::clone(&drew),
+        },
+        writer_log,
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+    )
+    .expect("writer");
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            fx.drive(
+                Queue::default(),
+                fx.collector(),
+                GatePublish {
+                    count: Arc::clone(&published),
+                    pause: Arc::clone(&pause),
+                },
+                Sent {
+                    inner: writer,
+                    sent: Arc::clone(&sent),
+                },
+                notify,
+                FlagStop(Arc::clone(&stop)),
+                MemLog::new(),
+            )
+        });
+        // The first frame is stuck in the console.
+        wait_until("writer blocked", || {
+            console.entered.load(Ordering::SeqCst) == 1
+        });
+        let dogs = watchdogs(&events);
+        let pubs = published.load(Ordering::SeqCst);
+        wait_until("ticks go on", || {
+            watchdogs(&events) >= dogs + 50 && published.load(Ordering::SeqCst) >= pubs + 50
+        });
+        wait_until("stall logged", || {
+            writer_lines
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|line| line.contains("tty: output stalled"))
+        });
+        assert!(drew.lock().expect("drew").is_empty(), "nothing drawn yet");
+        // Hold the loop between ticks, so the newest frame is known.
+        pause.set_shut(true);
+        let paused = pause.entered.load(Ordering::SeqCst);
+        wait_until("loop held", || {
+            pause.entered.load(Ordering::SeqCst) > paused
+        });
+        let latest = *sent.lock().expect("sent").last().expect("sent a frame");
+        let sent_n = sent.lock().expect("sent").len();
+        assert!(sent_n > 50, "the loop handed on {sent_n} frames");
+        // The console takes output again.
+        console.set_shut(false);
+        wait_until("latest drawn", || {
+            drew.lock().expect("drew").last() == Some(&Drew::Frame(latest))
+        });
+        let drew_now = drew.lock().expect("drew").clone();
+        let first = *sent.lock().expect("sent").first().expect("first");
+        assert_eq!(
+            drew_now,
+            vec![Drew::Frame(first), Drew::Repaint, Drew::Frame(latest)],
+            "the stuck frame, a full repaint, then only the newest frame"
+        );
+        pause.set_shut(false);
+        let resumed_at = sent.lock().expect("sent").len();
+        wait_until("resume logged", || {
+            sent.lock().expect("sent").len() > resumed_at
+                && writer_lines
+                    .lock()
+                    .expect("log")
+                    .iter()
+                    .any(|line| line.contains("tty: output resumed"))
+        });
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            handle.join().expect("loop thread"),
+            service::LoopExit::Stopped
+        );
+    });
+    let lines = writer_lines.lock().expect("log").clone();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("output stalled"))
+            .count(),
+        1,
+        "stall logged once: {lines:?}"
+    );
+    assert_eq!(
+        *events.lock().expect("events").last().expect("last"),
+        "STOPPING"
+    );
+}
+
+#[test]
+fn a_stop_with_the_console_stuck_does_not_wait_for_the_writer() {
+    use llama_watch::tty::writer::FrameWriter;
+    let fx = Fixture::new("tty-stuck-stop");
+    let console = Gate::shut();
+    let drew = Arc::new(Mutex::new(Vec::new()));
+    let notify = RecNotify::default();
+    let events = Arc::clone(&notify.events);
+    let log = MemLog::new();
+    let lines = log.lines_handle();
+    let writer = FrameWriter::with_timing(
+        GateRender {
+            gate: Arc::clone(&console),
+            drew: Arc::clone(&drew),
+        },
+        MemLog::new(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    )
+    .expect("writer");
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            fx.drive(
+                Queue::default(),
+                fx.collector(),
+                OkPublish,
+                writer,
+                notify,
+                FlagStop(Arc::clone(&stop)),
+                log,
+            )
+        });
+        wait_until("writer blocked", || {
+            console.entered.load(Ordering::SeqCst) == 1
+        });
+        let asked = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            handle.join().expect("loop thread"),
+            service::LoopExit::Stopped
+        );
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "stop waited {:?} on a stuck console",
+            asked.elapsed()
+        );
+    });
+    assert_eq!(
+        *events.lock().expect("events").last().expect("last"),
+        "STOPPING"
+    );
+    assert!(
+        lines
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|line| line.contains("console restore failed") && line.contains("stuck")),
+        "{:?}",
+        lines.lock().expect("log")
+    );
+    // Let the detached writer go.
+    console.set_shut(false);
+}
+
+/// A console sink: bytes land in `bytes`, and `write` blocks while the gate
+/// is shut.
+struct GateSink {
+    gate: Arc<Gate>,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for GateSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.gate.pass();
+        self.bytes.lock().expect("bytes").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The real [`Term`] behind the writer, on a sink that blocks: frames sent
+/// while it is stuck are dropped but for the newest, which is drawn as a
+/// full repaint (`ESC [ 2 J`) once the sink takes bytes again.
+#[test]
+fn term_behind_a_stuck_sink_repaints_the_newest_frame_in_full() {
+    use llama_watch::service::RenderStep as _;
+    use llama_watch::tty::writer::FrameWriter;
+    let fx = Fixture::new("tty-stall-term");
+    let models = Arc::new(Mutex::new(Vec::new()));
+    fx.drive(
+        Queue::default(),
+        fx.collector(),
+        OkPublish,
+        RecRender {
+            models: Arc::clone(&models),
+        },
+        RecNotify::default(),
+        StopAfter::new(1),
+        MemLog::new(),
+    );
+    let base = models.lock().expect("models")[0].clone();
+    let frame = |name: &str| {
+        let mut model = base.clone();
+        model.host = name.to_owned();
+        model
+    };
+    let gate = Arc::new(Gate::default());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let now = Instant::now();
+    let term = Term::new(
+        GateSink {
+            gate: Arc::clone(&gate),
+            bytes: Arc::clone(&bytes),
+        },
+        || {
+            Ok(Size {
+                cols: 160,
+                rows: 48,
+            })
+        },
+        Duration::from_secs(3600),
+        now,
+    )
+    .expect("term");
+    let mut writer = FrameWriter::with_timing(
+        term,
+        MemLog::new(),
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+    )
+    .expect("writer");
+    writer.draw(&frame("HOSTAAA"), now).expect("draw");
+    wait_until("first frame", || writer.stats().drawn == 1);
+    gate.set_shut(true);
+    let entered = gate.entered.load(Ordering::SeqCst);
+    writer.draw(&frame("HOSTBBB"), now).expect("draw");
+    wait_until("sink blocked", || {
+        gate.entered.load(Ordering::SeqCst) > entered
+    });
+    std::thread::sleep(Duration::from_millis(80));
+    for n in 0..100 {
+        let asked = Instant::now();
+        writer
+            .draw(&frame(&format!("HOSTC{n:02}")), now)
+            .expect("draw");
+        assert!(
+            asked.elapsed() < Duration::from_millis(100),
+            "draw waited {:?} on a stuck console",
+            asked.elapsed()
+        );
+    }
+    writer.draw(&frame("HOSTZZZ"), now).expect("draw");
+    assert!(writer.stats().busy, "still stuck");
+    let before = bytes.lock().expect("bytes").len();
+    gate.set_shut(false);
+    wait_until("newest drawn", || writer.stats().drawn == 3);
+    let stats = writer.stats();
+    assert_eq!(stats.dropped, 100, "{stats:?}");
+    assert_eq!(stats.repaints, 1, "{stats:?}");
+    let all = bytes.lock().expect("bytes").clone();
+    let after = String::from_utf8_lossy(&all[before..]).into_owned();
+    let last_clear = after
+        .rfind("\x1b[2J")
+        .expect("a full repaint after the stall");
+    assert!(
+        after[last_clear..].contains("HOSTZZZ"),
+        "newest frame drawn in full"
+    );
+    assert!(
+        !after.contains("HOSTC"),
+        "frames sent while stuck are dropped"
+    );
+}

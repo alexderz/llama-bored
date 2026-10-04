@@ -1,7 +1,72 @@
-//! S13: the watcher source may ask for the window size and nothing else.
+//! S13: the watcher source may ask for the window size and, since #42, read
+//! and set tty11's line flags and flush its input. Nothing else.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// The `rustix::termios` names `tty/term.rs` may use.
+///
+/// #42 adds the line-flag calls: `quiet_stdout` clears `ixon ixoff echo
+/// icanon isig` (`tcgetattr`, `tcsetattr` with `TCSANOW`) and flushes input
+/// (`tcflush` `TCIFLUSH`); `tty-reset` and a clean exit put flags back. All
+/// three check that stdout is the character device `/dev/tty11` first. No
+/// `tcflow`, `tcsendbreak`, `tcdrain` or window-size set: the watcher never
+/// un-holds, drains or resizes the console.
+const TERMIOS_ALLOWED: &[&str] = &[
+    "tcgetwinsize",
+    "tcgetattr",
+    "tcsetattr",
+    "tcflush",
+    "Termios",
+    "InputModes",
+    "LocalModes",
+    "OptionalActions",
+    "QueueSelector",
+];
+
+/// Every name reached through `termios::`, including each name of a
+/// `termios::{a, b}` use list.
+fn termios_names(code: &str) -> Vec<String> {
+    let ident = |text: &str| -> String {
+        text.chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect()
+    };
+    let mut names = Vec::new();
+    let mut rest = code;
+    while let Some(at) = rest.find("termios::") {
+        let after = &rest[at + "termios::".len()..];
+        if let Some(list) = after.strip_prefix('{') {
+            let end = list.find('}').unwrap_or(list.len());
+            for item in list[..end].split(',') {
+                let name = ident(item.trim());
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+            rest = &list[end..];
+        } else {
+            let name = ident(after);
+            rest = &after[name.len()..];
+            names.push(name);
+        }
+    }
+    names
+}
+
+#[test]
+fn termios_scan_reads_paths_and_use_lists() {
+    let names = termios_names(
+        "use rustix::termios::{tcflush, tcflow};\nlet _ = rustix::termios::tcsetwinsize(fd, ws);\n",
+    );
+    assert_eq!(names, ["tcflush", "tcflow", "tcsetwinsize"]);
+    for name in ["tcflow", "tcsetwinsize", "tcsendbreak", "tcdrain", ""] {
+        assert!(
+            !TERMIOS_ALLOWED.contains(&name),
+            "{name} must stay outside the S13 allowlist"
+        );
+    }
+}
 
 #[test]
 fn watcher_source_only_reads_the_window_size() {
@@ -60,17 +125,10 @@ fn watcher_source_only_reads_the_window_size() {
             if !code.contains("rustix::termios::tcgetwinsize") {
                 hits.push("tty/term.rs does not call rustix::termios::tcgetwinsize".to_string());
             }
-            let mut rest = code.as_str();
-            while let Some(at) = rest.find("termios::") {
-                let after = &rest[at + "termios::".len()..];
-                let name: String = after
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                    .collect();
-                if name != "tcgetwinsize" {
+            for name in termios_names(&code) {
+                if !TERMIOS_ALLOWED.contains(&name.as_str()) {
                     hits.push(format!("tty/term.rs uses termios::{name}"));
                 }
-                rest = &after[name.len()..];
             }
             for mac in [
                 "write!",
