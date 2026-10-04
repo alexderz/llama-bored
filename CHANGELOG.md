@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.5 — 2026-10-04
+
 ### Fixed
 
 - tty11 SLOTS ctx sparklines are no longer wiped on every model swap (#45). A history is kept per (model display name, slot) and dropped only when its slot has not been on `/slots` for 30 min (or `tty.ctx_history_h`, if shorter), or to make room at the 64-slot cap (the slot away longest goes); a second model loading (A→A+B) leaves A's line alone, and A→B→A within that time resumes A's line, the time away shown as a gap. Only slots on `/slots` are drawn. A slot that comes back after the set of `/running` models changed gets the existing reset marker and drops its held context (the reloaded model's cache is gone); new lines after a swap are marked as before. The conversations a model's slots lost (#9's `evicted`) now outlive an unload and a llama-swap restart for their own 1 h, 16 per model, at most 64 models (oldest loss dropped first), so an eviction can be told across a swap. Drop counts behave as before. No golden changed
