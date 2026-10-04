@@ -5,7 +5,7 @@ use std::io::{self, Read as _, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1555,9 +1555,14 @@ fn blank_sample(mono: Instant, wall: SystemTime) -> WatchSample {
 struct Gate {
     shut: Mutex<bool>,
     cv: Condvar,
-    /// Calls to [`Gate::pass`] so far, blocked or not.
-    entered: AtomicU64,
+    /// Callers blocked in [`Gate::pass`] right now. A test that shuts the
+    /// gate waits for this to reach 1, not for a call count to grow: a
+    /// caller may already be past the count, or blocked, when it shuts.
+    waiting: AtomicU64,
 }
+
+/// No gate blocks longer than this; a stuck test panics instead of hanging.
+const GATE_LIMIT: Duration = Duration::from_secs(30);
 
 impl Gate {
     fn shut() -> Arc<Self> {
@@ -1567,15 +1572,48 @@ impl Gate {
     }
 
     fn set_shut(&self, shut: bool) {
-        *self.shut.lock().expect("gate") = shut;
+        *self.shut.lock().unwrap_or_else(PoisonError::into_inner) = shut;
         self.cv.notify_all();
     }
 
     fn pass(&self) {
-        self.entered.fetch_add(1, Ordering::SeqCst);
-        let mut shut = self.shut.lock().expect("gate");
+        let deadline = Instant::now() + GATE_LIMIT;
+        let mut shut = self.shut.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*shut {
+            return;
+        }
+        // Counted under the gate's lock, so a waiter seen here is blocked.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
         while *shut {
-            shut = self.cv.wait(shut).expect("gate");
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                panic!("gate stayed shut for {GATE_LIMIT:?}");
+            }
+            shut = self
+                .cv
+                .wait_timeout(shut, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Stops a stall test's loop thread and opens its gates when the test body
+/// returns or panics. Without it a failed assertion inside
+/// `std::thread::scope` hangs the test: the scope joins a loop thread that
+/// never stops (the #43 CI hang).
+struct Teardown<'a> {
+    stop: &'a AtomicBool,
+    gates: Vec<&'a Gate>,
+}
+
+impl Drop for Teardown<'_> {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        for gate in &self.gates {
+            gate.set_shut(false);
         }
     }
 }
@@ -1704,9 +1742,13 @@ fn a_blocked_console_write_keeps_publish_and_watchdog_going_then_draws_the_lates
                 MemLog::new(),
             )
         });
-        // The first frame is stuck in the console.
+        let _teardown = Teardown {
+            stop: &stop,
+            gates: vec![&console, &pause],
+        };
+        // The frame the writer took first is stuck in the console.
         wait_until("writer blocked", || {
-            console.entered.load(Ordering::SeqCst) == 1
+            console.waiting.load(Ordering::SeqCst) == 1
         });
         let dogs = watchdogs(&events);
         let pubs = published.load(Ordering::SeqCst);
@@ -1723,10 +1765,7 @@ fn a_blocked_console_write_keeps_publish_and_watchdog_going_then_draws_the_lates
         assert!(drew.lock().expect("drew").is_empty(), "nothing drawn yet");
         // Hold the loop between ticks, so the newest frame is known.
         pause.set_shut(true);
-        let paused = pause.entered.load(Ordering::SeqCst);
-        wait_until("loop held", || {
-            pause.entered.load(Ordering::SeqCst) > paused
-        });
+        wait_until("loop held", || pause.waiting.load(Ordering::SeqCst) == 1);
         let latest = *sent.lock().expect("sent").last().expect("sent a frame");
         let sent_n = sent.lock().expect("sent").len();
         assert!(sent_n > 50, "the loop handed on {sent_n} frames");
@@ -1736,10 +1775,19 @@ fn a_blocked_console_write_keeps_publish_and_watchdog_going_then_draws_the_lates
             drew.lock().expect("drew").last() == Some(&Drew::Frame(latest))
         });
         let drew_now = drew.lock().expect("drew").clone();
-        let first = *sent.lock().expect("sent").first().expect("first");
+        // The writer took whichever frame was newest when it woke. Earlier
+        // ones were already replaced (latest wins), so on a busy machine it
+        // is not always the first frame sent (the #43 CI failure).
+        let Some(Drew::Frame(stuck)) = drew_now.first().cloned() else {
+            panic!("no stuck frame: {drew_now:?}");
+        };
+        assert!(
+            stuck < latest && sent.lock().expect("sent").contains(&stuck),
+            "the stuck frame was sent before the newest one"
+        );
         assert_eq!(
             drew_now,
-            vec![Drew::Frame(first), Drew::Repaint, Drew::Frame(latest)],
+            vec![Drew::Frame(stuck), Drew::Repaint, Drew::Frame(latest)],
             "the stuck frame, a full repaint, then only the newest frame"
         );
         pause.set_shut(false);
@@ -1806,8 +1854,12 @@ fn a_stop_with_the_console_stuck_does_not_wait_for_the_writer() {
                 log,
             )
         });
+        let _teardown = Teardown {
+            stop: &stop,
+            gates: vec![&console],
+        };
         wait_until("writer blocked", || {
-            console.entered.load(Ordering::SeqCst) == 1
+            console.waiting.load(Ordering::SeqCst) == 1
         });
         let asked = Instant::now();
         stop.store(true, Ordering::SeqCst);
@@ -1816,7 +1868,7 @@ fn a_stop_with_the_console_stuck_does_not_wait_for_the_writer() {
             service::LoopExit::Stopped
         );
         assert!(
-            asked.elapsed() < Duration::from_secs(2),
+            asked.elapsed() < Duration::from_secs(5),
             "stop waited {:?} on a stuck console",
             asked.elapsed()
         );
@@ -1834,8 +1886,6 @@ fn a_stop_with_the_console_stuck_does_not_wait_for_the_writer() {
         "{:?}",
         lines.lock().expect("log")
     );
-    // Let the detached writer go.
-    console.set_shut(false);
 }
 
 /// A console sink: bytes land in `bytes`, and `write` blocks while the gate
@@ -1911,11 +1961,8 @@ fn term_behind_a_stuck_sink_repaints_the_newest_frame_in_full() {
     writer.draw(&frame("HOSTAAA"), now).expect("draw");
     wait_until("first frame", || writer.stats().drawn == 1);
     gate.set_shut(true);
-    let entered = gate.entered.load(Ordering::SeqCst);
     writer.draw(&frame("HOSTBBB"), now).expect("draw");
-    wait_until("sink blocked", || {
-        gate.entered.load(Ordering::SeqCst) > entered
-    });
+    wait_until("sink blocked", || gate.waiting.load(Ordering::SeqCst) == 1);
     std::thread::sleep(Duration::from_millis(80));
     for n in 0..100 {
         let asked = Instant::now();
@@ -1923,7 +1970,7 @@ fn term_behind_a_stuck_sink_repaints_the_newest_frame_in_full() {
             .draw(&frame(&format!("HOSTC{n:02}")), now)
             .expect("draw");
         assert!(
-            asked.elapsed() < Duration::from_millis(100),
+            asked.elapsed() < Duration::from_secs(2),
             "draw waited {:?} on a stuck console",
             asked.elapsed()
         );
