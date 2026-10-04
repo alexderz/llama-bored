@@ -50,6 +50,9 @@ pub const PENDING_TTL: Duration = Duration::from_secs(300);
 pub const DISPLACED_TTL: Duration = Duration::from_secs(3_600);
 /// Conversations remembered per model.
 pub const DISPLACED_MAX: usize = 16;
+/// Models whose lost conversations are remembered at once. They outlive an
+/// unload and a llama-swap restart (#45), so the oldest model goes first.
+pub const DISPLACED_MODELS: usize = 64;
 
 /// Why a context dropped. Every value is a guess; see the module docs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -157,8 +160,7 @@ impl Displaced {
     /// Take the newest remembered conversation a `prompt`-token prompt could
     /// be the return of. Expired ones are dropped first.
     pub fn take_match(&mut self, prompt: u64, now: Instant) -> bool {
-        self.sizes
-            .retain(|(_, at)| now.saturating_duration_since(*at) <= DISPLACED_TTL);
+        self.prune(now);
         let fits = |size: u64| {
             let low = size.saturating_mul(7) / 10;
             let high = size.saturating_add((size / 4).max(8_192));
@@ -171,6 +173,18 @@ impl Displaced {
             }
             None => false,
         }
+    }
+
+    /// Forget conversations older than [`DISPLACED_TTL`].
+    pub fn prune(&mut self, now: Instant) {
+        self.sizes
+            .retain(|(_, at)| now.saturating_duration_since(*at) <= DISPLACED_TTL);
+    }
+
+    /// When the newest remembered conversation left.
+    #[must_use]
+    pub fn newest(&self) -> Option<Instant> {
+        self.sizes.iter().map(|(_, at)| *at).max()
     }
 
     /// Conversations remembered now.
