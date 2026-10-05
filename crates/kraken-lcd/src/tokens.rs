@@ -263,14 +263,21 @@ pub const GEN_TAU_S: f64 = 5.0;
 
 /// The current generation rate (#55): an exponential moving average of
 /// the decoded-token counter's intervals with a [`GEN_TAU_S`] time
-/// constant. A gap (no interval: the first reading, a `run_id` change, a
-/// stall or a counter that went down or away) resets it to zero, so prompt
-/// processing and pauses decay it rather than hold the last burst.
+/// constant while tokens flow. Once the counter has not moved over
+/// intervals adding up to [`GEN_IDLE_MS`] (prompt processing, a pause, the
+/// end of a reply) it reads zero rather than a decaying tail. A gap (no
+/// interval: the first reading, a `run_id` change, a stall or a counter that
+/// went down or away) also resets it to zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenRate {
     ema: f64,
+    /// Milliseconds since the counter last moved, over counted intervals.
+    idle_ms: u64,
     seen: bool,
 }
+
+/// The counter standing still this long snaps the current rate to zero.
+pub const GEN_IDLE_MS: u64 = 3_000;
 
 impl GenRate {
     /// Fold in one [`TokenFeed::accept`] step. `counter` says whether the
@@ -282,18 +289,28 @@ impl GenRate {
         self.seen |= counter;
         match step.interval {
             Some((tok, ms)) if ms > 0 => {
+                if tok == 0 {
+                    self.idle_ms = self.idle_ms.saturating_add(u64::from(ms));
+                    if self.idle_ms >= GEN_IDLE_MS {
+                        self.ema = 0.0;
+                        return;
+                    }
+                } else {
+                    self.idle_ms = 0;
+                }
                 let rate = tok as f64 * 1000.0 / f64::from(ms);
                 let dt = f64::from(ms) / 1000.0;
                 self.ema += (rate - self.ema) * (1.0 - (-dt / GEN_TAU_S).exp());
             }
             Some(_) => {}
-            None => self.ema = 0.0,
+            None => self.gap(),
         }
     }
 
     /// A snapshot without a counter reading: a gap.
     pub fn gap(&mut self) {
         self.ema = 0.0;
+        self.idle_ms = 0;
     }
 
     /// tok/s, or `None` until a reading has carried a counter.
