@@ -6,19 +6,21 @@
 //! peak rounded up to 1 · 2 · 5 × 10ⁿ tok/s (at least 10), printed top-left.
 //! The fill is a vertical [`act_color`] gradient at 0.6 α; the line is 1.5 px
 //! `#F4F4F2`. With no data the frame, ticks and labels stay, and the ceiling
-//! reads "—/s".
+//! reads "—/s". The current generation rate (#55) floats over the far
+//! (24 h) end in 24 px ExtraBold, knocked out of the plot, with its unit
+//! "tok/s" in the title row above it.
 
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
-    Point, SpreadMode, Stroke, Transform,
+    PixmapPaint, Point, SpreadMode, Stroke, Transform,
 };
 
 use super::color::{act_color, hex};
 use super::geometry::LayoutGeometry;
 use super::text::{GlyphCache, Pen, TextStyle, Weight};
-use super::{OUTLINE, Rgb, TEXT};
+use super::{BACKGROUND, NO_DATA, OUTLINE, Rgb, TEXT};
 use crate::present::{Ai, View};
-use crate::tokens::{SLOTS, nice_ceiling};
+use crate::tokens::{SLOTS, gen_rate_text, nice_ceiling};
 
 const TICK: Rgb = hex(0x55555C);
 const LABEL_GREY: Rgb = hex(0x7A7A82);
@@ -91,14 +93,109 @@ pub(super) fn draw(
         geom.chart_title_baseline,
         0,
     );
-    write(
-        cache,
-        pixmap,
-        "tokens \u{00B7} 24h",
-        x0 + w,
-        geom.chart_title_baseline,
-        2,
+    // The unit sits in the title row over the numeral, off the data (#55).
+    write(cache, pixmap, UNIT, x0 + w, geom.chart_title_baseline, 2);
+    let tenths = if view.ai == Ai::NoData {
+        None
+    } else {
+        view.gen_tps_tenths
+    };
+    current_rate(cache, pixmap, tenths, (x0 + w, top, base));
+}
+
+/// The title-row caption, right-aligned over the current rate.
+const UNIT: &str = "tok/s";
+/// Current-rate numeral, Inter ExtraBold.
+const NUM_PX: f32 = 24.0;
+/// Hard knockout around the numeral, px.
+const HALO: f32 = 2.0;
+/// Soft dark backing around the knockout, px past the glyphs.
+const GLOW: f32 = 5.0;
+/// The backing's opacity.
+const GLOW_ALPHA: f32 = 0.55;
+
+/// The current generation rate (#55), "Hover": a large numeral right-aligned
+/// at the plot's far end and centred in it, over a soft dark backing and a
+/// hard black knockout so it reads over a bright fill. Its ink, knockout and
+/// backing stay inside the plot, clear of the title row and the ticks.
+/// Zero and "—" are no-data grey.
+fn current_rate(
+    cache: &mut GlyphCache,
+    pixmap: &mut Pixmap,
+    tenths: Option<u32>,
+    (right, top, base): (f32, f32, f32),
+) {
+    let text = gen_rate_text(tenths);
+    let color = match tenths {
+        Some(t) if t > 0 => TEXT,
+        _ => NO_DATA,
+    };
+    let style = TextStyle {
+        px: NUM_PX,
+        weight: Weight::ExtraBold,
+        color,
+        tracking_em: 0.0,
+    };
+    let knock = TextStyle {
+        color: BACKGROUND,
+        ..style
+    };
+    let measured = cache.measure(&text, NUM_PX, Weight::ExtraBold, 0.0);
+    let pen = Pen {
+        x: (right - HALO - measured.ink_right).round(),
+        baseline: ((top + base + measured.above_baseline) * 0.5).round(),
+    };
+    // The backing: the glyphs grown by GLOW, drawn off-screen at full
+    // strength, then laid down at GLOW_ALPHA so the fill shows through.
+    let pad = GLOW + 1.0;
+    let gx = pen.x - pad;
+    let gy = pen.baseline - measured.above_baseline - pad;
+    let size = (
+        (measured.ink_right + pad * 2.0).ceil() as u32,
+        (measured.above_baseline + pad * 2.0 + 2.0).ceil() as u32,
     );
+    if let Some(mut glow) = Pixmap::new(size.0, size.1) {
+        let at = Pen {
+            x: pen.x - gx,
+            baseline: pen.baseline - gy,
+        };
+        for radius in 1..=GLOW as u8 {
+            halo(cache, &mut glow, &text, at, knock, f32::from(radius));
+        }
+        pixmap.draw_pixmap(
+            gx as i32,
+            gy as i32,
+            glow.as_ref(),
+            &PixmapPaint {
+                opacity: GLOW_ALPHA,
+                ..PixmapPaint::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+    halo(cache, pixmap, &text, pen, knock, HALO * 0.5);
+    halo(cache, pixmap, &text, pen, knock, HALO);
+    cache.draw(pixmap, &text, pen, style);
+}
+
+/// `text` drawn at sixteen points on a circle of `radius` around `pen`.
+fn halo(
+    cache: &mut GlyphCache,
+    pixmap: &mut Pixmap,
+    text: &str,
+    pen: Pen,
+    style: TextStyle,
+    radius: f32,
+) {
+    for k in 0..16 {
+        let angle = k as f32 * std::f32::consts::TAU / 16.0;
+        let at = Pen {
+            x: pen.x + angle.cos() * radius,
+            baseline: pen.baseline + angle.sin() * radius,
+        };
+        cache.draw(pixmap, text, at, style);
+    }
 }
 
 /// "100/s", "2k/s".

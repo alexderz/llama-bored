@@ -1,6 +1,8 @@
 //! Tokens · 24 h: the 40-point integer cascade and its counter feed.
 
-use kraken_lcd::tokens::{Bucket, SLOTS, TIERS, TokenChart, TokenFeed};
+use kraken_lcd::tokens::{
+    Bucket, GEN_TAU_S, GenRate, SLOTS, TIERS, TokenChart, TokenFeed, gen_rate_text, hold_gen_tenths,
+};
 use llama_core::sample::TokenReading;
 
 fn reading(run_id: u64, seq: u64, t_ms: u64, total: Option<u64>) -> TokenReading {
@@ -171,4 +173,137 @@ fn a_counter_reset_or_model_swap_is_a_gap_not_a_negative() {
         points.iter().all(|rate| (*rate - 50.0).abs() < 1e-3),
         "5 tokens per 100 ms is 50 tok/s either side of the reset: {points:?}"
     );
+}
+
+#[test]
+fn current_rate_text_at_each_range() {
+    assert_eq!(gen_rate_text(None), "\u{2014}", "no counter or no data");
+    assert_eq!(gen_rate_text(Some(0)), "0", "idle");
+    assert_eq!(gen_rate_text(Some(1)), "0.1");
+    assert_eq!(gen_rate_text(Some(75)), "7.5");
+    assert_eq!(gen_rate_text(Some(99)), "9.9");
+    assert_eq!(gen_rate_text(Some(100)), "10");
+    assert_eq!(gen_rate_text(Some(1_120)), "112");
+    assert_eq!(gen_rate_text(Some(9_990)), "999");
+    assert_eq!(gen_rate_text(Some(10_000)), "1.0k");
+    assert_eq!(gen_rate_text(Some(12_000)), "1.2k");
+    assert_eq!(gen_rate_text(Some(99_000)), "9.9k");
+    assert_eq!(gen_rate_text(Some(120_000)), "12k");
+    assert_eq!(gen_rate_text(Some(1_250_000)), "125k");
+}
+
+/// One fresh reading every `step_ms` with `tok` new tokens.
+fn feed_rate(
+    rate: &mut GenRate,
+    feed: &mut TokenFeed,
+    start: (u64, u64),
+    n: u64,
+    step_ms: u64,
+    tok: u64,
+) -> (u64, u64) {
+    let (mut seq, mut total) = start;
+    for _ in 0..n {
+        seq += 1;
+        total += tok;
+        let r = reading(1, seq, seq * step_ms, Some(total));
+        rate.step(feed.accept(r), true);
+    }
+    (seq, total)
+}
+
+#[test]
+fn current_rate_is_a_five_second_average_reset_by_a_gap() {
+    let mut rate = GenRate::default();
+    assert_eq!(rate.rate(), None, "no counter yet");
+    let mut feed = TokenFeed::new(2.0);
+    // A reading without a counter is still no counter.
+    rate.step(feed.accept(reading(1, 0, 0, None)), false);
+    assert_eq!(rate.rate(), None);
+
+    // 500 ms ticks, 50 tokens each: 100 tok/s.
+    let at = feed_rate(&mut rate, &mut feed, (0, 0), 1, 500, 0);
+    assert_eq!(rate.rate(), Some(0.0), "the first counted reading is a gap");
+    let at = feed_rate(&mut rate, &mut feed, at, 10, 500, 50);
+    // After 5 s (one time constant) it has covered 1 − 1/e of the step.
+    let expect = 100.0 * (1.0 - (-5.0 / GEN_TAU_S).exp()) as f32;
+    let got = rate.rate().expect("seen");
+    assert!((got - expect).abs() < 0.01, "{got} vs {expect}");
+    let at = feed_rate(&mut rate, &mut feed, at, 120, 500, 50);
+    assert!((rate.rate().expect("seen") - 100.0).abs() < 0.1);
+
+    // Prefill: no new tokens. It decays, it does not hold.
+    let at = feed_rate(&mut rate, &mut feed, at, 10, 500, 0);
+    let decayed = rate.rate().expect("seen");
+    assert!(
+        (decayed - 100.0 / std::f32::consts::E).abs() < 0.1,
+        "{decayed}"
+    );
+
+    // A re-read changes nothing.
+    rate.step(feed.accept(reading(1, at.0, at.0 * 500, Some(at.1))), true);
+    assert_eq!(rate.rate(), Some(decayed));
+
+    // A stall longer than max_gap_s resets to zero.
+    let (seq, total) = at;
+    rate.step(
+        feed.accept(reading(1, seq + 1, seq * 500 + 3_000, Some(total + 300))),
+        true,
+    );
+    assert_eq!(rate.rate(), Some(0.0), "stall");
+
+    // So does a run_id change, and a snapshot without a reading.
+    let at = feed_rate(&mut rate, &mut feed, (seq + 1, total + 300), 20, 500, 50);
+    assert!(rate.rate().expect("seen") > 10.0);
+    rate.step(feed.accept(reading(9, 0, at.0 * 500 + 500, Some(5))), true);
+    assert_eq!(rate.rate(), Some(0.0), "run_id change");
+    rate.step(
+        feed.accept(reading(9, 1, at.0 * 500 + 1_000, Some(55))),
+        true,
+    );
+    assert!(rate.rate().expect("seen") > 0.0);
+    rate.gap();
+    assert_eq!(rate.rate(), Some(0.0), "missing reading");
+}
+
+#[test]
+fn current_rate_holds_inside_a_thirty_percent_margin() {
+    // No shown value: round to the range's step.
+    assert_eq!(hold_gen_tenths(7.46, None), 75);
+    assert_eq!(hold_gen_tenths(112.4, None), 1_120);
+    assert_eq!(hold_gen_tenths(1_234.0, None), 12_000);
+    assert_eq!(hold_gen_tenths(12_345.0, None), 120_000);
+    assert_eq!(hold_gen_tenths(0.04, None), 0);
+    assert_eq!(hold_gen_tenths(f32::NAN, None), 0);
+    assert_eq!(hold_gen_tenths(-3.0, None), 0);
+
+    // Below 10: step 0.1, held within 0.08.
+    assert_eq!(hold_gen_tenths(7.57, Some(75)), 75);
+    assert_eq!(hold_gen_tenths(7.43, Some(75)), 75);
+    assert_eq!(hold_gen_tenths(7.59, Some(75)), 76);
+    assert_eq!(hold_gen_tenths(7.41, Some(75)), 74);
+    // 10..999: step 1, held within 0.8.
+    assert_eq!(hold_gen_tenths(112.79, Some(1_120)), 1_120);
+    assert_eq!(hold_gen_tenths(111.21, Some(1_120)), 1_120);
+    assert_eq!(hold_gen_tenths(112.81, Some(1_120)), 1_130);
+    assert_eq!(hold_gen_tenths(111.19, Some(1_120)), 1_110);
+    // From 1000: step 100, held within 80.
+    assert_eq!(hold_gen_tenths(1_279.0, Some(12_000)), 12_000);
+    assert_eq!(hold_gen_tenths(1_121.0, Some(12_000)), 12_000);
+    assert_eq!(hold_gen_tenths(1_281.0, Some(12_000)), 13_000);
+    // Across the 10 tok/s edge: 10 holds down to 9.2, then 0.1 steps.
+    assert_eq!(hold_gen_tenths(9.3, Some(100)), 100);
+    assert_eq!(hold_gen_tenths(9.1, Some(100)), 91);
+    assert_eq!(hold_gen_tenths(9.9, Some(99)), 99);
+    assert_eq!(hold_gen_tenths(10.2, Some(99)), 100);
+    // Idle: 0.1 decays to 0 once below 0.02.
+    assert_eq!(hold_gen_tenths(0.03, Some(1)), 1);
+    assert_eq!(hold_gen_tenths(0.01, Some(1)), 0);
+
+    // A noisy 112 ± 0.6 never changes the text.
+    let mut shown = Some(hold_gen_tenths(112.0, None));
+    for k in 0..200 {
+        let raw = 112.0 + 0.6 * ((k as f32) * 0.7).sin();
+        shown = Some(hold_gen_tenths(raw, shown));
+        assert_eq!(shown, Some(1_120), "k = {k}, raw = {raw}");
+    }
 }

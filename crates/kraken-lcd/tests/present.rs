@@ -820,6 +820,57 @@ fn tokens_feed_the_24h_chart() {
 }
 
 #[test]
+fn current_generation_rate_reaches_the_view() {
+    // No counter yet: no rate, so the face draws "—".
+    let (history, now) = ring_history(10.0);
+    let fresh = present(&snapshot(now), &history, None, &Config::default());
+    assert_eq!(fresh.gen_tps_tenths, None);
+
+    // 9 tokens per 100 ms is 90 tok/s. Change mode climbs in held steps
+    // and changes the frame key only when the text moves.
+    let mut drive = Drive::new(59_000_000_000_000);
+    let first = drive.run(&Config::default(), 1, 9, |_| Some(70.0)).clone();
+    assert_eq!(first.gen_tps_tenths, Some(0), "the first reading is a gap");
+    let mut changes = 0;
+    let mut last = first.gen_tps_tenths;
+    for _ in 0..600 {
+        let view = drive.run(&Config::default(), 1, 9, |_| Some(70.0));
+        if view.gen_tps_tenths != last {
+            changes += 1;
+            last = view.gen_tps_tenths;
+        }
+    }
+    assert_eq!(last, Some(900), "settles on 90 tok/s");
+    assert!(changes < 120, "held steps, not one per frame: {changes}");
+    // A steady 90 tok/s holds.
+    let held = drive.run(&Config::default(), 100, 9, |_| Some(70.0));
+    assert_eq!(held.gen_tps_tenths, Some(900));
+
+    // Stream mode shows the average, rounded, every frame.
+    let mut stream_drive = Drive::new(60_000_000_000_000);
+    stream_drive.run(&stream(), 1, 9, |_| Some(70.0));
+    let early = stream_drive.run(&stream(), 10, 9, |_| Some(70.0)).clone();
+    // 1 s at 90 tok/s with τ = 5 s: 90 × (1 − e^−0.2) ≈ 16.3.
+    assert_eq!(early.gen_tps_tenths, Some(160));
+    let next = stream_drive.run(&stream(), 1, 9, |_| Some(70.0));
+    assert_eq!(next.gen_tps_tenths, Some(180), "no hold in stream mode");
+
+    // Prefill or idle: the counter stops and the rate decays toward zero:
+    // 90 × e^−2 after 10 s, and "0" within a minute.
+    let prefill = drive.run(&Config::default(), 100, 0, |_| Some(70.0));
+    assert_eq!(prefill.gen_tps_tenths, Some(120));
+    let quiet = drive.run(&Config::default(), 500, 0, |_| Some(70.0));
+    assert_eq!(quiet.gen_tps_tenths, Some(0));
+
+    // No data clears it.
+    let previous = drive.view.clone();
+    let mut snap = snapshot(drive.origin + Duration::from_secs(3_600));
+    snap.ai = AiState::NoData;
+    let gone = present(&snap, &history, previous.as_ref(), &Config::default());
+    assert_eq!(gone.gen_tps_tenths, None);
+}
+
+#[test]
 fn stream_mode_carries_the_fill_sweeps_on_the_slow_tiers_only() {
     let mut drive = Drive::new(54_000_000_000_000 + 90_000_000_000);
     let view = drive.run(&stream(), 3, 0, |_| Some(50.0)).clone();

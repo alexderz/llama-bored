@@ -115,5 +115,6 @@
     360,
     353
   ],
-  "variant": "a3"
+  "variant": "a3",
+  "gen_tps_tenths": 1050
 }
