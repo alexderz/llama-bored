@@ -137,7 +137,8 @@ pub fn detect_layout(vcsa: &[u8], vcsu: Option<&[u8]>) -> Option<AttrLayout> {
 
 /// Glyphs the tty11 font actually draws. Same set `llama-watch` emits
 /// (`llama_watch::tty::term::GLYPHS`), including the lower eighths that
-/// `chart_glyphs = "eighths"` draws with llama-hack-12x24.
+/// `chart_glyphs = "eighths"` draws with llama-hack-12x24, the meter bars'
+/// `▇` included (#52).
 const GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '▁', '▂', '▃', '▅', '▆', '▇',
 ];

@@ -87,6 +87,39 @@ pub struct Activity {
     pub err: bool,
 }
 
+/// One item on a SETUP row (#52): `kv q8_0`, drawn after `sep`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupItem {
+    /// Separator before the item; the row's first item draws none.
+    pub sep: String,
+    /// Display text from a `[setup]` rule. Printable ASCII or `·`.
+    pub text: String,
+    /// A rule's `default` (nothing was set): drawn grey.
+    pub dim: bool,
+}
+
+/// One SETUP row: its label and items, most important first.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupRow {
+    pub label: String,
+    pub items: Vec<SetupItem>,
+}
+
+/// The SETUP block (#52) under the meters: the model generating now, or
+/// else the one used last, and its settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupView {
+    /// llama-swap model id, sanitised.
+    pub id: String,
+    /// llama-swap `name` (or alias). Drawn after the id when it fits and
+    /// differs from it.
+    pub name: String,
+    /// Other models loaded: `+N` at the right of the title.
+    pub more: usize,
+    /// Rows in order; the block drops the last ones when short of room.
+    pub rows: Vec<SetupRow>,
+}
+
 /// Plain data for one frame. T22 fills it. Text fields are untrusted and are
 /// passed through [`sanitize`] before they are placed.
 #[derive(Clone, Debug)]
@@ -94,8 +127,8 @@ pub struct TtyModel {
     pub state: WatchState,
     pub host: String,
     pub model_name: String,
-    /// Tuning detail of the first model (`262k · kv q8_0 · PTQ1_0`). Empty
-    /// draws nothing.
+    /// Header detail of the first model: its engine (#33). The settings
+    /// themselves are in [`Self::setup`] since #52. Empty draws nothing.
     pub model_detail: String,
     /// The first model has sat in llama-swap `stopping` for over a minute.
     pub model_stuck: bool,
@@ -164,15 +197,19 @@ pub struct TtyModel {
     pub fans: Option<FanPanel>,
     /// Hours the SLOTS sparklines span (`tty.ctx_history_h`).
     pub ctx_history_h: u32,
+    /// SETUP block under the meters (#52). `None` collapses it.
+    pub setup: Option<SetupView>,
 }
 
 /// Narrowest console the dashboard draws: the RECENT columns' floor.
 pub const MIN_COLS: u16 = 160;
 /// Shortest console the dashboard draws (#7). Rows 0-14 are the header, a
-/// rule, the six meters and ACTIVITY; then a rule, the RECENT header, 4
-/// request rows, the legend and the RECENT rule; then the health rule, the
-/// health line and the blank last row: 26. Each SLOTS row past the first
-/// pushes RECENT down a row, and it shows fewer requests.
+/// rule, the six meters, ACTIVITY and the SETUP rows that fit beside SLOTS
+/// (#52); then a rule, the RECENT header, 4 request rows, the legend and
+/// the RECENT rule; then the health rule, the health line and the blank
+/// last row: 26. Each SLOTS row past the first pushes RECENT down a row,
+/// and it shows fewer requests. From [`FULL_ROWS`] SETUP takes up to two
+/// more rows.
 pub const MIN_ROWS: u16 = 26;
 /// From this height the text-on layout keeps IN/OUT: the chart shrinks or
 /// hides first. Below it panels drop in order: IN/OUT, then FANS, then the
@@ -196,7 +233,7 @@ pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
     draw_rates(&mut grid, model, &g);
     draw_slots(&mut grid, model, &g);
     let stats_end = g.meter_last.max(g.slot_last);
-    let mid_rule = stats_end + 2;
+    let mid_rule = draw_setup(&mut grid, model, &g, stats_end + 2);
     draw_rule(&mut grid, mid_rule, g.cols);
     let req_header = mid_rule + 1;
     if model.show_text && (rows >= FULL_ROWS || text_fits(model, &g, req_header)) {
@@ -258,7 +295,9 @@ struct Geom {
 impl Geom {
     fn new(cols: u16, rows: u16) -> Self {
         let tall = rows >= 90;
-        let pitch: u16 = if tall { 3 } else { 2 };
+        // #52: one meter per row; the bars' short glyph keeps the rows
+        // apart. Tall screens keep two-row bars with a blank row between.
+        let pitch: u16 = if tall { 3 } else { 1 };
         let bar_rows: u16 = if tall { 2 } else { 1 };
         let meter_last = 3 + 5 * pitch + (bar_rows - 1);
         let left_bar = 27u16;
@@ -293,6 +332,33 @@ impl Geom {
 
     fn prompt_x(&self) -> u16 {
         self.right.saturating_add(self.half).saturating_add(3)
+    }
+
+    /// Row of the ACTIVITY bar, right under LOAD.
+    fn activity_row(&self) -> u16 {
+        3 + 5 * self.pitch + self.bar_rows
+    }
+
+    /// Last column of the left half: where the meter bars end.
+    fn left_end(&self) -> u16 {
+        self.left_bar + self.left_bar_w - 1
+    }
+
+    /// Single-spaced meters draw whole cells of a short block (#52).
+    fn meter_cells(&self, glyphs: ChartGlyphs) -> Option<char> {
+        (self.pitch == 1).then_some(meter_glyph(glyphs))
+    }
+}
+
+/// The lower seven-eighths block `▇` with a llama-hack font, which leaves
+/// an eighth of a cell (3 pixels) between stacked meters. eurlatgr lacks
+/// it, so `chart_glyphs = "halves"` (the setting that says which font is
+/// loaded) uses the lower half `▄` it does have (#52).
+#[must_use]
+pub fn meter_glyph(glyphs: ChartGlyphs) -> char {
+    match glyphs {
+        ChartGlyphs::Eighths => '\u{2587}',
+        ChartGlyphs::Halves => '\u{2584}',
     }
 }
 
@@ -447,24 +513,29 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
     col_u16(end.saturating_add(3))
 }
 
-/// Grey detail text. Printable ASCII and the `·` separator are drawn, any
-/// other scalar is `?`. Returns the cells used.
+/// Grey detail text. Printable ASCII, the `·` separator and `…` are drawn,
+/// any other scalar is `?`. Returns the cells used.
 fn paint_detail(grid: &mut Grid, col: usize, row: usize, text: &str, cap: usize) -> usize {
+    paint_detail_fg(grid, col, row, text, cap, C16::BrightBlack)
+}
+
+/// [`paint_detail`] in `fg`.
+fn paint_detail_fg(
+    grid: &mut Grid,
+    col: usize,
+    row: usize,
+    text: &str,
+    cap: usize,
+    fg: C16,
+) -> usize {
     let mut drawn = 0;
     for ch in text.chars().take(cap) {
-        let ch = if ch == '\u{00B7}' || ('\u{20}'..='\u{7e}').contains(&ch) {
+        let ch = if matches!(ch, '\u{00B7}' | '\u{2026}') || ('\u{20}'..='\u{7e}').contains(&ch) {
             ch
         } else {
             '?'
         };
-        paint_at(
-            grid,
-            col.saturating_add(drawn),
-            row,
-            ch,
-            C16::BrightBlack,
-            C16::Black,
-        );
+        paint_at(grid, col.saturating_add(drawn), row, ch, fg, C16::Black);
         drawn += 1;
     }
     drawn
@@ -527,6 +598,147 @@ fn draw_rule(grid: &mut Grid, row: u16, cols: u16) {
     }
 }
 
+/// SETUP rows (title included) on a screen under 60 rows, and from 60.
+const SETUP_ROWS: u16 = 6;
+const SETUP_ROWS_TALL: u16 = 8;
+/// SETUP row labels start here; their items at [`SETUP_VALUE_X`].
+const SETUP_LABEL_X: u16 = 4;
+const SETUP_VALUE_X: u16 = 13;
+const SETUP_TITLE: &str = "SETUP";
+
+/// The SETUP block (#52) under ACTIVITY, a blank row below it, left
+/// aligned under the meters. Returns the mid rule's row: `base_rule`
+/// (the row the meters and SLOTS want) or just under the block.
+///
+/// The rows beside SLOTS are free. From [`FULL_ROWS`] the block may take
+/// more, up to [`SETUP_ROWS`] in all ([`SETUP_ROWS_TALL`] from 60 rows),
+/// pushing RECENT down; a shorter screen keeps its panels (#7) and the
+/// block gets only the free rows. The last rows drop first. No view
+/// (nothing loaded, llama-swap down) draws nothing and leaves the rule
+/// where it was.
+fn draw_setup(grid: &mut Grid, model: &TtyModel, g: &Geom, base_rule: u16) -> u16 {
+    let Some(view) = &model.setup else {
+        return base_rule;
+    };
+    if !matches!(model.state, WatchState::Generating | WatchState::Ready) {
+        return base_rule;
+    }
+    let top = g
+        .activity_row()
+        .saturating_add(g.bar_rows)
+        .saturating_add(1);
+    let free = base_rule.saturating_sub(top);
+    let cap = if g.rows >= 60 {
+        SETUP_ROWS_TALL
+    } else {
+        SETUP_ROWS
+    };
+    let budget = if g.rows >= FULL_ROWS {
+        free.max(cap)
+    } else {
+        free
+    };
+    if budget == 0 {
+        return base_rule;
+    }
+    let right = usize::from(g.left_end());
+    draw_setup_title(grid, view, top, right);
+    let mut used: u16 = 1;
+    for row in &view.rows {
+        if used >= budget {
+            break;
+        }
+        draw_setup_row(grid, row, top.saturating_add(used), right);
+        used += 1;
+    }
+    base_rule.max(top.saturating_add(used))
+}
+
+/// `SETUP  <id> · <name>` with `+N` at the right end. The name only when
+/// it fits whole; the id is cut with `…` when even it does not.
+fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
+    paint_str(grid, 2, row, SETUP_TITLE, C16::White, C16::Black);
+    let x = 2 + SETUP_TITLE.len() + 2;
+    let mut end = right.saturating_add(1);
+    if view.more > 0 {
+        let more = format!("+{}", view.more);
+        let at = end.saturating_sub(more.chars().count());
+        paint_str(grid, col_u16(at), row, &more, C16::BrightYellow, C16::Black);
+        end = at.saturating_sub(2);
+    }
+    let room = end.saturating_sub(x);
+    let id = cut_text(&view.id, room);
+    paint_detail_fg(grid, x, usize::from(row), &id, room, C16::BrightWhite);
+    let name = &view.name;
+    if name.is_empty() || *name == view.id {
+        return;
+    }
+    let after = x + id.chars().count();
+    let text = format!("{}{name}", llama_core::detail::SEPARATOR);
+    if after + text.chars().count() <= end {
+        paint_detail(grid, after, usize::from(row), &text, end - after);
+    }
+}
+
+/// `  label    item · item`: the items that fit whole, else the first cut.
+fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
+    let label: String = setup.label.chars().take(8).collect();
+    paint_detail(
+        grid,
+        usize::from(SETUP_LABEL_X),
+        usize::from(row),
+        &label,
+        8,
+    );
+    let x = usize::from(SETUP_VALUE_X);
+    let room = right.saturating_add(1).saturating_sub(x);
+    let mut keep = setup.items.len();
+    while keep > 1 && setup_items_width(&setup.items[..keep]) > room {
+        keep -= 1;
+    }
+    let mut col = x;
+    for (i, item) in setup.items[..keep].iter().enumerate() {
+        if i > 0 {
+            col += paint_detail(grid, col, usize::from(row), &item.sep, room - (col - x));
+        }
+        let left = room.saturating_sub(col - x);
+        let text = cut_text(&item.text, left);
+        let fg = if item.dim {
+            C16::BrightBlack
+        } else {
+            C16::BrightWhite
+        };
+        col += paint_detail_fg(grid, col, usize::from(row), &text, left, fg);
+    }
+}
+
+/// `text`, or its first `width - 1` characters and `…`. No sanitising:
+/// [`paint_detail_fg`] draws only printable ASCII, `·` and `…`.
+fn cut_text(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    match width {
+        0 => String::new(),
+        n => text
+            .chars()
+            .take(n - 1)
+            .chain(std::iter::once('\u{2026}'))
+            .collect(),
+    }
+}
+
+fn setup_items_width(items: &[SetupItem]) -> usize {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let sep = if i > 0 { item.sep.chars().count() } else { 0 };
+            sep + item.text.chars().count()
+        })
+        .sum()
+}
+
 fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     // The bool is "a level": a spectrum along the bar. VRAM and MEM are
     // capacity and keep one band colour for the whole bar.
@@ -585,32 +797,35 @@ fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 frac,
                 ink,
                 rows: g.bar_rows,
+                cells: g.meter_cells(model.chart_glyphs),
             },
         );
     }
     draw_one_meter(
         grid,
         g,
+        model,
         "ACTIVITY",
         activity_value(model),
         model.activity_pct,
-        3 + 5 * g.pitch + g.bar_rows,
-        starting,
+        g.activity_row(),
     );
 }
 
 fn draw_one_meter(
     grid: &mut Grid,
     g: &Geom,
+    model: &TtyModel,
     label: &str,
     value: String,
     percent: Option<f64>,
     row: u16,
-    starting: bool,
 ) {
     if row + 1 >= grid.rows() {
         return;
     }
+    let starting = model.state == WatchState::Starting;
+    let cells = g.meter_cells(model.chart_glyphs);
     paint_str(grid, 2, row, label, C16::White, C16::Black);
     let shown = if starting { "--".to_string() } else { value };
     let value_fg = if starting || shown == "--" {
@@ -636,6 +851,7 @@ fn draw_one_meter(
             frac,
             ink: level_ink(pct),
             rows: g.bar_rows,
+            cells,
         },
     );
 }
@@ -755,13 +971,23 @@ struct HBar {
     frac: Option<f64>,
     ink: BarInk,
     rows: u16,
+    /// `Some(glyph)`: whole cells of `glyph` (#52's single-spaced meters),
+    /// no half-cell ends. `None`: half-cell resolution with full blocks.
+    cells: Option<char>,
 }
 
 fn draw_h_bar(grid: &mut Grid, bar: HBar) {
     let width = usize::from(bar.width);
-    let lit = lit_halves(bar.frac, width);
+    let lit = match bar.cells {
+        Some(_) => lit_cells(bar.frac, width),
+        None => lit_halves(bar.frac, width),
+    };
     for i in 0..width {
-        let ch = bar_glyph(i, lit);
+        let ch = match bar.cells {
+            Some(glyph) if i < lit => glyph,
+            Some(_) => '░',
+            None => bar_glyph(i, lit),
+        };
         let (fg_top, fg_bot) = match bar.ink {
             _ if ch == '░' => (C16::BrightBlack, C16::BrightBlack),
             BarInk::Fixed(top, bot) => (top, bot),
@@ -803,6 +1029,16 @@ fn lit_halves(frac: Option<f64>, width: usize) -> usize {
         Some(frac) if frac > 0.0 && width > 0 => {
             let tw = width * 2;
             ((frac * tw as f64).round() as usize).clamp(2, tw)
+        }
+        _ => 0,
+    }
+}
+
+/// Lit whole cells `clamp(round(frac × W), 1, W)`; 0 for no fill.
+fn lit_cells(frac: Option<f64>, width: usize) -> usize {
+    match frac {
+        Some(frac) if frac > 0.0 && width > 0 => {
+            ((frac * width as f64).round() as usize).clamp(1, width)
         }
         _ => 0,
     }
@@ -915,6 +1151,7 @@ fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64
             frac,
             ink: BarInk::Spectrum { hot },
             rows,
+            cells: None,
         },
     );
 }
@@ -1144,6 +1381,7 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 frac,
                 ink: BarInk::Fixed(fill, fill),
                 rows: 1,
+                cells: None,
             },
         );
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
@@ -1344,6 +1582,7 @@ fn paint_slot_spark(
                 frac: Some(frac),
                 ink: BarInk::Spectrum { hot: false },
                 rows: 1,
+                cells: None,
             },
         );
     }
@@ -1516,6 +1755,7 @@ fn paint_slot_ctx(grid: &mut Grid, row: u16, after_decoded: u16, cols: u16, slot
                 frac: Some(frac),
                 ink: BarInk::Spectrum { hot: false },
                 rows: 1,
+                cells: None,
             },
         );
         meter_x.saturating_sub(gap + label_w)
@@ -2061,6 +2301,7 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
                 frac,
                 ink,
                 rows: 1,
+                cells: None,
             },
         );
         if req.err {
@@ -2743,6 +2984,7 @@ fn draw_fan_row(grid: &mut Grid, fan: &FanReading, left: u16, width: usize, row:
                     BarInk::Spectrum { hot: false }
                 },
                 rows: 1,
+                cells: None,
             },
         );
         col += col_u16(bar_w) + 1;

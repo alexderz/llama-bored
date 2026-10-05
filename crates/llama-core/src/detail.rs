@@ -3,8 +3,9 @@
 //!
 //! The watcher derives it from the llama-swap launch command
 //! (`llama-watch` `sources::cmdline`). Only numbers and short allowlisted
-//! tokens are kept, never a path or a raw argument. The tty draws [`line`];
-//! the LCD draws [`fitted`] to its chord.
+//! tokens are kept, never a path or a raw argument. The LCD draws
+//! [`fitted`] to its chord; the tty shows these facts in its SETUP block
+//! (#52), which `llama-watch`'s `[setup]` rules build.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +47,8 @@ pub struct ModelDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fa: Option<bool>,
     /// KV cache block size in tokens, 1..=[`MAX_KV_BLOCK`] (vLLM's
-    /// `cache_config_info` `block_size`, #31). The tty draws it; the LCD does not.
+    /// `cache_config_info` `block_size`, #31). The tty's SETUP draws it;
+    /// the LCD does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block: Option<u32>,
     /// Prefix caching on or off (vLLM's `enable_prefix_caching`, #31).
@@ -75,23 +77,6 @@ pub fn is_valid(detail: &ModelDetail) -> bool {
         && detail
             .kv_block
             .is_none_or(|block| (1..=MAX_KV_BLOCK).contains(&block))
-}
-
-/// The engine's own cache facts for the tty (#31): `block 16`, `prefix on`.
-/// Empty when the server reported none. Not part of [`line`] or the LCD.
-#[must_use]
-pub fn engine_items(detail: &ModelDetail) -> Vec<String> {
-    let mut items = Vec::new();
-    if let Some(block) = detail
-        .kv_block
-        .filter(|block| (1..=MAX_KV_BLOCK).contains(block))
-    {
-        items.push(format!("block {block}"));
-    }
-    if let Some(on) = detail.prefix_cache {
-        items.push(if on { "prefix on" } else { "prefix off" }.to_owned());
-    }
-    items
 }
 
 /// [`fitted`] with `head` (the LCD's engine, #33) kept first and `tail`
@@ -433,19 +418,16 @@ mod tests {
     }
 
     #[test]
-    fn engine_items_are_block_and_prefix_only() {
-        let mut detail = ModelDetail::default();
-        assert!(engine_items(&detail).is_empty());
-        detail.kv_block = Some(16);
-        detail.prefix_cache = Some(true);
-        assert_eq!(engine_items(&detail), ["block 16", "prefix on"]);
+    fn block_and_prefix_stay_off_the_shared_line() {
+        let mut detail = ModelDetail {
+            kv_block: Some(16),
+            prefix_cache: Some(true),
+            ..ModelDetail::default()
+        };
         assert_eq!(line(&detail), "kv f16", "not on the shared line");
-        detail.prefix_cache = Some(false);
-        assert_eq!(engine_items(&detail), ["block 16", "prefix off"]);
         assert!(is_valid(&detail));
         detail.kv_block = Some(0);
         assert!(!is_valid(&detail));
-        assert_eq!(engine_items(&detail), ["prefix off"]);
         detail.kv_block = Some(MAX_KV_BLOCK + 1);
         assert!(!is_valid(&detail));
     }

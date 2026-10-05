@@ -3,12 +3,15 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use llama_core::backend::{Backend, BackendInfo, EngineStats};
+use llama_core::detail::ModelDetail;
 use llama_watch::collector::LoadSource;
 use llama_watch::config::ChartGlyphs;
+use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
-    Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState, layout, replay_shown,
+    Activity, HealthSeg, HealthStatus, SetupView, Slot, TtyModel, WatchState, layout, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -221,7 +224,10 @@ fn slot_context_fits_at_160x48_and_240x67() {
         let row = row_with(&grid, "91k/262k");
         let text = row_string(&grid, row);
         let tok = char_at(&text, "612 tok");
-        let label = char_at(&text, "ctx");
+        // The slot's own `ctx`, right of decoded (SETUP's ctx row may
+        // share the line on the left, #52).
+        let after: String = text.chars().skip(tok).collect();
+        let label = tok + char_at(&after, "ctx");
         let value = char_at(&text, "91k/262k");
         assert!(
             tok < label && label < value,
@@ -743,7 +749,7 @@ fn huge_model_name_does_not_panic_or_spill() {
         header.contains("slots"),
         "slots label was pushed off: {header}"
     );
-    let request = full_row(&grid, 17);
+    let request = full_row(&grid, row_with(&grid, "RECENT") + 1);
     let qwen = find_chars(&request, "Qwen 35B").expect("model column overwritten");
     let mark = find_chars(&request, "…").expect("overlong source was not clipped");
     assert!(mark < qwen, "source ellipsis ran into the model: {request}");
@@ -1888,7 +1894,48 @@ fn sample(state: WatchState) -> TtyModel {
         chart_glyphs: ChartGlyphs::Halves,
         fans: None,
         ctx_history_h: 6,
+        setup: match state {
+            WatchState::Generating | WatchState::Ready => Some(qwen_setup()),
+            WatchState::AiDown | WatchState::Starting | WatchState::NoLlama => None,
+        },
     }
+}
+
+/// An invented llama.cpp launch for the sample model (#52).
+const QWEN_CMD: &str = "/opt/llama.cpp/bin/llama-server --port 5810 -m /models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ncmoe 16 --spec-type draft-mtp --spec-draft-n-max 3 --reasoning-budget 24000 --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0";
+
+/// SETUP for `cmd` through the built-in rules, as llama-watch builds it.
+fn setup_of(
+    id: &str,
+    name: &str,
+    cmd: &str,
+    backend: Backend,
+    detail: Option<&ModelDetail>,
+    info: Option<&BackendInfo>,
+) -> SetupView {
+    let rules = Rules::builtin();
+    let live = LiveCtx {
+        backend,
+        detail,
+        info,
+    };
+    SetupView {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        more: 0,
+        rows: rules.rows(&rules.extract(cmd), &live),
+    }
+}
+
+fn qwen_setup() -> SetupView {
+    setup_of(
+        "qwen3.6-35b-a3b",
+        "Qwen 35B",
+        QWEN_CMD,
+        Backend::LlamaCpp,
+        None,
+        None,
+    )
 }
 
 fn activity_pct_for(state: WatchState) -> Option<f64> {
@@ -2012,7 +2059,7 @@ fn activity_over_100_is_a_full_bar_with_a_hot_top_step_and_the_real_number() {
         let text: String = row_string(&grid, row).chars().take(25).collect();
         let cells: Vec<_> = (25..grid.cols())
             .map(|col| grid.get(col, row).expect("cell"))
-            .filter(|cell| matches!(cell.ch, '█' | '░' | '▉'..='▏'))
+            .filter(|cell| matches!(cell.ch, '█' | '░' | '▉'..='▏' | '▄' | '▇'))
             .collect();
         (text, cells)
     };
@@ -2333,11 +2380,14 @@ fn bg_sgr(colour: C16) -> u16 {
 
 /// Every size T45 must fit, with the RECENT rows and trailing blank rows the
 /// text-off allocation gives it (one slot, 40 requests on hand).
+/// `(cols, rows, RECENT rows, blank rows)` with text off. Since #52 the
+/// SETUP block under the meters takes two rows from RECENT at 160x48 and
+/// three from 60 rows; 4K has the rows to spare.
 const TEXT_OFF_SIZES: [(u16, u16, u16, u16); 4] = [
-    (160, 48, 13, 0),
-    (240, 67, 32, 0),
-    (286, 60, 25, 0),
-    (480, 135, 32, 60),
+    (160, 48, 11, 0),
+    (240, 67, 29, 0),
+    (286, 60, 22, 0),
+    (480, 135, 32, 53),
 ];
 
 fn many_requests(n: u32) -> Vec<Activity> {
@@ -3177,7 +3227,7 @@ fn steps_of(fgs: &[C16]) -> Vec<C16> {
 fn bar_from(grid: &llama_watch::tty::grid::Grid, row: u16, col: u16) -> Vec<C16> {
     (col..grid.cols())
         .map(|c| grid.get(c, row).expect("cell"))
-        .take_while(|cell| matches!(cell.ch, '█' | '▓' | '▐' | '▌'))
+        .take_while(|cell| matches!(cell.ch, '█' | '▓' | '▐' | '▌' | '▄' | '▇'))
         .map(|cell| cell.fg)
         .collect()
 }
@@ -3200,7 +3250,12 @@ fn cpu_bar(pct: f64, cols: u16, rows: u16) -> (Vec<C16>, Vec<C16>, usize) {
     let grid = draw(&model, cols, rows);
     let row = meter_row(&grid, "CPU");
     let track = (27..grid.cols())
-        .take_while(|c| matches!(grid.get(*c, row).expect("cell").ch, '█' | '▐' | '▌' | '░'))
+        .take_while(|c| {
+            matches!(
+                grid.get(*c, row).expect("cell").ch,
+                '█' | '▐' | '▌' | '░' | '▄' | '▇'
+            )
+        })
         .count();
     (
         bar_from(&grid, row, 27),
@@ -3277,7 +3332,22 @@ fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
 fn sglang_model() -> TtyModel {
     let mut model = sample(WatchState::Generating);
     model.model_name = "flash".to_string();
-    model.model_detail = "SGLang · 200k · kv fp8_e4m3 · exl3".to_string();
+    model.model_detail = "SGLang".to_string();
+    let detail = ModelDetail {
+        ctx: Some(204_800),
+        kv_k: Some("fp8_e4m3".to_owned()),
+        kv_v: Some("fp8_e4m3".to_owned()),
+        quant: Some("exl3".to_owned()),
+        ..ModelDetail::default()
+    };
+    model.setup = Some(setup_of(
+        "flash",
+        "flash",
+        SGLANG_CMD,
+        Backend::SgLang,
+        Some(&detail),
+        None,
+    ));
     model.slots_line = "--".to_string();
     model.slots = Vec::new();
     model.backend_lines = vec!["sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %".to_string()];
@@ -3294,6 +3364,9 @@ fn sglang_model() -> TtyModel {
     }
     model
 }
+
+/// An invented SGLang launch in a container (#52).
+const SGLANG_CMD: &str = "podman run --rm --name flash -e SGLANG_EXL3_MOE_OFFLOAD=gpu_cache ghcr.io/example/sglang-exl3 python3 -m sglang.launch_server --model-path /models/flash --quantization exl3 --kv-cache-dtype fp8_e4m3 --context-length 204800 --mem-fraction-static 0.88 --max-running-requests 4";
 
 const SGLANG_GOLDENS: [(&str, u16, u16); 2] =
     [("sglang-240.json", 240, 67), ("sglang-160.json", 160, 48)];
@@ -3323,7 +3396,31 @@ fn dump_sglang_goldens() {
 fn vllm_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "qwen3.8-27b".to_string();
-    model.model_detail = "vLLM · kv fp8_e4m3 · block 16 · prefix on".to_string();
+    model.model_detail = "vLLM".to_string();
+    let detail = ModelDetail {
+        kv_k: Some("fp8_e4m3".to_owned()),
+        kv_v: Some("fp8_e4m3".to_owned()),
+        kv_block: Some(16),
+        prefix_cache: Some(true),
+        ..ModelDetail::default()
+    };
+    let info = BackendInfo {
+        kind: Backend::Vllm,
+        engine: EngineStats {
+            spec_permille: Some(781),
+            spec_len_centi: Some(290),
+            ..EngineStats::default()
+        },
+        ..BackendInfo::default()
+    };
+    model.setup = Some(setup_of(
+        "qwen3.8-27b",
+        "qwen3.8-27b",
+        "podman run --rm --name hq -e SPEC=mtp ghcr.io/example/qwen-vllm single",
+        Backend::Vllm,
+        Some(&detail),
+        Some(&info),
+    ));
     model.backend_lines = vec![
         "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
             .to_string(),
@@ -3371,7 +3468,21 @@ fn dump_vllm_goldens() {
 fn strata_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "bonsai-27b".to_string();
-    model.model_detail = "Strata · 256k · kv q8".to_string();
+    model.model_detail = "Strata".to_string();
+    let detail = ModelDetail {
+        ctx: Some(262_144),
+        kv_k: Some("q8".to_owned()),
+        kv_v: Some("q8".to_owned()),
+        ..ModelDetail::default()
+    };
+    model.setup = Some(setup_of(
+        "bonsai-27b",
+        "Bonsai 27B",
+        "python serve/server.py --engine strata --config /data/strata.json",
+        Backend::Strata,
+        Some(&detail),
+        None,
+    ));
     model.backend_lines = vec!["strata  running 1/1 · queued 0".to_string()];
     for req in &mut model.requests {
         req.model = "bonsai-27b".to_string();
@@ -3384,6 +3495,14 @@ fn openai_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "tabby".to_string();
     model.model_detail = "OpenAI-compatible".to_string();
+    model.setup = Some(setup_of(
+        "tabby",
+        "tabby",
+        "python3 main.py --config /tabby/config.yml",
+        Backend::OpenAi,
+        None,
+        None,
+    ));
     model.backend_lines = vec!["openai  running -- · queued -- · KV --".to_string()];
     for req in &mut model.requests {
         req.model = "tabby".to_string();
@@ -3424,9 +3543,9 @@ fn header_always_names_the_engine() {
     let cases: [(TtyModel, &str); 7] = [
         (sample(WatchState::Generating), "Qwen 35B  llama.cpp"),
         (sample(WatchState::Ready), "Qwen 35B  llama.cpp"),
-        (sglang_model(), "flash  SGLang · 200k"),
-        (vllm_model(), "qwen3.8-27b  vLLM · kv fp8_e4m3"),
-        (strata_model(), "bonsai-27b  Strata · 256k"),
+        (sglang_model(), "flash  SGLang"),
+        (vllm_model(), "qwen3.8-27b  vLLM"),
+        (strata_model(), "bonsai-27b  Strata"),
         (openai_model(), "tabby  OpenAI-compatible"),
         (sample(WatchState::AiDown), "model --  engine --"),
     ];
@@ -3452,7 +3571,7 @@ fn sglang_frame_names_the_backend_and_its_gauges() {
     for (cols, rows) in [(160, 48), (240, 67), (480, 135)] {
         let grid = draw(&model, cols, rows);
         let header = row_string(&grid, 0);
-        assert!(header.contains("flash  SGLang · 200k"), "{header}");
+        assert!(header.contains("flash  SGLang"), "{header}");
         let slots = row_with(&grid, "SLOTS");
         let line = row_string(&grid, slots + 1);
         assert!(
@@ -3784,6 +3903,8 @@ fn engine_measured_rates_are_marked_and_fit_their_columns() {
 
 /// #39: a long model name and a long engine detail at 160 columns. The
 /// detail drops whole trailing ` · item`s so a gap stays before the clock.
+/// Since #52 the real detail is the engine alone; the drop rule stays for
+/// any longer text.
 #[test]
 fn long_model_detail_drops_whole_items_before_the_clock() {
     let mut model = sample(WatchState::Generating);
@@ -3822,6 +3943,13 @@ fn long_model_detail_drops_whole_items_before_the_clock() {
     model.model_detail = "vLLM · kv q8".to_string();
     let header = row_string(&draw(&model, 160, 48), 0);
     assert!(header.contains("KV  vLLM · kv q8"), "{header}");
+    // #52: llama-watch now hands the header the engine alone (the rest is
+    // in SETUP), so even this name keeps it whole and the slots field.
+    model.model_detail = "vLLM".to_string();
+    for cols in [160u16, 180, 200, 240, 320] {
+        let header = row_string(&draw(&model, cols, 49), 0);
+        assert!(header.contains("240k KV  vLLM   slots"), "{cols}: {header}");
+    }
 }
 
 /// #38: a tool loop's IN, titled with what it holds. The panel is a few
@@ -3852,4 +3980,210 @@ fn a_tool_loop_in_panel_shows_the_newest_result_under_its_title() {
             .any(|row| row.contains("[tool] invented middle result")),
         "{rows:#?}"
     );
+}
+
+// ---- #52: SETUP under single-spaced meters ----------------------------------
+
+/// Titan's shape: the 12x22 font at 160x49, eighths glyphs, two models
+/// loaded and the llama.cpp one generating.
+fn setup_model() -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    let mut setup = qwen_setup();
+    setup.more = 1;
+    model.setup = Some(setup);
+    model
+}
+
+const SETUP_GOLDENS: [(&str, u16, u16); 2] = [
+    ("setup-160x49.json", 160, 49),
+    ("setup-320x90.json", 320, 90),
+];
+
+#[test]
+fn setup_goldens_match_character_and_colour() {
+    for (name, _, _) in SETUP_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &setup_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #52 SETUP goldens"]
+fn dump_setup_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in SETUP_GOLDENS {
+        let grid = draw(&setup_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write setup golden");
+    }
+}
+
+/// Rows from the label column of `grid`, `count` from `top`, trimmed.
+fn left_rows(grid: &llama_watch::tty::grid::Grid, top: u16, count: u16) -> Vec<String> {
+    let end = grid.cols() / 2 - 2;
+    (top..top + count)
+        .map(|row| {
+            (0..end)
+                .map(|col| grid.get(col, row).expect("cell").ch)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// #52: one meter per row, ACTIVITY right under LOAD, a blank row, then
+/// SETUP: the title with `+1`, and as many rows as fit (six at 160x49).
+#[test]
+fn setup_block_sits_under_single_spaced_meters_at_160x49() {
+    let grid = draw(&setup_model(), 160, 49);
+    let labels: Vec<u16> = ["CPU", "GPU", "VRAM", "MEM", "POWER", "LOAD", "ACTIVITY"]
+        .into_iter()
+        .map(|label| meter_row(&grid, label))
+        .collect();
+    assert_eq!(labels, [3, 4, 5, 6, 7, 8, 9], "single-spaced meters");
+    let rows = left_rows(&grid, 10, 7);
+    assert_eq!(rows[0], "", "a blank row under ACTIVITY");
+    assert!(
+        rows[1].starts_with("  SETUP  qwen3.6-35b-a3b · Qwen 35B"),
+        "{rows:#?}"
+    );
+    assert!(rows[1].ends_with("+1"), "{rows:#?}");
+    assert_eq!(
+        rows[2..],
+        [
+            "    engine   llama.cpp · UD-Q4_K_M · fa on",
+            "    ctx      262,144 · kv q8_0 / q8_0",
+            "    experts  16 layers in RAM",
+            "    spec     draft-mtp · n-max 3",
+            "    think    budget 24,000",
+        ]
+    );
+    // `sample` does not fit under 60 rows: the rule follows the block.
+    assert!(is_rule_row(&grid, 17), "{}", whole(&grid));
+    assert!(!whole(&grid).contains("temp 0.6"));
+    // The title's `+1` ends where the meter bars end; colours.
+    let title = 11;
+    let plus = col_of(&grid, title, "+1");
+    assert_eq!(plus + 1, 160 / 2 - 3);
+    assert_eq!(grid.get(plus, title).unwrap().fg, C16::BrightYellow);
+    assert_eq!(grid.get(2, title).unwrap().fg, C16::White);
+    assert_eq!(grid.get(9, title).unwrap().fg, C16::BrightWhite);
+    let name = col_of(&grid, title, "Qwen 35B");
+    assert_eq!(grid.get(name, title).unwrap().fg, C16::BrightBlack);
+    let ctx = 13;
+    assert_eq!(grid.get(4, ctx).unwrap().fg, C16::BrightBlack, "row label");
+    assert_eq!(grid.get(13, ctx).unwrap().fg, C16::BrightWhite, "value");
+}
+
+/// #52: the meter bars are whole cells of `▇` with a llama-hack font
+/// (eighths) and `▄` with eurlatgr (halves), so stacked bars keep a gap;
+/// the colours are the spectrum as before. Tall screens keep 2-row bars.
+#[test]
+fn single_spaced_meters_use_a_short_block_in_whole_cells() {
+    for (glyphs, glyph) in [(ChartGlyphs::Eighths, '▇'), (ChartGlyphs::Halves, '▄')] {
+        let mut model = setup_model();
+        model.chart_glyphs = glyphs;
+        model.cpu_pct = Some(50.0);
+        let grid = draw(&model, 160, 49);
+        let row = meter_row(&grid, "CPU");
+        let cells: Vec<char> = (27..78).map(|c| grid.get(c, row).unwrap().ch).collect();
+        let lit = cells.iter().filter(|ch| **ch == glyph).count();
+        assert_eq!(lit, 26, "{glyphs:?}: round(0.5 × 51) whole cells");
+        assert!(
+            cells.iter().all(|ch| *ch == glyph || *ch == '░'),
+            "{glyphs:?}: no half-cell ends {cells:?}"
+        );
+        assert_eq!(cells[0], glyph, "lit from the first cell");
+        assert_eq!(grid.get(27, row).unwrap().fg, C16::Blue);
+        assert!(GLYPHS.contains(&glyph), "term may emit {glyph}");
+    }
+    // A tiny value still lights one cell.
+    let mut model = setup_model();
+    model.gpu_pct = Some(1.0);
+    let grid = draw(&model, 160, 49);
+    assert_eq!(grid.get(27, meter_row(&grid, "GPU")).unwrap().ch, '▇');
+    // 4K keeps its two-row bars and blank rows.
+    let grid = draw(&setup_model(), 480, 135);
+    let cpu = meter_row(&grid, "CPU");
+    assert_eq!(meter_row(&grid, "GPU"), cpu + 3);
+    assert_eq!(grid.get(28, cpu).unwrap().ch, '█');
+    assert_eq!(grid.get(28, cpu + 1).unwrap().ch, '▓');
+}
+
+/// #52: a wide screen from 60 rows shows up to eight SETUP rows; a short
+/// one keeps the 160x26 floor (title and three rows beside SLOTS); with
+/// nothing loaded the block is gone and RECENT moves back up.
+#[test]
+fn setup_block_height_follows_the_screen() {
+    let grid = draw(&setup_model(), 240, 67);
+    let all = whole(&grid);
+    assert!(
+        all.contains("    sample   temp 0.6 · top-p 0.95 · top-k 20 · min-p 0"),
+        "{all}"
+    );
+    let grid = draw(&setup_model(), 160, 26);
+    assert_dashboard(&grid, "160x26 setup");
+    assert_eq!(recent_rows_shown(&grid), 4, "{}", whole(&grid));
+    let rows = left_rows(&grid, 11, 4);
+    assert!(rows[0].contains("SETUP"), "{rows:#?}");
+    assert!(rows[3].contains("experts"), "{rows:#?}");
+    assert!(is_rule_row(&grid, 15), "{}", whole(&grid));
+    let mut idle = setup_model();
+    idle.setup = None;
+    let grid = draw(&idle, 160, 49);
+    assert!(!whole(&grid).contains("SETUP"));
+    assert!(is_rule_row(&grid, 15), "{}", whole(&grid));
+    // Long values drop whole items from the end; a lone long one is cut.
+    let mut long = setup_model();
+    let setup = long.setup.as_mut().expect("setup");
+    setup.id = "a-very-long-llama-swap-model-id-for-a-bakeoff-case-with-suffix-r2".to_owned();
+    setup.rows[1].items[0].text = "x".repeat(90);
+    let grid = draw(&long, 160, 49);
+    let rows = left_rows(&grid, 11, 3);
+    assert!(
+        rows[0].contains("a-very-long-llama-swap-model-id-for-a-bakeoff-case-with-suffix-r2"),
+        "{rows:#?}"
+    );
+    assert!(
+        !rows[0].contains("Qwen 35B"),
+        "the name only when it fits: {rows:#?}"
+    );
+    assert!(
+        rows[2].ends_with('…') && rows[2].chars().count() == 78,
+        "{rows:#?}"
+    );
+    assert!(!rows[2].contains("kv"), "{rows:#?}");
+    assert_blank_edges(&grid);
+}
+
+#[test]
+#[ignore = "dev tool: print frames as text"]
+fn print_frames() {
+    for (name, model, cols, rows) in [
+        (
+            "generating 160x49",
+            sample(WatchState::Generating),
+            160u16,
+            49u16,
+        ),
+        ("vllm 160x49", vllm_model(), 160, 49),
+        ("generating 240x67", sample(WatchState::Generating), 240, 67),
+        ("sglang 160x26", sglang_model(), 160, 26),
+    ] {
+        println!("==== {name}");
+        let grid = draw(&model, cols, rows);
+        for row in 0..grid.rows() {
+            println!("{}", row_string(&grid, row));
+        }
+    }
+}
+
+#[test]
+#[ignore = "dev tool: print the SETUP golden's top-left as text"]
+fn print_setup_corner() {
+    let grid = draw(&setup_model(), 160, 49);
+    for line in left_rows(&grid, 0, 18) {
+        println!("{line}");
+    }
 }

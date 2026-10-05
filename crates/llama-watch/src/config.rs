@@ -282,6 +282,15 @@ pub enum InvalidWatchConfig {
         /// Which limit failed.
         reason: &'static str,
     },
+    /// A `[setup]` field rule is malformed (#52). `field` is its position
+    /// in `[[setup.field]]`, from 0; `reason` names the problem.
+    #[error("setup.field[{field}]: {reason}")]
+    Setup {
+        /// Index of the offending `[[setup.field]]`.
+        field: usize,
+        /// What is wrong with it.
+        reason: String,
+    },
     /// `tty.size` is below the layout floor or above the console bound.
     #[error(
         "tty.size {cols}x{rows} is outside {min_cols}x{min_rows}..={max_cols}x{max_rows}",
@@ -711,6 +720,87 @@ pub struct Config {
     /// Read-only fan panel on tty11. Off by default.
     #[serde(default)]
     pub fans: Fans,
+    /// Which launch settings tty11's SETUP block shows (#52).
+    #[serde(default)]
+    pub setup: Setup,
+}
+
+/// `[setup]`: the rules that pick tty11's SETUP rows from a model's
+/// launch command and its engine's own reports (#52).
+///
+/// The built-in rules (`src/setup_defaults.toml`) cover the upstream
+/// llama.cpp, vLLM and SGLang flags. `[[setup.field]]` entries extend them;
+/// `defaults = false` drops the built-in set so only the listed fields
+/// apply. [`crate::setup_rules`] checks every rule at load and enforces the
+/// display limits whatever a rule says.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setup {
+    /// Keep the built-in rules. `false` uses only `field`.
+    #[serde(default = "defaults::enabled")]
+    pub defaults: bool,
+    /// Field rules, in addition to (or instead of) the built-in ones.
+    #[serde(default)]
+    pub field: Vec<SetupField>,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            defaults: true,
+            field: Vec::new(),
+        }
+    }
+}
+
+/// One `[[setup.field]]`: where a value comes from, when it applies and
+/// how it reads. See README "SETUP rules" for every key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupField {
+    /// SETUP row the value is drawn on, such as `ctx` or `spec`.
+    pub row: String,
+    /// Engines the rule applies to. Empty is every engine.
+    #[serde(default)]
+    pub engines: Vec<Backend>,
+    /// Only for a launch command containing this text (ASCII case ignored).
+    #[serde(default, rename = "match")]
+    pub matches: Option<String>,
+    /// `flag:-c,--ctx-size`, `env:NAME`, `json:--flag:key` or `live:name`.
+    /// Absent: the field only ever shows its `default`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// `number`, `token`, `quant` or `present`. Required for `flag`, `env`
+    /// and `json` sources; not allowed with `live`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Text before the value: `kv` draws `kv q8_0`.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Text right after the value: ` layers in RAM`.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// Separator before this item on its row. Default ` · `.
+    #[serde(default)]
+    pub sep: Option<String>,
+    /// Value to the whole item's text, such as `0` to `full GPU`.
+    #[serde(default)]
+    pub map: BTreeMap<String, String>,
+    /// The whole item's text when there is no value. Drawn dim.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Drawn only when no earlier field of the same row drew anything, or
+    /// with `group`, no earlier field of that group.
+    #[serde(default)]
+    pub fallback: bool,
+    /// Names the fields a `fallback` stands in for, such as `prefix`.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Position: rows sort by their lowest order and items within a row by
+    /// theirs. Higher orders drop first when the block is short of room.
+    /// Default 1000, after the built-in rows.
+    #[serde(default = "defaults::setup_order")]
+    pub order: u16,
 }
 
 mod defaults {
@@ -812,6 +902,9 @@ mod defaults {
     }
     pub(super) fn nominal_frac() -> f64 {
         0.8
+    }
+    pub(super) fn setup_order() -> u16 {
+        1000
     }
 }
 
@@ -1109,6 +1202,8 @@ impl Config {
         self.fans
             .validate()
             .map_err(|reason| InvalidWatchConfig::Fans { reason })?;
+        crate::setup_rules::Rules::compile(&self.setup)
+            .map_err(|(field, reason)| InvalidWatchConfig::Setup { field, reason })?;
         Ok(())
     }
 }

@@ -61,6 +61,17 @@ pub fn parse_launch(cmd: &str) -> Launch {
     }
 }
 
+/// The index of the first argument after the server's entry point, or
+/// `None` when the command names no server this module knows (#52: the
+/// SETUP rules read server flags after it and a wrapper's env before it).
+#[must_use]
+pub fn entry_point(args: &[&str]) -> Option<usize> {
+    match detect(args) {
+        (Backend::OpenAi, _) => None,
+        (_, start) => Some(start),
+    }
+}
+
 /// The server kind and the index of the first argument after its entry point.
 fn detect(args: &[&str]) -> (Backend, usize) {
     for (index, arg) in args.iter().enumerate() {

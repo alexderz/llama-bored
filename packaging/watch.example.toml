@@ -133,3 +133,74 @@ palette = "llama"
 #hwmon = "nct6798"
 #channels = [2, 3, 5, 6]
 #labels = ["front1", "front2", "rear", "top"]
+
+# tty11's SETUP block (#52): the settings of the model generating now (or
+# the one used last) under the meters. Rules pick each value from the
+# llama-swap launch command (a flag, a `-e NAME=V` env, or a key of a JSON
+# flag), or from what the engine reports (`live:`). Only numbers and short
+# tokens are ever shown, never a path or a raw argument. Built-in rules
+# cover upstream llama.cpp, vLLM and SGLang flags
+# (crates/llama-watch/src/setup_defaults.toml); rules here are added to
+# them, and `defaults = false` keeps only the rules here. README "SETUP
+# rules" lists every key.
+#[setup]
+#defaults = true
+#
+# Example: a vLLM container configured by env vars rather than flags (the
+# HyperQwen image). `match` limits the rules to commands naming it; the
+# engine is told from its /metrics, so `engines = ["vllm"]` still applies.
+# Copy the block below, without the leading "#", into watch.toml.
+# >>> setup example
+#[[setup.field]]
+#row = "engine"
+#engines = ["vllm"]
+#match = "hyperqwen"
+#source = "env:MODEL"
+#kind = "token"
+#order = 13
+#
+#[[setup.field]]
+#row = "ctx"
+#engines = ["vllm"]
+#match = "hyperqwen"
+#source = "env:CTX"
+#kind = "token"
+#order = 19
+#
+#[[setup.field]]
+#row = "ctx"
+#engines = ["vllm"]
+#match = "hyperqwen"
+#source = "env:PREFIX_CACHE"
+#kind = "token"
+#map = { "1" = "prefix on", "0" = "prefix off" }
+#fallback = true
+#group = "prefix"
+#order = 26
+#
+#[[setup.field]]
+#row = "spec"
+#engines = ["vllm"]
+#match = "hyperqwen"
+#source = "env:SPEC"
+#kind = "token"
+#order = 40
+#
+#[[setup.field]]
+#row = "spec"
+#engines = ["vllm"]
+#match = "hyperqwen"
+#source = "env:DFLASH_TOKENS"
+#kind = "number"
+#label = "n"
+#order = 42
+#
+# Example: the SGLang EXL3 build's MoE offload switch.
+#[[setup.field]]
+#row = "experts"
+#engines = ["sglang"]
+#source = "env:SGLANG_EXL3_MOE_OFFLOAD"
+#kind = "token"
+#label = "offload"
+#order = 30
+# <<< setup example

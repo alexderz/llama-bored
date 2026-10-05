@@ -11,6 +11,7 @@ pub mod publish;
 pub mod recent;
 pub mod resets;
 pub mod service;
+pub mod setup_rules;
 pub mod slots;
 pub mod sources;
 pub mod speeds;

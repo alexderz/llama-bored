@@ -19,8 +19,9 @@ use thiserror::Error;
 use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
-use crate::poller::{self, CaptureView, LlamaDetail, PollLatencies};
+use crate::poller::{self, CaptureView, LlamaDetail, ModelSetup, PollLatencies};
 use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
+use crate::setup_rules::{LiveCtx, Rules};
 use crate::slots::{SlotView, pick_slot};
 use crate::sources::Roots;
 use crate::sources::gpu::{GpuBackend, NvidiaGpu};
@@ -28,7 +29,9 @@ use crate::sources::proc::count_cpus;
 use crate::tty::chart::TokenChart;
 use crate::tty::ctx_history::CtxBook;
 use crate::tty::grid::Cell;
-use crate::tty::layout::{self, Activity, HealthSeg, HealthStatus, Slot, TtyModel, WatchState};
+use crate::tty::layout::{
+    self, Activity, HealthSeg, HealthStatus, SetupView, Slot, TtyModel, WatchState,
+};
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
 use crate::tty::writer::FrameWriter;
@@ -389,6 +392,7 @@ where
         mem_total_bytes: mem_total_bytes(&roots.proc),
         llama_enabled: input.config.llama.enabled,
         show_text: input.config.tty.show_text,
+        setup: Rules::compile(&input.config.setup).unwrap_or_default(),
     };
     let mut state = TickState::new(
         input.config.tty.chart_bucket_s,
@@ -462,6 +466,7 @@ impl TickState {
                 latencies: PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,
+                setup: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -493,6 +498,8 @@ struct FrameCtx {
     llama_enabled: bool,
     /// `tty.show_text`. False hands the layout no llama text at all.
     show_text: bool,
+    /// `[setup]` rules, for the SETUP rows (#52).
+    setup: Rules,
 }
 
 fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
@@ -984,7 +991,63 @@ fn tty_model(
         chart_glyphs: ctx.chart_glyphs,
         fans: sample.fans.clone(),
         ctx_history_h: ctx.ctx_history_h,
+        setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
     }
+}
+
+/// The SETUP block (#52): the model generating now, else the one RECENT
+/// saw last, else the first loaded. `None` with nothing loaded.
+fn setup_view(
+    sample: &WatchSample,
+    detail: &LlamaDetail,
+    state: WatchState,
+    rules: &Rules,
+) -> Option<SetupView> {
+    if !matches!(state, WatchState::Generating | WatchState::Ready) {
+        return None;
+    }
+    let models = &sample.snapshot.models;
+    if models.is_empty() {
+        return None;
+    }
+    // The poller sends one entry per model, in the same order; anything
+    // else is a stale pair and shows only what the snapshot has.
+    let setups: &[ModelSetup] = if detail.setup.len() == models.len() {
+        &detail.setup
+    } else {
+        &[]
+    };
+    let busy = models.iter().position(|model| {
+        model
+            .backend
+            .is_some_and(|info| info.running.is_some_and(|n| n > 0))
+            || detail
+                .slots
+                .iter()
+                .any(|slot| slot.is_processing && slot.model == model.name)
+    });
+    let recent = detail
+        .activity
+        .first()
+        .and_then(|row| setups.iter().position(|setup| setup.key == row.model));
+    let at = busy.or(recent).unwrap_or(0);
+    let model = &models[at];
+    let setup = setups.get(at).cloned().unwrap_or_else(|| ModelSetup {
+        id: model.name.clone(),
+        name: model.full_name.clone().unwrap_or_default(),
+        ..ModelSetup::default()
+    });
+    let live = LiveCtx {
+        backend: model.backend.map(|info| info.kind).unwrap_or_default(),
+        detail: model.detail.as_ref(),
+        info: model.backend.as_ref(),
+    };
+    Some(SetupView {
+        id: setup.id,
+        name: setup.name,
+        more: models.len() - 1,
+        rows: rules.rows(&setup.found, &live),
+    })
 }
 
 /// IN and OUT for one frame, both from [`pick_slot`]. Advances the OUT
@@ -1109,10 +1172,10 @@ fn model_name(sample: &WatchSample, state: WatchState) -> String {
     }
 }
 
-/// Detail line of the first model. Its engine always leads it (#33),
-/// llama.cpp when the snapshot names none: `SGLang · 200k · kv fp8_e4m3`.
-/// The engine's own cache facts close it (#31): `· block 16 · prefix on`.
-/// With no model shown it is [`NO_ENGINE`].
+/// Header detail of the first model: its engine, always (#33), llama.cpp
+/// when the snapshot names none. Its settings (ctx, KV, block, prefix…)
+/// moved to the SETUP block (#52), so the header no longer runs into the
+/// clock. With no model shown it is [`NO_ENGINE`].
 fn model_detail(sample: &WatchSample, state: WatchState) -> String {
     let model = match state {
         WatchState::Generating | WatchState::Ready => sample.snapshot.models.first(),
@@ -1122,14 +1185,7 @@ fn model_detail(sample: &WatchSample, state: WatchState) -> String {
         return NO_ENGINE.to_owned();
     };
     let engine = model.backend.map(|info| info.kind).unwrap_or_default();
-    std::iter::once(engine.display_name().to_owned())
-        .chain(model.detail.as_ref().into_iter().flat_map(|detail| {
-            std::iter::once(llama_core::detail::line(detail))
-                .chain(llama_core::detail::engine_items(detail))
-        }))
-        .filter(|item| !item.is_empty())
-        .collect::<Vec<_>>()
-        .join(llama_core::detail::SEPARATOR)
+    engine.display_name().to_owned()
 }
 
 /// The header's engine item with no model shown (#33).
@@ -2124,6 +2180,7 @@ mod tests {
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
+                    setup: Vec::new(),
                 },
             ))
         }
@@ -2269,6 +2326,7 @@ mod tests {
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
+                    setup: Vec::new(),
                 },
             ))
         }
@@ -2306,8 +2364,8 @@ mod tests {
         );
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "llama.cpp · 256k · kv q8 · PTQ1_0",
-            "#33: no backend reads as llama.cpp"
+            "llama.cpp",
+            "#33: no backend reads as llama.cpp; #52: the settings are in SETUP"
         );
         assert_eq!(model_detail(&sample, WatchState::AiDown), "engine --");
         assert_eq!(model_detail(&sample, WatchState::Starting), "engine --");
@@ -2320,6 +2378,109 @@ mod tests {
         // #33: no model loaded.
         sample.snapshot.models.clear();
         assert_eq!(model_detail(&sample, WatchState::Ready), "engine --");
+    }
+
+    /// #52: SETUP shows the model generating now, else the one RECENT saw
+    /// last, else the first; `+N` counts the others; nothing loaded or
+    /// llama-swap down collapses it.
+    #[test]
+    fn setup_view_follows_the_busy_then_the_recent_model() {
+        let rules = Rules::builtin();
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let mut sample = backend_sample(vec![
+            served("Qwen 35B", "ready", Some(llama)),
+            served("flash", "ready", Some(sglang(Some(0)))),
+        ]);
+        let setup = |key: &str, id: &str, cmd: &str| ModelSetup {
+            key: key.to_owned(),
+            id: id.to_owned(),
+            name: String::new(),
+            found: rules.extract(cmd),
+        };
+        let mut detail = TickState::new(2, 6).detail;
+        detail.setup = vec![
+            setup("qwen-35b", "qwen-35b", "llama-server -c 8192"),
+            setup(
+                "flash",
+                "flash",
+                "python3 -m sglang.launch_server --context-length 204800",
+            ),
+        ];
+        let shown = |sample: &WatchSample, detail: &LlamaDetail| {
+            setup_view(sample, detail, WatchState::Ready, &rules)
+                .map(|view| (view.id, view.more, view.rows[1].items[0].text.clone()))
+        };
+        // Nothing busy, no RECENT row: the first model.
+        assert_eq!(
+            shown(&sample, &detail),
+            Some(("qwen-35b".to_owned(), 1, "8,192".to_owned()))
+        );
+        // RECENT's newest row names the second.
+        let mut row = crate::activity::ActivityRow {
+            id: 1,
+            seq: 1,
+            time: String::new(),
+            source: String::new(),
+            model: "flash".to_owned(),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: None,
+            prompt_tps: None,
+            gen_tps: None,
+            engine_prompt_tps: None,
+            engine_gen_tps: None,
+            duration_ms: None,
+            status: None,
+            captured: false,
+        };
+        detail.activity = vec![row.clone()];
+        assert_eq!(
+            shown(&sample, &detail).map(|v| v.0),
+            Some("flash".to_owned())
+        );
+        // A busy model wins over RECENT.
+        row.model = "qwen-35b".to_owned();
+        detail.activity = vec![row];
+        sample.snapshot.models[1].backend = Some(sglang(Some(1)));
+        assert_eq!(
+            shown(&sample, &detail).map(|v| v.0),
+            Some("flash".to_owned())
+        );
+        // A busy llama.cpp slot of the first model wins too.
+        sample.snapshot.models[1].backend = Some(sglang(Some(0)));
+        detail.activity.clear();
+        detail.slots = vec![SlotView {
+            model: "Qwen 35B".to_owned(),
+            id: 0,
+            id_task: 1,
+            is_processing: true,
+            n_prompt_tokens: 0,
+            n_prompt_tokens_processed: 0,
+            n_decoded: 0,
+            n_ctx: None,
+            ctx_prompt: None,
+            ctx_used: None,
+            resets: Default::default(),
+            last_reset: None,
+            input: Vec::new(),
+            output: Vec::new(),
+        }];
+        assert_eq!(
+            shown(&sample, &detail).map(|v| v.0),
+            Some("qwen-35b".to_owned())
+        );
+        // A stale setup list (another length) falls back to the snapshot.
+        detail.setup.pop();
+        let view = setup_view(&sample, &detail, WatchState::Ready, &rules).expect("view");
+        assert_eq!(view.id, "Qwen 35B");
+        assert_eq!(view.rows[0].items[0].text, "llama.cpp");
+        // Collapsed without a model or with llama-swap down.
+        assert!(setup_view(&sample, &detail, WatchState::AiDown, &rules).is_none());
+        sample.snapshot.models.clear();
+        assert!(setup_view(&sample, &detail, WatchState::Ready, &rules).is_none());
     }
 
     fn backend_sample(models: Vec<ModelInfo>) -> WatchSample {
@@ -2375,6 +2536,7 @@ mod tests {
             mem_total_bytes,
             llama_enabled,
             show_text: false,
+            setup: Rules::builtin(),
         }
     }
 
@@ -2509,7 +2671,8 @@ mod tests {
         let sample = backend_sample(vec![flash, tabby.clone()]);
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "SGLang · 200k · kv fp8_e4m3 · exl3"
+            "SGLang",
+            "#52: the header keeps only the engine"
         );
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
@@ -2589,7 +2752,8 @@ mod tests {
         let sample = backend_sample(vec![qwen.clone()]);
         assert_eq!(
             model_detail(&sample, WatchState::Ready),
-            "vLLM · kv fp8_e4m3 · block 16 · prefix on"
+            "vLLM",
+            "#52: kv, block and prefix moved to SETUP"
         );
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
@@ -2647,10 +2811,7 @@ mod tests {
             ..llama_core::detail::ModelDetail::default()
         });
         let sample = backend_sample(vec![flash]);
-        assert_eq!(
-            model_detail(&sample, WatchState::Ready),
-            "Strata · 256k · kv q8"
-        );
+        assert_eq!(model_detail(&sample, WatchState::Ready), "Strata");
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
             vec!["strata  running 1/1 · queued 0".to_owned()]

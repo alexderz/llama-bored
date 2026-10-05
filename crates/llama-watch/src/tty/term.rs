@@ -29,7 +29,8 @@ const MAX_ROWS: u16 = 512;
 /// The last six are the lower eighths U+2581–2583 and U+2585–2587 (`▄` is
 /// above). eurlatgr lacks them; they are verified present in
 /// llama-hack-12x24 (`tests/tty_font.rs` parses the committed PSF). Only
-/// `chart_glyphs = "eighths"` draws them. `▔` (U+2594) is in that font too but
+/// `chart_glyphs = "eighths"` draws them: the chart, and since #52 the
+/// single-spaced meter bars (`▇`; `▄` in halves mode). `▔` (U+2594) is in that font too but
 /// is not drawn, so it is not here.
 pub const GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '▁', '▂', '▃', '▅', '▆', '▇',
