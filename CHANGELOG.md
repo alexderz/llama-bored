@@ -6,6 +6,16 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- tty11 SETUP block (#52): under the meters, the settings of the model generating now (else the one RECENT saw last, else the first loaded). Title `SETUP  <llama-swap id> · <name>` (the name only when it fits) and `+N` for the other loaded models; then one labelled row per setting (`engine`, `ctx`, `experts`, `spec`, `think`, `serve`, `sample`), items in order of importance. Six rows with the title up to 59 rows, eight from 60; rows drop from the bottom and items from the end of a row when short of room; under 48 rows only the rows beside SLOTS, so the short-screen panel order is unchanged; collapsed with nothing loaded or llama-swap down. Values nothing set are grey (`kv f16`, `full GPU`, `spec none`). Live speculative acceptance (`acc 3.6/step · 65 %`) and vLLM's `cache_config_info` facts come from the engine
+- `[setup]` in watch.toml (#52): the rules that pick SETUP's values live in configuration. Each `[[setup.field]]` names a row, engines, an optional `match` on the launch command, a source (`flag:` names, `env:` name from `-e`/`--env`/`NAME=V`, `json:` flag and key one level deep, or `live:` engine/ctx/kv_dtype/kv_block/prefix_cache/spec_accept/spec_len), a kind (`number`, `token`, `quant`, `present`), and optional label, suffix, separator, map, default, fallback/group and order. Built-in rules (`crates/llama-watch/src/setup_defaults.toml`) cover upstream llama.cpp, vLLM and SGLang flags; watch.toml rules extend them and `defaults = false` drops them. Code keeps only numbers, short allowlisted tokens (file stem of a path-like value), quant tags and `on` from a command, whatever a rule says; the command is still read inside the `/running` decode and never kept. A bad rule fails validation with its index (`setup.field[3]: unknown kind "nubmer"`). `packaging/watch.example.toml` has a commented copy-paste block for an env-configured vLLM container (`SPEC`, `CTX`, `DFLASH_TOKENS`, `PREFIX_CACHE`, `MODEL`) and SGLang EXL3's `SGLANG_EXL3_MOE_OFFLOAD`. No new llama-swap path, no wire change
+
+### Changed
+
+- tty11 meters are one per row (#52): CPU, GPU, VRAM, MEM, POWER, LOAD and ACTIVITY on rows 3-9 instead of every other row. Their bars are whole cells of `▇` (lower seven eighths, 3 pixels short of the cell in both llama-hack fonts) with `chart_glyphs = "eighths"`, and `▄` with `"halves"` (eurlatgr has no `▇`), so stacked bars stay apart; colours unchanged. 4K (90+ rows) keeps its two-row bars. llama-view and llama-cast already drew both glyphs; llama-cast gains a test that the shipped fonts leave the gap
+- tty11's header detail is the engine alone (`model Qwen 35B  llama.cpp`); ctx, KV, quant, MoE, block and prefix moved to SETUP, so the header no longer runs into the clock (#52, #33's engine kept). `llama_core::detail::engine_items` is gone (no user left). Goldens: every tty frame (meters, SETUP, header), new `setup-160x49` and `setup-320x90`
+
 ## 0.3.5 — 2026-10-04
 
 ### Fixed
