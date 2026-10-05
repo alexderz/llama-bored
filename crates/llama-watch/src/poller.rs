@@ -33,16 +33,19 @@
 //! decoded counter once, so the counter still moves, at request end.
 //! Strata's `/metrics` is JSON ([`crate::metrics::parse_strata`]); its
 //! `engine` facts fill the model's ctx and KV, which its launch command
-//! cannot give. A 401 or 403 (Strata started with an API key; llama-bored
+//! cannot give, and SETUP's `engine:<key>` values; its `live` report (the
+//! phase, prompt progress, tok/s) rides to tty11 in
+//! [`LlamaDetail::engine_live`] while its gauges are fresh (#54). A 401 or 403 (Strata started with an API key; llama-bored
 //! keeps no secrets) falls back like any missing `/metrics`.
 //!
 //! A model whose launch command names no server (`openai`: a container
 //! whose image runs `vllm serve`, a wrapper script around llama-server) and
 //! that `[llama.backends]` does not name gets one `/upstream/<id>/metrics`
-//! GET per load, with the usual cap and timeout (#31). The first sample's
-//! metric prefix decides: `vllm:`, `sglang:` or `llamacpp:` (which then also
-//! gets `/slots`); anything else, or no `/metrics`, stays `openai`. Each
-//! outcome is logged once.
+//! GET per load, with the usual cap and timeout (#31). A JSON object with
+//! `engine` and `live` objects is Strata (#54, a container started by image
+//! digest); else the first sample's metric prefix decides: `vllm:`,
+//! `sglang:` or `llamacpp:` (which then also gets `/slots`); anything else,
+//! or no `/metrics`, stays `openai`. Each outcome is logged once.
 //!
 //! Every `/upstream/<id>/…` GET, the probe included, is for a model the last
 //! good `/running` read listed as `ready`: an upstream request for any other
@@ -83,8 +86,8 @@ use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
 use crate::metrics::{
-    DecodedCounter, EngineBook, EngineFacts, GenRate, MetricsSample, PromptCache, detect_backend,
-    parse_metrics_full,
+    DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, MetricsSample,
+    PromptCache, detect_backend, parse_metrics_full,
 };
 use crate::recent::{Merged, Recent};
 use crate::setup_rules::{Found, Rules};
@@ -142,6 +145,18 @@ pub struct LlamaDetail {
     /// What the `[setup]` rules read from each model's launch command
     /// (#52), in the order of the view's models.
     pub setup: Vec<ModelSetup>,
+    /// What each ready model's engine reports it is doing now, from a
+    /// fresh `/metrics` read (Strata's `live`, #54).
+    pub engine_live: Vec<ModelEngineLive>,
+}
+
+/// One ready model's [`EngineLive`] (#54).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelEngineLive {
+    /// Display name, as [`SlotView::model`] and the snapshot use it.
+    pub model: String,
+    /// The engine's own report: numbers and a sanitised phase.
+    pub live: EngineLive,
 }
 
 /// One loaded model's SETUP values (#52).
@@ -153,8 +168,11 @@ pub struct ModelSetup {
     pub id: String,
     /// The llama-swap `name` (or alias), sanitised.
     pub name: String,
-    /// Values the rules took from the launch command.
+    /// Values the rules took from the launch command and the model name.
     pub found: Vec<Found>,
+    /// Settings the engine reports about itself, for `engine:<key>` rules
+    /// (#54). Empty for an engine that reports none.
+    pub engine: EngineValues,
 }
 
 /// IN and OUT from one llama-swap capture (#5): sanitised tails only.
@@ -365,24 +383,32 @@ struct ReadyModel {
 }
 
 /// Live gauges from one backend `/metrics` read.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Gauges {
     running: Option<u16>,
     queued: Option<u16>,
     kv_permille: Option<u16>,
     hit_permille: Option<u16>,
     engine: EngineStats,
+    /// The engine's own `live` report (Strata, #54).
+    live: Option<EngineLive>,
     at: Instant,
 }
 
 impl Gauges {
-    fn of(sample: &MetricsSample, engine: EngineStats, at: Instant) -> Self {
+    fn of(
+        sample: &MetricsSample,
+        engine: EngineStats,
+        live: Option<EngineLive>,
+        at: Instant,
+    ) -> Self {
         Self {
             running: sample.requests_processing.and_then(backend::reqs),
             queued: sample.queued.and_then(backend::reqs),
             kv_permille: sample.kv_fill.and_then(backend::permille),
             hit_permille: sample.cache_hit.and_then(backend::permille),
             engine,
+            live,
             at,
         }
     }
@@ -586,7 +612,11 @@ impl<L: Sink> State<L> {
                 detail: info.detail.clone(),
                 backend: Some(BackendInfo {
                     kind: self.backend_of(info),
-                    max_running: info.max_running,
+                    max_running: info.max_running.or_else(|| {
+                        // Strata serves one request at a time, whichever
+                        // way it was told (#54).
+                        (self.backend_of(info) == Backend::Strata).then_some(1)
+                    }),
                     ..BackendInfo::default()
                 }),
             })
@@ -599,6 +629,7 @@ impl<L: Sink> State<L> {
                 id: sanitize(&info.id, llama_core::detail::MAX_FULL_NAME_CHARS),
                 name: info.full_name.clone(),
                 found: info.setup.clone(),
+                engine: EngineValues::default(),
             })
             .collect();
 
@@ -778,6 +809,9 @@ impl<L: Sink> State<L> {
                     && let Some(info) = model.backend.as_mut()
                 {
                     info.kind = kind;
+                    if kind == Backend::Strata {
+                        info.max_running = info.max_running.or(Some(1));
+                    }
                 }
             }
             if kind.has_metrics() {
@@ -812,8 +846,10 @@ impl<L: Sink> State<L> {
             .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
             .map(|text| parse_metrics_full(model.backend, &text));
             let now = Instant::now();
+            let mut live = None;
             let read = read.map(|(sample, facts)| {
-                if let Some(facts) = facts {
+                if let Some(mut facts) = facts {
+                    live = facts.live.take();
                     self.engine_facts.insert(model.id.clone(), facts);
                 }
                 sample
@@ -834,7 +870,7 @@ impl<L: Sink> State<L> {
                 let engine = self.engines.observe(&model.id, sample);
                 self.speeds.observe(&model.id, now, sample.speeds);
                 self.gauges
-                    .insert(model.id.clone(), Gauges::of(sample, engine, now));
+                    .insert(model.id.clone(), Gauges::of(sample, engine, live, now));
                 if let Some(prompt) = sample.prompt_total {
                     self.prompt_counter.observe(&model.id, prompt, None, now);
                 }
@@ -1202,13 +1238,43 @@ impl<L: Sink> State<L> {
                 })
                 .collect(),
             capture: self.capture.as_ref().map(|(_, view)| view.clone()),
-            setup: self.model_setup.clone(),
+            setup: self.setup_with_engine(),
+            engine_live: self.engine_live(now),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());
         }
         self.tx.put((view, detail));
         Ok(())
+    }
+
+    /// [`Self::model_setup`] with each model's engine-reported values (#54).
+    fn setup_with_engine(&self) -> Vec<ModelSetup> {
+        let mut setup = self.model_setup.clone();
+        for (entry, id) in setup.iter_mut().zip(&self.model_ids) {
+            if let Some(facts) = self.engine_facts.get(id) {
+                entry.engine = facts.values.clone();
+            }
+        }
+        setup
+    }
+
+    /// Each ready model's engine `live` report from a fresh read (#54).
+    fn engine_live(&self, now: Instant) -> Vec<ModelEngineLive> {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        self.ready
+            .iter()
+            .filter_map(|model| {
+                let gauges = self
+                    .gauges
+                    .get(&model.id)
+                    .filter(|gauges| now.saturating_duration_since(gauges.at) <= fresh)?;
+                Some(ModelEngineLive {
+                    model: model.name.clone(),
+                    live: gauges.live.clone()?,
+                })
+            })
+            .collect()
     }
 
     /// RECENT rows, newest first from llama-watch's own ring (#44), with

@@ -2,7 +2,8 @@
 //! model's launch command and its engine's own reports.
 //!
 //! Which flags matter is configuration: the built-in rules are
-//! `setup_defaults.toml` (upstream llama.cpp, vLLM and SGLang flags), and
+//! `setup_defaults.toml` (upstream llama.cpp, vLLM and SGLang flags, and
+//! Strata's own report), and
 //! `[[setup.field]]` in watch.toml adds more. This module is the plumbing,
 //! and it holds the limits whatever a rule says:
 //!
@@ -17,6 +18,14 @@
 //! - A JSON-valued flag is read one level deep and only up to
 //!   [`MAX_JSON_BYTES`].
 //!
+//! - `engine:<key>` (#54) reads a setting the engine reports about
+//!   itself. The keys are [`ENGINE_KEYS`], a fixed list the engine parser
+//!   fills with numbers and short tokens; no other part of its JSON is
+//!   reachable.
+//! - `name` (#54) scans the llama-swap model name for a GGUF quant tag
+//!   ([`cmdline::name_quant`]), for an engine whose command names no
+//!   weights file.
+//!
 //! [`Rules::rows`] turns the extracted values plus the live engine numbers
 //! into the rows the layout draws.
 
@@ -26,6 +35,7 @@ use llama_core::backend::{Backend, BackendInfo};
 use llama_core::detail::{ModelDetail, is_token};
 
 use crate::config::{Setup, SetupField};
+use crate::metrics::{ENGINE_KEYS, EngineValues};
 use crate::sources::cmdline;
 use crate::tty::layout::{SetupItem, SetupRow};
 
@@ -67,6 +77,8 @@ enum Kind {
     Quant,
     /// The flag is there: the value is `on`.
     Present,
+    /// A number of MiB, drawn as `16.4 GiB` (or `512 MiB` below 1 GiB).
+    Mib,
 }
 
 /// A number the watcher already has from the engine or the launch command.
@@ -86,6 +98,10 @@ enum Live {
     SpecAccept,
     /// Mean tokens per speculative step, `3.6/step`.
     SpecLen,
+    /// Expert cache hit rate of the newest request, `87 %` (#54).
+    ExpertHit,
+    /// PCIe share of that request's expert reads, `9 %` (#54).
+    PcieShare,
 }
 
 impl Live {
@@ -98,6 +114,8 @@ impl Live {
             "prefix_cache" => Self::PrefixCache,
             "spec_accept" => Self::SpecAccept,
             "spec_len" => Self::SpecLen,
+            "expert_hit" => Self::ExpertHit,
+            "pcie_share" => Self::PcieShare,
             _ => return None,
         })
     }
@@ -115,6 +133,10 @@ enum Source {
     Json { flags: Vec<String>, key: String },
     /// A number the watcher already has.
     Live(Live),
+    /// A setting the engine reports, one of [`ENGINE_KEYS`] (#54).
+    Engine(&'static str),
+    /// A quant tag in the llama-swap model name (#54).
+    Name,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +176,8 @@ pub struct LiveCtx<'a> {
     pub detail: Option<&'a ModelDetail>,
     /// The engine's live gauges.
     pub info: Option<&'a BackendInfo>,
+    /// Settings the engine reports about itself, for `engine:<key>` (#54).
+    pub engine: Option<&'a EngineValues>,
 }
 
 /// Compiled `[setup]` rules, sorted by order (stable: built-in rules first,
@@ -207,6 +231,13 @@ impl Rules {
     /// nothing of it is kept but the cleaned values.
     #[must_use]
     pub fn extract(&self, cmd: &str) -> Vec<Found> {
+        self.extract_all(cmd, "")
+    }
+
+    /// [`Self::extract`], plus the `name` rules' quant tag from the
+    /// llama-swap model `name` (#54). Of the name only the tag is kept.
+    #[must_use]
+    pub fn extract_all(&self, cmd: &str, name: &str) -> Vec<Found> {
         let tokens = tokenize(cmd);
         let words: Vec<&str> = tokens.iter().map(|(_, word)| *word).collect();
         // A server's flags come after its entry point and a wrapper's env
@@ -227,19 +258,23 @@ impl Rules {
             {
                 continue;
             }
-            let raw = match &rule.source {
+            let value = match &rule.source {
                 Source::Flag(names) => flag_value(&words[flags_from..], names, rule.kind),
                 Source::Env(name) => env_value(&words[..env_to], name),
                 Source::Json { flags, key } => json_value(cmd, &tokens[flags_from..], flags, key),
-                Source::Fixed | Source::Live(_) => continue,
-            };
-            let Some(value) = raw.and_then(|raw| clean(rule.kind, &raw)) else {
-                continue;
-            };
-            let Ok(rule) = u16::try_from(index) else {
-                break;
-            };
-            out.push(Found { rule, value });
+                // Already a checked tag, not a file name to read one from.
+                Source::Name => {
+                    if let Some(tag) = cmdline::name_quant(name) {
+                        push(&mut out, index, tag);
+                    }
+                    continue;
+                }
+                Source::Fixed | Source::Live(_) | Source::Engine(_) => continue,
+            }
+            .and_then(|raw| clean(rule.kind, &raw));
+            if let Some(value) = value {
+                push(&mut out, index, value);
+            }
         }
         out
     }
@@ -275,6 +310,10 @@ impl Rules {
             }
             let value = match &rule.source {
                 Source::Live(which) => live_value(*which, live),
+                Source::Engine(key) => live
+                    .engine
+                    .and_then(|values| values.get(key))
+                    .and_then(|value| engine_value(rule.kind, value)),
                 Source::Fixed => None,
                 _ => found
                     .iter()
@@ -286,10 +325,10 @@ impl Rules {
                 Some(value) => match rule.map.get(&value) {
                     Some(text) => (text.clone(), false),
                     None => {
-                        let shown = if rule.kind == Kind::Number && is_number(&value) {
-                            number_text(&value)
-                        } else {
-                            value
+                        let shown = match rule.kind {
+                            Kind::Number if is_number(&value) => number_text(&value),
+                            Kind::Mib if is_number(&value) => mib_text(&value),
+                            _ => value,
                         };
                         let text = if rule.label.is_empty() {
                             format!("{shown}{}", rule.suffix)
@@ -313,6 +352,13 @@ impl Rules {
         }
         rows.retain(|row| !row.items.is_empty());
         rows
+    }
+}
+
+/// Record rule `index`'s value. More than `u16::MAX` rules never compile.
+fn push(out: &mut Vec<Found>, index: usize, value: String) {
+    if let Ok(rule) = u16::try_from(index) {
+        out.push(Found { rule, value });
     }
 }
 
@@ -340,7 +386,9 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
     };
     let source = parse_source(field.source.as_deref())?;
     let kind = match (&source, field.kind.as_deref()) {
-        (Source::Fixed | Source::Live(_), None) => Kind::Token,
+        (Source::Fixed | Source::Live(_) | Source::Engine(_), None) => Kind::Token,
+        (Source::Name, Some("quant")) => Kind::Quant,
+        (Source::Name, _) => return Err("a name source needs kind quant".to_owned()),
         (Source::Fixed, Some(_)) => return Err("kind needs a source".to_owned()),
         (Source::Live(_), Some(_)) => {
             return Err("kind is not allowed with a live source".to_owned());
@@ -351,9 +399,10 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
             "token" => Kind::Token,
             "quant" => Kind::Quant,
             "present" => Kind::Present,
+            "mib" => Kind::Mib,
             other => {
                 return Err(format!(
-                    "unknown kind {:?} (number, token, quant, present)",
+                    "unknown kind {:?} (number, token, quant, present, mib)",
                     printable(other)
                 ));
             }
@@ -361,6 +410,9 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
     };
     if kind == Kind::Present && !matches!(source, Source::Flag(_)) {
         return Err("kind present needs a flag source".to_owned());
+    }
+    if matches!(source, Source::Engine(_)) && matches!(kind, Kind::Quant | Kind::Present) {
+        return Err("an engine source takes kind number, token or mib".to_owned());
     }
     if source == Source::Fixed && field.default.is_none() {
         return Err("a field with no source needs a default".to_owned());
@@ -413,9 +465,12 @@ fn parse_source(source: Option<&str>) -> Result<Source, String> {
     let Some(source) = source else {
         return Ok(Source::Fixed);
     };
+    if source == "name" {
+        return Ok(Source::Name);
+    }
     let bad = || {
         format!(
-            "source {:?} is not flag:NAMES, env:NAME, json:NAMES:KEY or live:NAME",
+            "source {:?} is not flag:NAMES, env:NAME, json:NAMES:KEY, live:NAME, engine:KEY or name",
             printable(source)
         )
     };
@@ -450,10 +505,20 @@ fn parse_source(source: Option<&str>) -> Result<Source, String> {
         }
         "live" => Live::from_name(rest).map(Source::Live).ok_or_else(|| {
             format!(
-                "unknown live source {:?} (engine, ctx, kv_dtype, kv_block, prefix_cache, spec_accept, spec_len)",
+                "unknown live source {:?} (engine, ctx, kv_dtype, kv_block, prefix_cache, spec_accept, spec_len, expert_hit, pcie_share)",
                 printable(rest)
             )
         }),
+        "engine" => ENGINE_KEYS
+            .iter()
+            .find(|key| **key == rest)
+            .map(|key| Source::Engine(key))
+            .ok_or_else(|| {
+                format!(
+                    "unknown engine key {:?} (see README, SETUP rules)",
+                    printable(rest)
+                )
+            }),
         _ => Err(bad()),
     }
 }
@@ -700,6 +765,34 @@ fn clean(kind: Kind, raw: &str) -> Option<String> {
         }
         Kind::Quant => cmdline::quant_tag(raw),
         Kind::Present => Some("on".to_owned()),
+        Kind::Mib => (is_number(raw) && !raw.starts_with('-')).then(|| raw.to_owned()),
+    }
+}
+
+/// An engine-reported value for a rule of `kind`: a number for `number`
+/// and `mib`, else a number or a short token.
+fn engine_value(kind: Kind, value: &str) -> Option<String> {
+    let ok = match kind {
+        Kind::Number | Kind::Mib => is_number(value),
+        _ => is_number(value) || is_token(value),
+    };
+    ok.then(|| value.to_owned())
+}
+
+/// MiB as `16.4 GiB`, or `512 MiB` below 1 GiB.
+fn mib_text(text: &str) -> String {
+    let Ok(mib) = text.parse::<f64>() else {
+        return text.to_owned();
+    };
+    if mib < 1024.0 {
+        format!("{} MiB", crate::tty::layout::commas(mib.round() as u64))
+    } else {
+        let tenths = (mib / 1024.0 * 10.0).round() as u64;
+        format!(
+            "{}.{} GiB",
+            crate::tty::layout::commas(tenths / 10),
+            tenths % 10
+        )
     }
 }
 
@@ -737,6 +830,11 @@ fn number_text(text: &str) -> String {
     }
 }
 
+/// Per mille as a whole percent, `87 %`.
+fn percent(permille: u16) -> String {
+    format!("{} %", (u32::from(permille.min(1000)) + 5) / 10)
+}
+
 fn live_value(which: Live, live: &LiveCtx<'_>) -> Option<String> {
     let detail = live.detail;
     let engine = live.info.map(|info| &info.engine);
@@ -761,9 +859,9 @@ fn live_value(which: Live, live: &LiveCtx<'_>) -> Option<String> {
         Live::PrefixCache => detail
             .and_then(|d| d.prefix_cache)
             .map(|on| if on { "on" } else { "off" }.to_owned()),
-        Live::SpecAccept => engine
-            .and_then(|e| e.spec_permille)
-            .map(|p| format!("{} %", (u32::from(p.min(1000)) + 5) / 10)),
+        Live::SpecAccept => engine.and_then(|e| e.spec_permille).map(percent),
+        Live::ExpertHit => engine.and_then(|e| e.expert_hit_permille).map(percent),
+        Live::PcieShare => engine.and_then(|e| e.pcie_share_permille).map(percent),
         Live::SpecLen => engine.and_then(|e| e.spec_len_centi).map(|centi| {
             let tenths = (u32::from(centi) + 5) / 10;
             format!("{}.{}/step", tenths / 10, tenths % 10)
@@ -1008,6 +1106,7 @@ mod tests {
             backend: Backend::LlamaCpp,
             detail: None,
             info: None,
+            engine: None,
         };
         let rows = |cmd: &str| -> Vec<(String, Vec<(String, bool)>)> {
             rules

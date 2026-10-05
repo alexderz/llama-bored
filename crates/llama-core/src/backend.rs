@@ -151,8 +151,9 @@ pub const MAX_ENGINE_TPS: f64 = 1_000_000.0;
 /// Speculative-decoding counters since the watcher started (#31).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SpecCounts {
-    /// Draft rounds (`vllm:spec_decode_num_drafts`).
-    pub drafts: u64,
+    /// Draft rounds (`vllm:spec_decode_num_drafts`). `None` for an engine
+    /// that counts drafted and accepted tokens but not rounds (Strata, #54).
+    pub drafts: Option<u64>,
     /// Tokens drafted (`vllm:spec_decode_num_draft_tokens`).
     pub draft_tokens: u64,
     /// Drafted tokens accepted, never above [`Self::draft_tokens`].
@@ -189,6 +190,12 @@ pub struct EngineStats {
     /// Decode speed over the same window: tokens after the first over
     /// decode time, speculative decoding included, in tenths.
     pub decode_tps_tenths: Option<u32>,
+    /// Expert cache hit rate of the newest finished request, 0..=1000
+    /// (Strata `requests[0].hit_rate`, #54).
+    pub expert_hit_permille: Option<u16>,
+    /// Share of that request's expert reads that crossed PCIe, 0..=1000
+    /// (Strata `requests[0].pcie_share`, #54).
+    pub pcie_share_permille: Option<u16>,
 }
 
 impl EngineStats {

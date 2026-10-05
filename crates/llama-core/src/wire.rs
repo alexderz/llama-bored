@@ -329,10 +329,17 @@ pub struct EngineWire {
     /// Decode tokens per second over the same window, 0..=[`MAX_ENGINE_TPS`].
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub decode_tps: Option<f32>,
+    /// Expert cache hit rate of the newest finished request, 0..=1 (#54,
+    /// Strata). Omitted by an older watcher and by other engines.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub expert_hit: Option<f32>,
+    /// Share of that request's expert reads served over PCIe, 0..=1 (#54).
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub pcie_share: Option<f32>,
 }
 
 impl EngineWire {
-    /// True when the numbers are in range: a ratio in 0..=1, a step length
+    /// True when the numbers are in range: ratios in 0..=1, a step length
     /// in 1..=[`MAX_SPEC_LEN`], accepted tokens not above draft tokens,
     /// latencies in 0..=[`MAX_ENGINE_LATENCY_S`], and speeds in
     /// 0..=[`MAX_ENGINE_TPS`].
@@ -341,7 +348,9 @@ impl EngineWire {
         let in_range = |value: Option<f32>, low: f64, high: f64| {
             value.is_none_or(|v| v.is_finite() && (low..=high).contains(&f64::from(v)))
         };
-        in_range(self.spec_accept, 0.0, 1.0)
+        [self.spec_accept, self.expert_hit, self.pcie_share]
+            .into_iter()
+            .all(|ratio| in_range(ratio, 0.0, 1.0))
             && in_range(self.spec_len, 1.0, MAX_SPEC_LEN)
             && [self.ttft_s, self.itl_s, self.e2e_s]
                 .into_iter()

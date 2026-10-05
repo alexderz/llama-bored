@@ -3381,7 +3381,7 @@ pub(crate) fn commas(n: u64) -> String {
     out.chars().rev().collect()
 }
 
-fn comma_pair(done: u64, total: u64) -> String {
+pub(crate) fn comma_pair(done: u64, total: u64) -> String {
     format!("{}/{}", commas(done), commas(total))
 }
 

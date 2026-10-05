@@ -437,7 +437,7 @@ fn engine_of(stats: &EngineStats) -> Option<EngineWire> {
             .spec_len_centi
             .map(|centi| f32::from(centi) / 100.0)
             .filter(|len| (1.0..=wire::MAX_SPEC_LEN as f32).contains(len)),
-        spec_drafts: counts.map(|c| c.drafts),
+        spec_drafts: counts.and_then(|c| c.drafts),
         spec_draft_tokens: counts.map(|c| c.draft_tokens),
         spec_accepted_tokens: counts.map(|c| c.accepted.min(c.draft_tokens)),
         preemptions: stats.preemptions,
@@ -447,6 +447,8 @@ fn engine_of(stats: &EngineStats) -> Option<EngineWire> {
         e2e_s: seconds(stats.e2e_us),
         prefill_tps: tps(stats.prefill_tps_tenths),
         decode_tps: tps(stats.decode_tps_tenths),
+        expert_hit: stats.expert_hit_permille.and_then(ratio),
+        pcie_share: stats.pcie_share_permille.and_then(ratio),
     };
     (engine != EngineWire::default()).then_some(engine)
 }

@@ -1918,6 +1918,7 @@ fn setup_of(
         backend,
         detail,
         info,
+        engine: None,
     };
     SetupView {
         id: id.to_owned(),
@@ -4016,6 +4017,104 @@ fn dump_setup_goldens() {
         let grid = draw(&setup_model(), cols, rows);
         std::fs::write(dir.join(name), dump_grid(&grid)).expect("write setup golden");
     }
+}
+
+// ---- #54: Strata's own report in SETUP and on the engine lines ------------
+
+/// Titan's shape at 160x49 with Strata generating in a container: SETUP
+/// from the invented `fixtures/llama/strata-metrics.json`, the quant from
+/// the llama-swap name, and the engine lines with the live phase.
+fn strata_setup_model() -> TtyModel {
+    let mut model = sglang_model();
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    model.model_name = "Flash Next Q4_K_M".to_string();
+    model.model_detail = "Strata".to_string();
+    let body = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/llama/strata-metrics.json"),
+    )
+    .expect("strata fixture");
+    let (_, facts) = llama_watch::metrics::parse_strata(&body);
+    let detail = ModelDetail {
+        ctx: facts.ctx,
+        kv_k: facts.kv.clone(),
+        kv_v: facts.kv.clone(),
+        ..ModelDetail::default()
+    };
+    let info = BackendInfo {
+        kind: Backend::Strata,
+        engine: EngineStats {
+            spec_permille: Some(700),
+            expert_hit_permille: Some(874),
+            pcie_share_permille: Some(92),
+            ..EngineStats::default()
+        },
+        ..BackendInfo::default()
+    };
+    let rules = Rules::builtin();
+    let live = LiveCtx {
+        backend: Backend::Strata,
+        detail: Some(&detail),
+        info: Some(&info),
+        engine: Some(&facts.values),
+    };
+    let cmd = "podman run --rm --name strata -v /models/strata:/data:ro 5e1f0c2d9a7b --config /data/configs/flash-next.json --port 8793";
+    model.setup = Some(SetupView {
+        id: "flash-next".to_owned(),
+        name: "Flash Next Q4_K_M".to_owned(),
+        more: 0,
+        rows: rules.rows(&rules.extract_all(cmd, "Flash Next Q4_K_M"), &live),
+    });
+    model.backend_lines = vec![
+        "strata  running 1/1 · queued 2 · spec 70 % · prefill 968/s · decode 30.9/s".to_string(),
+        "        drafting a reply: outline · gen 40/4,096 · 31.5/s".to_string(),
+    ];
+    for req in &mut model.requests {
+        req.model = "flash-next".to_string();
+    }
+    model
+}
+
+const STRATA_SETUP_GOLDEN: (&str, u16, u16) = ("setup-strata-160x49.json", 160, 49);
+
+#[test]
+fn strata_setup_golden_matches_character_and_colour() {
+    let (name, _, _) = STRATA_SETUP_GOLDEN;
+    assert_frame(name, &load(name), &strata_setup_model());
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #54 Strata SETUP golden"]
+fn dump_strata_setup_golden() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    let (name, cols, rows) = STRATA_SETUP_GOLDEN;
+    let grid = draw(&strata_setup_model(), cols, rows);
+    std::fs::write(dir.join(name), dump_grid(&grid)).expect("write strata setup golden");
+}
+
+/// #54: the five Strata rows fit at 160x49, under the title.
+#[test]
+fn strata_setup_rows_at_160x49() {
+    let grid = draw(&strata_setup_model(), 160, 49);
+    let rows = left_rows(&grid, 10, 7);
+    assert!(
+        rows[1].starts_with("  SETUP  flash-next · Flash Next Q4_K_M"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[2..],
+        [
+            "    engine   Strata 0.1.41 · Q4_K_M",
+            "    ctx      262,144 · kv q8 · resident 24,576",
+            "    experts  cache 14.6 GiB · 7,200 slots · hit 87 % · pcie 9 %",
+            "    spec     depth 5 · mtp 3 · lookup 2 · min-p 0.40 · 70 %",
+            "    serve    pcie 0.60 · arena 40.5 GiB · 12 workers · conv cache off",
+        ]
+    );
+    let all = whole(&grid);
+    assert!(
+        all.contains("drafting a reply: outline · gen 40/4,096 · 31.5/s"),
+        "{all}"
+    );
 }
 
 /// Rows from the label column of `grid`, `count` from `top`, trimmed.

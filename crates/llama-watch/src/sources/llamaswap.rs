@@ -203,7 +203,11 @@ fn parse_running(
                 detail: parsed.detail,
                 backend: parsed.backend,
                 max_running: parsed.max_running,
-                setup: launch.map(|text| rules.extract(text)).unwrap_or_default(),
+                // The `name` rules (#54) read llama-swap's own `name`.
+                setup: rules.extract_all(
+                    launch.unwrap_or_default(),
+                    entry.name.as_deref().unwrap_or_default(),
+                ),
             }
         })
         .collect();

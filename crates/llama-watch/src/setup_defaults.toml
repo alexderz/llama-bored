@@ -1,4 +1,5 @@
-# Built-in SETUP rules (#52): upstream llama.cpp, vLLM and SGLang flags.
+# Built-in SETUP rules (#52): upstream llama.cpp, vLLM and SGLang flags,
+# and the settings Strata reports in its /metrics (#54, `engine:<key>`).
 #
 # The same format as `[[setup.field]]` in watch.toml (README "SETUP rules").
 # watch.toml rules extend these; `[setup] defaults = false` drops them.
@@ -24,6 +25,22 @@ row = "engine"
 engines = ["vllm", "sglang"]
 source = "flag:--quantization"
 kind = "token"
+order = 11
+
+# Strata: its version, and the quant from the llama-swap model name (its
+# command names only a config file).
+[[field]]
+row = "engine"
+engines = ["strata"]
+source = "engine:version"
+sep = " "
+order = 10
+
+[[field]]
+row = "engine"
+engines = ["strata"]
+source = "name"
+kind = "quant"
 order = 11
 
 [[field]]
@@ -91,6 +108,15 @@ source = "live:kv_dtype"
 label = "kv"
 order = 22
 
+# Strata: KV tokens kept resident on the GPU.
+[[field]]
+row = "ctx"
+engines = ["strata"]
+source = "engine:kv_resident"
+kind = "number"
+label = "resident"
+order = 23
+
 [[field]]
 row = "ctx"
 engines = ["vllm"]
@@ -126,6 +152,37 @@ map = { "0" = "full GPU" }
 default = "full GPU"
 fallback = true
 order = 31
+
+# Strata: its expert cache, size and slots.
+[[field]]
+row = "experts"
+engines = ["strata"]
+source = "engine:expert_cache_mib"
+kind = "mib"
+label = "cache"
+order = 30
+
+[[field]]
+row = "experts"
+engines = ["strata"]
+source = "engine:expert_slots"
+kind = "number"
+suffix = " slots"
+order = 31
+
+# The newest request's expert cache hit rate and PCIe share (any engine
+# that reports them; Strata does).
+[[field]]
+row = "experts"
+source = "live:expert_hit"
+label = "hit"
+order = 32
+
+[[field]]
+row = "experts"
+source = "live:pcie_share"
+label = "pcie"
+order = 33
 
 # ---- spec: speculative decoding and its live acceptance ------------------
 
@@ -182,6 +239,40 @@ source = "flag:--speculative-num-draft-tokens"
 kind = "number"
 label = "n"
 order = 42
+
+# Strata: draft depth, MTP and lookup drafts, and the draft min-p.
+[[field]]
+row = "spec"
+engines = ["strata"]
+source = "engine:spec"
+kind = "number"
+label = "depth"
+map = { "0" = "off" }
+order = 40
+
+[[field]]
+row = "spec"
+engines = ["strata"]
+source = "engine:mtp_max"
+kind = "number"
+label = "mtp"
+order = 41
+
+[[field]]
+row = "spec"
+engines = ["strata"]
+source = "engine:lookup"
+kind = "number"
+label = "lookup"
+order = 42
+
+[[field]]
+row = "spec"
+engines = ["strata"]
+source = "engine:spec_min_p"
+kind = "number"
+label = "min-p"
+order = 43
 
 [[field]]
 row = "spec"
@@ -269,6 +360,50 @@ source = "flag:--max-num-batched-tokens"
 kind = "number"
 label = "batch"
 order = 62
+
+# Strata: the PCIe fraction, the arena, pool workers and the conversation
+# cache (its budget while on, else `conv cache off`).
+[[field]]
+row = "serve"
+engines = ["strata"]
+source = "engine:pcie_frac"
+kind = "number"
+label = "pcie"
+order = 60
+
+[[field]]
+row = "serve"
+engines = ["strata"]
+source = "engine:arena_mib"
+kind = "mib"
+label = "arena"
+order = 61
+
+[[field]]
+row = "serve"
+engines = ["strata"]
+source = "engine:pool_workers"
+kind = "number"
+suffix = " workers"
+order = 62
+
+[[field]]
+row = "serve"
+engines = ["strata"]
+source = "engine:conversation_cache_mib"
+kind = "mib"
+label = "conv cache"
+group = "conv"
+order = 63
+
+[[field]]
+row = "serve"
+engines = ["strata"]
+source = "engine:conversation_cache"
+map = { on = "conv cache on", off = "conv cache off" }
+group = "conv"
+fallback = true
+order = 64
 
 # ---- sample: sampling overrides ------------------------------------------
 

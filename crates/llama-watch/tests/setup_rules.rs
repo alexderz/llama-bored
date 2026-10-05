@@ -7,11 +7,27 @@ use std::path::PathBuf;
 use llama_core::backend::{Backend, BackendInfo, EngineStats};
 use llama_core::detail::ModelDetail;
 use llama_watch::config::{Config, Setup};
+use llama_watch::metrics::{EngineFacts, parse_strata};
 use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::sources::cmdline::parse_launch;
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// `name` of a fixture entry.
+fn name_of(id: &str) -> String {
+    let text =
+        std::fs::read_to_string(root().join("fixtures/llama/running-setup.json")).expect("fixture");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    body["running"]
+        .as_array()
+        .expect("running")
+        .iter()
+        .find(|entry| entry["model"] == id)
+        .and_then(|entry| entry["name"].as_str())
+        .unwrap_or_else(|| panic!("no fixture {id}"))
+        .to_owned()
 }
 
 /// `(id, cmd)` of every fixture entry.
@@ -76,6 +92,7 @@ fn rows(
         backend,
         detail,
         info,
+        engine: None,
     };
     rules
         .rows(&rules.extract(cmd), &live)
@@ -270,6 +287,164 @@ fn strata_reports_its_own_ctx_and_kv() {
         rows(&with_example(), &cmd, Backend::Strata, Some(&facts), None),
         ["engine: Strata", "ctx: 262,144 · kv q8"]
     );
+}
+
+/// #54: Strata in a container names nothing in its command; what it
+/// reports in `/metrics` (the invented fixture) fills its SETUP rows, and
+/// the quant comes from the llama-swap model name.
+#[test]
+fn strata_in_a_container_shows_what_it_reports() {
+    let id = "flash-next-strata";
+    let cmd = cmd_of(id);
+    assert_eq!(
+        parse_launch(&cmd).backend,
+        Backend::OpenAi,
+        "told by /metrics"
+    );
+    let body = std::fs::read_to_string(root().join("fixtures/llama/strata-metrics.json"))
+        .expect("strata fixture");
+    let (_, facts) = parse_strata(&body);
+    let EngineFacts {
+        ctx, kv, values, ..
+    } = facts;
+    let detail = ModelDetail {
+        ctx,
+        kv_k: kv.clone(),
+        kv_v: kv,
+        ..ModelDetail::default()
+    };
+    let info = BackendInfo {
+        engine: EngineStats {
+            spec_permille: Some(700),
+            expert_hit_permille: Some(874),
+            pcie_share_permille: Some(92),
+            ..EngineStats::default()
+        },
+        ..BackendInfo::default()
+    };
+    let rules = with_example();
+    let live = LiveCtx {
+        backend: Backend::Strata,
+        detail: Some(&detail),
+        info: Some(&info),
+        engine: Some(&values),
+    };
+    let found = rules.extract_all(&cmd, &name_of(id));
+    let text: Vec<String> = rules
+        .rows(&found, &live)
+        .into_iter()
+        .map(|row| {
+            let items: Vec<String> = row
+                .items
+                .iter()
+                .map(|item| format!("{}{}", item.sep, item.text))
+                .collect();
+            format!("{}:{}", row.label, items.concat())
+        })
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "engine: · Strata 0.1.41 · Q4_K_M",
+            "ctx: · 262,144 · kv q8 · resident 24,576",
+            "experts: · cache 14.6 GiB · 7,200 slots · hit 87 % · pcie 9 %",
+            "spec: · depth 5 · mtp 3 · lookup 2 · min-p 0.40 · 70 %",
+            "serve: · pcie 0.60 · arena 40.5 GiB · 12 workers · conv cache off",
+        ]
+    );
+    // The conversation cache's budget stands in for `off` while it is on.
+    let mut on = values.clone();
+    on.insert("conversation_cache", "on".to_owned());
+    on.insert("conversation_cache_mib", "2560".to_owned());
+    let live = LiveCtx {
+        engine: Some(&on),
+        ..live
+    };
+    let serve = rules
+        .rows(&found, &live)
+        .into_iter()
+        .find(|row| row.label == "serve")
+        .expect("serve");
+    let items: Vec<&str> = serve.items.iter().map(|item| item.text.as_str()).collect();
+    assert_eq!(
+        items,
+        [
+            "pcie 0.60",
+            "arena 40.5 GiB",
+            "12 workers",
+            "conv cache 2.5 GiB"
+        ]
+    );
+    // Without its report, Strata's rows are what the command gives: none
+    // but the engine and the quant from the name.
+    let bare = LiveCtx {
+        backend: Backend::Strata,
+        detail: None,
+        info: None,
+        engine: None,
+    };
+    let rows = rules.rows(&found, &bare);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].items.len(), 2);
+}
+
+/// #54: `engine:<key>` names a key of the fixed list, `name` needs kind
+/// quant, and `mib` draws GiB.
+#[test]
+fn engine_and_name_sources_are_checked() {
+    for (toml, want) in [
+        (
+            "[[setup.field]]\nrow = \"x\"\nsource = \"engine:history\"\n",
+            "setup.field[0]: unknown engine key \"history\"",
+        ),
+        (
+            "[[setup.field]]\nrow = \"x\"\nsource = \"engine:kv\"\nkind = \"present\"\n",
+            "setup.field[0]: kind present needs a flag source",
+        ),
+        (
+            "[[setup.field]]\nrow = \"x\"\nsource = \"engine:kv\"\nkind = \"quant\"\n",
+            "setup.field[0]: an engine source takes",
+        ),
+        (
+            "[[setup.field]]\nrow = \"x\"\nsource = \"name\"\n",
+            "setup.field[0]: a name source needs kind quant",
+        ),
+        (
+            "[[setup.field]]\nrow = \"x\"\nsource = \"name\"\nkind = \"token\"\n",
+            "setup.field[0]: a name source needs kind quant",
+        ),
+    ] {
+        let config = Config::from_toml(toml).expect("parses");
+        let error = config.validate(8).expect_err("invalid").to_string();
+        assert!(error.starts_with(want), "{error}");
+    }
+    let config = Config::from_toml(
+        "[setup]\ndefaults = false\n[[setup.field]]\nrow = \"mem\"\nsource = \"engine:arena_mib\"\nkind = \"mib\"\n[[setup.field]]\nrow = \"mem\"\nsource = \"engine:expert_cache_mib\"\nkind = \"mib\"\n[[setup.field]]\nrow = \"mem\"\nsource = \"engine:kv\"\nkind = \"number\"\n",
+    )
+    .expect("toml");
+    assert!(config.validate(8).is_ok());
+    let rules = Rules::compile(&config.setup).expect("rules");
+    let values = [
+        ("arena_mib", "512"),
+        ("expert_cache_mib", "1048576"),
+        ("kv", "q8"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key, value.to_owned()))
+    .collect();
+    let live = LiveCtx {
+        backend: Backend::Strata,
+        detail: None,
+        info: None,
+        engine: Some(&values),
+    };
+    let rows = rules.rows(&[], &live);
+    let items: Vec<&str> = rows[0]
+        .items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect();
+    assert_eq!(items, ["512 MiB", "1,024.0 GiB"], "a token is not a number");
 }
 
 /// Whatever a rule names, a path, a long value or a shell fragment never

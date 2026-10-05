@@ -137,9 +137,10 @@ palette = "llama"
 # tty11's SETUP block (#52): the settings of the model generating now (or
 # the one used last) under the meters. Rules pick each value from the
 # llama-swap launch command (a flag, a `-e NAME=V` env, or a key of a JSON
-# flag), or from what the engine reports (`live:`). Only numbers and short
-# tokens are ever shown, never a path or a raw argument. Built-in rules
-# cover upstream llama.cpp, vLLM and SGLang flags
+# flag), or from what the engine reports (`live:`, and `engine:` for the
+# settings Strata reports, #54). Only numbers and short tokens are ever
+# shown, never a path or a raw argument. Built-in rules cover upstream
+# llama.cpp, vLLM and SGLang flags and Strata's report
 # (crates/llama-watch/src/setup_defaults.toml); rules here are added to
 # them, and `defaults = false` keeps only the rules here. README "SETUP
 # rules" lists every key.

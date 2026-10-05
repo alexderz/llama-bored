@@ -477,7 +477,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
             }
         }
     }
-    let model_families: [(&str, &str, &str, ModelValue); 23] = [
+    let model_families: [(&str, &str, &str, ModelValue); 25] = [
         (
             "llamabored_model_ctx_size_tokens",
             "gauge",
@@ -558,7 +558,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         (
             "llamabored_model_spec_acceptance_ratio",
             "gauge",
-            "Speculative decoding: accepted / draft tokens, 0 to 1, over the latest metrics window with drafts (vLLM; SGLang's gauge).",
+            "Speculative decoding: accepted / draft tokens, 0 to 1, over the latest metrics window with drafts (vLLM, Strata; SGLang's gauge).",
             |m| {
                 engine(m)
                     .and_then(|e| e.spec_accept)
@@ -586,7 +586,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         (
             "llamabored_model_spec_draft_tokens_total",
             "counter",
-            "Speculative decoding tokens drafted since the watcher started (vLLM).",
+            "Speculative decoding tokens drafted since the watcher started (vLLM, Strata).",
             |m| {
                 engine(m)
                     .and_then(|e| e.spec_draft_tokens)
@@ -596,7 +596,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         (
             "llamabored_model_spec_accepted_tokens_total",
             "counter",
-            "Drafted tokens accepted since the watcher started (vLLM); acceptance = rate of this / rate of draft_tokens_total.",
+            "Drafted tokens accepted since the watcher started (vLLM, Strata); acceptance = rate of this / rate of draft_tokens_total.",
             |m| {
                 engine(m)
                     .and_then(|e| e.spec_accepted_tokens)
@@ -651,7 +651,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         (
             "llamabored_model_prefill_tokens_per_second",
             "gauge",
-            "Prefill tok/s: uncached prompt tokens over prefill time of the requests finished in the latest metrics window with any (vLLM).",
+            "Prefill tok/s: uncached prompt tokens over prefill time of the requests finished in the latest metrics window with any (vLLM, Strata).",
             |m| {
                 engine(m)
                     .and_then(|e| e.prefill_tps)
@@ -662,10 +662,32 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         (
             "llamabored_model_decode_tokens_per_second",
             "gauge",
-            "Decode tok/s: tokens after the first over decode time, spec decoding included, same requests and window (vLLM).",
+            "Decode tok/s: tokens after the first over decode time, spec decoding included, same requests and window (vLLM; Strata counts every output token).",
             |m| {
                 engine(m)
                     .and_then(|e| e.decode_tps)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_expert_cache_hit_ratio",
+            "gauge",
+            "Expert cache hit rate of the newest finished request, 0 to 1 (Strata).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.expert_hit)
+                    .filter(|v| v.is_finite())
+                    .map(num)
+            },
+        ),
+        (
+            "llamabored_model_pcie_share_ratio",
+            "gauge",
+            "Share of the newest finished request's expert reads served over PCIe, 0 to 1 (Strata).",
+            |m| {
+                engine(m)
+                    .and_then(|e| e.pcie_share)
                     .filter(|v| v.is_finite())
                     .map(num)
             },

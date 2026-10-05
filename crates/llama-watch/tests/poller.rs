@@ -901,6 +901,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 prompt_cache: Vec::new(),
                 capture: None,
                 setup: Vec::new(),
+                engine_live: Vec::new(),
             },
         ));
     }
@@ -1428,7 +1429,7 @@ fn a_container_vllm_is_found_by_its_metrics_and_reads_engine_numbers() {
     assert_eq!(
         engine.spec_counts,
         Some(llama_core::backend::SpecCounts {
-            drafts: 100,
+            drafts: Some(100),
             draft_tokens: 300,
             accepted: 240,
         })
@@ -1837,6 +1838,136 @@ fn config_override_can_name_strata() {
 }
 
 // ---- #10: per-model prompt and cached-prompt counters -----------------------
+
+/// #54: Strata in a container, as Titan runs it: the command names an
+/// image digest and a config, nothing that says Strata.
+const STRATA_CONTAINER_CMD: &str = "podman run --rm --name strata --network llama --device nvidia.com/gpu=all -v /models/strata:/data:ro 5e1f0c2d9a7b4e6f8c3d2a1b0e9f8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e --config /data/configs/flash-next.json --port 8793";
+
+/// #54: the /metrics probe tells Strata by its JSON's shape, once per
+/// load; the model then reads as Strata everywhere: its engine numbers,
+/// its SETUP values and its live phase.
+#[test]
+fn a_container_strata_is_found_by_the_shape_of_its_metrics() {
+    let running = serde_json::to_vec(&serde_json::json!({
+        "running": [{
+            "model": "flash-next",
+            "name": "Flash Next Q4_K_M",
+            "state": "ready",
+            "cmd": STRATA_CONTAINER_CMD,
+        }]
+    }))
+    .expect("json");
+    let mut world = World::running(running);
+    world.metrics.insert(
+        "flash-next".to_owned(),
+        strata_metrics(2500, 12_000, 9000, "generating", 40),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, detail| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| info.engine.spec_permille.is_some())
+            && !detail.engine_live.is_empty()
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kind, llama_core::backend::Backend::Strata);
+    assert_eq!(info.max_running, Some(1), "Strata serves one at a time");
+    assert_eq!(info.running, Some(1));
+    assert_eq!(info.queued, Some(2));
+    // The first read: everything since Strata started.
+    assert_eq!(info.engine.spec_permille, Some(700));
+    assert_eq!(info.engine.spec_len_centi, None);
+    assert_eq!(info.engine.prefill_tps_tenths, Some(9677));
+    assert_eq!(info.engine.decode_tps_tenths, Some(309));
+    assert_eq!(info.engine.expert_hit_permille, Some(874));
+    assert_eq!(info.engine.pcie_share_permille, Some(92));
+    let tuning = view.models[0].detail.as_ref().expect("detail from engine");
+    assert_eq!(tuning.ctx, Some(262_144));
+    assert_eq!(tuning.kv_k.as_deref(), Some("q8"));
+    // SETUP gets the engine's settings and the quant from the name.
+    let setup = &detail.setup[0];
+    assert_eq!(
+        setup.engine.get("expert_cache_mib").map(String::as_str),
+        Some("14950")
+    );
+    assert_eq!(
+        setup.engine.get("version").map(String::as_str),
+        Some("0.1.41")
+    );
+    assert!(
+        setup.found.iter().any(|found| found.value == "Q4_K_M"),
+        "{setup:?}"
+    );
+    // The live phase, sanitised, for tty11 only.
+    let live = &detail.engine_live[0];
+    assert_eq!(live.model, view.models[0].name, "keyed like the snapshot");
+    assert_eq!(
+        live.live.phase.as_deref(),
+        Some("drafting a reply: outline")
+    );
+    assert_eq!(live.live.generated, Some(40));
+
+    // The next window: one more request.
+    server.update(|world| {
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&strata_metrics(2800, 13_000, 9800, "idle", 0)).expect("json");
+        doc["totals"]["requests"] = serde_json::json!(8);
+        doc["totals"]["prompt_ms"] = serde_json::json!(3500.0);
+        doc["totals"]["decode_ms"] = serde_json::json!(91_000.0);
+        doc["totals"]["drafts_offered"] = serde_json::json!(2680);
+        doc["totals"]["drafts_accepted"] = serde_json::json!(1890);
+        world.metrics.insert(
+            "flash-next".to_owned(),
+            serde_json::to_vec(&doc).expect("json"),
+        );
+    });
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.models[0]
+            .backend
+            .is_some_and(|info| info.engine.spec_permille == Some(750))
+    });
+    let engine = view.models[0].backend.expect("backend").engine;
+    assert_eq!(engine.prefill_tps_tenths, Some(5000));
+    assert_eq!(engine.decode_tps_tenths, Some(300));
+    assert_eq!(
+        engine.spec_counts,
+        Some(llama_core::backend::SpecCounts {
+            drafts: None,
+            draft_tokens: 280,
+            accepted: 210,
+        })
+    );
+    // Idle: the live report says so, and the line has nothing to show.
+    assert_eq!(
+        detail
+            .engine_live
+            .first()
+            .and_then(|entry| entry.live.state.as_deref()),
+        Some("idle")
+    );
+
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| !path.contains("/slots")), "{hits:?}");
+    let lines = log.lines();
+    let notes: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("names no server"))
+        .collect();
+    assert_eq!(notes.len(), 1, "probed once: {lines:?}");
+    assert!(
+        notes[0].contains("flash-next: launch command names no server; /metrics says strata"),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("no /metrics")),
+        "{lines:?}"
+    );
+}
 
 fn cache_row(id: i64, model: &str, input: i64, cache: i64) -> serde_json::Value {
     serde_json::json!({
