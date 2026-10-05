@@ -1839,7 +1839,7 @@ fn config_override_can_name_strata() {
 
 // ---- #10: per-model prompt and cached-prompt counters -----------------------
 
-/// #54: Strata in a container, as Titan runs it: the command names an
+/// #54: Strata in a container started by image digest: the command names an
 /// image digest and a config, nothing that says Strata.
 const STRATA_CONTAINER_CMD: &str = "podman run --rm --name strata --network llama --device nvidia.com/gpu=all -v /models/strata:/data:ro 5e1f0c2d9a7b4e6f8c3d2a1b0e9f8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e --config /data/configs/flash-next.json --port 8793";
 

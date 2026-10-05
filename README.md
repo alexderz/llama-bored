@@ -54,22 +54,6 @@ line under the model name with the short name (`llama.cpp`, `sglang`,
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
 `openai`) as the `backend` label on `llamabored_model_loaded`.
 
-| Engine | Told by | Read from it |
-|---|---|---|
-| llama.cpp | `llama-server` in the launch command, or `llamacpp:` metric names | `/slots`, `/metrics` |
-| SGLang | `sglang.launch_server` / `sglang serve`, or `sglang:` names | `/metrics` |
-| vLLM | `vllm serve` / `vllm.entrypoints`, or `vllm:` names | `/metrics` (engine numbers, speeds, `cache_config_info`) |
-| Strata | `serve/server.py --engine strata` (or a `strata…` image), or a JSON `/metrics` with `engine` and `live` objects (#54) | `/metrics` JSON: counters, live state and phase, settings, spec, speeds, expert cache |
-| OpenAI-compatible | anything else | llama-swap activity rows only |
-
-A launch command that names no engine (a container started by image
-digest, a wrapper script) gets one `/metrics` probe per load; its shape
-or metric prefix decides, and `[llama.backends]` in `watch.toml` overrides
-both. Strata's JSON is read for numbers and short tokens only, at most
-1 MiB, and its `history` is never looked at. Its `live.phase` (`writing a
-tool call: write`) is shown on tty11's engine line, printable ASCII and
-at most 40 characters, and never exported.
-
 **Speeds.** RECENT's PROMPT and GEN tok/s come from llama-swap, which has
 them only for llama.cpp. For a vLLM request they are measured by the
 engine instead and marked `~` (`~2,134`, `~41.3`): llama-watch reads vLLM's
@@ -88,21 +72,6 @@ but its lifetime `totals` (#54): prefill = Δ(prompt − reused tokens) ÷
 as Strata times them), over the same windows; a total going down is a
 restart and its new totals are the window. Its RECENT rows keep
 llama-swap's own speeds.
-
-Engine series on the exporter (each with `name` and `full_name`; absent
-when the engine does not report it):
-
-| Series | Type | From |
-|---|---|---|
-| `llamabored_model_spec_acceptance_ratio` | gauge | vLLM, Strata (`drafts_accepted` / `drafts_offered`), SGLang's gauge |
-| `llamabored_model_spec_accepted_length` | gauge | vLLM, SGLang (Strata counts no draft rounds) |
-| `llamabored_model_spec_drafts_total` | counter | vLLM |
-| `llamabored_model_spec_draft_tokens_total`, `…_spec_accepted_tokens_total` | counter | vLLM, Strata |
-| `llamabored_model_preemptions_total`, `llamabored_model_sleeping` | counter, gauge | vLLM |
-| `llamabored_model_ttft_seconds`, `…_itl_seconds`, `…_e2e_latency_seconds` | gauge | vLLM, SGLang |
-| `llamabored_model_prefill_tokens_per_second`, `…_decode_tokens_per_second` | gauge | vLLM, Strata |
-| `llamabored_model_expert_cache_hit_ratio` | gauge | Strata: the newest finished request's expert cache `hit_rate` (#54) |
-| `llamabored_model_pcie_share_ratio` | gauge | Strata: that request's `pcie_share` (#54) |
 
 ## Features
 
@@ -234,7 +203,9 @@ falls back to utilisation.
 | `llamabored_slot_ctx_resets_total` | `name`, `full_name`, `slot`, `reason` | Context drops by best-guess reason (compacted, new, evicted, unknown) |
 | `llamabored_model_prompt_tokens_total`, `_model_prompt_cached_tokens_total` | `name`, `full_name` | Prompt tokens and the cached part; hit ratio = `rate(cached) / rate(total)` |
 | `llamabored_model_requests_running`, `_requests_queued`, `_kv_cache_usage_ratio`, `_cache_hit_ratio` | `name`, `full_name` | SGLang / vLLM request and cache gauges |
-| `llamabored_model_spec_acceptance_ratio`, `_spec_accepted_length`; `_spec_drafts_total`, `_spec_draft_tokens_total`, `_spec_accepted_tokens_total` | `name`, `full_name` | Speculative decoding (vLLM, SGLang) |
+| `llamabored_model_spec_acceptance_ratio`, `_spec_accepted_length`; `_spec_drafts_total`, `_spec_draft_tokens_total`, `_spec_accepted_tokens_total` | `name`, `full_name` | Speculative decoding (vLLM, SGLang; Strata fills acceptance and the draft/accepted token totals, but counts no draft rounds, so no accepted length or drafts total) |
+| `llamabored_model_prefill_tokens_per_second`, `_decode_tokens_per_second` | `name`, `full_name` | Engine-measured prefill and decode tok/s over the last window (vLLM, Strata) |
+| `llamabored_model_expert_cache_hit_ratio`, `_pcie_share_ratio` | `name`, `full_name` | Strata: expert cache hit rate and PCIe share of the newest finished request, 0 to 1 |
 | `llamabored_model_ttft_seconds`, `_itl_seconds`, `_e2e_latency_seconds` | `name`, `full_name` | Mean time to first token, inter-token and request latency over the last window |
 | `llamabored_model_preemptions_total`, `_sleeping`, `_kv_block_size_tokens`, `_prefix_caching` | `name`, `full_name` | vLLM preemptions, engine sleep, cache config |
 | `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
@@ -250,13 +221,14 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 | llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text, the tuning line |
 | SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
 | vLLM | The same from `vllm:*` metrics, plus speculative-decoding acceptance (`spec 78 %`, also on the LCD), mean TTFT, inter-token and request latency, preemptions, and the KV dtype, block size and prefix caching from `cache_config_info`; IN/OUT from llama-swap captures |
-| Strata (`serve/server.py --engine strata`) | tok/s, running and queued requests (one at a time) and context from its JSON `/metrics`; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
+| Strata (`serve/server.py --engine strata`, or recognised by its JSON `/metrics`) | From its JSON `/metrics`: tok/s, running and queued requests (one at a time), its settings in SETUP (context, KV, expert cache, spec depth, serving knobs), speculative acceptance, window prefill and decode tok/s, expert cache hit rate and PCIe share, and its live phase (`writing a tool call: write`, tty11 only, never exported); numbers and short tokens only, at most 1 MiB, `history` never read; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
 | Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
 
 When the launch command does not name the server (a container whose image
 starts it, or a wrapper script), llama-watch reads that model's `/metrics`
 once while it is loaded and recognises the server by its metric names
-(`vllm:`, `sglang:`, `llamacpp:`). It only ever reads models llama-swap
+(`vllm:`, `sglang:`, `llamacpp:`), or Strata by the shape of its JSON (an
+object whose `engine` and `live` members are objects). It only ever reads models llama-swap
 reports as `ready`, so it never makes llama-swap load one.
 `[llama.backends]` overrides the detection.
 

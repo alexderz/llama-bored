@@ -1,7 +1,7 @@
 //! The tty writer thread (#42): the tick loop never writes the console.
 //!
 //! A `write` to tty11 can block for as long as the console wants. The main
-//! trigger seen on Titan is the console waking from blank on a keypress
+//! trigger seen in practice is the console waking from blank on a keypress
 //! (Space, so no XOFF): `con_write` waits on the console lock while fbcon and
 //! nvidia-drm unblank and modeset the monitor, which took from 1 s to over
 //! 10 s. Scroll Lock (VT hold) also stops output whatever the line settings
