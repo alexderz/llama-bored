@@ -719,7 +719,7 @@ fn tty_reset_writes_only_the_palette_reset() {
     assert!(bad.stdout.is_empty());
 }
 
-/// #42: tty11 as found on Titan (`ixon isig icanon echo`, plus the usual
+/// #42: tty11 as a fresh console has it (`ixon isig icanon echo`, plus the usual
 /// `icrnl` and `echoe`). Flow control, echo, canonical mode and signal keys
 /// go; every other flag stays as it was.
 #[test]

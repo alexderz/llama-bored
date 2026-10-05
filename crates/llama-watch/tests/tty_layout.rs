@@ -3985,7 +3985,7 @@ fn a_tool_loop_in_panel_shows_the_newest_result_under_its_title() {
 
 // ---- #52: SETUP under single-spaced meters ----------------------------------
 
-/// Titan's shape: the 12x22 font at 160x49, eighths glyphs, two models
+/// A common shape: the 12x22 font at 160x49, eighths glyphs, two models
 /// loaded and the llama.cpp one generating.
 fn setup_model() -> TtyModel {
     let mut model = sample(WatchState::Generating);
@@ -4021,7 +4021,7 @@ fn dump_setup_goldens() {
 
 // ---- #54: Strata's own report in SETUP and on the engine lines ------------
 
-/// Titan's shape at 160x49 with Strata generating in a container: SETUP
+/// 160x49 with Strata generating in a container: SETUP
 /// from the invented `fixtures/llama/strata-metrics.json`, the quant from
 /// the llama-swap name, and the engine lines with the live phase.
 fn strata_setup_model() -> TtyModel {
