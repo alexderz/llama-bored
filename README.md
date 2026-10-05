@@ -46,9 +46,9 @@ buffer.</sub>
 name sanitiser, logging.
 
 **Engine.** tty11's header always names the inference engine serving the
-shown model, before its tuning: `llama.cpp · 256k · kv f16 · Q6_K`, or
-`SGLang`, `vLLM`, `Strata`, `OpenAI-compatible` (a llama.cpp fork is
-`llama.cpp`); with no model loaded it says `engine --`. The LCD starts the
+shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
+(a llama.cpp fork is `llama.cpp`); with no model loaded it says
+`engine --`. Its settings are in the SETUP block (below). The LCD starts the
 line under the model name with the short name (`llama.cpp`, `sglang`,
 `vllm`, `strata`, `openai`) and drops the quant first when space is short.
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
@@ -90,8 +90,47 @@ model's backend line on tty11 when it fits.
   capture). Turn all text off, captures included, with `show_text = false`.
 - **FANS** (optional): read-only rpm and pwm of motherboard fans from a
   Super-I/O hwmon chosen by name.
-- The model's full name and a tuning line (ctx, KV cache type, quant, CPU MoE
-  layers) read from llama-swap's launch command.
+- The model's full name and engine in the header, and a **SETUP** block with
+  the loaded model's settings (below).
+
+**SETUP.** Under the meters (one per row since #52), tty11 shows the
+settings of the model generating now, or else the one RECENT saw last:
+
+```text
+  CPU           41 %  16c  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+  GPU                97 %  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░
+  VRAM       22.8/24.0 GB  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░
+  MEM        38.1/62.6 GB  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░░░░░░░░░░░░░░░░░░
+  POWER         312/350 W  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░░░░
+  LOAD               70 %  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░░░░░░░░░░░░░
+  ACTIVITY 42 % gpu 312 W  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+  SETUP  qwen3.6-35b-a3b · Qwen 35B                                         +1
+    engine   llama.cpp · UD-Q4_K_M · fa on
+    ctx      262,144 · kv q8_0 / q8_0
+    experts  16 layers in RAM
+    spec     draft-mtp · n-max 3
+    think    budget 24,000
+```
+
+The title is the llama-swap model id, then its `name` when that fits, and
+`+N` when N more models are loaded. Each row is a setting read from the
+model's llama-swap launch command, or from what the engine reports (KV
+dtype, block size and prefix caching from vLLM's `cache_config_info`,
+Strata's context and KV, live speculative acceptance `acc 3.6/step · 65 %`).
+A value nothing set is grey (`kv f16`, `full GPU`, `spec none`). Which
+settings show is configuration: see **SETUP rules** under Configuration.
+The block has six rows (title included) up to 59 rows and eight from 60;
+rows that do not fit drop from the bottom, and items that do not fit drop
+from the end of their row. Under 48 rows it uses only the rows beside
+SLOTS, so the short-screen panel order is unchanged. With nothing loaded,
+or llama-swap down, it is gone.
+
+The meter bars are whole cells of `▇` (lower seven eighths) when
+`tty.chart_glyphs = "eighths"`, which needs the llama-hack font, so
+stacked bars keep a gap; with `"halves"` (a console font such as eurlatgr,
+which has no `▇`) they use `▄`. 4K screens (90+ rows) keep their two-row
+bars.
 
 **Activity** is the bottleneck device's power headroom. For the GPU (NVML) and
 the CPU (zenergy socket energy), `(watts − idle) / (nominal_frac × limit −
@@ -414,6 +453,50 @@ pre-step (`llama-watch tty-setup`) that runs `setfont` and `stty` from the
 validated values; restart the unit after a change. Under 48 rows the
 dashboard drops panels to fit (IN/OUT first, then FANS, then the chart
 shrinks) and shows `tty too small` only below 160x26.
+
+**SETUP rules** (`watch.toml`, `[setup]`): each `[[setup.field]]` puts one
+value on a SETUP row. Built-in rules
+([`setup_defaults.toml`](crates/llama-watch/src/setup_defaults.toml)) cover
+the upstream llama.cpp, vLLM and SGLang flags; rules in `watch.toml` are
+added to them, and `defaults = false` keeps only yours.
+
+```toml
+[setup]
+defaults = true
+
+[[setup.field]]
+row = "spec"              # the row it is drawn on, 1..=8 of A-Z a-z 0-9 _ - .
+engines = ["vllm"]        # llamacpp, sglang, vllm, strata, openai; absent: any
+match = "hyperqwen"       # only commands containing this (case ignored)
+source = "env:SPEC"       # where the value comes from, below
+kind = "token"            # how it is read, below
+label = "method"          # text before the value: "method mtp"
+suffix = ""               # text after it: " layers in RAM"
+sep = " · "               # separator before this item (default " · ")
+map = { mtp = "MTP" }     # value -> the whole item's text
+default = "none"          # the item when there is no value (drawn grey)
+fallback = false          # true: only when no earlier field of the row drew
+group = "prefix"          # with fallback: only the fields of this group count
+order = 40                # rows sort by their lowest order, items by theirs
+```
+
+Sources: `flag:-c,--ctx-size` (`--flag V`, `--flag=V`; the last one wins;
+for a server, only after its entry point), `env:NAME` (`-e NAME=V`,
+`--env NAME=V`, `--env=NAME=V` or `NAME=V` in the wrapper before the
+entry point, or anywhere when the command names no server),
+`json:--speculative-config:num_speculative_tokens` (a key of a JSON
+object given to a flag, one level deep), `live:NAME` (`engine`, `ctx`,
+`kv_dtype`, `kv_block`, `prefix_cache`, `spec_accept`, `spec_len`), or no
+source at all for a field that only shows its `default`. Kinds: `number`
+(drawn with thousands separators), `token` (at most 16 characters of
+`A-Z a-z 0-9 _ . + -`; a path-like value gives only its file stem),
+`quant` (the GGUF quant tag of a model file name, `UD-Q4_K_M`), `present`
+(the flag is there: `on`). Whatever a rule says, only numbers and short
+tokens leave the launch command, never a path or a raw argument, and the
+command itself is not kept. A bad rule (unknown kind or source, text too
+long) fails `watch.toml` validation with its index:
+`setup.field[3]: unknown kind "nubmer"`. `packaging/watch.example.toml`
+has a copy-paste block for a vLLM container configured by `-e` env vars.
 
 **tty11 colours** (`watch.toml`, `[tty]`): the console has 16 colour slots,
 and llama-watch loads its own palette into them, built from the same heat
