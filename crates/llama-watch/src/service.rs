@@ -19,7 +19,8 @@ use thiserror::Error;
 use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
-use crate::poller::{self, CaptureView, LlamaDetail, ModelSetup, PollLatencies};
+use crate::metrics::EngineLive;
+use crate::poller::{self, CaptureView, LlamaDetail, ModelEngineLive, ModelSetup, PollLatencies};
 use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
 use crate::setup_rules::{LiveCtx, Rules};
 use crate::slots::{SlotView, pick_slot};
@@ -467,6 +468,7 @@ impl TickState {
                 prompt_cache: Vec::new(),
                 capture: None,
                 setup: Vec::new(),
+                engine_live: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -959,7 +961,7 @@ fn tty_model(
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
         slots: layout_slots(&tick.detail.slots, &tick.ctx_history),
-        backend_lines: backend_lines(sample, watch),
+        backend_lines: engine_lines(sample, &tick.detail.engine_live, watch),
         text_note: if ctx.show_text && no_slots && tick.detail.slots.is_empty() && capture.is_none()
         {
             NO_SLOTS_TEXT.to_owned()
@@ -1041,12 +1043,14 @@ fn setup_view(
         backend: model.backend.map(|info| info.kind).unwrap_or_default(),
         detail: model.detail.as_ref(),
         info: model.backend.as_ref(),
+        engine: Some(&setup.engine),
     };
+    let rows = rules.rows(&setup.found, &live);
     Some(SetupView {
         id: setup.id,
         name: setup.name,
         more: models.len() - 1,
-        rows: rules.rows(&setup.found, &live),
+        rows,
     })
 }
 
@@ -1243,7 +1247,15 @@ fn model_stuck(
 /// (#35): `· prefill 2,134/s · decode 41.2/s`. A sleeping engine says so
 /// first: `vllm  sleeping · running 0 · …`. The line is cut at the panel's
 /// edge, so the speeds show where it fits.
+#[cfg(test)]
 fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
+    engine_lines(sample, &[], state)
+}
+
+/// One line per ready model without `/slots`: its gauges and engine
+/// numbers, and for an engine that reports what it is doing (Strata, #54)
+/// a second line with its phase and the request's progress.
+fn engine_lines(sample: &WatchSample, live: &[ModelEngineLive], state: WatchState) -> Vec<String> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return Vec::new();
     }
@@ -1255,14 +1267,16 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
             |p| format!("{} %", (u32::from(p) + 5) / 10),
         )
     };
-    sample
+    let mut lines = Vec::new();
+    for (model, info) in sample
         .snapshot
         .models
         .iter()
         .filter(|model| model.state == "ready")
-        .filter_map(|model| model.backend)
-        .filter(|info| !info.kind.has_slots())
-        .map(|info| {
+        .filter_map(|model| Some((model, model.backend?)))
+        .filter(|(_, info)| !info.kind.has_slots())
+    {
+        lines.push({
             let running = match (info.running, info.max_running) {
                 (Some(n), Some(max)) => format!("{n}/{max}"),
                 (running, _) => num(running),
@@ -1311,8 +1325,56 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
                 line.push_str(&format!("{sep}decode {}.{}/s", tenths / 10, tenths % 10));
             }
             line
-        })
-        .collect()
+        });
+        if let Some(entry) = live.iter().find(|entry| entry.model == model.name)
+            && let Some(text) = live_line(&entry.live)
+        {
+            let indent = " ".repeat(info.kind.as_str().len() + 2);
+            lines.push(format!("{indent}{text}"));
+        }
+    }
+    lines
+}
+
+/// What a busy engine is doing (#54): its phase (or state word), then the
+/// prompt read so far while it reads, or the tokens generated and the
+/// live tok/s while it generates. `None` while idle.
+fn live_line(live: &EngineLive) -> Option<String> {
+    let sep = llama_core::detail::SEPARATOR;
+    let state = live.state.as_deref()?;
+    if !matches!(state, "reading" | "generating") {
+        return None;
+    }
+    let mut items: Vec<String> = vec![live.phase.clone().unwrap_or_else(|| state.to_owned())];
+    match state {
+        "reading" => {
+            if let (Some(done), Some(total)) = (live.prompt_read, live.prompt_total)
+                && total > 0
+            {
+                let done = done.min(total);
+                items.push(format!(
+                    "prompt {} ({} %)",
+                    layout::comma_pair(done, total),
+                    (done * 100 + total / 2) / total
+                ));
+            } else if let Some(prompt) = live.prompt_tokens {
+                items.push(format!("prompt {}", layout::commas(prompt)));
+            }
+        }
+        _ => {
+            if let Some(generated) = live.generated {
+                items.push(match live.max_tokens.filter(|max| *max > 0) {
+                    Some(max) => format!("gen {}", layout::comma_pair(generated, max)),
+                    None => format!("gen {}", layout::commas(generated)),
+                });
+            }
+            if let Some(tps) = live.tok_s {
+                let tenths = (tps * 10.0).round() as u64;
+                items.push(format!("{}.{}/s", tenths / 10, tenths % 10));
+            }
+        }
+    }
+    Some(items.join(sep))
 }
 
 /// `420 ms` below a second, `12.5 s` below 100 s, else whole seconds.
@@ -2181,6 +2243,7 @@ mod tests {
                     prompt_cache: Vec::new(),
                     capture: None,
                     setup: Vec::new(),
+                    engine_live: Vec::new(),
                 },
             ))
         }
@@ -2327,6 +2390,7 @@ mod tests {
                     prompt_cache: Vec::new(),
                     capture: None,
                     setup: Vec::new(),
+                    engine_live: Vec::new(),
                 },
             ))
         }
@@ -2399,6 +2463,7 @@ mod tests {
             id: id.to_owned(),
             name: String::new(),
             found: rules.extract(cmd),
+            ..ModelSetup::default()
         };
         let mut detail = TickState::new(2, 6).detail;
         detail.setup = vec![
@@ -2821,6 +2886,80 @@ mod tests {
             watch_state(&sample, &TickState::new(2, 6).detail, true, true),
             WatchState::Generating
         );
+    }
+
+    /// #54: Strata's engine numbers, then a second line with its live
+    /// phase and progress: the prompt read while reading, the tokens and
+    /// tok/s while generating, nothing while idle.
+    #[test]
+    fn strata_live_line_shows_phase_and_progress() {
+        use llama_core::backend::EngineStats;
+        let flash = served(
+            "flash",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::Strata,
+                max_running: Some(1),
+                running: Some(1),
+                queued: Some(0),
+                engine: EngineStats {
+                    spec_permille: Some(700),
+                    prefill_tps_tenths: Some(9677),
+                    decode_tps_tenths: Some(309),
+                    expert_hit_permille: Some(874),
+                    pcie_share_permille: Some(92),
+                    ..EngineStats::default()
+                },
+                ..BackendInfo::default()
+            }),
+        );
+        let sample = backend_sample(vec![flash]);
+        let mut live = vec![ModelEngineLive {
+            model: "flash".to_owned(),
+            live: EngineLive {
+                state: Some("generating".to_owned()),
+                phase: Some("writing a tool call: edit".to_owned()),
+                prompt_tokens: Some(1800),
+                generated: Some(14_558),
+                max_tokens: Some(32_000),
+                tok_s: Some(29.64),
+                ..EngineLive::default()
+            },
+        }];
+        // The expert cache numbers are SETUP's (`live:expert_hit`).
+        let first = "strata  running 1/1 · queued 0 · spec 70 % · prefill 968/s · decode 30.9/s";
+        assert_eq!(
+            engine_lines(&sample, &live, WatchState::Ready),
+            vec![
+                first.to_owned(),
+                "        writing a tool call: edit · gen 14,558/32,000 · 29.6/s".to_owned(),
+            ]
+        );
+        live[0].live = EngineLive {
+            state: Some("reading".to_owned()),
+            prompt_read: Some(4096),
+            prompt_total: Some(10_240),
+            ..EngineLive::default()
+        };
+        assert_eq!(
+            engine_lines(&sample, &live, WatchState::Ready)[1],
+            "        reading · prompt 4,096/10,240 (40 %)"
+        );
+        live[0].live.prompt_read = None;
+        live[0].live.prompt_tokens = Some(1800);
+        assert_eq!(
+            engine_lines(&sample, &live, WatchState::Ready)[1],
+            "        reading · prompt 1,800"
+        );
+        live[0].live.state = Some("idle".to_owned());
+        assert_eq!(
+            engine_lines(&sample, &live, WatchState::Ready),
+            vec![first.to_owned()]
+        );
+        // Another model's report is not this one's.
+        live[0].model = "other".to_owned();
+        live[0].live.state = Some("generating".to_owned());
+        assert_eq!(engine_lines(&sample, &live, WatchState::Ready).len(), 1);
     }
 
     /// #5: a header model without `/slots` shows its last capture, titled

@@ -870,7 +870,7 @@ fn engine_numbers_reach_the_wire() {
         spec_permille: Some(780),
         spec_len_centi: Some(290),
         spec_counts: Some(SpecCounts {
-            drafts: 100,
+            drafts: Some(100),
             draft_tokens: 300,
             accepted: 234,
         }),
@@ -881,6 +881,20 @@ fn engine_numbers_reach_the_wire() {
         e2e_us: Some(12_500_000),
         prefill_tps_tenths: Some(21_345),
         decode_tps_tenths: Some(412),
+        expert_hit_permille: Some(856),
+        pcie_share_permille: Some(106),
+    };
+    // #54: Strata counts draft tokens but no rounds.
+    let strata = EngineStats {
+        spec_permille: Some(700),
+        spec_counts: Some(SpecCounts {
+            drafts: None,
+            draft_tokens: 391,
+            accepted: 274,
+        }),
+        expert_hit_permille: Some(1000),
+        pcie_share_permille: Some(0),
+        ..EngineStats::default()
     };
     let model = |name: &str, kind: Backend, engine: EngineStats| ModelInfo {
         name: name.to_owned(),
@@ -897,6 +911,7 @@ fn engine_numbers_reach_the_wire() {
         model("vllm", Backend::Vllm, engine),
         model("idle", Backend::Vllm, EngineStats::default()),
         model("llama", Backend::LlamaCpp, engine),
+        model("strata", Backend::Strata, strata),
     ];
     let snap = snapshot(wall, Some(1.0), AiState::Loaded, models.clone());
     publisher
@@ -920,7 +935,21 @@ fn engine_numbers_reach_the_wire() {
             e2e_s: Some(12.5),
             prefill_tps: Some(2134.5),
             decode_tps: Some(41.2),
+            expert_hit: Some(0.856),
+            pcie_share: Some(0.106),
         }
+    );
+    assert_eq!(
+        parsed.ai.models[3].engine,
+        Some(wire::EngineWire {
+            spec_accept: Some(0.7),
+            spec_draft_tokens: Some(391),
+            spec_accepted_tokens: Some(274),
+            expert_hit: Some(1.0),
+            pcie_share: Some(0.0),
+            ..wire::EngineWire::default()
+        }),
+        "no rounds, no spec_drafts"
     );
     assert_eq!(parsed.ai.models[1].engine, None);
     assert_eq!(

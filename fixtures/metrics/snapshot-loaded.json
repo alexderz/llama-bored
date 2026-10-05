@@ -95,6 +95,29 @@
           "prefill_tps": 2134.5,
           "decode_tps": 41.25
         }
+      },
+      {
+        "name": "flash-next",
+        "state": "ready",
+        "backend": "strata",
+        "running": 1,
+        "queued": 0,
+        "detail": {
+          "ctx": 262144,
+          "kv_k": "q8",
+          "kv_v": "q8"
+        },
+        "prompt_tokens": 12000,
+        "prompt_cached_tokens": 9000,
+        "engine": {
+          "spec_accept": 0.7,
+          "spec_draft_tokens": 2400,
+          "spec_accepted_tokens": 1680,
+          "prefill_tps": 967.7,
+          "decode_tps": 30.9,
+          "expert_hit": 0.875,
+          "pcie_share": 0.09375
+        }
       }
     ]
   },

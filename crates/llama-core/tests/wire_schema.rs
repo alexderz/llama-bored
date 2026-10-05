@@ -1097,6 +1097,9 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
             // #35: both speeds at their widest.
             prefill_tps: Some(987_654.3),
             decode_tps: Some(123_456.79),
+            // #54: Strata's expert cache ratios.
+            expert_hit: Some(0.123_456_7),
+            pcie_share: Some(0.123_456_7),
         }),
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
@@ -1139,6 +1142,8 @@ fn engine_numbers_are_optional_and_bounded() {
         e2e_s: Some(12.5),
         prefill_tps: Some(2134.5),
         decode_tps: Some(41.25),
+        expert_hit: Some(0.856),
+        pcie_share: Some(0.106),
     };
     let mut snap = valid();
     snap.ai.models[0].engine = Some(engine());
@@ -1146,7 +1151,9 @@ fn engine_numbers_are_optional_and_bounded() {
     let text = std::str::from_utf8(&bytes).expect("utf8");
     assert!(text.contains(r#""engine":{"spec_accept":0.78"#), "{text}");
     assert!(
-        text.contains(r#""prefill_tps":2134.5,"decode_tps":41.25}"#),
+        text.contains(
+            r#""prefill_tps":2134.5,"decode_tps":41.25,"expert_hit":0.856,"pcie_share":0.106}"#
+        ),
         "{text}"
     );
     assert_eq!(parse_validated(&bytes).expect("valid"), snap);
@@ -1161,7 +1168,7 @@ fn engine_numbers_are_optional_and_bounded() {
         read.ai.models[0].engine.as_ref().and_then(|e| e.sleeping),
         Some(true)
     );
-    let cases: [Mutate; 12] = [
+    let cases: [Mutate; 18] = [
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(1.01),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(f32::NAN),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(0.5),
@@ -1175,6 +1182,13 @@ fn engine_numbers_are_optional_and_bounded() {
         |s| s.ai.models[0].engine.as_mut().unwrap().prefill_tps = Some(1_000_001.0),
         |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(f32::INFINITY),
         |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(-0.5),
+        // #54: the expert cache ratios are 0..=1 and finite.
+        |s| s.ai.models[0].engine.as_mut().unwrap().expert_hit = Some(1.01),
+        |s| s.ai.models[0].engine.as_mut().unwrap().expert_hit = Some(-0.01),
+        |s| s.ai.models[0].engine.as_mut().unwrap().expert_hit = Some(f32::NAN),
+        |s| s.ai.models[0].engine.as_mut().unwrap().pcie_share = Some(1.5),
+        |s| s.ai.models[0].engine.as_mut().unwrap().pcie_share = Some(-1.0),
+        |s| s.ai.models[0].engine.as_mut().unwrap().pcie_share = Some(f32::INFINITY),
     ];
     for (i, bad) in cases.into_iter().enumerate() {
         let mut snap = valid();

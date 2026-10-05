@@ -280,6 +280,31 @@ pub fn quant_tag(path: &str) -> Option<String> {
     None
 }
 
+/// A GGUF quant tag among the words of a model's display name (#54):
+/// `Flash Next (Strata, Q4_K_M)` gives `Q4_K_M`. The name is split on
+/// anything but `[A-Za-z0-9_]` and the last piece that is a tag wins, with
+/// a `UD` piece right before it kept as `UD-`, as in [`quant_tag`].
+#[must_use]
+pub fn name_quant(name: &str) -> Option<String> {
+    let pieces: Vec<&str> = name
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|piece| !piece.is_empty())
+        .collect();
+    for index in (0..pieces.len()).rev() {
+        let piece = pieces[index].to_ascii_uppercase();
+        if !is_quant(&piece) {
+            continue;
+        }
+        let tag = if index > 0 && pieces[index - 1].eq_ignore_ascii_case("ud") {
+            format!("UD-{piece}")
+        } else {
+            piece
+        };
+        return (tag.len() <= MAX_TOKEN_CHARS && is_token(&tag)).then_some(tag);
+    }
+    None
+}
+
 /// Drop a trailing `-NNNNN-of-NNNNN`.
 fn strip_shard(stem: &str) -> &str {
     let bytes = stem.as_bytes();
@@ -537,6 +562,23 @@ mod tests {
                 .ctx,
             None
         );
+    }
+
+    #[test]
+    fn name_quants() {
+        let cases = [
+            ("Flash Next (Strata, Q4_K_M)", Some("Q4_K_M")),
+            ("qwen3.8-flash-next-ud-q2_k_xl", Some("UD-Q2_K_XL")),
+            ("Big MXFP4 model", Some("MXFP4")),
+            ("Q8_0 then IQ4_XS", Some("IQ4_XS")),
+            ("Flash Next", None),
+            ("Q4 model", None),
+            ("Q4_K_MM", None),
+            ("", None),
+        ];
+        for (name, expect) in cases {
+            assert_eq!(name_quant(name).as_deref(), expect, "{name}");
+        }
     }
 
     #[test]

@@ -766,12 +766,14 @@ pub struct SetupField {
     /// Only for a launch command containing this text (ASCII case ignored).
     #[serde(default, rename = "match")]
     pub matches: Option<String>,
-    /// `flag:-c,--ctx-size`, `env:NAME`, `json:--flag:key` or `live:name`.
-    /// Absent: the field only ever shows its `default`.
+    /// `flag:-c,--ctx-size`, `env:NAME`, `json:--flag:key`, `live:name`,
+    /// `engine:key` or `name` (#54). Absent: the field only ever shows its
+    /// `default`.
     #[serde(default)]
     pub source: Option<String>,
-    /// `number`, `token`, `quant` or `present`. Required for `flag`, `env`
-    /// and `json` sources; not allowed with `live`.
+    /// `number`, `token`, `quant`, `present` or `mib`. Required for `flag`,
+    /// `env` and `json` sources, `quant` for `name`; optional for `engine`;
+    /// not allowed with `live`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Text before the value: `kv` draws `kv q8_0`.

@@ -14,7 +14,7 @@
 //! [`detect_backend`] tells a server the launch command did not name by
 //! its metric prefix.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use llama_core::backend::{self, Backend, EngineStats, MAX_SPEC_LEN, SpecCounts};
@@ -176,11 +176,15 @@ pub const MAX_LABEL_VALUE: usize = 64;
 /// Most labels scanned on one series line.
 const MAX_LABELS: usize = 128;
 
-/// Server kind from the metric names in a `/metrics` body (#31): the first
-/// sample whose name starts with `vllm:`, `sglang:` or `llamacpp:`. Comments
-/// are skipped. `None` when no sample has one of those prefixes.
+/// Server kind from a `/metrics` body: Strata's JSON by its shape (#54,
+/// [`is_strata_json`]), else the first sample whose name starts with
+/// `vllm:`, `sglang:` or `llamacpp:` (#31). Comments are skipped. `None`
+/// when neither matches.
 #[must_use]
 pub fn detect_backend(body: &str) -> Option<Backend> {
+    if is_strata_json(body) {
+        return Some(Backend::Strata);
+    }
     body.lines().find_map(|line| {
         let line = line.trim_start();
         if line.starts_with('#') {
@@ -196,6 +200,22 @@ pub fn detect_backend(body: &str) -> Option<Backend> {
         .find(|(prefix, _)| name.len() > prefix.len() && name.starts_with(prefix))
         .map(|(_, kind)| kind)
     })
+}
+
+/// Strata's `/metrics` shape (#54): a JSON object whose `engine` and
+/// `live` members are both objects. Their contents and every other member
+/// are not looked at; a Prometheus body fails at its first byte.
+#[must_use]
+pub fn is_strata_json(body: &str) -> bool {
+    type Object = serde_json::Map<String, serde_json::Value>;
+    #[derive(Deserialize)]
+    struct Shape {
+        #[allow(dead_code)]
+        engine: Object,
+        #[allow(dead_code)]
+        live: Object,
+    }
+    body.trim_start().starts_with('{') && serde_json::from_str::<Shape>(body).is_ok()
 }
 
 /// A histogram's `_sum` and `_count`, summed over label sets.
@@ -243,9 +263,14 @@ pub struct MetricsSample {
     pub itl: Option<Hist>,
     /// End-to-end request latency histogram.
     pub e2e: Option<Hist>,
-    /// Per-request prefill and decode histograms for the engine speeds
-    /// (#35). vLLM only.
+    /// Per-request prefill and decode totals for the engine speeds: vLLM's
+    /// histograms (#35), Strata's `totals` (#54).
     pub speeds: Option<SpeedTotals>,
+    /// Expert cache hit rate of the newest finished request, 0..=1
+    /// (Strata, #54).
+    pub expert_hit: Option<f64>,
+    /// Share of that request's expert reads over PCIe, 0..=1 (Strata, #54).
+    pub pcie_share: Option<f64>,
 }
 
 /// llama.cpp parse, the pre-T72 behaviour. See [`parse_metrics_for`].
@@ -375,7 +400,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         (Some(drafts), Some(tokens), Some(accepted)) => {
             match (finite_u64(drafts), finite_u64(tokens), finite_u64(accepted)) {
                 (Some(drafts), Some(draft_tokens), Some(accepted)) => Some(SpecCounts {
-                    drafts,
+                    drafts: Some(drafts),
                     draft_tokens,
                     accepted,
                 }),
@@ -413,6 +438,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         itl: hist(&hists[1]),
         e2e: hist(&hists[2]),
         speeds,
+        expert_hit: None,
+        pcie_share: None,
     };
     (sample, facts)
 }
@@ -477,6 +504,7 @@ fn cache_facts(line: &str) -> EngineFacts {
             Some("False" | "false") => Some(false),
             _ => None,
         },
+        ..EngineFacts::default()
     }
 }
 
@@ -554,12 +582,66 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
     out
 }
 
+/// Engine-reported settings and counters for SETUP's `engine:<key>`
+/// source (#54), keyed by a name from [`ENGINE_KEYS`]. Each value is a
+/// plain number (`-?digits(.digits)?`, at most [`MAX_ENGINE_VALUE`]
+/// characters), a short token ([`is_token`]) or `on` / `off`.
+pub type EngineValues = BTreeMap<&'static str, String>;
+
+/// Longest value kept in [`EngineValues`].
+pub const MAX_ENGINE_VALUE: usize = 16;
+
+/// Every key the engine parsers fill (Strata's, #54). `[setup]`'s
+/// `engine:<key>` must name one of these; nothing else of the JSON is
+/// reachable.
+pub const ENGINE_KEYS: [&str; 30] = [
+    // `engine` object: the server's own settings.
+    "engine",
+    "version",
+    "context",
+    "max_context",
+    "kv",
+    "kv_resident",
+    "expert_slots",
+    "expert_cache_mib",
+    "spec",
+    "mtp_max",
+    "lookup",
+    "spec_min_p",
+    "pcie_frac",
+    "arena_mib",
+    "pool_workers",
+    "conversation_cache_slots",
+    // `conversation_cache` object: `on` / `off`, then its budget (only
+    // while it is on) and counters.
+    "conversation_cache",
+    "conversation_cache_mib",
+    "conversation_cache_requests",
+    "conversation_cache_requests_reused",
+    "conversation_cache_reused_tokens",
+    "conversation_cache_prompt_tokens",
+    "conversation_cache_evictions",
+    // `totals.requests`.
+    "requests",
+    // The newest finished request.
+    "last_hit_rate",
+    "last_pcie_share",
+    "last_decode_tok_s",
+    "last_drafts_offered",
+    "last_drafts_accepted",
+    // `live.max_tokens` of the request in flight.
+    "max_tokens",
+];
+
+/// Longest `live.phase` kept, characters (#54).
+pub const MAX_PHASE_CHARS: usize = 40;
+
 /// Tuning facts a server reports about itself (Strata's `engine` object,
 /// vLLM's `cache_config_info`), for a detail line its launch command
 /// cannot give.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EngineFacts {
-    /// `engine.max_context`, when a positive `u32`.
+    /// Strata `engine.context` (else `max_context`), when a positive `u32`.
     pub ctx: Option<u32>,
     /// `engine.kv` or `cache_dtype` lowercased, when it is a short token
     /// (`q8`, `fp8_e4m3`).
@@ -568,25 +650,89 @@ pub struct EngineFacts {
     pub kv_block: Option<u32>,
     /// vLLM `enable_prefix_caching`.
     pub prefix_cache: Option<bool>,
+    /// Settings and counters for SETUP's `engine:<key>` (#54).
+    pub values: EngineValues,
+    /// What the engine is doing now (Strata's `live`, #54).
+    pub live: Option<EngineLive>,
+}
+
+/// The request in flight, as Strata's `live` object reports it (#54).
+/// Numbers, a state word and the sanitised phase only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineLive {
+    /// `reading`, `generating`, `idle` or another short token.
+    pub state: Option<String>,
+    /// `live.phase`: printable ASCII, single-spaced, at most
+    /// [`MAX_PHASE_CHARS`]. Shown on tty11 only; never exported.
+    pub phase: Option<String>,
+    /// Prompt tokens of the request.
+    pub prompt_tokens: Option<u64>,
+    /// Prompt tokens read so far while it is `reading`.
+    pub prompt_read: Option<u64>,
+    /// Prompt tokens to read, the denominator of [`Self::prompt_read`].
+    pub prompt_total: Option<u64>,
+    /// Tokens generated so far.
+    pub generated: Option<u64>,
+    /// The request's `max_tokens`.
+    pub max_tokens: Option<u64>,
+    /// Decode tok/s over Strata's last short window.
+    pub tok_s: Option<f64>,
+    /// Decode tok/s over the request so far.
+    pub tok_s_mean: Option<f64>,
+    /// Prefill tok/s of the request.
+    pub prefill_tok_s_mean: Option<f64>,
 }
 
 /// The parts of Strata's `GET /metrics` JSON this reads. Everything else
-/// (the last requests, hardware and its history) is skipped unread.
+/// (hardware and its history) is skipped unread.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct StrataDoc {
     engine: StrataEngine,
     live: StrataLive,
     totals: StrataTotals,
+    #[serde(deserialize_with = "newest_request")]
+    requests: Option<StrataRequest>,
+    conversation_cache: StrataConvCache,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct StrataEngine {
-    #[serde(deserialize_with = "number")]
-    max_context: Option<f64>,
+    #[serde(deserialize_with = "word")]
+    engine: Option<String>,
+    #[serde(deserialize_with = "word")]
+    version: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    context: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    max_context: Option<String>,
     #[serde(deserialize_with = "word")]
     kv: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    kv_resident: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    expert_slots: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    expert_cache_mib: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    spec: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    mtp_max: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    lookup: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    spec_min_p: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    pcie_frac: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    arena_mib: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    pool_workers: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    conversation_cache_mib: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    conversation_cache_slots: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -596,19 +742,82 @@ struct StrataLive {
     state: Option<String>,
     #[serde(deserialize_with = "number")]
     queued: Option<f64>,
+    #[serde(deserialize_with = "word")]
+    phase: Option<String>,
+    #[serde(deserialize_with = "number")]
+    prompt_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    prompt_read: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    prompt_total: Option<f64>,
     #[serde(deserialize_with = "number")]
     generated: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    max_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    tok_s: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    tok_s_mean: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    prefill_tok_s_mean: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct StrataTotals {
     #[serde(deserialize_with = "number")]
+    requests: Option<f64>,
+    #[serde(deserialize_with = "number")]
     prompt_tokens: Option<f64>,
     #[serde(deserialize_with = "number")]
     reused: Option<f64>,
     #[serde(deserialize_with = "number")]
     output_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    prompt_ms: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    decode_ms: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    drafts_offered: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    drafts_accepted: Option<f64>,
+}
+
+/// One finished request of `requests[]`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataRequest {
+    #[serde(deserialize_with = "number")]
+    time: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    hit_rate: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    pcie_share: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    drafts_offered: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    drafts_accepted: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    decode_tok_s: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataConvCache {
+    #[serde(deserialize_with = "flag")]
+    enabled: Option<bool>,
+    #[serde(deserialize_with = "num_text")]
+    budget_mib: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    requests: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    requests_reused: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    reused_tokens: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    prompt_tokens: Option<String>,
+    #[serde(deserialize_with = "num_text")]
+    evictions: Option<String>,
 }
 
 /// A finite, non-negative number; any other JSON value is `None`.
@@ -625,6 +834,102 @@ fn word<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D:
     }
 }
 
+/// A JSON bool; any other value is `None`.
+fn flag<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool())
+}
+
+/// A non-negative number, or a string that is one (Strata sends
+/// `pcie_frac` and `spec_min_p` as `"0.55"`), as plain decimal text of at
+/// most [`MAX_ENGINE_VALUE`] characters. A string keeps its digits as
+/// written (`0.50`).
+fn num_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let text = match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Number(number) => match number.as_f64() {
+            Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n < 1e15 => {
+                format!("{n:.0}")
+            }
+            Some(n) if n.is_finite() && n >= 0.0 => format!("{n}"),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    Ok(is_plain_number(&text).then_some(text))
+}
+
+/// `digits(.digits)?`, at most [`MAX_ENGINE_VALUE`] characters.
+fn is_plain_number(text: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    text.len() <= MAX_ENGINE_VALUE
+        && match text.split_once('.') {
+            Some((whole, fraction)) => digits(whole) && digits(fraction),
+            None => digits(text),
+        }
+}
+
+/// The newest entry of `requests[]`: the one with the largest `time`
+/// (Strata lists them newest first, so ties and missing times keep the
+/// first). Anything but an array is `None`.
+fn newest_request<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<StrataRequest>, D::Error> {
+    let serde_json::Value::Array(items) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mut newest: Option<StrataRequest> = None;
+    for item in items {
+        let Ok(request) = serde_json::from_value::<StrataRequest>(item) else {
+            continue;
+        };
+        let newer = match (&newest, request.time) {
+            (None, _) => true,
+            (Some(kept), Some(time)) => kept.time.is_none_or(|kept| time > kept),
+            (Some(_), None) => false,
+        };
+        if newer {
+            newest = Some(request);
+        }
+    }
+    Ok(newest)
+}
+
+/// Strata's `live.phase` for tty11: printable ASCII, runs of blanks as one
+/// space, at most [`MAX_PHASE_CHARS`] characters. Empty is `None`.
+#[must_use]
+pub fn clean_phase(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut space = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if !ch.is_ascii_graphic() {
+            continue;
+        }
+        if out.chars().count() + usize::from(space) + 1 > MAX_PHASE_CHARS {
+            break;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(ch);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `value` rounded to three decimals.
+fn thousandths(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
+/// A 0..=1 ratio; anything above 1 is `None`.
+fn unit(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| *v <= 1.0)
+}
+
 /// Strata's `/metrics` JSON (not Prometheus text).
 ///
 /// - decode: `totals.output_tokens` (finished requests) plus
@@ -636,10 +941,21 @@ fn word<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D:
 ///   reused prefix is part of the prompt, as SGLang's cached counter is).
 /// - running: 1 while `live.state` is `reading` or `generating`, 0 when
 ///   `idle`; queued: `live.queued`.
+/// - speculative decoding (#54): `totals.drafts_offered` are the draft
+///   tokens and `drafts_accepted` the accepted ones. Strata counts no draft
+///   rounds, so there is no step length.
+/// - engine speeds (#54): prefill is Δ(`prompt_tokens` − `reused`) over
+///   Δ`prompt_ms`, decode Δ`output_tokens` over Δ`decode_ms` (Strata's
+///   decode time covers every output token, so none is skipped), through
+///   [`speeds::window`] like vLLM's histograms, `totals.requests` the count.
+/// - the newest finished request's expert cache `hit_rate` and
+///   `pcie_share` (#54), as gauges.
 /// - no KV fill (Strata has none) and no hit ratio: `totals` holds only
 ///   lifetime sums, not the recent-window rate other backends report.
 ///
-/// A body that is not such a JSON object reads as all `None`.
+/// The facts carry `engine` (ctx, KV, and the [`ENGINE_KEYS`] values for
+/// SETUP) and `live` ([`EngineLive`]). `history` and `hardware` are never
+/// read. A body that is not such a JSON object reads as all `None`.
 #[must_use]
 pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
     let Ok(doc) = serde_json::from_str::<StrataDoc>(body) else {
@@ -654,34 +970,199 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         Some(true) => doc.live.generated.unwrap_or(0.0),
         _ => 0.0,
     };
+    let totals = &doc.totals;
+    let spec = match (totals.drafts_offered, totals.drafts_accepted) {
+        (Some(offered), Some(accepted)) => match (finite_u64(offered), finite_u64(accepted)) {
+            (Some(draft_tokens), Some(accepted)) => Some(SpecCounts {
+                drafts: None,
+                draft_tokens,
+                accepted: accepted.min(draft_tokens),
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    let requests = totals.requests;
+    let phase = |ms: Option<f64>, tokens: Option<f64>, counted: bool| {
+        let requests = requests?;
+        Some(Phase {
+            seconds: Hist {
+                sum: ms? / 1000.0,
+                count: requests,
+            },
+            // A zero count: [`speeds::window`] skips no first token.
+            tokens: Hist {
+                sum: tokens?,
+                count: if counted { requests } else { 0.0 },
+            },
+        })
+    };
+    let computed = match (totals.prompt_tokens, totals.reused) {
+        (Some(prompt), Some(reused)) => Some((prompt - reused).max(0.0)),
+        (Some(prompt), None) => Some(prompt),
+        _ => None,
+    };
+    let speeds = SpeedTotals {
+        prefill: phase(totals.prompt_ms, computed, true),
+        decode: phase(totals.decode_ms, totals.output_tokens, false),
+    }
+    .reported();
+    let newest = doc.requests.as_ref();
     let sample = MetricsSample {
-        n_decode_total: doc
-            .totals
+        n_decode_total: totals
             .output_tokens
             .and_then(|done| finite_u64(done + live)),
         requests_processing: busy.map(|busy| if busy { 1.0 } else { 0.0 }),
-        prompt_total: doc.totals.prompt_tokens.and_then(finite_u64),
+        prompt_total: totals.prompt_tokens.and_then(finite_u64),
         queued: doc.live.queued,
         kv_fill: None,
         cache_hit: None,
-        cached_total: doc.totals.reused.and_then(finite_u64),
+        cached_total: totals.reused.and_then(finite_u64),
+        spec,
+        speeds,
+        expert_hit: unit(newest.and_then(|r| r.hit_rate)),
+        pcie_share: unit(newest.and_then(|r| r.pcie_share)),
         ..MetricsSample::default()
     };
+    let engine = &doc.engine;
+    let ctx = engine
+        .context
+        .as_deref()
+        .or(engine.max_context.as_deref())
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|ctx| *ctx > 0);
+    let kv = engine
+        .kv
+        .as_ref()
+        .map(|kv| kv.to_ascii_lowercase())
+        .filter(|kv| is_token(kv));
     let facts = EngineFacts {
-        ctx: doc
-            .engine
-            .max_context
-            .and_then(finite_u64)
-            .and_then(|ctx| u32::try_from(ctx).ok())
-            .filter(|ctx| *ctx > 0),
-        kv: doc
-            .engine
-            .kv
-            .map(|kv| kv.to_ascii_lowercase())
-            .filter(|kv| is_token(kv)),
+        ctx,
+        kv: kv.clone(),
+        values: strata_values(&doc, kv),
+        live: Some(strata_live(&doc.live)).filter(|live| *live != EngineLive::default()),
         ..EngineFacts::default()
     };
     (sample, facts)
+}
+
+/// The [`ENGINE_KEYS`] values of one Strata document.
+fn strata_values(doc: &StrataDoc, kv: Option<String>) -> EngineValues {
+    let engine = &doc.engine;
+    let cache = &doc.conversation_cache;
+    let newest = doc.requests.as_ref();
+    let plain = |value: Option<f64>| {
+        value.and_then(|n| {
+            let text = if n.fract() == 0.0 && n < 1e15 {
+                format!("{n:.0}")
+            } else {
+                format!("{n}")
+            };
+            is_plain_number(&text).then_some(text)
+        })
+    };
+    let token = |value: &Option<String>| value.clone().filter(|text| is_token(text));
+    let on = cache.enabled == Some(true);
+    let entries: [(&'static str, Option<String>); 30] = [
+        ("engine", token(&engine.engine)),
+        ("version", token(&engine.version).or(token(&engine.engine))),
+        ("context", engine.context.clone()),
+        ("max_context", engine.max_context.clone()),
+        ("kv", kv),
+        ("kv_resident", engine.kv_resident.clone()),
+        ("expert_slots", engine.expert_slots.clone()),
+        ("expert_cache_mib", engine.expert_cache_mib.clone()),
+        ("spec", engine.spec.clone()),
+        ("mtp_max", engine.mtp_max.clone()),
+        ("lookup", engine.lookup.clone()),
+        ("spec_min_p", engine.spec_min_p.clone()),
+        ("pcie_frac", engine.pcie_frac.clone()),
+        ("arena_mib", engine.arena_mib.clone()),
+        ("pool_workers", engine.pool_workers.clone()),
+        (
+            "conversation_cache_slots",
+            engine.conversation_cache_slots.clone(),
+        ),
+        (
+            "conversation_cache",
+            cache
+                .enabled
+                .map(|on| if on { "on" } else { "off" }.to_owned()),
+        ),
+        (
+            "conversation_cache_mib",
+            if on {
+                engine
+                    .conversation_cache_mib
+                    .clone()
+                    .or(cache.budget_mib.clone())
+            } else {
+                None
+            },
+        ),
+        ("conversation_cache_requests", cache.requests.clone()),
+        (
+            "conversation_cache_requests_reused",
+            cache.requests_reused.clone(),
+        ),
+        (
+            "conversation_cache_reused_tokens",
+            cache.reused_tokens.clone(),
+        ),
+        (
+            "conversation_cache_prompt_tokens",
+            cache.prompt_tokens.clone(),
+        ),
+        ("conversation_cache_evictions", cache.evictions.clone()),
+        ("requests", plain(doc.totals.requests)),
+        (
+            "last_hit_rate",
+            plain(unit(newest.and_then(|r| r.hit_rate)).map(thousandths)),
+        ),
+        (
+            "last_pcie_share",
+            plain(unit(newest.and_then(|r| r.pcie_share)).map(thousandths)),
+        ),
+        (
+            "last_decode_tok_s",
+            plain(
+                newest
+                    .and_then(|r| r.decode_tok_s)
+                    .map(|t| (t * 10.0).round() / 10.0),
+            ),
+        ),
+        (
+            "last_drafts_offered",
+            plain(newest.and_then(|r| r.drafts_offered)),
+        ),
+        (
+            "last_drafts_accepted",
+            plain(newest.and_then(|r| r.drafts_accepted)),
+        ),
+        ("max_tokens", plain(doc.live.max_tokens)),
+    ];
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, value?)))
+        .collect()
+}
+
+/// Strata's `live` object, numbers and the cleaned phase only.
+fn strata_live(live: &StrataLive) -> EngineLive {
+    let count = |value: Option<f64>| value.and_then(finite_u64);
+    let rate = |value: Option<f64>| value.filter(|tps| *tps <= backend::MAX_ENGINE_TPS);
+    EngineLive {
+        state: live.state.clone().filter(|state| is_token(state)),
+        phase: live.phase.as_deref().and_then(clean_phase),
+        prompt_tokens: count(live.prompt_tokens),
+        prompt_read: count(live.prompt_read),
+        prompt_total: count(live.prompt_total),
+        generated: count(live.generated),
+        max_tokens: count(live.max_tokens),
+        tok_s: rate(live.tok_s),
+        tok_s_mean: rate(live.tok_s_mean),
+        prefill_tok_s_mean: rate(live.prefill_tok_s_mean),
+    }
 }
 
 /// One series value: the sum over label sets, or the last one.
@@ -1021,6 +1502,8 @@ impl EngineTrack {
             e2e_us: self.means[2].and_then(backend::micros),
             prefill_tps_tenths: self.tps[0].and_then(backend::tps_tenths),
             decode_tps_tenths: self.tps[1].and_then(backend::tps_tenths),
+            expert_hit_permille: sample.expert_hit.and_then(backend::permille),
+            pcie_share_permille: sample.pcie_share.and_then(backend::permille),
         }
     }
 
@@ -1049,14 +1532,20 @@ impl EngineTrack {
 
     fn observe_spec(&mut self, sample: &MetricsSample) {
         if let Some(now) = sample.spec {
+            // Rounds count only when both reads have them (Strata has none).
+            let rounds = match self.last_spec.map(|last| (now.drafts, last.drafts)) {
+                Some((Some(now), Some(last))) => Some(now.checked_sub(last)),
+                _ => None,
+            };
             let window = match self.last_spec {
                 Some(last)
-                    if now.drafts >= last.drafts
+                    if rounds.is_none_or(|delta| delta.is_some())
+                        && now.drafts.is_some() == last.drafts.is_some()
                         && now.draft_tokens >= last.draft_tokens
                         && now.accepted >= last.accepted =>
                 {
                     SpecCounts {
-                        drafts: now.drafts - last.drafts,
+                        drafts: rounds.flatten(),
                         draft_tokens: now.draft_tokens - last.draft_tokens,
                         accepted: now.accepted - last.accepted,
                     }
@@ -1065,22 +1554,34 @@ impl EngineTrack {
             };
             let accepted = window.accepted.min(window.draft_tokens);
             if self.last_spec.is_some() {
-                let total = self.spec_total.get_or_insert_with(SpecCounts::default);
-                total.drafts = total.drafts.saturating_add(window.drafts);
+                let total = self.spec_total.get_or_insert_with(|| SpecCounts {
+                    drafts: now.drafts.map(|_| 0),
+                    ..SpecCounts::default()
+                });
+                total.drafts = match (total.drafts, window.drafts) {
+                    (Some(total), Some(window)) => Some(total.saturating_add(window)),
+                    _ => None,
+                };
                 total.draft_tokens = total.draft_tokens.saturating_add(window.draft_tokens);
                 total.accepted = total
                     .accepted
                     .saturating_add(accepted)
                     .min(total.draft_tokens);
             } else if self.spec_total.is_none() {
-                self.spec_total = Some(SpecCounts::default());
+                self.spec_total = Some(SpecCounts {
+                    drafts: now.drafts.map(|_| 0),
+                    ..SpecCounts::default()
+                });
             }
             if window.draft_tokens > 0 {
                 self.spec_rate = Some(accepted as f64 / window.draft_tokens as f64);
             }
-            if window.drafts > 0 {
-                self.spec_len =
-                    Some((1.0 + accepted as f64 / window.drafts as f64).min(MAX_SPEC_LEN));
+            match window.drafts {
+                Some(drafts) if drafts > 0 => {
+                    self.spec_len = Some((1.0 + accepted as f64 / drafts as f64).min(MAX_SPEC_LEN));
+                }
+                Some(_) => {}
+                None => self.spec_len = None,
             }
             self.last_spec = Some(now);
         } else {
@@ -1187,6 +1688,13 @@ mod tests {
     #[test]
     fn strata_generating_counts_the_running_request() {
         let (sample, facts) = parse_strata(STRATA);
+        let phase = |seconds: f64, tokens: f64, count: f64| Phase {
+            seconds: Hist {
+                sum: seconds,
+                count: 7.0,
+            },
+            tokens: Hist { sum: tokens, count },
+        };
         assert_eq!(
             sample,
             MetricsSample {
@@ -1197,21 +1705,285 @@ mod tests {
                 kv_fill: None,
                 cache_hit: None,
                 cached_total: Some(9000),
+                // #54: drafted and accepted tokens, no rounds.
+                spec: Some(SpecCounts {
+                    drafts: None,
+                    draft_tokens: 2400,
+                    accepted: 1680,
+                }),
+                // #54: prompt minus reused over prompt_ms; every output
+                // token over decode_ms (a zero count skips no first token).
+                speeds: Some(SpeedTotals {
+                    prefill: Some(phase(3.1, 3000.0, 7.0)),
+                    decode: Some(phase(81.0, 2500.0, 0.0)),
+                }),
+                // The newest request's expert cache.
+                expert_hit: Some(0.874),
+                pcie_share: Some(0.092),
                 ..MetricsSample::default()
             }
         );
+        let want: EngineValues = [
+            ("engine", "0.1.41"),
+            ("version", "0.1.41"),
+            ("context", "262144"),
+            ("max_context", "262144"),
+            ("kv", "q8"),
+            ("kv_resident", "24576"),
+            ("expert_slots", "7200"),
+            ("expert_cache_mib", "14950"),
+            ("spec", "5"),
+            ("mtp_max", "3"),
+            ("lookup", "2"),
+            ("spec_min_p", "0.40"),
+            ("pcie_frac", "0.60"),
+            ("arena_mib", "41500"),
+            ("pool_workers", "12"),
+            ("conversation_cache_slots", "4"),
+            ("conversation_cache", "off"),
+            ("conversation_cache_requests", "7"),
+            ("conversation_cache_requests_reused", "5"),
+            ("conversation_cache_reused_tokens", "9000"),
+            ("conversation_cache_prompt_tokens", "12000"),
+            ("conversation_cache_evictions", "0"),
+            ("requests", "7"),
+            ("last_hit_rate", "0.874"),
+            ("last_pcie_share", "0.092"),
+            ("last_decode_tok_s", "30.6"),
+            ("last_drafts_offered", "290"),
+            ("last_drafts_accepted", "203"),
+            ("max_tokens", "4096"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key, value.to_owned()))
+        .collect();
         assert_eq!(
             facts,
             EngineFacts {
                 ctx: Some(262_144),
                 kv: Some("q8".to_owned()),
+                values: want,
+                live: Some(EngineLive {
+                    state: Some("generating".to_owned()),
+                    phase: Some("drafting a reply: outline".to_owned()),
+                    prompt_tokens: Some(1800),
+                    prompt_read: None,
+                    prompt_total: None,
+                    generated: Some(40),
+                    max_tokens: Some(4096),
+                    tok_s: Some(31.5),
+                    tok_s_mean: Some(30.1),
+                    prefill_tok_s_mean: Some(612.4),
+                }),
                 ..EngineFacts::default()
             }
         );
+        // Every key it fills is on the allowlist, and every value is a
+        // plain number or a short token.
+        for (key, value) in &facts.values {
+            assert!(ENGINE_KEYS.contains(key), "{key}");
+            assert!(
+                is_plain_number(value) || is_token(value),
+                "{key} = {value:?}"
+            );
+        }
         assert_eq!(parse_metrics_for(Backend::Strata, STRATA), sample);
         assert_eq!(
             parse_metrics_full(Backend::Strata, STRATA),
             (sample, Some(facts))
+        );
+    }
+
+    /// #54: Strata is told by its JSON's shape, and nothing else is.
+    #[test]
+    fn strata_is_detected_by_the_shape_of_its_json() {
+        assert_eq!(detect_backend(STRATA), Some(Backend::Strata));
+        assert!(is_strata_json(STRATA));
+        assert_eq!(
+            detect_backend("\n  {\"engine\":{},\"live\":{\"state\":\"idle\"}}"),
+            Some(Backend::Strata)
+        );
+        for body in [
+            "",
+            "{}",
+            "[]",
+            r#"{"engine":{}}"#,
+            r#"{"live":{}}"#,
+            r#"{"engine":"strata","live":{}}"#,
+            r#"{"engine":{},"live":null}"#,
+            r#"{"engine":{},"live":[]}"#,
+            r#"{"engine":{},"live":{}"#,
+            r#"{"status":"ok","service":"strata"}"#,
+            "llamacpp:n_decode_total 5\n",
+        ] {
+            assert!(!is_strata_json(body), "{body}");
+        }
+        assert_eq!(
+            detect_backend(r#"{"service":"strata"}"#),
+            None,
+            "a health body is not /metrics"
+        );
+        assert_eq!(
+            detect_backend("vllm:num_requests_running 1\n"),
+            Some(Backend::Vllm)
+        );
+    }
+
+    /// #54: the newest request is the one with the latest `time`, wherever
+    /// it sits; ratios above 1 and other junk are dropped.
+    #[test]
+    fn strata_newest_request_and_bounds() {
+        let mut doc: serde_json::Value = serde_json::from_str(STRATA).expect("fixture");
+        doc["requests"].as_array_mut().expect("requests").reverse();
+        let (sample, facts) = parse_strata(&doc.to_string());
+        assert_eq!(sample.expert_hit, Some(0.874));
+        assert_eq!(sample.pcie_share, Some(0.092));
+        assert_eq!(
+            facts.values.get("last_drafts_offered").map(String::as_str),
+            Some("290")
+        );
+        doc["requests"] = serde_json::json!([
+            {"time": 5.0, "hit_rate": 1.5, "pcie_share": -0.1},
+            "junk",
+            {"time": 1.0, "hit_rate": 0.5, "pcie_share": 0.5}
+        ]);
+        doc["engine"]["pcie_frac"] = serde_json::json!("0.5; rm -rf");
+        doc["engine"]["spec_min_p"] = serde_json::json!(0.25);
+        doc["engine"]["arena_mib"] = serde_json::json!(1e300);
+        doc["engine"]["version"] = serde_json::json!("v1 with spaces");
+        doc["live"]["phase"] = serde_json::json!(
+            "\u{1b}[31mwriting\ta  tool call:\n write_file \u{e9}and more text that runs well past forty"
+        );
+        let (sample, facts) = parse_strata(&doc.to_string());
+        assert_eq!((sample.expert_hit, sample.pcie_share), (None, None));
+        assert_eq!(facts.values.get("pcie_frac"), None);
+        assert_eq!(
+            facts.values.get("spec_min_p").map(String::as_str),
+            Some("0.25")
+        );
+        assert_eq!(facts.values.get("arena_mib"), None);
+        // `engine.engine` stands in for a version that is not a token.
+        assert_eq!(
+            facts.values.get("version").map(String::as_str),
+            Some("0.1.41")
+        );
+        let phase = facts.live.and_then(|live| live.phase).expect("phase");
+        // Cut at a whole word's end here: one more would pass 40.
+        assert_eq!(phase, "[31mwriting a tool call: write_file and");
+        assert!(phase.chars().count() <= MAX_PHASE_CHARS);
+        assert_eq!(
+            clean_phase(&"x".repeat(99)).map(|p| p.len()),
+            Some(MAX_PHASE_CHARS)
+        );
+        assert!(phase.chars().all(|ch| ch.is_ascii_graphic() || ch == ' '));
+        assert_eq!(clean_phase("  \t "), None);
+        assert_eq!(
+            clean_phase(" reading  the prompt "),
+            Some("reading the prompt".to_owned())
+        );
+        // The conversation cache budget shows only while it is on.
+        doc["conversation_cache"]["enabled"] = serde_json::json!(true);
+        doc["engine"]["conversation_cache_mib"] = serde_json::json!(2560);
+        let (_, facts) = parse_strata(&doc.to_string());
+        assert_eq!(
+            facts.values.get("conversation_cache").map(String::as_str),
+            Some("on")
+        );
+        assert_eq!(
+            facts
+                .values
+                .get("conversation_cache_mib")
+                .map(String::as_str),
+            Some("2560")
+        );
+    }
+
+    /// #54: Strata's window speeds and spec acceptance through the engine
+    /// book: the first read is every request since it started, then deltas,
+    /// a window without requests keeps the last, and a restart is a window
+    /// of its own.
+    #[test]
+    fn strata_window_speeds_and_spec_across_a_restart() {
+        let read = |requests: u64,
+                    prompt: u64,
+                    reused: u64,
+                    output: u64,
+                    prompt_ms: f64,
+                    decode_ms: f64,
+                    offered: u64,
+                    accepted: u64| {
+            let mut doc: serde_json::Value = serde_json::from_str(STRATA).expect("fixture");
+            doc["totals"] = serde_json::json!({
+                "requests": requests, "prompt_tokens": prompt, "reused": reused,
+                "output_tokens": output, "prompt_ms": prompt_ms, "decode_ms": decode_ms,
+                "drafts_offered": offered, "drafts_accepted": accepted,
+            });
+            parse_metrics_for(Backend::Strata, &doc.to_string())
+        };
+        let mut book = EngineBook::default();
+        // First read: 3,000 computed tokens in 3.1 s, 2,500 in 81 s.
+        let first = book.observe(
+            "flash",
+            &read(7, 12_000, 9000, 2500, 3100.0, 81_000.0, 2400, 1680),
+        );
+        assert_eq!(first.prefill_tps_tenths, Some(9677));
+        assert_eq!(first.decode_tps_tenths, Some(309));
+        assert_eq!(first.spec_permille, Some(700));
+        assert_eq!(first.spec_len_centi, None, "no rounds, no step length");
+        assert_eq!(
+            first.spec_counts,
+            Some(SpecCounts {
+                drafts: None,
+                draft_tokens: 0,
+                accepted: 0
+            }),
+            "the first read is the baseline"
+        );
+        assert_eq!(first.expert_hit_permille, Some(874));
+        assert_eq!(first.pcie_share_permille, Some(92));
+        // One more request: 1,000 prompt, 800 reused → 200 in 0.4 s; 300
+        // output in 10 s; 280 drafted, 210 accepted.
+        let second = book.observe(
+            "flash",
+            &read(8, 13_000, 9800, 2800, 3500.0, 91_000.0, 2680, 1890),
+        );
+        assert_eq!(second.prefill_tps_tenths, Some(5000));
+        assert_eq!(second.decode_tps_tenths, Some(300));
+        assert_eq!(second.spec_permille, Some(750));
+        assert_eq!(
+            second.spec_counts,
+            Some(SpecCounts {
+                drafts: None,
+                draft_tokens: 280,
+                accepted: 210
+            })
+        );
+        // No new request: the last window stays.
+        let idle = book.observe(
+            "flash",
+            &read(8, 13_000, 9800, 2800, 3500.0, 91_000.0, 2680, 1890),
+        );
+        assert_eq!(idle.prefill_tps_tenths, Some(5000));
+        assert_eq!(idle.decode_tps_tenths, Some(300));
+        assert_eq!(idle.spec_permille, Some(750));
+        // Strata restarted: its totals are the window, counters add them.
+        let restarted = book.observe("flash", &read(1, 600, 100, 90, 250.0, 3000.0, 80, 40));
+        assert_eq!(restarted.prefill_tps_tenths, Some(20_000));
+        assert_eq!(restarted.decode_tps_tenths, Some(300));
+        assert_eq!(restarted.spec_permille, Some(500));
+        assert_eq!(
+            restarted.spec_counts,
+            Some(SpecCounts {
+                drafts: None,
+                draft_tokens: 360,
+                accepted: 250
+            })
+        );
+        // Reused above prompt reads as no computed tokens, not a negative.
+        let odd = read(9, 600, 900, 100, 260.0, 3100.0, 80, 40);
+        assert_eq!(
+            odd.speeds.and_then(|s| s.prefill).map(|p| p.tokens.sum),
+            Some(0.0)
         );
     }
 
@@ -1468,7 +2240,7 @@ vllm:prefix_cache_queries_total{model_name=\"m\"} 120.0
         assert_eq!(
             sample.spec,
             Some(SpecCounts {
-                drafts: 20_000,
+                drafts: Some(20_000),
                 draft_tokens: 60_000,
                 accepted: 38_000,
             }),
@@ -1504,6 +2276,7 @@ vllm:prefix_cache_queries_total{model_name=\"m\"} 120.0
                 kv: Some("fp8_e4m3".to_owned()),
                 kv_block: Some(16),
                 prefix_cache: Some(true),
+                ..EngineFacts::default()
             })
         );
         // #35: the four per-request histograms, buckets and _created ignored.
@@ -1633,7 +2406,7 @@ vllm:spec_decode_num_drafts_total{model_name=\"m\"} 5.0
     fn spec(drafts: u64, draft_tokens: u64, accepted: u64) -> MetricsSample {
         MetricsSample {
             spec: Some(SpecCounts {
-                drafts,
+                drafts: Some(drafts),
                 draft_tokens,
                 accepted,
             }),
@@ -1648,7 +2421,13 @@ vllm:spec_decode_num_drafts_total{model_name=\"m\"} 5.0
         let first = book.observe("m", &spec(100, 300, 150));
         assert_eq!(first.spec_permille, Some(500));
         assert_eq!(first.spec_len_centi, Some(250));
-        assert_eq!(first.spec_counts, Some(SpecCounts::default()));
+        assert_eq!(
+            first.spec_counts,
+            Some(SpecCounts {
+                drafts: Some(0),
+                ..SpecCounts::default()
+            })
+        );
         // A window: 10 drafts of 3, 24 accepted: 80 %, 3.4 per step.
         let next = book.observe("m", &spec(110, 330, 174));
         assert_eq!(next.spec_permille, Some(800));
@@ -1656,7 +2435,7 @@ vllm:spec_decode_num_drafts_total{model_name=\"m\"} 5.0
         assert_eq!(
             next.spec_counts,
             Some(SpecCounts {
-                drafts: 10,
+                drafts: Some(10),
                 draft_tokens: 30,
                 accepted: 24,
             })
@@ -1672,7 +2451,7 @@ vllm:spec_decode_num_drafts_total{model_name=\"m\"} 5.0
         assert_eq!(
             reset.spec_counts,
             Some(SpecCounts {
-                drafts: 14,
+                drafts: Some(14),
                 draft_tokens: 42,
                 accepted: 27,
             })
@@ -1684,7 +2463,7 @@ vllm:spec_decode_num_drafts_total{model_name=\"m\"} 5.0
         book.forget("m");
         let again = book.observe("m", &spec(1, 3, 3));
         assert_eq!(again.spec_permille, Some(1000));
-        assert_eq!(again.spec_counts.map(|c| c.drafts), Some(19));
+        assert_eq!(again.spec_counts.map(|c| c.drafts), Some(Some(19)));
         // A server that stops reporting spec shows none.
         let gone = book.observe("m", &MetricsSample::default());
         assert_eq!(gone.spec_permille, None);

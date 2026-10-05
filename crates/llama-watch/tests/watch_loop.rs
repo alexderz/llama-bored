@@ -1326,6 +1326,7 @@ fn empty_detail() -> LlamaDetail {
         prompt_cache: Vec::new(),
         capture: None,
         setup: Vec::new(),
+        engine_live: Vec::new(),
     }
 }
 

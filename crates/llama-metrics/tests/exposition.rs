@@ -357,7 +357,7 @@ fn model_labels_round_trip_through_the_parser() {
         .filter(|(n, _, _)| n == "llamabored_model_loaded")
         .map(|(_, l, _)| l)
         .collect();
-    assert_eq!(models.len(), 4);
+    assert_eq!(models.len(), 5);
     let qwen = models
         .iter()
         .find(|l| l[0].1 == "Qwen3-Coder\u{2026}")
@@ -393,6 +393,52 @@ fn model_labels_round_trip_through_the_parser() {
         .expect("vllm");
     assert_eq!(vllm[3].1, "fp8_e4m3");
     assert_eq!(vllm[6].1, "vllm");
+    // #54: a Strata model's ctx and KV come from its own report.
+    let strata = models
+        .iter()
+        .find(|l| l[0].1 == "flash-next")
+        .expect("strata");
+    assert_eq!(strata[3].1, "q8");
+    assert_eq!(strata[4].1, "262144");
+    assert_eq!(strata[6].1, "strata");
+}
+
+/// #54: Strata's expert cache ratios are two gauges of its model, and its
+/// spec counters have no rounds series.
+#[test]
+fn strata_expert_cache_gauges() {
+    let text = render(&Ok(load("snapshot-loaded.json")), T0);
+    let all = samples(&text);
+    let value = |name: &str, model: &str| {
+        all.iter()
+            .find(|(n, l, _)| n == name && l[0].1 == model)
+            .map(|(_, _, v)| v.clone())
+    };
+    assert_eq!(
+        value("llamabored_model_expert_cache_hit_ratio", "flash-next").as_deref(),
+        Some("0.875")
+    );
+    assert_eq!(
+        value("llamabored_model_pcie_share_ratio", "flash-next").as_deref(),
+        Some("0.09375")
+    );
+    assert_eq!(
+        value("llamabored_model_spec_draft_tokens_total", "flash-next").as_deref(),
+        Some("2400")
+    );
+    assert_eq!(
+        value("llamabored_model_spec_drafts_total", "flash-next"),
+        None
+    );
+    assert_eq!(
+        value("llamabored_model_spec_accepted_length", "flash-next"),
+        None
+    );
+    assert_eq!(
+        value("llamabored_model_expert_cache_hit_ratio", "qwen3.8-27b"),
+        None
+    );
+    assert!(text.contains("# TYPE llamabored_model_pcie_share_ratio gauge\n"));
 }
 
 #[test]
@@ -430,12 +476,12 @@ fn duplicate_models_export_one_series() {
         .lines()
         .filter(|l| l.starts_with("llamabored_model_loaded{"))
         .count();
-    assert_eq!(loaded, 4);
+    assert_eq!(loaded, 5);
     let ctx = text
         .lines()
         .filter(|l| l.starts_with("llamabored_model_ctx_size_tokens{"))
         .count();
-    assert_eq!(ctx, 2);
+    assert_eq!(ctx, 3);
 }
 
 /// The wire carries no prompt or output text, and the exporter exports none.
@@ -519,6 +565,8 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.engine.e2e_s",
         "ai.models.engine.prefill_tps",
         "ai.models.engine.decode_tps",
+        "ai.models.engine.expert_hit",
+        "ai.models.engine.pcie_share",
         "tokens",
         "tokens.decoded_total",
         "tokens.prompt_total",
@@ -748,6 +796,14 @@ const EXPORTED: &[(&str, &str)] = &[
     (
         "ai.models.engine.decode_tps",
         "llamabored_model_decode_tokens_per_second",
+    ),
+    (
+        "ai.models.engine.expert_hit",
+        "llamabored_model_expert_cache_hit_ratio",
+    ),
+    (
+        "ai.models.engine.pcie_share",
+        "llamabored_model_pcie_share_ratio",
     ),
     ("ai.models.slot_ctx.slot", "llamabored_slot_ctx_used_tokens"),
     ("ai.models.slot_ctx.used", "llamabored_slot_ctx_used_tokens"),
