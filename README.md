@@ -54,6 +54,22 @@ line under the model name with the short name (`llama.cpp`, `sglang`,
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
 `openai`) as the `backend` label on `llamabored_model_loaded`.
 
+| Engine | Told by | Read from it |
+|---|---|---|
+| llama.cpp | `llama-server` in the launch command, or `llamacpp:` metric names | `/slots`, `/metrics` |
+| SGLang | `sglang.launch_server` / `sglang serve`, or `sglang:` names | `/metrics` |
+| vLLM | `vllm serve` / `vllm.entrypoints`, or `vllm:` names | `/metrics` (engine numbers, speeds, `cache_config_info`) |
+| Strata | `serve/server.py --engine strata` (or a `strata…` image), or a JSON `/metrics` with `engine` and `live` objects (#54) | `/metrics` JSON: counters, live state and phase, settings, spec, speeds, expert cache |
+| OpenAI-compatible | anything else | llama-swap activity rows only |
+
+A launch command that names no engine (a container started by image
+digest, a wrapper script) gets one `/metrics` probe per load; its shape
+or metric prefix decides, and `[llama.backends]` in `watch.toml` overrides
+both. Strata's JSON is read for numbers and short tokens only, at most
+1 MiB, and its `history` is never looked at. Its `live.phase` (`writing a
+tool call: write`) is shown on tty11's engine line, printable ASCII and
+at most 40 characters, and never exported.
+
 **Speeds.** RECENT's PROMPT and GEN tok/s come from llama-swap, which has
 them only for llama.cpp. For a vLLM request they are measured by the
 engine instead and marked `~` (`~2,134`, `~41.3`): llama-watch reads vLLM's
@@ -66,7 +82,27 @@ did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
 per-request prefill or decode time, so its rows keep `--`. The same window
 speeds are on the exporter as `llamabored_model_prefill_tokens_per_second`
 and `llamabored_model_decode_tokens_per_second`, and at the end of the
-model's backend line on tty11 when it fits.
+model's backend line on tty11 when it fits. Strata reports no histograms
+but its lifetime `totals` (#54): prefill = Δ(prompt − reused tokens) ÷
+Δ`prompt_ms`, decode = Δoutput tokens ÷ Δ`decode_ms` (every output token,
+as Strata times them), over the same windows; a total going down is a
+restart and its new totals are the window. Its RECENT rows keep
+llama-swap's own speeds.
+
+Engine series on the exporter (each with `name` and `full_name`; absent
+when the engine does not report it):
+
+| Series | Type | From |
+|---|---|---|
+| `llamabored_model_spec_acceptance_ratio` | gauge | vLLM, Strata (`drafts_accepted` / `drafts_offered`), SGLang's gauge |
+| `llamabored_model_spec_accepted_length` | gauge | vLLM, SGLang (Strata counts no draft rounds) |
+| `llamabored_model_spec_drafts_total` | counter | vLLM |
+| `llamabored_model_spec_draft_tokens_total`, `…_spec_accepted_tokens_total` | counter | vLLM, Strata |
+| `llamabored_model_preemptions_total`, `llamabored_model_sleeping` | counter, gauge | vLLM |
+| `llamabored_model_ttft_seconds`, `…_itl_seconds`, `…_e2e_latency_seconds` | gauge | vLLM, SGLang |
+| `llamabored_model_prefill_tokens_per_second`, `…_decode_tokens_per_second` | gauge | vLLM, Strata |
+| `llamabored_model_expert_cache_hit_ratio` | gauge | Strata: the newest finished request's expert cache `hit_rate` (#54) |
+| `llamabored_model_pcie_share_ratio` | gauge | Strata: that request's `pcie_share` (#54) |
 
 ## Features
 
@@ -117,7 +153,16 @@ The title is the llama-swap model id, then its `name` when that fits, and
 `+N` when N more models are loaded. Each row is a setting read from the
 model's llama-swap launch command, or from what the engine reports (KV
 dtype, block size and prefix caching from vLLM's `cache_config_info`,
-Strata's context and KV, live speculative acceptance `acc 3.6/step · 65 %`).
+Strata's context, KV and the rest of its `engine` settings, live
+speculative acceptance `acc 3.6/step · 65 %`). A Strata model reads:
+
+```text
+    engine   Strata 0.1.41 · Q4_K_M
+    ctx      262,144 · kv q8 · resident 24,576
+    experts  cache 14.6 GiB · 7,200 slots · hit 87 % · pcie 9 %
+    spec     depth 5 · mtp 3 · lookup 2 · min-p 0.40 · 70 %
+    serve    pcie 0.60 · arena 40.5 GiB · 12 workers · conv cache off
+```
 A value nothing set is grey (`kv f16`, `full GPU`, `spec none`). Which
 settings show is configuration: see **SETUP rules** under Configuration.
 The block has six rows (title included) up to 59 rows and eight from 60;
@@ -486,12 +531,34 @@ for a server, only after its entry point), `env:NAME` (`-e NAME=V`,
 entry point, or anywhere when the command names no server),
 `json:--speculative-config:num_speculative_tokens` (a key of a JSON
 object given to a flag, one level deep), `live:NAME` (`engine`, `ctx`,
-`kv_dtype`, `kv_block`, `prefix_cache`, `spec_accept`, `spec_len`), or no
-source at all for a field that only shows its `default`. Kinds: `number`
-(drawn with thousands separators), `token` (at most 16 characters of
-`A-Z a-z 0-9 _ . + -`; a path-like value gives only its file stem),
-`quant` (the GGUF quant tag of a model file name, `UD-Q4_K_M`), `present`
-(the flag is there: `on`). Whatever a rule says, only numbers and short
+`kv_dtype`, `kv_block`, `prefix_cache`, `spec_accept`, `spec_len`,
+`expert_hit`, `pcie_share`), `engine:KEY` (#54: a setting the engine
+reports about itself, below), `name` (#54: the GGUF quant tag in the
+llama-swap model `name`, `Flash Next Q4_K_M`, with kind `quant`; for an
+engine whose command names no weights file), or no source at all for a
+field that only shows its `default`. Kinds: `number` (drawn with thousands
+separators), `token` (at most 16 characters of `A-Z a-z 0-9 _ . + -`; a
+path-like value gives only its file stem), `quant` (the GGUF quant tag of
+a model file name, `UD-Q4_K_M`), `present` (the flag is there: `on`),
+`mib` (a number of MiB drawn as `16.4 GiB`, or `512 MiB` below 1 GiB).
+An `engine:` source takes `number`, `token` or `mib` (default: as
+reported).
+
+`engine:KEY` keys are a fixed list the engine parser fills, each a plain
+number, a short token or `on`/`off`; nothing else of an engine's report is
+reachable. Strata (#54) fills, from `engine`: `engine`, `version`,
+`context`, `max_context`, `kv`, `kv_resident`, `expert_slots`,
+`expert_cache_mib`, `spec`, `mtp_max`, `lookup`, `spec_min_p`,
+`pcie_frac`, `arena_mib`, `pool_workers`, `conversation_cache_slots`; from
+`conversation_cache`: `conversation_cache` (`on`/`off`),
+`conversation_cache_mib` (its budget, only while on),
+`conversation_cache_requests`, `conversation_cache_requests_reused`,
+`conversation_cache_reused_tokens`, `conversation_cache_prompt_tokens`,
+`conversation_cache_evictions`; `requests` (`totals.requests`);
+`max_tokens` (the request in flight); and of the newest finished request
+`last_hit_rate`, `last_pcie_share`, `last_decode_tok_s`,
+`last_drafts_offered`, `last_drafts_accepted`. The built-in rules show
+Strata's rows above. Whatever a rule says, only numbers and short
 tokens leave the launch command, never a path or a raw argument, and the
 command itself is not kept. A bad rule (unknown kind or source, text too
 long) fails `watch.toml` validation with its index:
