@@ -22,7 +22,7 @@ use crate::anim::Anim;
 use crate::collector::{AiState, Snapshot};
 use crate::config::{Bands, Config, StepMargin, UploadMode};
 use crate::history::History;
-use crate::tokens::{TokenChart, TokenFeed};
+use crate::tokens::{GenRate, TokenChart, TokenFeed, hold_gen_tenths};
 
 /// Load colour for the ring and the three history blocks.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -116,6 +116,9 @@ pub struct Memory {
     pub chart: TokenChart,
     /// Counter deltas for the cascade.
     pub feed: TokenFeed,
+    /// Current generation rate, the moving average behind
+    /// [`View::gen_tps_tenths`].
+    pub gen_rate: GenRate,
     /// Writer `Instant` paired with a sample's `t_mono_ns`.
     anchor: Option<(Instant, u64)>,
     /// Frame clock, stream smoothing and the peg's particles.
@@ -130,6 +133,7 @@ impl Memory {
             activity: ActivityDial::new(settings),
             chart: TokenChart::default(),
             feed: TokenFeed::new(settings.max_gap_s),
+            gen_rate: GenRate::default(),
             anchor: None,
             anim: Anim::default(),
         }
@@ -250,6 +254,12 @@ pub struct View {
     /// Layout variant from `display.variant`.
     #[serde(default)]
     pub variant: Variant,
+    /// Current generation rate in tenths of a tok/s, drawn over the chart's
+    /// far end (#55). Rounded to the step its text shows, held with a 30 %
+    /// margin in change mode. `None` before any decoded-token counter, and
+    /// with no data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_tps_tenths: Option<u32>,
     /// Writer memory. Not a frame-key field.
     #[serde(skip)]
     pub dial_state: DialMemory,
@@ -276,6 +286,7 @@ impl Default for View {
             scale: default_scale(),
             tokens: Vec::new(),
             variant: Variant::A1,
+            gen_tps_tenths: None,
             dial_state: DialMemory::default(),
         }
     }
@@ -370,6 +381,7 @@ pub fn present(
     if let Some(reading) = snapshot.tokens {
         memory.anchor = Some((snapshot.t_mono, reading.t_mono_ns));
         let step = memory.feed.accept(reading);
+        memory.gen_rate.step(step, reading.decoded_total.is_some());
         if step.fresh
             && let Some(value) = bar_sample
         {
@@ -378,6 +390,8 @@ pub fn present(
         if let Some((tok, ms)) = step.interval {
             memory.chart.add(tok, ms);
         }
+    } else {
+        memory.gen_rate.gap();
     }
     let now_ns = snapshot
         .tokens
@@ -432,6 +446,19 @@ pub fn present(
         )
     };
     let ai = map_ai(snapshot.ai);
+    // Stream mode shows the average every frame; change mode holds it.
+    let gen_tps_tenths = memory
+        .gen_rate
+        .rate()
+        .filter(|_| ai != Ai::NoData)
+        .map(|rate| {
+            let shown = if streaming {
+                None
+            } else {
+                previous.and_then(|view| view.gen_tps_tenths)
+            };
+            hold_gen_tenths(rate, shown)
+        });
     let variant = map_variant(config.display.variant);
     memory.anim.frame = memory.anim.frame.wrapping_add(1);
     let peg = memory
@@ -487,6 +514,7 @@ pub fn present(
         scale,
         tokens,
         variant,
+        gen_tps_tenths,
         dial_state: memory,
     }
 }

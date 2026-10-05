@@ -187,6 +187,189 @@ fn the_tokens_chart_takes_the_block_slot() {
     assert!(diff > 400, "the chart fills its slot, saw {diff} pixels");
 }
 
+/// The plot rect, exclusive: x 85..=235, y 174..=206 (the baseline is 206.5).
+const PLOT: Rect = Rect {
+    x0: 85,
+    y0: 174,
+    x1: 236,
+    y1: 207,
+};
+/// The title row: the ceiling label on the left, "tok/s" on the right.
+const TITLE_ROW: Rect = Rect {
+    x0: 80,
+    y0: 158,
+    x1: 240,
+    y1: 174,
+};
+/// The tick marks and "now · 1h · 6h · 24h".
+const TICK_ROW: Rect = Rect {
+    x0: 80,
+    y0: 207,
+    x1: 240,
+    y1: 224,
+};
+/// Where the current rate sits: the plot's far (24 h) end.
+const RATE: Rect = Rect {
+    x0: 180,
+    y0: 174,
+    x1: 236,
+    y1: 207,
+};
+
+/// Bounding box of the pixels that differ between two frames.
+fn diff_box(left: &Frame, right: &Frame) -> Option<Rect> {
+    let mut found: Option<Rect> = None;
+    for y in 0..320 {
+        for x in 0..320 {
+            let a = rgb(left, x, y);
+            let b = rgb(right, x, y);
+            if a.0.abs_diff(b.0) > 8 || a.1.abs_diff(b.1) > 8 || a.2.abs_diff(b.2) > 8 {
+                found = Some(match found {
+                    None => Rect {
+                        x0: x,
+                        y0: y,
+                        x1: x + 1,
+                        y1: y + 1,
+                    },
+                    Some(r) => Rect {
+                        x0: r.x0.min(x),
+                        y0: r.y0.min(y),
+                        x1: r.x1.max(x + 1),
+                        y1: r.y1.max(y + 1),
+                    },
+                });
+            }
+        }
+    }
+    found
+}
+
+fn chart_view(gen_tps_tenths: Option<u32>, peak_at_far_end: bool) -> View {
+    let mut view = loaded(&["Qwen3.6 35B-A3B"]);
+    // 112 tok/s now, 20 tok/s behind it; or full height at the far end.
+    view.tokens = (0..40)
+        .map(|i| match (i, peak_at_far_end) {
+            (0, _) => 11_250,
+            (26.., true) => 20_000,
+            _ => 2_000,
+        })
+        .collect();
+    view.gen_tps_tenths = gen_tps_tenths;
+    view
+}
+
+#[test]
+fn the_current_rate_hovers_over_the_far_end_of_the_plot() {
+    let mut assets = Assets::load().expect("assets");
+    // Busy: a white numeral at the far end.
+    let busy = paint(&chart_view(Some(1_120), false), &mut assets);
+    let ink = count_near(&busy, RATE, TEXT_RGB, 20);
+    assert!(ink > 120, "\"112\" is drawn in #F4F4F2, saw {ink} pixels");
+    // Idle: "0" in the no-data grey; no counter: a grey "—".
+    let idle = paint(&chart_view(Some(0), false), &mut assets);
+    let grey = count_near(&idle, RATE, NO_DATA_RGB, 12);
+    assert!(grey > 40, "idle \"0\" is #666, saw {grey} pixels");
+    let none = paint(&chart_view(None, false), &mut assets);
+    // The chart's line is white too; idle adds no white to it.
+    assert!(
+        count_near(&idle, RATE, TEXT_RGB, 20) <= count_near(&none, RATE, TEXT_RGB, 20) + 4,
+        "idle is not white"
+    );
+    let dash = count_near(&none, RATE, NO_DATA_RGB, 12);
+    assert!(dash > 15, "no counter draws a grey dash, saw {dash} pixels");
+    // NoData: a grey dash too, on an empty plot.
+    let mut nodata = chart_view(Some(1_120), false);
+    nodata.ai = Ai::NoData;
+    let nodata = paint(&nodata, &mut assets);
+    assert!(count_near(&nodata, RATE, NO_DATA_RGB, 12) > 15);
+    assert!(count_near(&nodata, RATE, TEXT_RGB, 20) < 5);
+
+    // The unit is in the title row over the numeral: "tok/s" in label grey.
+    let unit = Rect {
+        x0: 200,
+        y0: 160,
+        x1: 236,
+        y1: 172,
+    };
+    let label_grey = (0x7A, 0x7A, 0x7A);
+    let caption = count_near(&busy, unit, label_grey, 40);
+    assert!(caption > 15, "tok/s caption, saw {caption}");
+}
+
+#[test]
+fn the_current_rate_stays_inside_the_plot_and_off_the_labels() {
+    let mut assets = Assets::load().expect("assets");
+    for bright in [false, true] {
+        let reference = paint(&chart_view(None, bright), &mut assets);
+        for tenths in [
+            0, 1, 75, 99, 1_120, 8_880, 12_000, 98_000, 120_000, 1_250_000,
+        ] {
+            let frame = paint(&chart_view(Some(tenths), bright), &mut assets);
+            let Some(changed) = diff_box(&frame, &reference) else {
+                panic!("{tenths}: the numeral did not change the frame");
+            };
+            assert!(
+                changed.x0 >= PLOT.x0
+                    && changed.y0 >= PLOT.y0
+                    && changed.x1 <= PLOT.x1
+                    && changed.y1 <= PLOT.y1,
+                "{tenths}: numeral, knockout and backing stay in the plot, changed x {}..{} y {}..{}",
+                changed.x0,
+                changed.x1,
+                changed.y0,
+                changed.y1
+            );
+            assert_eq!(
+                zone_diff(&frame, &reference, TITLE_ROW),
+                0,
+                "{tenths}: title row"
+            );
+            assert_eq!(
+                zone_diff(&frame, &reference, TICK_ROW),
+                0,
+                "{tenths}: tick row"
+            );
+            // Clear of the ceiling label's column too: the plot's first third.
+            assert!(
+                changed.x0 > PLOT.x0 + 50,
+                "{tenths}: starts at x {}",
+                changed.x0
+            );
+        }
+    }
+}
+
+#[test]
+fn the_current_rate_reads_over_a_bright_fill() {
+    let mut assets = Assets::load().expect("assets");
+    let frame = paint(&chart_view(Some(1_120), true), &mut assets);
+    // The knockout rings the white glyphs in black; the fill never touches
+    // the numeral's ink. The glyphs sit right of x 190 and below the line,
+    // which runs along the top at full height.
+    let black = count_near(&frame, RATE, (0, 0, 0), 12);
+    let white = count_near(&frame, RATE, TEXT_RGB, 20);
+    assert!(white > 120, "numeral ink, saw {white}");
+    assert!(
+        black > white / 2,
+        "knockout, saw {black} black for {white} white"
+    );
+    for y in 178..RATE.y1 {
+        for x in 190..RATE.x1 {
+            if !near(rgb(&frame, x, y), TEXT_RGB, 20) {
+                continue;
+            }
+            for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                let (nx, ny) = (x.saturating_add_signed(dx), y.saturating_add_signed(dy));
+                let p = rgb(&frame, nx, ny);
+                // A neighbour is ink, its anti-aliased edge (grey), or knockout;
+                // never the coloured fill.
+                let spread = p.0.max(p.1).max(p.2) - p.0.min(p.1).min(p.2);
+                assert!(spread < 40, "fill touches the ink at ({nx}, {ny}): {p:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn none_fields_draw_the_grey_dash() {
     let mut assets = Assets::load().expect("assets");

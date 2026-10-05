@@ -258,6 +258,118 @@ impl TokenFeed {
     }
 }
 
+/// Time constant of the current generation rate, seconds.
+pub const GEN_TAU_S: f64 = 5.0;
+
+/// The current generation rate (#55): an exponential moving average of
+/// the decoded-token counter's intervals with a [`GEN_TAU_S`] time
+/// constant. A gap (no interval: the first reading, a `run_id` change, a
+/// stall or a counter that went down or away) resets it to zero, so prompt
+/// processing and pauses decay it rather than hold the last burst.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GenRate {
+    ema: f64,
+    seen: bool,
+}
+
+impl GenRate {
+    /// Fold in one [`TokenFeed::accept`] step. `counter` says whether the
+    /// reading carried a decoded-token total.
+    pub fn step(&mut self, step: Step, counter: bool) {
+        if !step.fresh {
+            return;
+        }
+        self.seen |= counter;
+        match step.interval {
+            Some((tok, ms)) if ms > 0 => {
+                let rate = tok as f64 * 1000.0 / f64::from(ms);
+                let dt = f64::from(ms) / 1000.0;
+                self.ema += (rate - self.ema) * (1.0 - (-dt / GEN_TAU_S).exp());
+            }
+            Some(_) => {}
+            None => self.ema = 0.0,
+        }
+    }
+
+    /// A snapshot without a counter reading: a gap.
+    pub fn gap(&mut self) {
+        self.ema = 0.0;
+    }
+
+    /// tok/s, or `None` until a reading has carried a counter.
+    #[must_use]
+    pub fn rate(&self) -> Option<f32> {
+        self.seen.then_some(self.ema as f32)
+    }
+}
+
+/// Display step of the current rate, in tenths of a tok/s: 0.1 below 10,
+/// 1 below 1000, 100 below 10 k, then 1000. Each matches what
+/// [`gen_rate_text`] prints, so a new step is new text.
+#[must_use]
+pub fn gen_step_tenths(tenths: f64) -> u32 {
+    if tenths < 99.5 {
+        1
+    } else if tenths < 9_950.0 {
+        10
+    } else if tenths < 99_500.0 {
+        1_000
+    } else {
+        10_000
+    }
+}
+
+/// Dead zone around the shown rate, as a fraction of its step.
+pub const GEN_MARGIN: f64 = 0.3;
+
+/// The rate to show, in tenths. With `shown`, it is held while `raw` is
+/// within half a step plus [`GEN_MARGIN`] of a step; otherwise `raw` is
+/// rounded to its own step. Non-finite or negative is zero.
+#[must_use]
+pub fn hold_gen_tenths(raw: f32, shown: Option<u32>) -> u32 {
+    let raw = if raw.is_finite() && raw > 0.0 {
+        f64::from(raw) * 10.0
+    } else {
+        0.0
+    };
+    if let Some(shown) = shown {
+        let shown_f = f64::from(shown);
+        let slack = f64::from(gen_step_tenths(shown_f)) * (0.5 + GEN_MARGIN);
+        if (raw - shown_f).abs() <= slack {
+            return shown;
+        }
+    }
+    let step = f64::from(gen_step_tenths(raw));
+    ((raw / step).round() * step).min(f64::from(u32::MAX)) as u32
+}
+
+/// The current rate as drawn, from tenths of a tok/s: "7.5" below 10,
+/// "112" below 1000, "1.2k" below 10 k, then "12k". Zero is "0" and `None`
+/// (no counter, or no data) is "—".
+#[must_use]
+pub fn gen_rate_text(tenths: Option<u32>) -> String {
+    let Some(tenths) = tenths else {
+        return "\u{2014}".to_owned();
+    };
+    if tenths < 100 {
+        return if tenths == 0 {
+            "0".to_owned()
+        } else {
+            format!("{}.{}", tenths / 10, tenths % 10)
+        };
+    }
+    let whole = (u64::from(tenths) + 5) / 10;
+    if whole < 1000 {
+        return format!("{whole}");
+    }
+    let hundreds = (whole + 50) / 100;
+    if hundreds < 100 {
+        format!("{}.{}k", hundreds / 10, hundreds % 10)
+    } else {
+        format!("{}k", (whole + 500) / 1000)
+    }
+}
+
 /// The ceiling for a peak: the smallest `1 · 2 · 5 × 10ⁿ` at or above it,
 /// never below 10 tok/s.
 #[must_use]

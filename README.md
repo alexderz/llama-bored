@@ -159,6 +159,15 @@ falls back to utilisation.
 - An inner dial of 24 bars with 30 minutes of activity history and a time
   scale; a tokens·24h chart; model name and tuning line; coolant, CPU and GPU
   temperatures; CPU and memory.
+- **LCD tokens chart.** Under the temperatures the LCD (layout A1) plots
+  decoded tok/s over 24 hours, newest on the left, scaled to a 1·2·5 ceiling
+  printed top left. The current generation rate floats large over the
+  chart's far end, with `tok/s` above it (#55): a 5 s moving average of the
+  decoded-token counter, `7.5` under 10, `112` up to 999, then `1.2k` and
+  `12k`. It falls toward `0` (grey) during prompt processing and when idle,
+  and reads `—` with no counter or no data. In `upload.mode = "change"` it
+  moves in its printed steps with a 30 % margin, so the panel re-uploads
+  only when the text changes; stream mode shows it every frame.
 - Distinct "AI down", "no model" and "no data" states. After 30 s without data
   the LCD returns to the stock coolant screen.
 - *Change* mode (default: upload only when a drawn value changes, at most once
