@@ -42,6 +42,63 @@ fn shipped_fonts_parse() {
     }
 }
 
+/// The font slot the PSF2 Unicode table maps `ch` to.
+fn slot_of(bytes: &[u8], ch: char) -> usize {
+    let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    let (header, glyphs, per_glyph) = (word(2), word(4), word(5));
+    let mut rest = &bytes[header + glyphs * per_glyph..];
+    for slot in 0..glyphs {
+        let end = rest
+            .iter()
+            .position(|b| *b == 0xFF)
+            .expect("terminated entry");
+        let singles = rest[..end].split(|b| *b == 0xFE).next().unwrap_or(&[]);
+        if std::str::from_utf8(singles).is_ok_and(|text| text.contains(ch)) {
+            return slot;
+        }
+        rest = &rest[end + 1..];
+    }
+    panic!("{ch:?} is not in the font");
+}
+
+/// #52: llama-watch draws its single-spaced meters with `▇` (llama-hack)
+/// or `▄` (eurlatgr): llama-cast draws the shipped font's own glyph for the
+/// cell, so the bar is whole-width and leaves the top of the cell blank,
+/// the gap between stacked meters.
+#[test]
+fn meter_glyphs_leave_a_gap_at_the_top_of_the_cell() {
+    for size in ["12x24", "12x22"] {
+        let bytes = std::fs::read(shipped_font(size)).unwrap();
+        let font = Psf2::parse(&bytes).unwrap();
+        let (w, h) = (font.width(), font.height());
+        for (ch, eighths) in [('\u{2587}', 7usize), ('\u{2584}', 4)] {
+            let slot = slot_of(&bytes, ch);
+            // build-psf.py: lit rows are round(h * n / 8), ties to even.
+            let exact = h as f64 * eighths as f64 / 8.0;
+            let lit = if (exact.fract() - 0.5).abs() < f64::EPSILON {
+                let down = exact.floor() as usize;
+                if down.is_multiple_of(2) {
+                    down
+                } else {
+                    down + 1
+                }
+            } else {
+                exact.round() as usize
+            };
+            let gap = h - lit;
+            assert!(gap >= 3, "{size} {ch}: a gap of {gap} rows");
+            for y in 0..h {
+                let row: Vec<bool> = (0..w).map(|x| font.pixel(slot, x, y)).collect();
+                if y < gap {
+                    assert!(row.iter().all(|on| !on), "{size} {ch} row {y} lit");
+                } else {
+                    assert!(row.iter().all(|on| *on), "{size} {ch} row {y} not full");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn bad_fonts_are_refused() {
     let good = std::fs::read(shipped_font("12x24")).unwrap();

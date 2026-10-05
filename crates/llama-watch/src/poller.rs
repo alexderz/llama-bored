@@ -87,6 +87,7 @@ use crate::metrics::{
     parse_metrics_full,
 };
 use crate::recent::{Merged, Recent};
+use crate::setup_rules::{Found, Rules};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
@@ -138,6 +139,22 @@ pub struct LlamaDetail {
     /// The last finished exchange of a model without `/slots`, from a
     /// llama-swap capture (#5). Always `None` with `tty.show_text = false`.
     pub capture: Option<CaptureView>,
+    /// What the `[setup]` rules read from each model's launch command
+    /// (#52), in the order of the view's models.
+    pub setup: Vec<ModelSetup>,
+}
+
+/// One loaded model's SETUP values (#52).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelSetup {
+    /// [`activity::model_key`] of the llama-swap id, to match RECENT rows.
+    pub key: String,
+    /// The llama-swap id, sanitised for display.
+    pub id: String,
+    /// The llama-swap `name` (or alias), sanitised.
+    pub name: String,
+    /// Values the rules took from the launch command.
+    pub found: Vec<Found>,
 }
 
 /// IN and OUT from one llama-swap capture (#5): sanitised tails only.
@@ -298,6 +315,8 @@ struct Limits {
     aliases: HashMap<String, String>,
     /// `[llama.backends]`: model id to backend, over the launch command.
     backends: HashMap<String, Backend>,
+    /// `[setup]` rules read from each launch command (#52).
+    setup: Rules,
 }
 
 impl Limits {
@@ -330,6 +349,7 @@ impl Limits {
                 .iter()
                 .map(|(model, kind)| (model.clone(), *kind))
                 .collect(),
+            setup: Rules::compile(&config.setup).unwrap_or_default(),
         }
     }
 }
@@ -389,6 +409,8 @@ struct State<L> {
     models: Vec<ModelInfo>,
     /// Raw id of each entry of `models`, in the same order.
     model_ids: Vec<String>,
+    /// SETUP values of each entry of `models`, in the same order (#52).
+    model_setup: Vec<ModelSetup>,
     ready: Vec<ReadyModel>,
     /// While `/running` fails: the models ready at the last good read and
     /// their servers, for the first good read after it (#46).
@@ -454,6 +476,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         ai: AiState::Down,
         models: Vec::new(),
         model_ids: Vec::new(),
+        model_setup: Vec::new(),
         ready: Vec::new(),
         down_ready: Vec::new(),
         gauges: HashMap::new(),
@@ -536,6 +559,7 @@ impl<L: Sink> State<L> {
             &self.limits.url,
             self.limits.running_timeout,
             &self.limits.aliases,
+            &self.limits.setup,
         );
         let (ai, down) = match reading.ai {
             llamaswap::RunningStatus::Down(reason) => (AiState::Down, Some(reason)),
@@ -568,6 +592,15 @@ impl<L: Sink> State<L> {
             })
             .collect();
         self.model_ids = models.iter().map(|info| info.id.clone()).collect();
+        self.model_setup = models
+            .iter()
+            .map(|info| ModelSetup {
+                key: activity::model_key(&info.id),
+                id: sanitize(&info.id, llama_core::detail::MAX_FULL_NAME_CHARS),
+                name: info.full_name.clone(),
+                found: info.setup.clone(),
+            })
+            .collect();
 
         // The models ready at the last good read, with their servers. A
         // failed read clears `ready` but keeps them in `down_ready`, so the
@@ -1169,6 +1202,7 @@ impl<L: Sink> State<L> {
                 })
                 .collect(),
             capture: self.capture.as_ref().map(|(_, view)| view.clone()),
+            setup: self.model_setup.clone(),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());

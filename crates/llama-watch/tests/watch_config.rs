@@ -307,6 +307,7 @@ enum Rule {
     CpuLimit,
     IdleWatts,
     Fans,
+    Setup,
     TtySize,
 }
 
@@ -340,6 +341,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::CpuLimit { .. }) => Rule::CpuLimit,
         Err(InvalidWatchConfig::IdleWatts { .. }) => Rule::IdleWatts,
         Err(InvalidWatchConfig::Fans { .. }) => Rule::Fans,
+        Err(InvalidWatchConfig::Setup { .. }) => Rule::Setup,
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
     }
 }

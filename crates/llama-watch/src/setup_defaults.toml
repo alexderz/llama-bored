@@ -1,0 +1,313 @@
+# Built-in SETUP rules (#52): upstream llama.cpp, vLLM and SGLang flags.
+#
+# The same format as `[[setup.field]]` in watch.toml (README "SETUP rules").
+# watch.toml rules extend these; `[setup] defaults = false` drops them.
+# Orders: engine 10, ctx 20, experts 30, spec 40, think 50, serve 60,
+# sample 70. A watch.toml field with no order sorts after all of these.
+
+# ---- engine: the server, the weights' quant, flash attention ------------
+
+[[field]]
+row = "engine"
+source = "live:engine"
+order = 10
+
+[[field]]
+row = "engine"
+engines = ["llamacpp"]
+source = "flag:-m,--model"
+kind = "quant"
+order = 11
+
+[[field]]
+row = "engine"
+engines = ["vllm", "sglang"]
+source = "flag:--quantization"
+kind = "token"
+order = 11
+
+[[field]]
+row = "engine"
+engines = ["llamacpp"]
+source = "flag:-fa,--flash-attn"
+kind = "token"
+map = { on = "fa on", off = "fa off", auto = "fa auto", "1" = "fa on", "0" = "fa off" }
+order = 12
+
+# ---- ctx: context size and the KV cache ---------------------------------
+
+[[field]]
+row = "ctx"
+engines = ["llamacpp"]
+source = "flag:-c,--ctx-size"
+kind = "number"
+order = 20
+
+[[field]]
+row = "ctx"
+engines = ["vllm"]
+source = "flag:--max-model-len"
+kind = "number"
+order = 20
+
+[[field]]
+row = "ctx"
+engines = ["sglang"]
+source = "flag:--context-length"
+kind = "number"
+order = 20
+
+# What the engine itself reports (Strata's max_context), when no flag said.
+[[field]]
+row = "ctx"
+source = "live:ctx"
+fallback = true
+order = 21
+
+[[field]]
+row = "ctx"
+engines = ["llamacpp"]
+source = "flag:-ctk,--cache-type-k"
+kind = "token"
+label = "kv"
+default = "kv f16"
+order = 22
+
+[[field]]
+row = "ctx"
+engines = ["llamacpp"]
+source = "flag:-ctv,--cache-type-v"
+kind = "token"
+sep = " / "
+default = "f16"
+order = 23
+
+# vLLM's cache_config_info dtype (or --kv-cache-dtype), SGLang's flag,
+# Strata's engine.kv.
+[[field]]
+row = "ctx"
+engines = ["vllm", "sglang", "strata"]
+source = "live:kv_dtype"
+label = "kv"
+order = 22
+
+[[field]]
+row = "ctx"
+engines = ["vllm"]
+source = "live:kv_block"
+label = "block"
+order = 24
+
+[[field]]
+row = "ctx"
+engines = ["vllm"]
+source = "live:prefix_cache"
+map = { on = "prefix on", off = "prefix off" }
+group = "prefix"
+order = 25
+
+# ---- experts: MoE layers kept in system RAM ------------------------------
+
+[[field]]
+row = "experts"
+engines = ["llamacpp"]
+source = "flag:-cmoe,--cpu-moe"
+kind = "present"
+map = { on = "all layers in RAM" }
+order = 30
+
+[[field]]
+row = "experts"
+engines = ["llamacpp"]
+source = "flag:-ncmoe,--n-cpu-moe"
+kind = "number"
+suffix = " layers in RAM"
+map = { "0" = "full GPU" }
+default = "full GPU"
+fallback = true
+order = 31
+
+# ---- spec: speculative decoding and its live acceptance ------------------
+
+[[field]]
+row = "spec"
+engines = ["llamacpp"]
+source = "flag:--spec-type"
+kind = "token"
+order = 40
+
+[[field]]
+row = "spec"
+engines = ["llamacpp"]
+source = "flag:-md,--model-draft"
+kind = "present"
+map = { on = "draft model" }
+fallback = true
+order = 41
+
+[[field]]
+row = "spec"
+engines = ["llamacpp"]
+source = "flag:--spec-draft-n-max,--draft-max,--draft-n,--draft"
+kind = "number"
+label = "n-max"
+order = 42
+
+[[field]]
+row = "spec"
+engines = ["vllm"]
+source = "json:--speculative-config:method"
+kind = "token"
+order = 40
+
+[[field]]
+row = "spec"
+engines = ["vllm"]
+source = "json:--speculative-config:num_speculative_tokens"
+kind = "number"
+label = "n"
+order = 42
+
+[[field]]
+row = "spec"
+engines = ["sglang"]
+source = "flag:--speculative-algorithm"
+kind = "token"
+order = 40
+
+[[field]]
+row = "spec"
+engines = ["sglang"]
+source = "flag:--speculative-num-draft-tokens"
+kind = "number"
+label = "n"
+order = 42
+
+[[field]]
+row = "spec"
+source = "live:spec_len"
+label = "acc"
+order = 44
+
+[[field]]
+row = "spec"
+source = "live:spec_accept"
+order = 45
+
+[[field]]
+row = "spec"
+engines = ["llamacpp", "vllm", "sglang"]
+default = "none"
+fallback = true
+order = 49
+
+# ---- think: reasoning budget and switches --------------------------------
+
+[[field]]
+row = "think"
+engines = ["llamacpp"]
+source = "flag:--reasoning-budget"
+kind = "number"
+label = "budget"
+map = { "-1" = "unlimited", "0" = "off" }
+order = 50
+
+[[field]]
+row = "think"
+engines = ["llamacpp"]
+source = "json:--chat-template-kwargs:enable_thinking"
+kind = "token"
+map = { "true" = "on", "false" = "off" }
+order = 51
+
+[[field]]
+row = "think"
+engines = ["vllm", "sglang"]
+source = "flag:--reasoning-parser"
+kind = "token"
+label = "parser"
+order = 52
+
+# ---- serve: memory share and batch limits --------------------------------
+
+[[field]]
+row = "serve"
+engines = ["vllm"]
+source = "flag:--gpu-memory-utilization"
+kind = "number"
+label = "mem"
+order = 60
+
+[[field]]
+row = "serve"
+engines = ["sglang"]
+source = "flag:--mem-fraction-static"
+kind = "number"
+label = "mem"
+order = 60
+
+[[field]]
+row = "serve"
+engines = ["vllm"]
+source = "flag:--max-num-seqs"
+kind = "number"
+label = "seqs"
+order = 61
+
+[[field]]
+row = "serve"
+engines = ["sglang"]
+source = "flag:--max-running-requests"
+kind = "number"
+label = "reqs"
+order = 61
+
+[[field]]
+row = "serve"
+engines = ["vllm"]
+source = "flag:--max-num-batched-tokens"
+kind = "number"
+label = "batch"
+order = 62
+
+# ---- sample: sampling overrides ------------------------------------------
+
+[[field]]
+row = "sample"
+engines = ["llamacpp"]
+source = "flag:--temp"
+kind = "number"
+label = "temp"
+order = 70
+
+[[field]]
+row = "sample"
+engines = ["llamacpp"]
+source = "flag:--top-p"
+kind = "number"
+label = "top-p"
+order = 71
+
+[[field]]
+row = "sample"
+engines = ["llamacpp"]
+source = "flag:--top-k"
+kind = "number"
+label = "top-k"
+order = 72
+
+[[field]]
+row = "sample"
+engines = ["llamacpp"]
+source = "flag:--min-p"
+kind = "number"
+label = "min-p"
+order = 73
+
+[[field]]
+row = "sample"
+engines = ["llamacpp"]
+source = "flag:--presence-penalty"
+kind = "number"
+label = "pres"
+order = 74

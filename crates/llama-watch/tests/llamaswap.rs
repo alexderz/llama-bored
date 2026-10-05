@@ -31,7 +31,13 @@ fn assert_down(reading: &Reading, reason: &'static str) {
 }
 
 fn fetch(url: &str, timeout: Duration, aliases: &HashMap<String, String>) -> Reading {
-    read_with(&new_agent(), url, timeout, aliases)
+    read_with(
+        &new_agent(),
+        url,
+        timeout,
+        aliases,
+        &llama_watch::setup_rules::Rules::builtin(),
+    )
 }
 
 fn fetch_default(port: u16) -> Reading {

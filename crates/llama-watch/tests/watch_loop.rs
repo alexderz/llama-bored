@@ -1325,6 +1325,7 @@ fn empty_detail() -> LlamaDetail {
         latencies: PollLatencies::default(),
         prompt_cache: Vec::new(),
         capture: None,
+        setup: Vec::new(),
     }
 }
 

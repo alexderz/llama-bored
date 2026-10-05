@@ -14,7 +14,9 @@ use std::time::Duration;
 use llama_core::backend::Backend;
 use llama_core::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 use llama_core::names::{sanitize, sanitize_wire};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
+
+use crate::setup_rules::{Found, Rules};
 
 /// One model from a single `/running` body: raw id, display name, and state.
 ///
@@ -36,6 +38,9 @@ pub struct RunningModel {
     pub backend: Backend,
     /// Request cap from an SGLang or vLLM launch command.
     pub max_running: Option<u16>,
+    /// What the `[setup]` rules took from the launch command (#52): numbers
+    /// and short tokens only.
+    pub setup: Vec<Found>,
 }
 
 /// Whether llama-swap is unreachable, up with nothing loaded, or serving models.
@@ -74,7 +79,8 @@ pub fn new_agent() -> ureq::Agent {
 
 /// `GET {url}/running` on `agent` and classify that one body.
 ///
-/// `aliases` is keyed by the raw `model` field. `timeout` is the deadline for
+/// `aliases` is keyed by the raw `model` field. `rules` are the `[setup]`
+/// rules read from each launch command (#52). `timeout` is the deadline for
 /// this call. Display names go through [`sanitize_wire`](llama_core::names::sanitize_wire).
 /// Does not log. On failure, [`RunningStatus::Down`] carries one of
 /// `"timeout"`, `"connection refused"`, `"request failed"`, `"http status"`,
@@ -86,6 +92,7 @@ pub fn read_with(
     url: &str,
     timeout: Duration,
     aliases: &HashMap<String, String>,
+    rules: &Rules,
 ) -> Reading {
     let endpoint = running_endpoint(url);
     let mut response = match agent
@@ -116,7 +123,7 @@ pub fn read_with(
         Err(err) => return down_reading(body_reason(&err)),
     };
 
-    match parse_running(&bytes, aliases) {
+    match parse_running(&bytes, aliases, rules) {
         Ok(reading) => reading,
         Err(()) => down_reading("malformed json"),
     }
@@ -163,7 +170,11 @@ fn io_reason(err: &std::io::Error) -> &'static str {
     }
 }
 
-fn parse_running(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Reading, ()> {
+fn parse_running(
+    bytes: &[u8],
+    aliases: &HashMap<String, String>,
+    rules: &Rules,
+) -> Result<Reading, ()> {
     let parsed: RunningResponse = serde_json::from_slice(bytes).map_err(|_| ())?;
     if parsed.running.is_empty() {
         return Ok(Reading {
@@ -171,18 +182,29 @@ fn parse_running(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Read
             models: Vec::new(),
         });
     }
-    let models = parsed
-        .running
+    let mut entries = Vec::new();
+    for value in &parsed.running {
+        entries.push((RunningEntry::deserialize(value).map_err(|_| ())?, value));
+    }
+    let models = entries
         .iter()
         .take(MAX_MODELS)
-        .map(|entry| RunningModel {
-            id: entry.model.clone().unwrap_or_default(),
-            name: display_name(entry, aliases, sanitize_wire),
-            state: entry.state.clone().unwrap_or_default(),
-            full_name: display_name(entry, aliases, |raw| sanitize(raw, MAX_FULL_NAME_CHARS)),
-            detail: entry.launch.detail.clone(),
-            backend: entry.launch.backend,
-            max_running: entry.launch.max_running,
+        .map(|(entry, value)| {
+            // The launch command is borrowed from the body's value tree,
+            // read, and dropped with it: only the launch facts and the rule
+            // values leave this function.
+            let launch = launch_command(value);
+            let parsed = launch.map(super::cmdline::parse_launch).unwrap_or_default();
+            RunningModel {
+                id: entry.model.clone().unwrap_or_default(),
+                name: display_name(entry, aliases, sanitize_wire),
+                state: entry.state.clone().unwrap_or_default(),
+                full_name: display_name(entry, aliases, |raw| sanitize(raw, MAX_FULL_NAME_CHARS)),
+                detail: parsed.detail,
+                backend: parsed.backend,
+                max_running: parsed.max_running,
+                setup: launch.map(|text| rules.extract(text)).unwrap_or_default(),
+            }
         })
         .collect();
     Ok(Reading {
@@ -222,16 +244,17 @@ fn choose_label<'a>(entry: &'a RunningEntry, aliases: &'a HashMap<String, String
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// The body as a value tree: each entry is read into a [`RunningEntry`],
+/// and its launch command is borrowed from the tree by [`launch_command`].
+/// The tree is dropped when [`parse_running`] returns.
+#[derive(Deserialize)]
 struct RunningResponse {
-    running: Vec<RunningEntry>,
+    running: Vec<serde_json::Value>,
 }
 
-/// Only `model`, `name`, `state`, and the detail and backend parsed from the launch
-/// command. Other members, including the upstream proxy URL, are skipped.
-/// The command is borrowed by [`launch_from_command`] and never kept, so it
-/// cannot reach a log or the screen.
-#[derive(Debug, Deserialize)]
+/// Only `model`, `name`, and `state`. Other members, including the launch
+/// command and the upstream proxy URL, are not declared here.
+#[derive(Deserialize)]
 struct RunningEntry {
     #[serde(default)]
     model: Option<String>,
@@ -239,30 +262,28 @@ struct RunningEntry {
     name: Option<String>,
     #[serde(default)]
     state: Option<String>,
-    #[serde(default, rename = "cmd", deserialize_with = "launch_from_command")]
-    launch: super::cmdline::Launch,
 }
 
-/// Parse the command in place. A non-string command gives no detail and
-/// counts as llama.cpp, as before T72.
-fn launch_from_command<'de, D>(deserializer: D) -> Result<super::cmdline::Launch, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .map(super::cmdline::parse_launch)
-        .unwrap_or_default())
+/// The entry's launch command, read in place and never kept: [`parse_running`]
+/// turns it into a [`super::cmdline::Launch`] and the `[setup]` values (#52)
+/// at once. A non-string command gives no detail and counts as llama.cpp,
+/// as before T72.
+fn launch_command(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("cmd").and_then(serde_json::Value::as_str)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The built-in `[setup]` rules, as a default watch.toml has them.
+    fn parse_with_builtin(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Reading, ()> {
+        parse_running(bytes, aliases, &Rules::builtin())
+    }
+
     #[test]
     fn snapshot_names_use_the_wire_width_not_config() {
-        let reading = parse_running(
+        let reading = parse_with_builtin(
             br#"{"running":[{"model":"abcdefghijklmnopqrstuvwxyz","state":"ready"}]}"#,
             &HashMap::new(),
         )
@@ -274,7 +295,7 @@ mod tests {
     #[test]
     fn real_running_body_gives_full_name_and_detail() {
         let body = br#"{"running":[{"model":"bonsai2-27b","state":"ready","cmd":"/models/prism/llama-server --host 127.0.0.1 --port 5800 -fa on --metrics\n-ctk q8_0 -ctv q8_0\n-m /models/llm/bonsai2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf\n-ngl 999 -c 262144\n","proxy":"http://localhost:5800","ttl":900,"name":"Ternary Bonsai 2 27B","description":"Qwen3.8-27B compressed to ternary weights"}]}"#;
-        let reading = parse_running(body, &HashMap::new()).expect("parse");
+        let reading = parse_with_builtin(body, &HashMap::new()).expect("parse");
         let model = &reading.models[0];
         assert_eq!(model.name, "Ternary Bon…");
         assert_eq!(model.full_name, "Ternary Bonsai 2 27B");
@@ -295,7 +316,7 @@ mod tests {
             assert!(!debug.contains(leak), "{leak} leaked: {debug}");
         }
 
-        let no_cmd = parse_running(
+        let no_cmd = parse_with_builtin(
             br#"{"running":[{"model":"m","state":"ready","cmd":7}]}"#,
             &HashMap::new(),
         )
@@ -321,7 +342,7 @@ mod tests {
 
     #[test]
     fn parse_empty_running_is_idle() {
-        let reading = parse_running(br#"{"running":[]}"#, &HashMap::new()).expect("parse");
+        let reading = parse_with_builtin(br#"{"running":[]}"#, &HashMap::new()).expect("parse");
         assert_eq!(reading.ai, RunningStatus::Idle);
         assert!(reading.models.is_empty());
     }
@@ -332,7 +353,7 @@ mod tests {
         aliases.insert("qwen3.6-35b-a3b".to_owned(), "Qwen   35B 🔥".to_owned());
         aliases.insert("blank-alias".to_owned(), String::new());
 
-        let aliased = parse_running(
+        let aliased = parse_with_builtin(
             br#"{"running":[{"model":"qwen3.6-35b-a3b","name":"raw-name","state":"ready","cmd":"CANARY_CMD_9f3a2c7e","proxy":"CANARY_PROXY_1b6d4e8a"}]}"#,
             &aliases,
         )
@@ -345,7 +366,7 @@ mod tests {
         assert!(!format!("{aliased:?}").contains("CANARY_PROXY_1b6d4e8a"));
         assert!(!format!("{aliased:?}").contains("raw-name"));
 
-        let named = parse_running(
+        let named = parse_with_builtin(
             br#"{"running":[{"model":"other","name":"DeepSeek","state":"starting"}]}"#,
             &HashMap::new(),
         )
@@ -353,14 +374,14 @@ mod tests {
         assert_eq!(named.models[0].name, "DeepSeek");
         assert_eq!(named.models[0].state, "starting");
 
-        let modeled = parse_running(
+        let modeled = parse_with_builtin(
             br#"{"running":[{"model":"plain-model","state":"ready"}]}"#,
             &HashMap::new(),
         )
         .expect("parse");
         assert_eq!(modeled.models[0].name, "plain-model");
 
-        let empty_name = parse_running(
+        let empty_name = parse_with_builtin(
             br#"{"running":[{"model":"fallback","name":"","state":"ready"}]}"#,
             &HashMap::new(),
         )
@@ -368,14 +389,14 @@ mod tests {
         assert_eq!(empty_name.models[0].name, "fallback");
 
         // A name that sanitises to empty falls back to the sanitised model id.
-        let blank_name = parse_running(
+        let blank_name = parse_with_builtin(
             br#"{"running":[{"model":"fallback","name":"   ","state":"ready"}]}"#,
             &HashMap::new(),
         )
         .expect("parse");
         assert_eq!(blank_name.models[0].name, "fallback");
 
-        let unicode_name = parse_running(
+        let unicode_name = parse_with_builtin(
             r#"{"running":[{"model":"qwen-id","name":"三五","state":"ready"}]}"#.as_bytes(),
             &HashMap::new(),
         )
@@ -383,7 +404,7 @@ mod tests {
         assert_eq!(unicode_name.models[0].name, "qwen-id");
 
         // An alias that sanitises to empty likewise falls back to the model id.
-        let blank_alias = parse_running(
+        let blank_alias = parse_with_builtin(
             br#"{"running":[{"model":"blank-alias","name":"Visible","state":"ready"}]}"#,
             &aliases,
         )
@@ -401,7 +422,7 @@ mod tests {
             entries.push_str(&format!(r#"{{"model":"model-{index}","state":"ready"}}"#));
         }
         entries.push_str("]}");
-        let reading = parse_running(entries.as_bytes(), &HashMap::new()).expect("parse");
+        let reading = parse_with_builtin(entries.as_bytes(), &HashMap::new()).expect("parse");
         assert_eq!(reading.ai, RunningStatus::Loaded);
         assert_eq!(reading.models.len(), 8);
         let names: Vec<_> = reading
@@ -431,7 +452,7 @@ mod tests {
         ];
         for bytes in cases {
             assert!(
-                parse_running(bytes, &HashMap::new()).is_err(),
+                parse_with_builtin(bytes, &HashMap::new()).is_err(),
                 "{}",
                 String::from_utf8_lossy(bytes)
             );
