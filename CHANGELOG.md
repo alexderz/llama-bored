@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.3.6 — 2026-10-05
+
 ### Added
 
 - LCD current tok/s (#55): the generation rate over the tokens chart's far (24 h) end, 24 px Inter ExtraBold right-aligned and centred in the plot, with a 2 px black knockout and a soft dark backing so it reads over a bright fill; the unit `tok/s` replaces the `tokens · 24h` caption in the title row above it, off the data. A 5 s moving average of decoded tokens (τ = 5 s, from the counter intervals), reset by a gap (first reading, `run_id` change, stall, counter going down or missing); 3 s without a decoded token (prefill, idle) snaps it to `0` instead of leaving a decaying tail. `7.5` under 10, `112` up to 999, `1.2k`, `12k`; idle `0` and no counter or no data `—` in #666. Change mode holds it in its printed step (0.1, 1, 100 tok/s, then 1k) with a 30 % margin; stream mode shows it every frame. View (frame key, additive): `gen_tps_tenths`. Goldens: every A1 `layout_a` frame (caption and numeral); the `a1-v3b-*` and `a3-v3b-pinned` view fixtures gain a rate
