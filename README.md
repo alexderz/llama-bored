@@ -164,8 +164,8 @@ falls back to utilisation.
   printed top left. The current generation rate floats large over the
   chart's far end, with `tok/s` above it (#55): a 5 s moving average of the
   decoded-token counter, `7.5` under 10, `112` up to 999, then `1.2k` and
-  `12k`. It falls toward `0` (grey) during prompt processing and when idle,
-  and reads `—` with no counter or no data. In `upload.mode = "change"` it
+  `12k`. It reads `0` (grey) once no token has been decoded for 3 s, as
+  during prompt processing or when idle, and `—` with no counter or no data. In `upload.mode = "change"` it
   moves in its printed steps with a 30 % margin, so the panel re-uploads
   only when the text changes; stream mode shows it every frame.
 - Distinct "AI down", "no model" and "no data" states. After 30 s without data

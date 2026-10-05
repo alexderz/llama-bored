@@ -855,11 +855,19 @@ fn current_generation_rate_reaches_the_view() {
     let next = stream_drive.run(&stream(), 1, 9, |_| Some(70.0));
     assert_eq!(next.gen_tps_tenths, Some(180), "no hold in stream mode");
 
-    // Prefill or idle: the counter stops and the rate decays toward zero:
-    // 90 × e^−2 after 10 s, and "0" within a minute.
-    let prefill = drive.run(&Config::default(), 100, 0, |_| Some(70.0));
-    assert_eq!(prefill.gen_tps_tenths, Some(120));
-    let quiet = drive.run(&Config::default(), 500, 0, |_| Some(70.0));
+    // Prefill or idle: the counter stops. It decays for under 3 s, then
+    // the frame reads "0" at 3 s and stays there.
+    let prefill = drive.run(&Config::default(), 29, 0, |_| Some(70.0));
+    assert!(
+        prefill
+            .gen_tps_tenths
+            .is_some_and(|t| (400..=600).contains(&t)),
+        "{:?}",
+        prefill.gen_tps_tenths
+    );
+    let snapped = drive.run(&Config::default(), 1, 0, |_| Some(70.0));
+    assert_eq!(snapped.gen_tps_tenths, Some(0), "3 s without a token");
+    let quiet = drive.run(&Config::default(), 100, 0, |_| Some(70.0));
     assert_eq!(quiet.gen_tps_tenths, Some(0));
 
     // No data clears it.

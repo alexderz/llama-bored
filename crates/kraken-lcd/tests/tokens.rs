@@ -231,17 +231,22 @@ fn current_rate_is_a_five_second_average_reset_by_a_gap() {
     let at = feed_rate(&mut rate, &mut feed, at, 120, 500, 50);
     assert!((rate.rate().expect("seen") - 100.0).abs() < 0.1);
 
-    // Prefill: no new tokens. It decays, it does not hold.
-    let at = feed_rate(&mut rate, &mut feed, at, 10, 500, 0);
+    // Prefill: no new tokens. Under 3 s it decays with τ = 5 s...
+    let at = feed_rate(&mut rate, &mut feed, at, 5, 500, 0);
     let decayed = rate.rate().expect("seen");
-    assert!(
-        (decayed - 100.0 / std::f32::consts::E).abs() < 0.1,
-        "{decayed}"
-    );
+    let expect = 100.0 * (-2.5 / GEN_TAU_S).exp() as f32;
+    assert!((decayed - expect).abs() < 0.1, "{decayed} vs {expect}");
 
     // A re-read changes nothing.
+    let before = rate.rate();
     rate.step(feed.accept(reading(1, at.0, at.0 * 500, Some(at.1))), true);
-    assert_eq!(rate.rate(), Some(decayed));
+    assert_eq!(rate.rate(), before);
+
+    // ...and at 3 s without a token it snaps to zero.
+    let at = feed_rate(&mut rate, &mut feed, at, 1, 500, 0);
+    assert_eq!(rate.rate(), Some(0.0), "3 s idle");
+    let at = feed_rate(&mut rate, &mut feed, at, 1, 500, 50);
+    assert!(rate.rate().expect("seen") > 0.0, "tokens again");
 
     // A stall longer than max_gap_s resets to zero.
     let (seq, total) = at;
@@ -306,4 +311,37 @@ fn current_rate_holds_inside_a_thirty_percent_margin() {
         shown = Some(hold_gen_tenths(raw, shown));
         assert_eq!(shown, Some(1_120), "k = {k}, raw = {raw}");
     }
+}
+
+#[test]
+fn current_rate_snaps_to_zero_after_three_idle_seconds() {
+    let mut rate = GenRate::default();
+    let mut feed = TokenFeed::new(2.0);
+    // 100 ms ticks at 90 tok/s for a minute.
+    let at = feed_rate(&mut rate, &mut feed, (0, 0), 600, 100, 9);
+    assert!((rate.rate().expect("seen") - 90.0).abs() < 0.1);
+    // Pauses shorter than 3 s, broken by tokens, never add up: the
+    // average decays through them but never snaps.
+    let mut at = at;
+    for _ in 0..5 {
+        at = feed_rate(&mut rate, &mut feed, at, 29, 100, 0);
+        assert!(rate.rate().expect("seen") > 0.0, "2.9 s idle still decays");
+        at = feed_rate(&mut rate, &mut feed, at, 1, 100, 9);
+    }
+    // Back at 90, then 2.9 s still: 90 × e^(−2.9/5) ≈ 50; at 3.0 s, zero,
+    // and it stays there.
+    let at = feed_rate(&mut rate, &mut feed, at, 600, 100, 9);
+    let at = feed_rate(&mut rate, &mut feed, at, 29, 100, 0);
+    let held = rate.rate().expect("seen");
+    let expect = 90.0 * (-2.9 / GEN_TAU_S).exp() as f32;
+    assert!((held - expect).abs() < 0.1, "{held} vs {expect}");
+    let at = feed_rate(&mut rate, &mut feed, at, 1, 100, 0);
+    assert_eq!(rate.rate(), Some(0.0), "3 s without a token");
+    let at = feed_rate(&mut rate, &mut feed, at, 50, 100, 0);
+    assert_eq!(rate.rate(), Some(0.0));
+    // Tokens again: it climbs with τ = 5 s from zero.
+    feed_rate(&mut rate, &mut feed, at, 10, 100, 9);
+    let expect = 90.0 * (1.0 - (-1.0 / GEN_TAU_S).exp()) as f32;
+    let got = rate.rate().expect("seen");
+    assert!((got - expect).abs() < 0.01, "{got} vs {expect}");
 }
