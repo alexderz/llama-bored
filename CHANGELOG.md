@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.4.1 — 2026-10-06
+
 ### Fixed
 
 - A llama.cpp model whose `/slots` carries no prompt or generated text now gets IN and OUT from llama-swap's request captures (#66). Current llama-server (b11429) sends `prompt` and `generated` only with `LLAMA_SERVER_SLOTS_DEBUG=1`, which an env var on llama-swap does not pass into a server's own container, so IN and OUT stayed empty with no reason given. A model whose newest `/slots` body with a task has neither key (any slot with one counts as text) gets the last finished exchange from its captures, as vLLM and SGLang do: the same `GET /api/captures/<id>`, once per new row, text on and `has_capture` only, same cap; no new path. It is logged once per model: `<id>: /slots has no prompt text; start llama-server with LLAMA_SERVER_SLOTS_DEBUG=1 for live IN/OUT`. Every `/slots` read checks again, so text that appears (the server restarted with the variable) switches IN and OUT back to live and drops the capture. SLOTS, ctx fill, prompt progress and reset reasons still come from `/slots`, whose `n_prompt_tokens` and `n_prompt_tokens_cache` are still sent; the older shape with text always present reads as before. `CaptureView` gains `over_slots`
