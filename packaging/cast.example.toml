@@ -43,6 +43,25 @@ fps = 2
 # Viewers at once, 1..=4. One more is answered 503.
 max_clients = 2
 
+# Constant video bitrate in kbit/s, 500..=20000, or 0 for none. A still
+# dashboard encodes to a few kbit/s; a TV that waits for a fixed amount of
+# data before it plays (Roku Media Player) then takes tens of seconds to
+# start (#20). At this rate the encoder pads a still screen with filler, so
+# the TV's buffer fills in about a second. 0 is the old quality-based
+# stream: least bandwidth, slowest start. Each viewer costs this much LAN
+# bandwidth.
+bitrate_kbps = 4000
+
+# Seconds between keyframes, 1..=10. Each viewer's stream starts at a
+# keyframe anyway; this is how soon a TV recovers from a lost packet.
+keyframe_s = 1
+
+# Seconds of picture each new viewer gets at once, 0..=10: the first frame,
+# repeated, encoded as fast as ffmpeg can, so the TV's start buffer is full
+# before the live frames follow. The picture then runs this far behind
+# tty11. 0 sends frames only as they are rendered.
+preroll_s = 3
+
 # The encoder, an absolute path. It needs libx264. Run with a fixed
 # argument list, no shell and an empty environment.
 ffmpeg = "/usr/bin/ffmpeg"

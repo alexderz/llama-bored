@@ -187,7 +187,19 @@ fn stream_head_and_body() {
     assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
     assert!(resp.contains("\r\nContent-Type: video/mpeg\r\n"), "{resp}");
     assert!(resp.contains("\r\ntransferMode.dlna.org: Streaming\r\n"));
+    // #20: the live stream says its DLNA features (no seek) and has no
+    // length; the head is the same for GET.
+    assert!(
+        resp.contains(&format!(
+            "\r\ncontentFeatures.dlna.org: {}\r\n",
+            llama_cast::dlna::DLNA_FEATURES
+        )),
+        "{resp}"
+    );
+    assert!(resp.contains("\r\nConnection: close\r\n"));
     assert!(!resp.contains("Content-Length"));
+    assert!(!resp.contains("Accept-Ranges"));
+    assert_eq!(resp, llama_cast::http::stream_head());
     assert!(body(&resp).is_empty());
     assert_eq!(
         h.opened.load(Ordering::SeqCst),

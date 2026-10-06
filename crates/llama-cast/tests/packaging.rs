@@ -152,6 +152,9 @@ fn example_config_says_it_is_lan_exposed() {
     assert_eq!(cfg.name, "llama-bored");
     assert_eq!(cfg.fps, 2);
     assert_eq!(cfg.max_clients, 2);
+    assert_eq!(cfg.bitrate_kbps, 4000);
+    assert_eq!(cfg.keyframe_s, 1);
+    assert_eq!(cfg.preroll_s, 3);
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
 }
 

@@ -16,7 +16,7 @@ use sd_notify::NotifyState;
 use crate::config::Config;
 use crate::discovery::{self, Advert};
 use crate::dlna::Device;
-use crate::encoder::Encoder;
+use crate::encoder::{Encoder, Settings};
 use crate::http::{self, App, Limits, Live, ServerConfig, Stats};
 use crate::render::FRAME_BYTES;
 use crate::source::{self, FrameSource, VcsaSource};
@@ -58,7 +58,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 /// The production stream: ffmpeg fed from tty11.
 pub struct FfmpegLive {
     pub ffmpeg: PathBuf,
-    pub fps: u32,
+    pub settings: Settings,
     pub source: Arc<dyn FrameSource>,
 }
 
@@ -71,7 +71,7 @@ impl Live for FfmpegLive {
             .frame(&mut probe)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", source::VCSA_PATH)))?;
         drop(probe);
-        let encoder = Encoder::start(&self.ffmpeg, self.fps, Arc::clone(&self.source))?;
+        let encoder = Encoder::start(&self.ffmpeg, self.settings, Arc::clone(&self.source))?;
         Ok(Box::new(encoder))
     }
 }
@@ -101,13 +101,16 @@ fn summary(config: &Config) -> String {
         .map(ToString::to_string)
         .collect();
     format!(
-        "listen {} allow [{}] interface_addr {} name {:?} fps {} max_clients {} ffmpeg {} font {} palette {}",
+        "listen {} allow [{}] interface_addr {} name {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} font {} palette {}",
         config.listen,
         nets.join(", "),
         config.interface_addr,
         config.name,
         config.fps,
         config.max_clients,
+        config.bitrate_kbps,
+        config.keyframe_s,
+        config.preroll_s,
         config.ffmpeg.display(),
         config.font.label(),
         config.palette.label(),
@@ -244,7 +247,7 @@ fn run(config: &Config) -> i32 {
         device,
         live: Arc::new(FfmpegLive {
             ffmpeg: config.ffmpeg.clone(),
-            fps: config.fps,
+            settings: config.encode_settings(),
             source: screen,
         }),
     });

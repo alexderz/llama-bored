@@ -151,7 +151,7 @@ fn cast_source_reaches_only_what_it_needs() {
     // The spawn: the configured program, the pinned vector, no environment.
     let encoder = code_of("encoder.rs");
     assert!(encoder.contains("Command::new(ffmpeg)"));
-    assert!(encoder.contains(".args(ffmpeg_args(fps))"));
+    assert!(encoder.contains(".args(ffmpeg_args(settings))"));
     assert!(encoder.contains(".env_clear()"));
     for token in [
         ".arg(",

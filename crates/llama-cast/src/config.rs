@@ -12,6 +12,7 @@ use thiserror::Error;
 pub use llama_core::palette::Palette;
 
 use crate::acl::{Allowlist, Cidr, CidrError};
+use crate::encoder::Settings;
 
 /// Largest config file read.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -31,6 +32,16 @@ pub const MAX_FPS: u32 = 5;
 /// Default and bounds of `max_clients`.
 pub const DEFAULT_MAX_CLIENTS: u32 = 2;
 pub const MAX_CLIENTS: u32 = 4;
+/// Default and bounds of `bitrate_kbps` (0 turns the floor off).
+pub const DEFAULT_BITRATE_KBPS: u32 = 4000;
+pub const MIN_BITRATE_KBPS: u32 = 500;
+pub const MAX_BITRATE_KBPS: u32 = 20_000;
+/// Default and bound of `keyframe_s`.
+pub const DEFAULT_KEYFRAME_S: u32 = 1;
+pub const MAX_KEYFRAME_S: u32 = 10;
+/// Default and bound of `preroll_s`.
+pub const DEFAULT_PREROLL_S: u32 = 3;
+pub const MAX_PREROLL_S: u32 = 10;
 /// Default encoder.
 pub const DEFAULT_FFMPEG: &str = "/usr/bin/ffmpeg";
 /// Longest `ffmpeg` path.
@@ -99,6 +110,12 @@ pub enum ConfigError {
     Fps,
     #[error("max_clients must be 1..=4")]
     MaxClients,
+    #[error("bitrate_kbps must be 0 (off) or 500..=20000")]
+    Bitrate,
+    #[error("keyframe_s must be 1..=10")]
+    Keyframe,
+    #[error("preroll_s must be 0..=10")]
+    Preroll,
     #[error("ffmpeg must be an absolute, normalised path of at most 255 bytes")]
     Ffmpeg,
 }
@@ -115,6 +132,12 @@ struct Raw {
     fps: u32,
     #[serde(default = "default_max_clients")]
     max_clients: u32,
+    #[serde(default = "default_bitrate")]
+    bitrate_kbps: u32,
+    #[serde(default = "default_keyframe")]
+    keyframe_s: u32,
+    #[serde(default = "default_preroll")]
+    preroll_s: u32,
     #[serde(default = "default_ffmpeg")]
     ffmpeg: String,
     #[serde(default)]
@@ -133,6 +156,18 @@ fn default_fps() -> u32 {
 
 fn default_max_clients() -> u32 {
     DEFAULT_MAX_CLIENTS
+}
+
+fn default_bitrate() -> u32 {
+    DEFAULT_BITRATE_KBPS
+}
+
+fn default_keyframe() -> u32 {
+    DEFAULT_KEYFRAME_S
+}
+
+fn default_preroll() -> u32 {
+    DEFAULT_PREROLL_S
 }
 
 fn default_ffmpeg() -> String {
@@ -155,6 +190,12 @@ pub struct Config {
     pub fps: u32,
     /// Streams served at once; more are answered 503.
     pub max_clients: u32,
+    /// Constant bitrate, kbit/s (0: quality-based, no floor).
+    pub bitrate_kbps: u32,
+    /// Keyframe interval, seconds.
+    pub keyframe_s: u32,
+    /// Seconds of the first frame each new viewer gets at once.
+    pub preroll_s: u32,
     /// The encoder binary.
     pub ffmpeg: PathBuf,
     /// The tty11 console font.
@@ -201,6 +242,17 @@ impl Config {
         if raw.max_clients == 0 || raw.max_clients > MAX_CLIENTS {
             return Err(ConfigError::MaxClients);
         }
+        if raw.bitrate_kbps != 0
+            && !(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS).contains(&raw.bitrate_kbps)
+        {
+            return Err(ConfigError::Bitrate);
+        }
+        if raw.keyframe_s == 0 || raw.keyframe_s > MAX_KEYFRAME_S {
+            return Err(ConfigError::Keyframe);
+        }
+        if raw.preroll_s > MAX_PREROLL_S {
+            return Err(ConfigError::Preroll);
+        }
         let ffmpeg = PathBuf::from(&raw.ffmpeg);
         if !clean_absolute(&raw.ffmpeg) || raw.ffmpeg.len() > MAX_PATH_BYTES {
             return Err(ConfigError::Ffmpeg);
@@ -212,6 +264,9 @@ impl Config {
             name,
             fps: raw.fps,
             max_clients: raw.max_clients,
+            bitrate_kbps: raw.bitrate_kbps,
+            keyframe_s: raw.keyframe_s,
+            preroll_s: raw.preroll_s,
             ffmpeg,
             font: raw.font,
             palette: raw.palette,
@@ -233,6 +288,17 @@ impl Config {
             return Err(ConfigError::TooLarge);
         }
         Self::from_toml(&text)
+    }
+
+    /// The encoder knobs.
+    #[must_use]
+    pub fn encode_settings(&self) -> Settings {
+        Settings {
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            keyframe_s: self.keyframe_s,
+            preroll_s: self.preroll_s,
+        }
     }
 
     /// `http://ADDR:PORT`, the base of every URL the server advertises.
