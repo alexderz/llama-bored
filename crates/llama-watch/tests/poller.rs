@@ -2417,6 +2417,90 @@ fn a_llamacpp_model_never_fetches_captures() {
     assert!(hits.iter().all(|path| allowed_path(path)), "{hits:?}");
 }
 
+/// #66: current llama-server's `/slots` without SLOTS_DEBUG, values
+/// invented: numbers, no `prompt` or `generated`.
+fn textless_slots(id_task: i64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!([{
+        "id": 0, "n_ctx": 262_144, "speculative": false, "is_processing": true,
+        "id_task": id_task, "n_prompt_tokens": 40, "n_prompt_tokens_processed": 30,
+        "n_prompt_tokens_cache": 10, "params": {"n_predict": -1},
+        "next_token": [{"has_next_token": true, "has_new_line": false, "n_remain": -1, "n_decoded": 7}]
+    }]))
+    .expect("json")
+}
+
+const TEXTLESS_LOG: &str = "lcpp: /slots has no prompt text; start llama-server with LLAMA_SERVER_SLOTS_DEBUG=1 for live IN/OUT";
+
+/// #66: a llama.cpp model whose `/slots` has no text gets IN and OUT from
+/// its captures, says why once, and goes back to live text when `/slots`
+/// has it again. `/slots` still gives the numbers.
+#[test]
+fn a_llamacpp_model_without_slot_text_uses_captures_until_text_appears() {
+    let id = "lcpp";
+    let mut world = World::running(running_model(id, "Lcpp", "ready"));
+    world.metrics.insert(id.to_owned(), metrics_body(20, 1.0));
+    world.slots.insert(id.to_owned(), textless_slots(3));
+    world.activity = cache_page(&[capture_row(4, id, true), capture_row(3, id, true)]);
+    world.captures.insert(
+        "4".to_owned(),
+        capture_body(
+            "Newest invented question?",
+            r#"{"choices":[{"message":{"content":"An invented reply."}}]}"#,
+        ),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.capture.is_some()
+    });
+    let capture = detail.capture.clone().expect("capture");
+    assert!(capture.over_slots);
+    assert_eq!(capture.model, "Lcpp");
+    assert_eq!(capture.id, 4);
+    assert_eq!(cells_text(&capture.input), "Newest invented question?");
+    assert_eq!(cells_text(&capture.output), "An invented reply.");
+    // The slot numbers still come from `/slots`.
+    let slot = detail.slots.first().expect("slot");
+    assert_eq!(
+        (slot.n_ctx, slot.ctx_used, slot.n_decoded),
+        (Some(262_144), Some(47), 7)
+    );
+    // Several more `/slots` reads: logged once, fetched once.
+    thread::sleep(Duration::from_millis(1_200));
+    assert_eq!(lines_count(&log, TEXTLESS_LOG), 1, "{:?}", log.lines());
+    assert_eq!(capture_hits(&server), vec!["/api/captures/4".to_owned()]);
+
+    // The server comes back with SLOTS_DEBUG: live text, no capture.
+    server.update(|world| {
+        world.slots.insert(
+            id.to_owned(),
+            slot_body(5, "Live invented prompt", "Live invented output", 3, 2),
+        );
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.capture.is_none()
+            && detail
+                .slots
+                .first()
+                .is_some_and(|slot| cells(&slot.output) == "Live invented output")
+    });
+    assert!(detail.capture.is_none());
+    // A newer row is no longer fetched for it.
+    server.update(|world| {
+        world.activity = cache_page(&[capture_row(6, id, true), capture_row(4, id, true)]);
+        world
+            .captures
+            .insert("6".to_owned(), capture_body("INVENTED-NOT-FETCHED", "{}"));
+    });
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(capture_hits(&server), vec!["/api/captures/4".to_owned()]);
+    assert_eq!(lines_count(&log, TEXTLESS_LOG), 1);
+    let hits = server.hits();
+    assert!(hits.iter().all(|path| allowed_path(path)), "{hits:?}");
+}
+
 // ---- #35: engine-measured speeds on RECENT rows ---------------------------------
 
 /// The vLLM fixture with `extra` requests finished past its 42, each of

@@ -211,6 +211,8 @@ pub struct SlotBook {
     displaced: HashMap<String, Displaced>,
     /// Newest activity row number seen (#9, #44).
     activity_newest: Option<u64>,
+    /// Whether each model's last body with a task carried its text (#66).
+    text: HashMap<String, bool>,
 }
 
 impl SlotBook {
@@ -348,6 +350,15 @@ impl SlotBook {
         }
     }
 
+    /// Whether `model_id`'s newest body with a task carried `prompt` or
+    /// `generated` (#66). Current llama-server sends them only with
+    /// `LLAMA_SERVER_SLOTS_DEBUG=1`; older builds always did. `None` until a
+    /// body showed a slot with a task, and always with text off.
+    #[must_use]
+    pub fn has_text(&self, model_id: &str) -> Option<bool> {
+        self.text.get(model_id).copied()
+    }
+
     /// Ingest one model's body. A body that does not parse leaves this model
     /// unchanged and returns `false`.
     ///
@@ -381,6 +392,11 @@ impl SlotBook {
         let Some(parsed) = parse_light(body) else {
             return false;
         };
+        let tasks: Vec<&LightSlot> = parsed.iter().filter(|slot| slot.id_task >= 0).collect();
+        if !tasks.is_empty() {
+            let text = tasks.iter().any(|slot| slot.has_text);
+            self.text.insert(model_id.to_owned(), text);
+        }
         let prompts = if parsed
             .iter()
             .any(|slot| self.needs_prompt(model_id, slot.id, slot.id_task))
@@ -464,6 +480,8 @@ impl SlotBook {
     pub fn retain_models(&mut self, model_ids: &[&str]) {
         self.slots
             .retain(|row| model_ids.iter().any(|id| *id == row.model_id));
+        self.text
+            .retain(|model, _| model_ids.contains(&model.as_str()));
         self.settle(|model| !model_ids.contains(&model));
         for ((model, _), track) in &mut self.ctx {
             if !model_ids.iter().any(|id| id == model) {
@@ -546,6 +564,8 @@ struct LightSlot {
     /// `n_prompt_tokens_cache`, when the server sends it (#9 evidence).
     n_prompt_tokens_cache: Option<u64>,
     generated: String,
+    /// The body had `prompt` or `generated` for this slot (#66).
+    has_text: bool,
 }
 
 struct FullSlot {
@@ -578,6 +598,7 @@ fn parse_numbers(body: &[u8]) -> Option<Vec<LightSlot>> {
                 ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
                 n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
                 generated: String::new(),
+                has_text: false,
             })
             .collect(),
     )
@@ -597,7 +618,7 @@ fn parse_full(body: &[u8]) -> Option<Vec<FullSlot>> {
 
 impl From<SlotJsonLight> for LightSlot {
     fn from(slot: SlotJsonLight) -> Self {
-        let _ = slot.prompt;
+        let has_text = slot.prompt.is_some() || slot.generated.is_some();
         Self {
             id: slot.id,
             id_task: slot.id_task,
@@ -612,7 +633,8 @@ impl From<SlotJsonLight> for LightSlot {
             n_ctx: slot.n_ctx,
             ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
             n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
-            generated: slot.generated,
+            generated: slot.generated.unwrap_or_default(),
+            has_text,
         }
     }
 }
@@ -672,10 +694,13 @@ struct SlotJsonLight {
     n_prompt_tokens_processed: u64,
     #[serde(default)]
     next_token: Vec<NextTokenJson>,
+    /// Present only with `LLAMA_SERVER_SLOTS_DEBUG=1` on current
+    /// llama-server (#66); skipped, never allocated, here.
     #[serde(default)]
-    prompt: IgnoredAny,
+    prompt: Option<IgnoredAny>,
+    /// Present with `prompt`.
     #[serde(default)]
-    generated: String,
+    generated: Option<String>,
 }
 
 /// [`SlotJsonLight`] without `prompt` or `generated`. Used when text is off.
@@ -1264,6 +1289,99 @@ mod tests {
             reasons(&book, 0),
             (counts(1, 0, 0, 1), Some(ResetReason::Unknown))
         );
+    }
+
+    /// #66: current llama-server's `/slots` without
+    /// `LLAMA_SERVER_SLOTS_DEBUG` (shape from build b11429, values
+    /// invented): no `prompt` or `generated`, the numbers still there.
+    fn bare_slot(
+        id_task: Option<i64>,
+        busy: bool,
+        prompt: u64,
+        cache: u64,
+        decoded: u64,
+    ) -> serde_json::Value {
+        let mut slot = serde_json::json!({
+            "id": 0, "n_ctx": 262_144, "speculative": false, "is_processing": busy,
+        });
+        if let Some(id_task) = id_task {
+            slot["id_task"] = id_task.into();
+            slot["n_prompt_tokens"] = prompt.into();
+            slot["n_prompt_tokens_processed"] = prompt.saturating_sub(cache).into();
+            slot["n_prompt_tokens_cache"] = cache.into();
+            slot["params"] = serde_json::json!({"n_predict": -1, "temperature": 1.0});
+            slot["next_token"] = serde_json::json!([{
+                "has_next_token": busy, "has_new_line": false,
+                "n_remain": -1, "n_decoded": decoded,
+            }]);
+        }
+        slot
+    }
+
+    fn bodies(slots: &[serde_json::Value]) -> Vec<u8> {
+        serde_json::to_vec(slots).expect("json")
+    }
+
+    #[test]
+    fn slots_without_text_keep_their_numbers_and_say_so() {
+        let mut book = SlotBook::default();
+        // An idle slot with no task decides nothing.
+        assert!(book.apply(
+            "m",
+            "M",
+            &bodies(&[bare_slot(None, false, 0, 0, 0)]),
+            64,
+            64
+        ));
+        assert_eq!(book.has_text("m"), None);
+        let slots = book.slots();
+        assert_eq!(slots[0].id_task, -1);
+        assert_eq!(slots[0].ctx_used, None);
+
+        let busy = bodies(&[bare_slot(Some(5), true, 80_000, 60_000, 500)]);
+        assert!(book.apply("m", "M", &busy, 64, 64));
+        assert_eq!(book.has_text("m"), Some(false));
+        let slot = &book.slots()[0];
+        assert_eq!(slot.n_ctx, Some(262_144));
+        assert_eq!(slot.n_prompt_tokens, 80_000);
+        assert_eq!(slot.n_prompt_tokens_processed, 20_000);
+        assert_eq!(slot.n_decoded, 500);
+        assert_eq!(slot.ctx_used, Some(80_500));
+        assert!(slot.input.is_empty() && slot.output.is_empty());
+
+        // A drop is still counted and decided on `n_prompt_tokens_cache`.
+        let dropped = bodies(&[bare_slot(Some(6), true, 30_000, 25_000, 0)]);
+        assert!(book.apply("m", "M", &dropped, 64, 64));
+        settle(&mut book);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(1, 0, 0, 0), Some(ResetReason::Compacted))
+        );
+
+        // The server restarted with SLOTS_DEBUG: text again.
+        let mut debug = bare_slot(Some(7), true, 31_000, 30_000, 2);
+        debug["prompt"] = "INVENTED-PROMPT".into();
+        debug["generated"] = "INVENTED-OUTPUT".into();
+        assert!(book.apply("m", "M", &bodies(&[debug]), 64, 64));
+        assert_eq!(book.has_text("m"), Some(true));
+        assert_eq!(cells(&book.slots()[0].output), "INVENTED-OUTPUT");
+
+        // The older shape (text always sent) has text; one slot with text
+        // among textless ones is enough; text off never says.
+        let mut other = SlotBook::default();
+        assert!(other.apply("o", "O", &body(4, "hello", "world", 3, 2), 64, 64));
+        assert_eq!(other.has_text("o"), Some(true));
+        let mut with = bare_slot(Some(8), true, 10, 0, 1);
+        with["id"] = 1.into();
+        with["generated"] = "x".into();
+        let mixed = bodies(&[bare_slot(Some(9), true, 10, 0, 1), with]);
+        assert!(other.apply("o", "O", &mixed, 64, 64));
+        assert_eq!(other.has_text("o"), Some(true));
+        other.retain_models(&[]);
+        assert_eq!(other.has_text("o"), None);
+        let mut quiet = SlotBook::without_text();
+        assert!(quiet.apply("q", "Q", &busy, 64, 64));
+        assert_eq!(quiet.has_text("q"), None);
     }
 
     #[test]
