@@ -6,6 +6,14 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-05
+
+### Upgrading
+
+- Run `install.sh`, then restart every unit: `systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics llama-cast`. The kraken-lcd unit gains `ExecStop=` and `RuntimeDirectory=kraken-lcd` (#59); the first stop after the upgrade still uses SIGTERM.
+- `cast.toml`: a file that sets `name = "llama-bored"` keeps that exact name. Change it to `"llama-bored ({host})"`, or remove the line, so the TV tells servers apart (#21). The new keys `bitrate_kbps`, `keyframe_s` and `preroll_s` default to the fast start (#20); set `bitrate_kbps = 0` and `preroll_s = 0` for the lean stream.
+- tty11's header clock and RECENT now show local time, not UTC (#48).
+
 ### Changed
 
 - llama-cast servers are told apart in the TV's list (#21). The friendly name defaults to `llama-bored ({host})` and the video's title to `tty11 on {host}`; `{host}` is the kernel host name (`uname(2)`, no file read): its first label, letters, digits, `-` and `_` only, at most 32 characters, else `host-` and 8 hex digits of the UDN hash. New `cast.toml` key `title`; `name` and `title` are 1..=64 printable characters with braces only in `{host}`, and the expanded text is cut to 64. A `cast.toml` that sets `name = "llama-bored"` keeps that exact name. The UDN stays the SHA-256 hash of `/etc/machine-id` (stable per host, not the id). SSDP: one `ssdp:byebye` round at start, so a TV drops an entry cached from before a restart, and two rounds 100 ms apart on stop (`llama-cast bye`, the unit's `ExecStop=`). `llama-cast check` prints the friendly name and title it would use

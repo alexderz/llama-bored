@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "kraken-lcd"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "fontdue",
  "llama-core",
@@ -336,7 +336,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llama-cast"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "llama-core",
  "png",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "llama-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "llama-light"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "llama-core",
  "rustix",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "llama-metrics"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "llama-core",
  "rustix",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "llama-view"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "llama-core",
  "rustix",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "llama-watch"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "llama-core",
  "nvml-wrapper",
