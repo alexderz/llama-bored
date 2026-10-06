@@ -913,10 +913,11 @@ fn tty_model(
 ) -> TtyModel {
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
     let no_slots = first_without_slots(sample, watch);
-    // The header model has no `/slots`: IN and OUT from its last capture (#5).
+    // The header model has no `/slots`, or `/slots` without text (#66): IN
+    // and OUT from its last capture (#5).
+    let header_up = matches!(watch, WatchState::Generating | WatchState::Ready);
     let capture = tick.detail.capture.as_ref().filter(|capture| {
-        no_slots
-            && tick.detail.slots.is_empty()
+        ((no_slots && tick.detail.slots.is_empty()) || (header_up && capture.over_slots))
             && sample
                 .snapshot
                 .models
@@ -3013,6 +3014,7 @@ mod tests {
             input: cells("An invented question?"),
             input_note: String::new(),
             output: cells("An invented answer."),
+            over_slots: false,
         });
         let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
@@ -3036,6 +3038,55 @@ mod tests {
         let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert!(model.in_lines.is_empty() && model.out_lines.is_empty());
         assert!(model.text_note.is_empty());
+    }
+
+    /// #66: a llama.cpp header model whose `/slots` has no text shows its
+    /// last capture in IN and OUT; SLOTS still counts its slots.
+    #[test]
+    fn a_capture_over_textless_slots_fills_in_and_out() {
+        let cells = |text: &str| -> Vec<Cell> {
+            text.chars()
+                .map(|ch| Cell::new(ch, crate::tty::C16::White, crate::tty::C16::Black))
+                .collect()
+        };
+        let lcpp = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("lcpp", "ready", Some(lcpp))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mut textless = slot(0, 7, true, "", "");
+        textless.model = "lcpp".to_owned();
+        tick.detail.slots = vec![textless];
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut capture = CaptureView {
+            model: "lcpp".to_owned(),
+            id: 9,
+            input: cells("An invented question?"),
+            input_note: String::new(),
+            output: cells("An invented answer."),
+            over_slots: false,
+        };
+        // A capture not meant to stand in for slots is not used.
+        tick.detail.capture = Some(capture.clone());
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
+        assert_ne!(model.in_title, CAPTURE_IN_TITLE);
+        capture.over_slots = true;
+        tick.detail.capture = Some(capture);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
+        assert_eq!(model.in_title, CAPTURE_IN_TITLE);
+        assert_eq!(model.in_lines, vec!["An invented question?".to_owned()]);
+        assert_eq!(model.out_lines, vec!["An invented answer.".to_owned()]);
+        assert_eq!(model.slots_line, "1/1 busy");
+        assert!(model.text_note.is_empty());
+        // Another model's capture is not this header's.
+        tick.detail.capture.as_mut().expect("capture").model = "other".to_owned();
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
+        assert_ne!(model.in_title, CAPTURE_IN_TITLE);
     }
 
     #[test]

@@ -16,7 +16,12 @@
 //! hang cannot stall the main loop.
 //!
 //! IN and OUT for a model without `/slots` come from llama-swap's request
-//! capture of its newest finished activity row (#5, [`crate::capture`]):
+//! capture of its newest finished activity row (#5, [`crate::capture`]),
+//! and so do a llama.cpp model's while its `/slots` carries no prompt or
+//! generated text (#66: current llama-server sends them only with
+//! `LLAMA_SERVER_SLOTS_DEBUG=1`). That is re-checked on every `/slots`
+//! read, so text that appears switches IN and OUT back to live; the
+//! numbers keep coming from `/slots` either way. Captures are
 //! `GET /api/captures/<id>` once per new row id, only with
 //! `tty.show_text = true`, only for a row marked `has_capture`, at most
 //! [`CAPTURE_CAP`] bytes. The capture's bodies become sanitised tails here
@@ -193,6 +198,9 @@ pub struct CaptureView {
     pub input_note: String,
     /// The answer.
     pub output: Vec<Cell>,
+    /// The model has `/slots` without text (#66): IN and OUT show this
+    /// capture over its slots.
+    pub over_slots: bool,
 }
 
 /// One ready model's prompt token counters since the watcher started (#10).
@@ -486,6 +494,11 @@ struct State<L> {
     capture_seen: Option<(u32, i64)>,
     /// The capture shown, with the raw id of its model.
     capture: Option<(String, CaptureView)>,
+    /// Ready llama.cpp models whose `/slots` carries no text: IN and OUT
+    /// come from their captures (#66).
+    slots_textless: HashSet<String>,
+    /// Models whose textless `/slots` was logged this run.
+    textless_logged: HashSet<String>,
     capture_failed: bool,
     capture_oversize: bool,
 }
@@ -534,6 +547,8 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         activity_failed: false,
         capture_seen: None,
         capture: None,
+        slots_textless: HashSet::new(),
+        textless_logged: HashSet::new(),
         capture_failed: false,
         capture_oversize: false,
     };
@@ -729,6 +744,7 @@ impl<L: Sink> State<L> {
             self.capture = None;
         }
         self.fallback.retain(|id| ready.contains(id.as_str()));
+        self.slots_textless.retain(|id| ready.contains(id.as_str()));
         self.gauges.retain(|id, _| ready.contains(id.as_str()));
         self.engine_facts
             .retain(|id, _| ready.contains(id.as_str()));
@@ -983,14 +999,15 @@ impl<L: Sink> State<L> {
                 self.limits.slots_cap,
             ) {
                 Ok(Limited::Exact(bytes)) => {
-                    if !self.slots.apply(
+                    if self.slots.apply(
                         &model.id,
                         &model.name,
                         &bytes,
                         self.limits.input_tail,
                         self.limits.output_tail,
-                    ) && failure.is_none()
-                    {
+                    ) {
+                        self.note_slot_text(&model.id);
+                    } else if failure.is_none() {
                         failure = Some("malformed");
                     }
                 }
@@ -1015,6 +1032,36 @@ impl<L: Sink> State<L> {
         }
         note_flag(&mut self.log, &mut self.slots_failed, failure, "slots");
         self.latencies.slots = Some(started.elapsed());
+    }
+
+    /// Use captures for `id`'s IN and OUT while its `/slots` has no text,
+    /// and its live text again once it has (#66). Logged once per model.
+    fn note_slot_text(&mut self, id: &str) {
+        let Some(text) = self.slots.has_text(id) else {
+            return;
+        };
+        if text {
+            if self.slots_textless.remove(id)
+                && self.capture.as_ref().is_some_and(|(model, _)| model == id)
+            {
+                self.capture = None;
+            }
+        } else if self.slots_textless.insert(id.to_owned())
+            && self.textless_logged.insert(id.to_owned())
+        {
+            log::emit(
+                &mut self.log,
+                Priority::Info,
+                &format!(
+                    "{id}: /slots has no prompt text; start llama-server with LLAMA_SERVER_SLOTS_DEBUG=1 for live IN/OUT"
+                ),
+            );
+        }
+    }
+
+    /// IN and OUT come from captures: no `/slots`, or no text on it (#66).
+    fn textless(&self, model: &ReadyModel) -> bool {
+        !model.backend.has_slots() || self.slots_textless.contains(&model.id)
     }
 
     fn poll_activity(&mut self) {
@@ -1138,7 +1185,7 @@ impl<L: Sink> State<L> {
         let textless: Vec<(String, &ReadyModel)> = self
             .ready
             .iter()
-            .filter(|model| !model.backend.has_slots())
+            .filter(|model| self.textless(model))
             .map(|model| (activity::model_key(&model.id), model))
             .collect();
         let Some((row, model)) = rows
@@ -1173,6 +1220,7 @@ impl<L: Sink> State<L> {
                         ),
                         input_note: text.input_note,
                         output: tail_cells(&text.output, self.limits.output_tail),
+                        over_slots: model.backend.has_slots(),
                     };
                     self.capture = Some((model.id.clone(), view));
                     None

@@ -227,7 +227,7 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 
 | Backend | What you get |
 |---|---|
-| llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text, the tuning line |
+| llama.cpp `llama-server` and forks (ik_llama.cpp, PrismML) | Everything: tok/s, SLOTS with context fill and reset reasons, live IN/OUT text (needs `LLAMA_SERVER_SLOTS_DEBUG=1` on current llama-server; without it IN/OUT show the last finished exchange from llama-swap captures, #66), the tuning line |
 | SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
 | vLLM | The same from `vllm:*` metrics, plus speculative-decoding acceptance (`spec 78 %`, also on the LCD), mean TTFT, inter-token and request latency, preemptions, and the KV dtype, block size and prefix caching from `cache_config_info`; IN/OUT from llama-swap captures |
 | Strata (`serve/server.py --engine strata`, or recognised by its JSON `/metrics`) | From its JSON `/metrics`: tok/s, running and queued requests (one at a time), its settings in SETUP (context, KV, expert cache, spec depth, serving knobs), speculative acceptance, window prefill and decode tok/s, expert cache hit rate and PCIe share, and its live phase (`writing a tool call: write`, tty11 only, never exported); numbers and short tokens only, at most 1 MiB, `history` never read; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
@@ -244,6 +244,14 @@ way, its flags are read from the arguments after the image of a
 `podman run` / `docker run` command (the whole command when no image is
 found), so a llama.cpp image started by digest still gets its ctx, KV,
 `-ncmoe` and quant in SETUP and on the exporter (#67).
+
+IN and OUT show a llama.cpp model's live prompt and output from `/slots`.
+Current llama-server sends that text only when it runs with
+`LLAMA_SERVER_SLOTS_DEBUG=1`; an env var set on llama-swap does not reach a
+server in its own container, so pass it there with `-e`. Without it IN and
+OUT show the last finished exchange from llama-swap's request captures and
+the log says so once per model; SLOTS, ctx and resets still come from
+`/slots`, and a server restarted with the variable gets live text again.
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
 controller are optional; missing sources show "—".
