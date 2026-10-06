@@ -49,7 +49,9 @@ fi
 
 cargo build --release --locked
 
-symbols="$(nm -C target/release/kraken-lcd)"
+# Names only: `nm` prints an address and a type letter first, and an
+# address such as 0000000000217800 would match the `21780` pattern.
+symbols="$(nm -C target/release/kraken-lcd | sed -E 's/^[0-9a-fA-F]* *[A-Za-z?-] //')"
 # An empty or fully stripped table must fail. `main` is linked even when
 # fat LTO drops the uncalled LCD paths; `run` is what pulls those in.
 if ! grep -q 'kraken_lcd::main' <<<"$symbols"; then
