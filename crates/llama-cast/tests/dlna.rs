@@ -37,6 +37,39 @@ fn protocol_info_is_the_roku_variant_exactly() {
     assert_eq!(dlna::STREAM_PATH, "/live.ts");
 }
 
+/// #20: the live item is streaming-only: no seek operations, the
+/// streaming transfer mode bit, and no byte/time range or sender pacing.
+#[test]
+fn dlna_flags_describe_a_live_stream() {
+    let field = |key: &str| {
+        DLNA_FEATURES
+            .split(';')
+            .find_map(|kv| kv.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} missing"))
+    };
+    assert_eq!(field("DLNA.ORG_PN="), "MPEG_TS_HD_NA_ISO");
+    assert_eq!(field("DLNA.ORG_OP="), "00", "no time or byte seek");
+    let flags = field("DLNA.ORG_FLAGS=");
+    assert_eq!(flags.len(), 32);
+    assert!(flags[8..].bytes().all(|b| b == b'0'), "reserved bits set");
+    let primary = u32::from_str_radix(&flags[..8], 16).unwrap();
+    assert_eq!(
+        primary,
+        dlna::FLAG_STREAMING
+            | dlna::FLAG_BACKGROUND
+            | dlna::FLAG_HTTP_STALLING
+            | dlna::FLAG_DLNA_V15
+    );
+    for (bit, what) in [
+        (31, "sender paced"),
+        (30, "lop-npt (time seek)"),
+        (29, "lop-bytes (byte seek)"),
+        (23, "interactive transfer"),
+    ] {
+        assert_eq!(primary & (1 << bit), 0, "{what} must be clear");
+    }
+}
+
 #[test]
 fn description_golden() {
     let want = std::fs::read_to_string(fixture("desc.xml")).unwrap();

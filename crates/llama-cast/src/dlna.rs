@@ -25,6 +25,16 @@ pub const CMS_TYPE: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
 
 /// The stream's MIME type.
 pub const STREAM_MIME: &str = "video/mpeg";
+/// `DLNA.ORG_FLAGS` primary bits (the first 8 of its 32 hex digits) set
+/// for this live stream: streaming transfer mode (tm-s), background
+/// transfer (tm-b), HTTP connection stalling, DLNA 1.5. Not set: sender
+/// paced, limited-range seek (lop-npt, lop-bytes) and s0/sN-increasing; with
+/// `DLNA.ORG_OP=00` (no time or byte seek) a player treats it as a stream
+/// to play from where it joins. This is the set the Roku accepted.
+pub const FLAG_STREAMING: u32 = 1 << 24;
+pub const FLAG_BACKGROUND: u32 = 1 << 22;
+pub const FLAG_HTTP_STALLING: u32 = 1 << 21;
+pub const FLAG_DLNA_V15: u32 = 1 << 20;
 /// The DLNA fourth field of `protocolInfo`.
 pub const DLNA_FEATURES: &str =
     "DLNA.ORG_PN=MPEG_TS_HD_NA_ISO;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=01700000000000000000000000000000";

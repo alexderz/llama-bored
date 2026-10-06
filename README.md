@@ -631,6 +631,19 @@ media server over SSDP and streams 1920x1080 H.264 in MPEG-TS, rendered from
 tty11 at 2 frames per second. Each viewer gets its own `ffmpeg` (libx264
 required), two at a time by default.
 
+The stream is tuned to start fast on a TV (#20). Each viewer's stream
+begins with PAT, PMT and a keyframe, and is encoded for low latency (no
+B-frames, no lookahead). The defaults below are in `cast.toml`:
+
+| Key | Default | What it does |
+|---|---|---|
+| `bitrate_kbps` | `4000` | Constant bitrate, with filler on a still screen. A TV that waits for a fixed amount of data (Roku Media Player) starts in about a second instead of tens of seconds. `0` turns it off: least bandwidth, slowest start. 500..=20000. |
+| `keyframe_s` | `1` | Seconds between keyframes, 1..=10. |
+| `preroll_s` | `3` | Seconds of the first frame each new viewer gets at once, 0..=10. The picture then runs this far behind tty11. |
+
+Each viewer uses `bitrate_kbps` of LAN bandwidth. If the TV still waits,
+raise `preroll_s` or `bitrate_kbps`.
+
 It is LAN-exposed by design: any host in `allow` can watch whatever tty11
 shows. It reads tty11's screen read-only, writes no file, and connects to
 nothing. The installer installs it but never enables it.

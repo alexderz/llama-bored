@@ -754,12 +754,16 @@ impl Worker {
     }
 }
 
-/// The stream response head: close-delimited, no length.
+/// The stream response head: close-delimited, no `Content-Length` (live,
+/// no end), DLNA streaming transfer mode, and `contentFeatures.dlna.org`
+/// with the same profile, operations (none: no seek) and flags as the
+/// item's `protocolInfo`, so a player need not guess (#20).
 #[must_use]
 pub fn stream_head() -> String {
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\ntransferMode.dlna.org: Streaming\r\nServer: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\ntransferMode.dlna.org: Streaming\r\ncontentFeatures.dlna.org: {}\r\nServer: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         dlna::STREAM_MIME,
+        dlna::DLNA_FEATURES,
         crate::ssdp::server_header(),
     )
 }

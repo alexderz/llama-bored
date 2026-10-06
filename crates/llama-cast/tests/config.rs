@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 
 use llama_cast::acl::CidrError;
 use llama_cast::config::{Config, ConfigError, Font, Palette};
+use llama_cast::encoder::Settings;
 use llama_cast::service::{Command, parse_args};
 
 const GOOD: &str = r#"
@@ -15,6 +16,9 @@ interface_addr = "192.168.1.20"
 name = "llama-bored"
 fps = 2
 max_clients = 2
+bitrate_kbps = 4000
+keyframe_s = 1
+preroll_s = 3
 ffmpeg = "/usr/bin/ffmpeg"
 font = "12x24"
 palette = "llama"
@@ -49,6 +53,15 @@ fn defaults_fill_everything_but_listen_and_allow() {
     assert_eq!(cfg.name, "llama-bored");
     assert_eq!(cfg.fps, 2);
     assert_eq!(cfg.max_clients, 2);
+    assert_eq!(
+        cfg.encode_settings(),
+        Settings {
+            fps: 2,
+            bitrate_kbps: 4000,
+            keyframe_s: 1,
+            preroll_s: 3,
+        }
+    );
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
     assert_eq!(cfg.font, Font::Hack12x24);
     assert_eq!(cfg.font.file_name(), "llama-hack-12x24.psfu");
@@ -238,6 +251,52 @@ fn name_fps_clients_font_and_ffmpeg_bounds() {
         );
     }
     assert!(with("\"/usr/bin/ffmpeg\"", "\"/opt/ffmpeg/bin/ffmpeg\"").is_ok());
+}
+
+/// #20: the stream knobs.
+#[test]
+fn bitrate_keyframe_and_preroll_bounds() {
+    for ok in ["0", "500", "20000"] {
+        let cfg = with("bitrate_kbps = 4000", &format!("bitrate_kbps = {ok}")).unwrap();
+        assert_eq!(cfg.bitrate_kbps.to_string(), ok);
+    }
+    for bad in ["1", "499", "20001"] {
+        assert!(
+            matches!(
+                with("bitrate_kbps = 4000", &format!("bitrate_kbps = {bad}")),
+                Err(ConfigError::Bitrate)
+            ),
+            "{bad}"
+        );
+    }
+    assert!(matches!(
+        with("bitrate_kbps = 4000", "bitrate_kbps = -1"),
+        Err(ConfigError::Parse(_))
+    ));
+    assert!(matches!(
+        with("keyframe_s = 1", "keyframe_s = 0"),
+        Err(ConfigError::Keyframe)
+    ));
+    assert!(matches!(
+        with("keyframe_s = 1", "keyframe_s = 11"),
+        Err(ConfigError::Keyframe)
+    ));
+    assert_eq!(
+        with("keyframe_s = 1", "keyframe_s = 10")
+            .unwrap()
+            .encode_settings()
+            .gop(),
+        100
+    );
+    assert_eq!(with("preroll_s = 3", "preroll_s = 0").unwrap().preroll_s, 0);
+    assert_eq!(
+        with("preroll_s = 3", "preroll_s = 10").unwrap().preroll_s,
+        10
+    );
+    assert!(matches!(
+        with("preroll_s = 3", "preroll_s = 11"),
+        Err(ConfigError::Preroll)
+    ));
 }
 
 #[test]
