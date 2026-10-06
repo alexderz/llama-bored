@@ -333,7 +333,10 @@ sudo scripts/install.sh           # add --enable-light to enable RGB for boot; s
 tree whose HEAD is on `main`**, with matching binary hashes. It creates the
 users and udev rules, creates `/var/lib/kraken-lcd`, enables `llama-watch`,
 and **never starts kraken-lcd**. llama-light is enabled only with
-`--enable-light`; llama-metrics is never enabled. Then, as root:
+`--enable-light`; llama-metrics is never enabled. A file it replaces with different content is kept as
+`<file>.bak-<previous sha>`; an unchanged file gets no backup, and it keeps
+only the newest three of its own backups per file. Backups you name yourself
+(`watch.toml.bak-pre-setup`) are left alone. Then, as root:
 
 ```sh
 systemctl start llama-watch                           # tty11: Ctrl+Alt+F11

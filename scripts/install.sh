@@ -1367,17 +1367,25 @@ previous_installed_sha() {
   printf '%s\n' "$prev"
 }
 
-# Copy the live writer config aside. Never overwrites an existing backup.
-# The name is config.toml.bak-<previous INSTALLED_SHA>, or bak-none.
+# Copy the live writer config aside, only when plan_config swaps in a
+# config.toml.new that differs from it (#57): a kept config is not written,
+# so it needs no backup. Never overwrites an existing backup. The name is
+# config.toml.bak-<previous INSTALLED_SHA>, or bak-none.
 # shellcheck disable=SC2329 # called as `must backup_live_config`
 backup_live_config() {
   local staging=$1 dest_root=$2 prev=$3
   local mode bak
+  INSTALL_CONFIG_BAK_NEW=0
+  INSTALL_CONFIG_BAK_PATH=""
   if ! mode="$(tr -d '[:space:]' <"$staging/config.mode")"; then
     echo "install.sh: staged config mode is unreadable" >&2
     return 1
   fi
   if [[ "$mode" != "keep" ]]; then
+    return 0
+  fi
+  if [[ "${CONFIG_ACTION:-keep}" != "swap" ]] \
+    || cmp -s -- "${CONFIG_SOURCE:-}" "$staging/config.toml"; then
     return 0
   fi
   if [[ ! "$prev" =~ ^([0-9a-f]{40}|none)$ ]]; then
@@ -1389,14 +1397,68 @@ backup_live_config() {
     echo "install.sh: refusing to follow a symlink at $bak" >&2
     return 1
   fi
-  INSTALL_CONFIG_BAK_NEW=0
-  INSTALL_CONFIG_BAK_PATH=""
   if [[ -e "$bak" ]]; then
     return 0
   fi
   place_file 0644 "$staging/config.toml" "$bak" || return 1
   INSTALL_CONFIG_BAK_NEW=1
   INSTALL_CONFIG_BAK_PATH=$bak
+}
+
+# install.sh names its backups <file>.bak-<previous INSTALLED_SHA> (40 hex)
+# or <file>.bak-none. Each install keeps the newest few per file (#57).
+INSTALL_BACKUP_KEEP=3
+
+# Remove all but the newest INSTALL_BACKUP_KEEP backups of `dest`, by mtime.
+# Only <dest>.bak-<40 hex> and <dest>.bak-none regular files are candidates:
+# a hand-named backup (watch.toml.bak-pre-setup), a symlink or another
+# file's backup is never touched. A backup this run recorded for its
+# rollback is always kept and counts toward the limit. Prints each removal.
+prune_backups() {
+  local dest=$1
+  local path suffix mtime protected=0 room keep bak
+  local -a found=()
+  for path in "$dest".bak-*; do
+    suffix="${path#"$dest".bak-}"
+    if [[ ! "$suffix" =~ ^([0-9a-f]{40}|none)$ || -L "$path" || ! -f "$path" ]]; then
+      continue
+    fi
+    keep=0
+    for bak in "${ROLLBACK_BAK[@]}" "${INSTALL_CONFIG_BAK_PATH:-}"; do
+      if [[ -n "$bak" && "$bak" == "$path" ]]; then
+        keep=1
+      fi
+    done
+    if [[ "$keep" == 1 ]]; then
+      protected=$((protected + 1))
+      continue
+    fi
+    mtime="$(stat -c '%Y' -- "$path")" || continue
+    found+=("$mtime $path")
+  done
+  room=$((INSTALL_BACKUP_KEEP - protected))
+  if [[ ${#found[@]} -le "$room" || ${#found[@]} -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "$room" -lt 0 ]]; then
+    room=0
+  fi
+  printf '%s\n' "${found[@]}" | sort -k1,1nr -k2 | tail -n +"$((room + 1))" \
+    | while read -r mtime path; do
+      if rm -f -- "$path"; then
+        echo "install.sh: removed old backup $(display_path "$path")"
+      else
+        echo "install.sh: could not remove old backup $(display_path "$path")" >&2
+      fi
+    done
+}
+
+# Prune the backups of every file this run installed or kept.
+prune_install_backups() {
+  local dest
+  for dest in "${INSTALL_BACKUP_DESTS[@]}"; do
+    prune_backups "$dest"
+  done
 }
 
 mark_write() {
@@ -1522,7 +1584,7 @@ stage_new_file() {
 # Swap dest.new into dest. An identical file is left in place and recorded
 # as nothing. A different file is backed up to <dest>.bak-<previous sha>
 # (never a bare .bak, and never over an existing backup). A missing file is
-# recorded as created.
+# recorded as created. prune_install_backups trims old backups at the end.
 # shellcheck disable=SC2329 # called as `must commit_new_file`
 commit_new_file() {
   local dest=$1
@@ -1542,6 +1604,7 @@ commit_new_file() {
     echo "install.sh: refusing to follow a symlink at $dest" >&2
     return 1
   fi
+  INSTALL_BACKUP_DESTS+=("$dest")
   if [[ -e "$dest" ]] && cmp -s -- "$new" "$dest"; then
     rm -f -- "$new"
     return 0
@@ -1573,6 +1636,7 @@ commit_installed_sha() {
     echo "install.sh: refusing to follow a symlink at $dest" >&2
     return 1
   fi
+  INSTALL_BACKUP_DESTS+=("$dest")
   tmp="$(mktemp)"
   if ! printf '%s\n' "$head" >"$tmp"; then
     rm -f -- "$tmp"
@@ -1638,6 +1702,7 @@ apply_from_staging() {
   INSTALL_RULES_CHANGED=0
   INSTALL_CONFIG_BAK_NEW=0
   INSTALL_CONFIG_BAK_PATH=""
+  INSTALL_BACKUP_DESTS=()
   INSTALL_KRAKEN=1
   INSTALL_DEST_ROOT="${dest_root%/}"
   INSTALL_SAVED_EXIT="$(trap -p EXIT || true)"
@@ -1948,7 +2013,14 @@ apply_from_staging() {
 
   config_dest="$(dest_path "$dest_root" /etc/llama-bored/config.toml)"
   config_bak="$(dest_path "$dest_root" "/etc/llama-bored/config.toml.bak-$prev")"
-  if [[ "$CONFIG_ACTION" == "swap" || "$CONFIG_ACTION" == "install" ]]; then
+  # The other configs are only written when absent, so this run makes no
+  # backup of them; older installs' backups are still trimmed.
+  INSTALL_BACKUP_DESTS+=("$config_dest" "$watch_dest" "$light_dest" "$metrics_dest" "$cast_dest")
+  if [[ "$CONFIG_ACTION" == "swap" && -e "$config_dest" ]] \
+    && cmp -s -- "$CONFIG_SOURCE" "$config_dest"; then
+    # The migrated config is the live one already: nothing to write (#57).
+    rm -f -- "$(dest_path "$dest_root" /etc/llama-bored/config.toml.new)"
+  elif [[ "$CONFIG_ACTION" == "swap" || "$CONFIG_ACTION" == "install" ]]; then
     if [[ "$CONFIG_ACTION" == "swap" && -e "$config_dest" ]]; then
       must place_file 0644 "$CONFIG_SOURCE" "$config_dest" || return 1
       rollback_record replaced "$config_dest" "$config_bak"
@@ -1987,6 +2059,8 @@ apply_from_staging() {
 
   sha_dest="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
   must commit_installed_sha "$sha_dest" "$head" || return 1
+  # Last, after every write succeeded: a failed run keeps all backups.
+  prune_install_backups
   restore_exit_trap
   print_phase_b
 }
@@ -3016,10 +3090,15 @@ self_test() {
     "fake-watch" "installed llama-watch"
   assert_eq "$(cat -- "$(dest_path "$both" /etc/llama-bored/watch.toml)")" \
     "custom watch" "watch.toml not overwritten"
+  # #57: the kept config is not written, so it gets no backup.
   bak="$(dest_path "$both" /etc/llama-bored/config.toml.bak-none)"
-  assert_eq "$(cat -- "$bak")" \
+  if [[ -e "$bak" ]] || compgen -G "$(dest_path "$both" /etc/llama-bored)/config.toml.bak-*" >/dev/null; then
+    echo "install self-test: an unchanged config.toml was backed up" >&2
+    exit 1
+  fi
+  assert_eq "$(cat -- "$(dest_path "$both" /etc/llama-bored/config.toml)")" \
     "$(printf 'custom config\n[upload]\nmin_interval_s = 30\n')" \
-    "live config backed up"
+    "live config kept"
   cmp -s -- "$ROOT/packaging/llama-watch.service" \
     "$(dest_path "$both" /etc/systemd/system/llama-watch.service)" || {
     echo "install self-test: llama-watch.service was not installed verbatim" >&2
@@ -3046,9 +3125,105 @@ self_test() {
   printf 'sentinel-backup\n' >"$sentinel_bak"
   apply_from_staging "$both_stage" "$both" "$sys" "$head" >/dev/null
   assert_eq "$(cat -- "$sentinel_bak")" "sentinel-backup" "config backup was overwritten"
-  assert_eq "$(cat -- "$bak")" \
-    "$(printf 'custom config\n[upload]\nmin_interval_s = 30\n')" \
-    "first config backup changed on the second apply"
+  if [[ -e "$bak" ]]; then
+    echo "install self-test: the second apply backed up an unchanged config.toml" >&2
+    exit 1
+  fi
+  rm -f -- "$sentinel_bak"
+
+  # #57: old install.sh backups are pruned to the newest three per file, by
+  # mtime. Hand-named backups, another name's backups and symlinks stay.
+  local etc_dir libexec_dir i sha_i stamp prune_out path
+  local -a old_baks=()
+  etc_dir="$(dest_path "$both" /etc/llama-bored)"
+  libexec_dir="$(dest_path "$both" /usr/local/libexec/llama-bored)"
+  for i in 1 2 3 4 5; do
+    sha_i="$(printf '%040d' "$i" | tr 0 a)"
+    stamp="2026-01-0${i} 00:00:00"
+    printf 'old config %s\n' "$i" >"$etc_dir/config.toml.bak-$sha_i"
+    touch -d "$stamp" -- "$etc_dir/config.toml.bak-$sha_i"
+    printf 'old binary %s\n' "$i" >"$libexec_dir/kraken-lcd.bak-$sha_i"
+    printf 'old watch %s\n' "$i" >"$etc_dir/watch.toml.bak-$sha_i"
+    touch -d "$stamp" -- "$etc_dir/watch.toml.bak-$sha_i"
+    touch -d "$stamp" -- "$libexec_dir/kraken-lcd.bak-$sha_i"
+    old_baks+=("$sha_i")
+  done
+  # bak-none is the oldest of the config backups.
+  printf 'oldest config\n' >"$etc_dir/config.toml.bak-none"
+  touch -d '2025-06-01 00:00:00' -- "$etc_dir/config.toml.bak-none"
+  printf 'hand made\n' >"$etc_dir/watch.toml.bak-pre-setup"
+  touch -d '2020-01-01 00:00:00' -- "$etc_dir/watch.toml.bak-pre-setup"
+  printf 'hand made\n' >"$etc_dir/config.toml.bak-pre-setup"
+  touch -d '2020-01-01 00:00:00' -- "$etc_dir/config.toml.bak-pre-setup"
+  printf 'short sha\n' >"$etc_dir/config.toml.bak-abc123"
+  touch -d '2020-01-01 00:00:00' -- "$etc_dir/config.toml.bak-abc123"
+  printf 'other\n' >"$etc_dir/other.toml.bak-${old_baks[0]}"
+  touch -d '2020-01-01 00:00:00' -- "$etc_dir/other.toml.bak-${old_baks[0]}"
+  ln -s -- "$tmp/nowhere" "$etc_dir/config.toml.bak-$(printf '%040d' 9)"
+  prune_out="$(apply_from_staging "$both_stage" "$both" "$sys" "$head")"
+  for i in 0 1; do
+    if [[ -e "$etc_dir/config.toml.bak-${old_baks[$i]}" \
+      || -e "$libexec_dir/kraken-lcd.bak-${old_baks[$i]}" ]]; then
+      echo "install self-test: backup ${old_baks[$i]} was not pruned" >&2
+      exit 1
+    fi
+  done
+  if [[ -e "$etc_dir/config.toml.bak-none" ]]; then
+    echo "install self-test: the oldest config backup was not pruned" >&2
+    exit 1
+  fi
+  for i in 2 3 4; do
+    assert_eq "$(cat -- "$etc_dir/config.toml.bak-${old_baks[$i]}")" \
+      "old config $((i + 1))" "newest config backups kept"
+    assert_eq "$(cat -- "$libexec_dir/kraken-lcd.bak-${old_baks[$i]}")" \
+      "old binary $((i + 1))" "newest binary backups kept"
+    assert_eq "$(cat -- "$etc_dir/watch.toml.bak-${old_baks[$i]}")" \
+      "old watch $((i + 1))" "newest watch.toml backups kept"
+  done
+  if compgen -G "$etc_dir/watch.toml.bak-${old_baks[1]}" >/dev/null; then
+    echo "install self-test: old watch.toml backups were not trimmed" >&2
+    exit 1
+  fi
+  for path in watch.toml.bak-pre-setup config.toml.bak-pre-setup config.toml.bak-abc123 \
+    "other.toml.bak-${old_baks[0]}"; do
+    if [[ ! -f "$etc_dir/$path" ]]; then
+      echo "install self-test: prune removed $path, which install.sh did not make" >&2
+      exit 1
+    fi
+  done
+  if [[ ! -L "$etc_dir/config.toml.bak-$(printf '%040d' 9)" ]]; then
+    echo "install self-test: prune removed a symlink" >&2
+    exit 1
+  fi
+  [[ "$prune_out" == *"removed old backup /etc/llama-bored/config.toml.bak-none"* ]] || {
+    echo "install self-test: prune did not report its removals" >&2
+    printf '%s\n' "$prune_out" >&2
+    exit 1
+  }
+  if [[ "$(compgen -G "$etc_dir/config.toml.bak-*" | wc -l)" -ne 6 ]]; then
+    echo "install self-test: unexpected config backups after pruning" >&2
+    ls -la -- "$etc_dir" >&2
+    exit 1
+  fi
+  # A run's own backup is never pruned, even when older than three others.
+  local own_prev own_bak
+  own_prev="$(previous_installed_sha "$both")"
+  printf 'swapped config\n' >"$tmp/own.toml"
+  own_bak="$etc_dir/config.toml.bak-$own_prev"
+  rm -f -- "$own_bak"
+  INSTALL_BACKUP_DESTS=("$etc_dir/config.toml")
+  ROLLBACK_BAK=("$own_bak")
+  INSTALL_CONFIG_BAK_PATH=""
+  cp -- "$etc_dir/config.toml" "$own_bak"
+  touch -d '2019-01-01 00:00:00' -- "$own_bak"
+  prune_install_backups >/dev/null
+  if [[ ! -f "$own_bak" || ! -f "$etc_dir/config.toml.bak-${old_baks[4]}" \
+    || ! -f "$etc_dir/config.toml.bak-${old_baks[3]}" \
+    || -e "$etc_dir/config.toml.bak-${old_baks[2]}" ]]; then
+    echo "install self-test: prune did not keep this run's backup and the newest two" >&2
+    ls -la -- "$etc_dir" >&2
+    exit 1
+  fi
   rm -rf -- "$both_stage"
 
   fresh_watch="$tmp/fresh-watch"
