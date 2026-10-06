@@ -8,8 +8,8 @@ use llama_core::backend::{Backend, BackendInfo, EngineStats};
 use llama_core::detail::ModelDetail;
 use llama_watch::config::{Config, Setup};
 use llama_watch::metrics::{EngineFacts, parse_strata};
-use llama_watch::setup_rules::{LiveCtx, Rules};
-use llama_watch::sources::cmdline::parse_launch;
+use llama_watch::setup_rules::{Found, LiveCtx, Rules};
+use llama_watch::sources::cmdline::{parse_launch, parse_launch_as};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -88,6 +88,16 @@ fn rows(
     detail: Option<&ModelDetail>,
     info: Option<&BackendInfo>,
 ) -> Vec<String> {
+    rows_of(rules, &rules.extract(cmd), backend, detail, info)
+}
+
+fn rows_of(
+    rules: &Rules,
+    found: &[Found],
+    backend: Backend,
+    detail: Option<&ModelDetail>,
+    info: Option<&BackendInfo>,
+) -> Vec<String> {
     let live = LiveCtx {
         backend,
         detail,
@@ -95,7 +105,7 @@ fn rows(
         engine: None,
     };
     rules
-        .rows(&rules.extract(cmd), &live)
+        .rows(found, &live)
         .into_iter()
         .map(|row| {
             let mut text = format!("{}:", row.label);
@@ -172,6 +182,43 @@ fn llama_cpp_defaults_show_dim() {
     );
 }
 
+/// #67: a llama.cpp image started by digest names no server. Once the
+/// config or the `/metrics` probe says llama.cpp, the flags after the
+/// image fill the detail and the SETUP rows; the podman options before it
+/// lend nothing.
+#[test]
+fn llama_cpp_container_flags_after_the_image() {
+    let id = "invented-lcpp-container";
+    let cmd = cmd_of(id);
+    assert_eq!(parse_launch(&cmd).backend, Backend::OpenAi);
+    let rules = with_example();
+    // Not yet known: an OpenAI-compatible server, the engine row only.
+    let found = rules.extract_all(&cmd, &name_of(id));
+    assert_eq!(
+        rows_of(&rules, &found, Backend::OpenAi, None, None),
+        ["engine: OpenAI-compatible"]
+    );
+    let detail = parse_launch_as(&cmd, Some(Backend::LlamaCpp)).detail;
+    let found = rules.extract_as(&cmd, &name_of(id), Some(Backend::LlamaCpp));
+    assert_eq!(
+        rows_of(&rules, &found, Backend::LlamaCpp, detail.as_ref(), None),
+        [
+            "engine: llama.cpp · IQ4_XS · fa on",
+            "ctx: 262,144 · kv f16 / f16",
+            "experts: 39 layers in RAM",
+            "spec: none*",
+            "think: budget 26,000 · on",
+            "sample: temp 1.0 · top-p 0.95 · top-k 20 · min-p 0",
+        ]
+    );
+    for value in &found {
+        assert!(
+            !value.value.contains('/') && !value.value.contains("sha256"),
+            "{value:?}"
+        );
+    }
+}
+
 #[test]
 fn vllm_serve_flags_and_live_acceptance() {
     let cmd = cmd_of("gemma-4-31b-vllm");
@@ -223,6 +270,9 @@ fn env_configured_container_with_the_example_rules() {
             "spec: dflash2 · n 15 · acc 4.1/step",
         ]
     );
+    // Known as vLLM (#67): the env before the image reads the same.
+    let known = rules.extract_as(&cmd, "", Some(Backend::Vllm));
+    assert_eq!(known, rules.extract(&cmd));
     // No cache facts yet: PREFIX_CACHE stands in for the engine's report.
     assert_eq!(
         rows(&rules, &cmd, Backend::Vllm, None, None),

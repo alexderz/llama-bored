@@ -37,6 +37,7 @@ fn fetch(url: &str, timeout: Duration, aliases: &HashMap<String, String>) -> Rea
         timeout,
         aliases,
         &llama_watch::setup_rules::Rules::builtin(),
+        &HashMap::new(),
     )
 }
 

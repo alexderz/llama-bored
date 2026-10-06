@@ -45,7 +45,10 @@
 //! `engine` and `live` objects is Strata (#54, a container started by image
 //! digest); else the first sample's metric prefix decides: `vllm:`,
 //! `sglang:` or `llamacpp:` (which then also gets `/slots`); anything else,
-//! or no `/metrics`, stays `openai`. Each outcome is logged once.
+//! or no `/metrics`, stays `openai`. Each outcome is logged once. A probe
+//! that names a server re-reads `/running` at once, and that read and each
+//! one after it pass the server to the launch command parser, which reads
+//! a container's flags after its image (#67).
 //!
 //! Every `/upstream/<id>/…` GET, the probe included, is for a model the last
 //! good `/running` read listed as `ready`: an upstream request for any other
@@ -467,6 +470,9 @@ struct State<L> {
     detected: HashMap<String, Backend>,
     /// `id:kind` probe outcomes already logged this run.
     detect_logged: HashSet<String>,
+    /// A probe found a server: read `/running` again at once, so the
+    /// launch command's flags are read as that server's (#67).
+    running_due: bool,
     running_up: bool,
     unmetered: bool,
     latencies: PollLatencies,
@@ -517,6 +523,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         speeds: SpeedBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
+        running_due: false,
         running_up: false,
         unmetered: false,
         latencies: PollLatencies::default(),
@@ -540,7 +547,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         }
         let now = Instant::now();
         let mut worked = false;
-        if now >= next_running {
+        if now >= next_running || state.running_due {
             state.poll_running();
             next_running = Instant::now() + state.limits.running_interval;
             worked = true;
@@ -563,7 +570,11 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         if worked && state.publish().is_err() {
             break;
         }
-        let mut next = next_running;
+        let mut next = if state.running_due {
+            Instant::now()
+        } else {
+            next_running
+        };
         for candidate in [next_metrics, next_slots, next_activity] {
             if candidate < next {
                 next = candidate;
@@ -580,12 +591,22 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
 impl<L: Sink> State<L> {
     fn poll_running(&mut self) {
         let started = Instant::now();
+        self.running_due = false;
+        // Each model's server where the config or this load's probe named
+        // one, so a container's flags are read as that server's (#67).
+        let mut known = self.limits.backends.clone();
+        for (id, kind) in &self.detected {
+            if *kind != Backend::OpenAi {
+                known.entry(id.clone()).or_insert(*kind);
+            }
+        }
         let reading = llamaswap::read_with(
             &self.agent,
             &self.limits.url,
             self.limits.running_timeout,
             &self.limits.aliases,
             &self.limits.setup,
+            &known,
         );
         let (ai, down) = match reading.ai {
             llamaswap::RunningStatus::Down(reason) => (AiState::Down, Some(reason)),
@@ -794,6 +815,12 @@ impl<L: Sink> State<L> {
                 ),
             };
             self.detected.insert(id.clone(), kind);
+            // The detail and SETUP values were read before the server was
+            // known: read `/running` again now, so its container flags are
+            // read as this server's (#67).
+            if kind != Backend::OpenAi {
+                self.running_due = true;
+            }
             if self.detect_logged.insert(format!("{id}:{}", kind.as_str())) {
                 log::emit(
                     &mut self.log,

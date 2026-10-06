@@ -238,13 +238,21 @@ impl Rules {
     /// llama-swap model `name` (#54). Of the name only the tag is kept.
     #[must_use]
     pub fn extract_all(&self, cmd: &str, name: &str) -> Vec<Found> {
+        self.extract_as(cmd, name, None)
+    }
+
+    /// [`Self::extract_all`] with the server `known` from `[llama.backends]`
+    /// or the `/metrics` probe (#67): a container that names no server has
+    /// its server flags after the image and its env before it.
+    #[must_use]
+    pub fn extract_as(&self, cmd: &str, name: &str, known: Option<Backend>) -> Vec<Found> {
         let tokens = tokenize(cmd);
         let words: Vec<&str> = tokens.iter().map(|(_, word)| *word).collect();
-        // A server's flags come after its entry point and a wrapper's env
-        // before it, so `podman run -e` cannot lend a server flag and a
-        // llama-server `-e` (escapes) is never read as env. With no entry
-        // point the whole command is both.
-        let (flags_from, env_to) = match cmdline::entry_point(&words) {
+        // A server's flags come after its entry point (or its container
+        // image, #67) and a wrapper's env before it, so `podman run -e`
+        // cannot lend a server flag and a llama-server `-e` (escapes) is
+        // never read as env. With neither the whole command is both.
+        let (flags_from, env_to) = match cmdline::flags_start(&words, known) {
             Some(at) => (at, at),
             None => (0, words.len()),
         };

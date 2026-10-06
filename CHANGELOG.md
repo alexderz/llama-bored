@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- A llama.cpp server started as a container image (`podman run … <image@digest> --host … -m …/X-IQ4_XS.gguf -c 262144 -ctk f16 -ctv f16 -ncmoe 39 …`) now gets its ctx, KV, `-ncmoe` and quant in SETUP and on the exporter (#67). The flag parser ran only on a command that names `llama-server`, so a model told by its `/metrics` (#31) showed `quant="" kv="" ctx="" moe=""`. Once the engine is known from the command, the probe or `[llama.backends]`, that engine's flags are read from the arguments after the image of a `podman run` / `docker run` (also `container run`): the image is the first word after `run` that is neither an option nor an option's value (a bare digest or image id, `name@sha256:…`, `registry/name:tag`), every long option takes a value unless it is one of the known boolean ones (`--rm`, `--init`, `--privileged`, …) or carries `=`, and `-it`-style short clusters are read as podman does. With no image found the whole command is read, as before. A probe that names a server re-reads `/running` at once, so the detail does not wait for the next poll. A command that names its server is read after its entry point for llama.cpp too, so a wrapper's own `-c` or `-m` lends nothing. The `[setup]` rules read server flags after the image and env before it. Same allowlist: numbers and short tokens only, the command is not kept. Fixture: an invented llama.cpp image entry in `fixtures/llama/running-setup.json`
+
 ## 0.4.0 — 2026-10-05
 
 ### Upgrading
