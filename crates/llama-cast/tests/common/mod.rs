@@ -39,6 +39,7 @@ pub fn scratch(label: &str) -> PathBuf {
 pub fn device() -> Device {
     Device {
         name: "llama-bored".to_owned(),
+        title: "llama-bored live".to_owned(),
         udn: UDN.to_owned(),
         base_url: BASE.to_owned(),
     }

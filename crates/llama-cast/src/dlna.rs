@@ -54,6 +54,8 @@ pub const ITEM_ID: &str = "1";
 pub struct Device {
     /// Friendly name (already validated: printable, 1..=64 chars).
     pub name: String,
+    /// The video item's title (likewise).
+    pub title: String,
     /// `uuid:...`.
     pub udn: String,
     /// `http://ADDR:PORT`.
@@ -65,12 +67,6 @@ impl Device {
     #[must_use]
     pub fn stream_url(&self) -> String {
         format!("{}{STREAM_PATH}", self.base_url)
-    }
-
-    /// The item's title.
-    #[must_use]
-    pub fn item_title(&self) -> String {
-        format!("{} live", self.name)
     }
 }
 
@@ -142,7 +138,7 @@ fn didl(inner: &str) -> String {
 pub fn item(dev: &Device) -> String {
     format!(
         "<item id=\"{ITEM_ID}\" parentID=\"{ROOT_ID}\" restricted=\"1\"><dc:title>{}</dc:title><upnp:class>object.item.videoItem</upnp:class><res protocolInfo=\"{PROTOCOL_INFO}\" resolution=\"{RESOLUTION}\">{}</res></item>",
-        escape(&dev.item_title()),
+        escape(&dev.title),
         escape(&dev.stream_url()),
     )
 }

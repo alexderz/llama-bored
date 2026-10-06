@@ -13,7 +13,7 @@ use llama_core::log::{self, Priority};
 use rustix::net::{AddressFamily, SocketType, ipproto, sockopt};
 use sd_notify::NotifyState;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::discovery::{self, Advert};
 use crate::dlna::Device;
 use crate::encoder::{Encoder, Settings};
@@ -101,11 +101,12 @@ fn summary(config: &Config) -> String {
         .map(ToString::to_string)
         .collect();
     format!(
-        "listen {} allow [{}] interface_addr {} name {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} font {} palette {}",
+        "listen {} allow [{}] interface_addr {} name {:?} title {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} font {} palette {}",
         config.listen,
         nets.join(", "),
         config.interface_addr,
         config.name,
+        config.title,
         config.fps,
         config.max_clients,
         config.bitrate_kbps,
@@ -143,7 +144,16 @@ fn check(config: &Config) -> i32 {
         err(&format!("font {}: {e}", font_path.display()));
         return EXIT_CONFIG;
     }
+    let host = match source::machine_udn(Path::new(source::MACHINE_ID_PATH)) {
+        Ok(udn) => config::host_label(&source::nodename(), &udn),
+        Err(e) => {
+            err(&format!("machine id: {e}"));
+            return 1;
+        }
+    };
     println!("config ok: {}", summary(config));
+    println!("friendly name: {:?}", config.friendly_name(&host));
+    println!("item title: {:?}", config.item_title(&host));
     println!(
         "stream url: {}{}",
         config.base_url(),
@@ -219,8 +229,10 @@ fn run(config: &Config) -> i32 {
         }
     };
     let base_url = config.base_url();
+    let host = config::host_label(&source::nodename(), &udn);
     let device = Device {
-        name: config.name.clone(),
+        name: config.friendly_name(&host),
+        title: config.item_title(&host),
         udn: udn.clone(),
         base_url: base_url.clone(),
     };
@@ -241,7 +253,7 @@ fn run(config: &Config) -> i32 {
     log::emit(
         &mut log::Stderr,
         Priority::Info,
-        &format!("casting tty11: {}", summary(config)),
+        &format!("casting tty11 as {:?}: {}", device.name, summary(config)),
     );
     let app = Arc::new(App {
         device,

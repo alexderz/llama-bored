@@ -22,10 +22,18 @@ pub const MAX_ALLOW: usize = 32;
 pub const DEFAULT_PORT: u16 = 19478;
 /// The SSDP port. The HTTP listener may not use it.
 pub const SSDP_PORT: u16 = 1900;
-/// Default friendly name, shown in the TV's source list.
-pub const DEFAULT_NAME: &str = "llama-bored";
-/// Longest friendly name, in characters.
+/// Replaced in `name` and `title` by this host's name (#21).
+pub const HOST_PLACEHOLDER: &str = "{host}";
+/// Default friendly name, shown in the TV's source list. The host name
+/// tells two servers (or two boxes) apart there (#21).
+pub const DEFAULT_NAME: &str = "llama-bored ({host})";
+/// Default title of the one video item.
+pub const DEFAULT_TITLE: &str = "tty11 on {host}";
+/// Longest friendly name or title, in characters, before and after the
+/// host is put in (the expanded text is cut to this).
 pub const MAX_NAME_CHARS: usize = 64;
+/// Longest host name put into `{host}`, in characters.
+pub const MAX_HOST_CHARS: usize = 32;
 /// Default and bounds of `fps`.
 pub const DEFAULT_FPS: u32 = 2;
 pub const MAX_FPS: u32 = 5;
@@ -104,8 +112,10 @@ pub enum ConfigError {
     InterfaceAddrMissing,
     #[error("interface_addr {0} differs from the listen address {1}")]
     InterfaceAddrMismatch(Ipv4Addr, Ipv4Addr),
-    #[error("name must be 1..=64 printable characters")]
+    #[error("name must be 1..=64 printable characters, with braces only in {{host}}")]
     Name,
+    #[error("title must be 1..=64 printable characters, with braces only in {{host}}")]
+    Title,
     #[error("fps must be 1..=5")]
     Fps,
     #[error("max_clients must be 1..=4")]
@@ -128,6 +138,8 @@ struct Raw {
     interface_addr: Option<String>,
     #[serde(default = "default_name")]
     name: String,
+    #[serde(default = "default_title")]
+    title: String,
     #[serde(default = "default_fps")]
     fps: u32,
     #[serde(default = "default_max_clients")]
@@ -148,6 +160,10 @@ struct Raw {
 
 fn default_name() -> String {
     DEFAULT_NAME.to_owned()
+}
+
+fn default_title() -> String {
+    DEFAULT_TITLE.to_owned()
 }
 
 fn default_fps() -> u32 {
@@ -184,8 +200,10 @@ pub struct Config {
     /// The LAN address SSDP joins the multicast group on, sends from, and
     /// advertises in `LOCATION` and the stream URL.
     pub interface_addr: Ipv4Addr,
-    /// Friendly name.
+    /// Friendly name template (`{host}` is this host's name).
     pub name: String,
+    /// The video item's title template (`{host}` likewise).
+    pub title: String,
     /// Frames rendered per second.
     pub fps: u32,
     /// Streams served at once; more are answered 503.
@@ -227,14 +245,11 @@ impl Config {
             nets.push(net);
         }
         let interface_addr = interface_addr(raw.interface_addr.as_deref(), *listen.ip())?;
-        let name = raw.name;
-        let chars = name.chars().count();
-        if chars == 0
-            || chars > MAX_NAME_CHARS
-            || name.chars().any(char::is_control)
-            || name.trim() != name
-        {
+        if !valid_template(&raw.name) {
             return Err(ConfigError::Name);
+        }
+        if !valid_template(&raw.title) {
+            return Err(ConfigError::Title);
         }
         if raw.fps == 0 || raw.fps > MAX_FPS {
             return Err(ConfigError::Fps);
@@ -261,7 +276,8 @@ impl Config {
             listen,
             allow: Allowlist::new(nets),
             interface_addr,
-            name,
+            name: raw.name,
+            title: raw.title,
             fps: raw.fps,
             max_clients: raw.max_clients,
             bitrate_kbps: raw.bitrate_kbps,
@@ -290,6 +306,18 @@ impl Config {
         Self::from_toml(&text)
     }
 
+    /// The friendly name with `host` (from [`host_label`]) put in.
+    #[must_use]
+    pub fn friendly_name(&self, host: &str) -> String {
+        expand(&self.name, host)
+    }
+
+    /// The video item's title with `host` put in.
+    #[must_use]
+    pub fn item_title(&self, host: &str) -> String {
+        expand(&self.title, host)
+    }
+
     /// The encoder knobs.
     #[must_use]
     pub fn encode_settings(&self) -> Settings {
@@ -306,6 +334,52 @@ impl Config {
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.interface_addr, self.listen.port())
     }
+}
+
+/// 1..=64 printable characters, no surrounding space, and `{`/`}` only
+/// as `{host}`.
+fn valid_template(text: &str) -> bool {
+    let chars = text.chars().count();
+    chars > 0
+        && chars <= MAX_NAME_CHARS
+        && !text.chars().any(char::is_control)
+        && text.trim() == text
+        && !text.replace(HOST_PLACEHOLDER, "").contains(['{', '}'])
+}
+
+/// `template` with every `{host}` replaced, cut to 64 characters.
+#[must_use]
+pub fn expand(template: &str, host: &str) -> String {
+    let text = template.replace(HOST_PLACEHOLDER, host);
+    let cut: String = text.chars().take(MAX_NAME_CHARS).collect();
+    cut.trim_end().to_owned()
+}
+
+/// The name put into `{host}`: the first label of `nodename` (the kernel
+/// host name), only ASCII letters, digits, `-` and `_` kept, at most 32
+/// characters. When that leaves nothing, `host-` and the first 8 hex
+/// digits of the UDN (a hash, not the machine id), still one per host.
+#[must_use]
+pub fn host_label(nodename: &[u8], udn: &str) -> String {
+    let first = nodename.split(|b| *b == b'.').next().unwrap_or_default();
+    let label: String = first
+        .iter()
+        .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+        .take(MAX_HOST_CHARS)
+        .map(|b| char::from(*b))
+        .collect();
+    // "(none)" is the kernel's name for an unnamed host.
+    if !label.is_empty() && first != b"(none)" {
+        return label;
+    }
+    let hex: String = udn
+        .strip_prefix("uuid:")
+        .unwrap_or(udn)
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    format!("host-{hex}")
 }
 
 fn interface_addr(text: Option<&str>, listen: Ipv4Addr) -> Result<Ipv4Addr, ConfigError> {

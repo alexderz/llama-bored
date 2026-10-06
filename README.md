@@ -670,8 +670,20 @@ nothing. The installer installs it but never enables it.
    sudo firewall-cmd --reload
    ```
 
-5. On the TV, open Roku Media Player, choose **llama-bored**, then
-   **llama-bored live**.
+5. On the TV, open Roku Media Player, choose **llama-bored (HOST)**, then
+   **tty11 on HOST**, HOST being this machine's host name.
+
+The TV lists each server by its name, so the default `name` carries the
+host name: two servers, or one and a stale entry the TV kept for it, are
+told apart (#21). `name` and `title` (the video's title) in `cast.toml`
+replace `{host}` with the host name's first label (letters, digits, `-`
+and `_`, at most 32 characters); without `{host}` they are used as
+written. A `cast.toml` from an earlier release that sets `name = "llama-bored"`
+keeps that name; change it to `"llama-bored ({host})"` or remove the line.
+The device id the TV keys an entry on is a hash of `/etc/machine-id`:
+stable on this host and different on another, and it does not reveal the
+machine id. llama-cast says goodbye over SSDP when it starts and twice
+when it stops, so a TV drops an old entry sooner.
 
 ## Troubleshooting
 

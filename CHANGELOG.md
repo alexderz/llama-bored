@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- llama-cast servers are told apart in the TV's list (#21). The friendly name defaults to `llama-bored ({host})` and the video's title to `tty11 on {host}`; `{host}` is the kernel host name (`uname(2)`, no file read): its first label, letters, digits, `-` and `_` only, at most 32 characters, else `host-` and 8 hex digits of the UDN hash. New `cast.toml` key `title`; `name` and `title` are 1..=64 printable characters with braces only in `{host}`, and the expanded text is cut to 64. A `cast.toml` that sets `name = "llama-bored"` keeps that exact name. The UDN stays the SHA-256 hash of `/etc/machine-id` (stable per host, not the id). SSDP: one `ssdp:byebye` round at start, so a TV drops an entry cached from before a restart, and two rounds 100 ms apart on stop (`llama-cast bye`, the unit's `ExecStop=`). `llama-cast check` prints the friendly name and title it would use
+
 ### Fixed
 
 - llama-cast starts much sooner on a Roku (#20). A still dashboard encoded to about 70 kbit/s (2 fps in, `-tune stillimage`, quality-based x264, B-frames and lookahead), so Roku Media Player, which waits for a fixed amount of data before it plays, sat at its loading percentage for tens of seconds. The stream is now constant bitrate with filler (`bitrate_kbps`, default 4000; `nal-hrd=cbr`), each new viewer gets `preroll_s` (default 3) seconds of the first frame at once before frames are paced, and x264 runs `stillimage,zerolatency` with no B-frames and a `keyframe_s` (default 1) keyframe interval; ffmpeg flushes packets as muxed and repeats PAT/PMT every 100 ms. Each viewer's stream already began with PAT, PMT and an IDR (one ffmpeg per viewer); a test now checks it. The stream response also sends `contentFeatures.dlna.org` with the item's profile, `DLNA.ORG_OP=00` and flags. New `cast.toml` keys `bitrate_kbps` (0 or 500..=20000), `keyframe_s` (1..=10) and `preroll_s` (0..=10); an existing `cast.toml` gets the defaults. S18's pinned argument vector is the new one, still built only from validated numbers

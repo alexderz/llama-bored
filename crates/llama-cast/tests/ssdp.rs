@@ -273,3 +273,13 @@ fn discovery_loop_ignores_peers_outside_the_allowlist() {
     stop.store(true, Ordering::SeqCst);
     join.join().unwrap().unwrap();
 }
+
+/// #21: byebye on stop is repeated, as datagrams get lost.
+#[test]
+fn byebye_is_sent_more_than_once() {
+    const { assert!(discovery::BYEBYE_ROUNDS >= 2) };
+    assert!(
+        discovery::BYEBYE_GAP < Duration::from_secs(1),
+        "fits TimeoutStopSec"
+    );
+}

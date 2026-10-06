@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 llama-core = { path = "../llama-core" }
-rustix = { workspace = true, features = ["event", "fs", "net", "time"] }
+rustix = { workspace = true, features = ["event", "fs", "net", "system", "time"] }
 sd-notify = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

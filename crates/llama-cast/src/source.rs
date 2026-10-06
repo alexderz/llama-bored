@@ -1,6 +1,7 @@
 //! Every file llama-cast reads besides its config: the tty11 screen, the
 //! console font, and the machine id (hashed into the UDN). Each is opened
 //! read-only, `O_NOFOLLOW | O_NOCTTY | O_CLOEXEC`, and read with a size cap.
+//! Also the host name, from `uname(2)` (no file), for the friendly name.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -67,6 +68,13 @@ pub fn machine_udn(path: &Path) -> io::Result<String> {
         ));
     }
     Ok(crate::ssdp::udn_from_machine_id(&text))
+}
+
+/// The kernel's host name (`uname(2)` nodename), raw. The caller keeps
+/// only a sanitised first label of it (`config::host_label`).
+#[must_use]
+pub fn nodename() -> Vec<u8> {
+    rustix::system::uname().nodename().to_bytes().to_vec()
 }
 
 /// Produces one RGB24 frame per call.

@@ -9,8 +9,8 @@
 //! It is one of two processes in this workspace with a listening socket
 //! (llama-metrics is the other). It binds one TCP listener and one UDP
 //! socket on port 1900, checks a CIDR allowlist in process before reading a
-//! byte, reads only its config, `/dev/vcsa11`, the font and
-//! `/etc/machine-id`, writes no file, opens no other device, dials nothing,
+//! byte, reads only its config, `/dev/vcsa11`, the font,
+//! `/etc/machine-id` and the host name (`uname(2)`), writes no file, opens no other device, dials nothing,
 //! and spawns only ffmpeg. S18 (`tests/s18_cast_scan.rs`) fences the source.
 
 #![forbid(unsafe_code)]
