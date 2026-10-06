@@ -2345,10 +2345,11 @@ fn paint_request_headers(grid: &mut Grid, row: u16, plan: &Plan) {
 
 /// Clock digits from an activity timestamp, to the second.
 ///
-/// `2026-09-25T15:57:08Z` becomes `09-25 15:57:08`, or the year form when
-/// `full` is set. The digits are the timestamp's own clock. The header clock
-/// is the same UTC civil time, and this crate has no zone database. A value
-/// that is not a timestamp is returned sanitised and unchanged.
+/// The service hands RECENT `YYYY-MM-DD HH:MM:SS` already in the host's
+/// zone, like the header clock (#48); that becomes `09-25 15:57:08`, or the
+/// year form when `full` is set. A timestamp the service could not convert
+/// keeps its own digits, and a value that is not a timestamp is returned
+/// sanitised and unchanged.
 fn format_request_time(raw: &str, full: bool) -> String {
     let clean = one_line(raw);
     let Some(clock) = parse_clock(&clean) else {
