@@ -294,14 +294,50 @@ impl Notifier for SdNotify {
     }
 }
 
-/// Always continues. Production relies on the default SIGTERM/SIGINT action;
-/// systemd treats death-by-SIGTERM as a clean stop and `ExecStopPost` restores
-/// stock (T15). Tests inject a different [`Stop`].
+/// Always continues. Tests and callers without a stop flag use it.
+/// SIGTERM keeps its default action: `unsafe` is forbidden and no signal crate
+/// is pinned. Production `run` uses [`StopFlag`] instead.
 pub struct NeverStop;
 
 impl Stop for NeverStop {
     fn requested(&self) -> bool {
         false
+    }
+}
+
+/// Stop request file the unit's `ExecStop=` creates (GitHub #59).
+///
+/// `systemctl stop` / `try-restart` first touches this file, then waits for
+/// the writer to exit, and only then sends SIGTERM. The loop reads it at the
+/// top of every tick, between uploads (an upload runs to its end inside one
+/// tick), so a requested stop never cuts an upload between `WriteStart` and
+/// `WriteEnd`; a SIGTERM in the middle of one left the Kraken refusing
+/// `DeleteBucket` for over a minute. systemd
+/// creates `/run/kraken-lcd` (`RuntimeDirectory=`) empty at each start and
+/// removes it at stop, so the writer itself never creates or removes it.
+pub const STOP_FLAG: &str = "/run/kraken-lcd/stop";
+
+/// [`Stop`] that is requested while a file exists. Read-only: one
+/// `symlink_metadata` per check, nothing is created or removed.
+pub struct StopFlag {
+    path: PathBuf,
+}
+
+impl StopFlag {
+    /// Watch `path`. Production passes [`STOP_FLAG`].
+    #[must_use]
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Stop for StopFlag {
+    /// Only a file that is there asks for a stop. Any other answer keeps the
+    /// writer running; SIGTERM after `ExecStop=` stays the backstop.
+    fn requested(&self) -> bool {
+        self.path.symlink_metadata().is_ok()
     }
 }
 
@@ -340,7 +376,7 @@ pub struct LoopInput<'a, Samp, Clk, Ntf, Stp, Lg, Op> {
     pub clock: Clk,
     /// sd-notify.
     pub notify: Ntf,
-    /// Injected stop for tests. Production uses [`NeverStop`].
+    /// Stop request. Production uses [`StopFlag`]; tests inject their own.
     pub stop: Stp,
     /// Log sink.
     pub log: Lg,
@@ -416,7 +452,10 @@ where
     let mut last_mono: Option<Instant> = None;
 
     loop {
+        // Checked here, between ticks, so no upload is in flight when the
+        // loop leaves (GitHub #59). Dropping the sink closes both ports.
         if input.stop.requested() {
+            info(&mut input.log, "stop requested; no upload in flight");
             input.notify.stopping();
             return LoopExit::Stopped;
         }
@@ -1060,7 +1099,7 @@ pub fn run(config_path: &Path, trace_hid: bool) -> i32 {
         sampler: &mut reader,
         clock: &mut clock,
         notify: &mut notify,
-        stop: NeverStop,
+        stop: StopFlag::new(Path::new(STOP_FLAG)),
         log: log::Stderr,
         open: || KrakenLcd::connect(rotate, trace_hid),
         assets: &mut assets,
