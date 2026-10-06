@@ -716,6 +716,7 @@ User=kraken-lcd
 Group=kraken-lcd
 SupplementaryGroups=llama-watch
 ExecStart=/usr/local/libexec/llama-bored/kraken-lcd run --config /etc/llama-bored/config.toml
+ExecStop=-/usr/bin/sh -c '/usr/bin/touch /run/kraken-lcd/stop && exec /usr/bin/timeout 5 /usr/bin/tail --pid=${MAINPID} -f /dev/null'
 ExecStopPost=-/usr/local/libexec/llama-bored/kraken-lcd restore-stock --config /etc/llama-bored/config.toml
 Restart=on-failure
 RestartPreventExitStatus=2
@@ -725,6 +726,8 @@ TimeoutStopSec=15
 UMask=0077
 StateDirectory=kraken-lcd
 StateDirectoryMode=0755
+RuntimeDirectory=kraken-lcd
+RuntimeDirectoryMode=0700
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

@@ -10,6 +10,12 @@ User=kraken-lcd
 Group=kraken-lcd
 SupplementaryGroups=llama-watch
 ExecStart=/usr/local/libexec/llama-bored/kraken-lcd run --config /etc/llama-bored/config.toml
+# GitHub #59: a stop asks the writer to leave between uploads, then waits
+# up to 5 s for it, and only then does systemd send SIGTERM. A SIGTERM in the
+# middle of an upload left the Kraken refusing uploads for over a minute.
+# The writer only reads the flag; RuntimeDirectory= is created empty at start
+# and removed at stop. `-`: if this fails, SIGTERM still stops the writer.
+ExecStop=-/usr/bin/sh -c '/usr/bin/touch /run/kraken-lcd/stop && exec /usr/bin/timeout 5 /usr/bin/tail --pid=${MAINPID} -f /dev/null'
 ExecStopPost=-/usr/local/libexec/llama-bored/kraken-lcd restore-stock --config /etc/llama-bored/config.toml
 Restart=on-failure
 # Exit 2 is Fence or Fatal and must not restart. RestartSec tracks
@@ -22,6 +28,8 @@ TimeoutStopSec=15
 UMask=0077
 StateDirectory=kraken-lcd
 StateDirectoryMode=0755
+RuntimeDirectory=kraken-lcd
+RuntimeDirectoryMode=0700
 
 # --- privilege
 NoNewPrivileges=yes
