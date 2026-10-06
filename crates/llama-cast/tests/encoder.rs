@@ -7,7 +7,7 @@ mod common;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::fixture;
@@ -61,6 +61,10 @@ fn start_retry(
     }
     Encoder::start(path, settings, source)
 }
+
+/// The real-ffmpeg tests run one at a time: in parallel they compete for
+/// the CPU, and the pre-roll test's wall-clock bound fails (#64).
+static REAL_FFMPEG: Mutex<()> = Mutex::new(());
 
 fn read_n(enc: &mut Encoder, n: usize, budget: Duration) -> Vec<u8> {
     let start = Instant::now();
@@ -181,6 +185,7 @@ fn a_missing_encoder_is_an_error() {
 
 #[test]
 fn real_ffmpeg_encodes_mpeg_ts_when_installed() {
+    let _serial = REAL_FFMPEG.lock().unwrap_or_else(|e| e.into_inner());
     let ffmpeg = Path::new("/usr/bin/ffmpeg");
     if !ffmpeg.exists() {
         eprintln!("SKIP: /usr/bin/ffmpeg is not installed");
@@ -283,6 +288,7 @@ fn nal_types(es: &[u8]) -> Vec<u8> {
 /// than real time at the configured bitrate.
 #[test]
 fn real_ffmpeg_starts_at_an_idr_and_bursts_the_preroll() {
+    let _serial = REAL_FFMPEG.lock().unwrap_or_else(|e| e.into_inner());
     let ffmpeg = Path::new("/usr/bin/ffmpeg");
     if !ffmpeg.exists() {
         eprintln!("SKIP: /usr/bin/ffmpeg is not installed");
