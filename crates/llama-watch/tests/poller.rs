@@ -1489,6 +1489,83 @@ fn a_wrapped_llama_server_is_found_by_its_metrics_and_gets_slots() {
     );
 }
 
+/// #67: a llama.cpp image started by digest (values invented). Its flags
+/// follow the image, and are read once `/metrics` says llama.cpp, or at
+/// once when `[llama.backends]` names it.
+const LCPP_IMAGE_CMD: &str = "podman run --name lcpp-a --rm --network llama --device nvidia.com/gpu=all --security-opt label=disable --cap-drop ALL -v /srv/models:/models:ro ghcr.io/example/llama.cpp@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --host 0.0.0.0 --port 5850 -fa on --metrics -m /models/invented/Invented-30B-A3B-IQ4_XS.gguf -ngl 999 -ncmoe 39 -c 262144 -ctk f16 -ctv f16 --reasoning-budget 26000";
+
+fn lcpp_detail_is_read(view: &LlamaView) -> bool {
+    view.models.first().is_some_and(|model| {
+        model
+            .backend
+            .is_some_and(|info| info.kind == llama_core::backend::Backend::LlamaCpp)
+            && model.detail.as_ref().is_some_and(|detail| {
+                detail.ctx == Some(262_144)
+                    && detail.ncmoe == Some(39)
+                    && detail.kv_k.as_deref() == Some("f16")
+                    && detail.kv_v.as_deref() == Some("f16")
+                    && detail.quant.as_deref() == Some("IQ4_XS")
+            })
+    })
+}
+
+#[test]
+fn a_llamacpp_image_gets_its_flags_once_its_metrics_say_llamacpp() {
+    let mut world = World::running(running_cmd("lcpp", LCPP_IMAGE_CMD));
+    world
+        .metrics
+        .insert("lcpp".to_owned(), metrics_body(10, 0.0));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        lcpp_detail_is_read(view)
+    });
+    // The probe's answer re-reads `/running` at once, in the same round
+    // as its metrics read, rather than one `/running` interval later.
+    let hits = server.hits();
+    assert_eq!(
+        hits[..5],
+        [
+            "/running",
+            "/upstream/lcpp/metrics",
+            "/upstream/lcpp/metrics",
+            "/api/metrics/activity",
+            "/running",
+        ],
+        "{hits:?}"
+    );
+    let setup = &detail.setup[0];
+    assert!(!setup.found.is_empty(), "{setup:?}");
+    let kept = format!("{view:?}{detail:?}");
+    for leak in ["/models", "/srv", "sha256", "5850", "lcpp-a"] {
+        assert!(!kept.contains(leak), "{leak} leaked");
+    }
+}
+
+#[test]
+fn a_llamacpp_image_named_in_the_config_gets_its_flags_at_once() {
+    let mut world = World::running(running_cmd("lcpp", LCPP_IMAGE_CMD));
+    world
+        .metrics
+        .insert("lcpp".to_owned(), metrics_body(10, 0.0));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(
+        server.port,
+        12,
+        4_194_304,
+        0.15,
+        "[llama.backends]\n\"lcpp\" = \"llamacpp\"\n",
+    );
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        !view.models.is_empty()
+    });
+    assert!(lcpp_detail_is_read(&view), "{:?}", view.models);
+}
+
 #[test]
 fn a_wrapped_sglang_is_found_by_its_metrics() {
     let mut world = World::running(running_cmd("flash", "/opt/bin/start-flash.sh"));

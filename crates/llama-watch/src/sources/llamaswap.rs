@@ -80,8 +80,12 @@ pub fn new_agent() -> ureq::Agent {
 /// `GET {url}/running` on `agent` and classify that one body.
 ///
 /// `aliases` is keyed by the raw `model` field. `rules` are the `[setup]`
-/// rules read from each launch command (#52). `timeout` is the deadline for
-/// this call. Display names go through [`sanitize_wire`](llama_core::names::sanitize_wire).
+/// rules read from each launch command (#52). `known` is each model's
+/// server as `[llama.backends]` or the `/metrics` probe gave it, keyed by
+/// the raw `model` field: a command that names no server has that
+/// server's flags read after its container image (#67). `timeout` is the
+/// deadline for this call. Display names go through
+/// [`sanitize_wire`](llama_core::names::sanitize_wire).
 /// Does not log. On failure, [`RunningStatus::Down`] carries one of
 /// `"timeout"`, `"connection refused"`, `"request failed"`, `"http status"`,
 /// `"oversized body"`, or `"malformed json"`. Invalid UTF-8 in the body is
@@ -93,6 +97,7 @@ pub fn read_with(
     timeout: Duration,
     aliases: &HashMap<String, String>,
     rules: &Rules,
+    known: &HashMap<String, Backend>,
 ) -> Reading {
     let endpoint = running_endpoint(url);
     let mut response = match agent
@@ -123,7 +128,7 @@ pub fn read_with(
         Err(err) => return down_reading(body_reason(&err)),
     };
 
-    match parse_running(&bytes, aliases, rules) {
+    match parse_running(&bytes, aliases, rules, known) {
         Ok(reading) => reading,
         Err(()) => down_reading("malformed json"),
     }
@@ -174,6 +179,7 @@ fn parse_running(
     bytes: &[u8],
     aliases: &HashMap<String, String>,
     rules: &Rules,
+    known: &HashMap<String, Backend>,
 ) -> Result<Reading, ()> {
     let parsed: RunningResponse = serde_json::from_slice(bytes).map_err(|_| ())?;
     if parsed.running.is_empty() {
@@ -194,7 +200,14 @@ fn parse_running(
             // read, and dropped with it: only the launch facts and the rule
             // values leave this function.
             let launch = launch_command(value);
-            let parsed = launch.map(super::cmdline::parse_launch).unwrap_or_default();
+            let kind = entry
+                .model
+                .as_deref()
+                .and_then(|model| known.get(model))
+                .copied();
+            let parsed = launch
+                .map(|cmd| super::cmdline::parse_launch_as(cmd, kind))
+                .unwrap_or_default();
             RunningModel {
                 id: entry.model.clone().unwrap_or_default(),
                 name: display_name(entry, aliases, sanitize_wire),
@@ -204,9 +217,10 @@ fn parse_running(
                 backend: parsed.backend,
                 max_running: parsed.max_running,
                 // The `name` rules (#54) read llama-swap's own `name`.
-                setup: rules.extract_all(
+                setup: rules.extract_as(
                     launch.unwrap_or_default(),
                     entry.name.as_deref().unwrap_or_default(),
+                    kind,
                 ),
             }
         })
@@ -282,7 +296,7 @@ mod tests {
 
     /// The built-in `[setup]` rules, as a default watch.toml has them.
     fn parse_with_builtin(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Reading, ()> {
-        parse_running(bytes, aliases, &Rules::builtin())
+        parse_running(bytes, aliases, &Rules::builtin(), &HashMap::new())
     }
 
     #[test]

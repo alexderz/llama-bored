@@ -9,9 +9,15 @@
 //! The server is told by its entry point (T72): a `llama-server` binary under
 //! any path, `sglang.launch_server` / `sglang serve`, `vllm serve` /
 //! `vllm.entrypoints`, Strata's `serve/server.py` (see [`strata_at`]), else
-//! any OpenAI-compatible server. SGLang and vLLM flags are read only after
-//! the entry point, so a `podman run ...` wrapper in front cannot lend its
-//! own flags.
+//! any OpenAI-compatible server. A server's flags are read only after its
+//! entry point, so a `podman run ...` wrapper in front cannot lend its own
+//! flags.
+//!
+//! A container started by image (`podman run … <image> --flags`) names no
+//! entry point. Once its server is known from elsewhere (`[llama.backends]`
+//! or the `/metrics` probe, #31), that server's flags are read after the
+//! image reference ([`container_flags`], #67), or from the whole command
+//! when no image is found.
 
 use llama_core::backend::Backend;
 use llama_core::detail::{MAX_TOKEN_CHARS, ModelDetail, NCMOE_ALL, is_token};
@@ -34,30 +40,50 @@ pub struct Launch {
 /// Detect the server, then read its flags.
 #[must_use]
 pub fn parse_launch(cmd: &str) -> Launch {
+    parse_launch_as(cmd, None)
+}
+
+/// [`parse_launch`] with the server already `known` from `[llama.backends]`
+/// or the `/metrics` probe (#67). [`Launch::backend`] stays what the
+/// command itself names; the flags are read as the known server's. For a
+/// command that names no server, they are read after the container image
+/// ([`container_flags`]), else from the whole command.
+#[must_use]
+pub fn parse_launch_as(cmd: &str, known: Option<Backend>) -> Launch {
     let args: Vec<&str> = cmd.split_whitespace().collect();
-    match detect(&args) {
-        (Backend::LlamaCpp, _) => Launch {
-            backend: Backend::LlamaCpp,
-            detail: Some(parse(cmd)),
-            max_running: None,
-        },
+    let (named, entry) = detect(&args);
+    let reader = known
+        .filter(|kind| *kind != Backend::OpenAi)
+        .unwrap_or(named);
+    let start = if named == Backend::OpenAi {
+        container_flags(&args).unwrap_or(0)
+    } else {
+        entry
+    };
+    let (detail, max_running) = read_flags(reader, &args[start..]);
+    Launch {
+        backend: named,
+        detail,
+        max_running,
+    }
+}
+
+/// `reader`'s flags in `args`, the arguments after its entry point or image.
+fn read_flags(reader: Backend, args: &[&str]) -> (Option<ModelDetail>, Option<u16>) {
+    match reader {
+        Backend::LlamaCpp => (Some(parse_args(args)), None),
         // Strata's flags name only a JSON config: ctx and KV come from its
         // `/metrics` (`engine.max_context`, `engine.kv`) once it answers.
-        (Backend::Strata, _) => Launch {
-            backend: Backend::Strata,
-            detail: Some(ModelDetail {
+        Backend::Strata => (
+            Some(ModelDetail {
                 kv_k: Some(KV_AUTO.to_owned()),
                 kv_v: Some(KV_AUTO.to_owned()),
                 ..ModelDetail::default()
             }),
-            max_running: Some(1),
-        },
-        (Backend::OpenAi, _) => Launch {
-            backend: Backend::OpenAi,
-            detail: None,
-            max_running: None,
-        },
-        (backend, start) => server_flags(backend, &args[start..]),
+            Some(1),
+        ),
+        Backend::OpenAi => (None, None),
+        Backend::SgLang | Backend::Vllm => server_flags(reader, args),
     }
 }
 
@@ -66,10 +92,98 @@ pub fn parse_launch(cmd: &str) -> Launch {
 /// SETUP rules read server flags after it and a wrapper's env before it).
 #[must_use]
 pub fn entry_point(args: &[&str]) -> Option<usize> {
+    flags_start(args, None)
+}
+
+/// [`entry_point`], or, for a command that names no server while the
+/// server is `known` (#67), the index of the first argument after the
+/// container image. `None` when neither is found: the whole command is
+/// read.
+#[must_use]
+pub fn flags_start(args: &[&str], known: Option<Backend>) -> Option<usize> {
     match detect(args) {
-        (Backend::OpenAi, _) => None,
+        (Backend::OpenAi, _) => known
+            .filter(|kind| *kind != Backend::OpenAi)
+            .and_then(|_| container_flags(args)),
         (_, start) => Some(start),
     }
+}
+
+/// Long `podman run` / `docker run` options that take no value. Any other
+/// long option without `=` takes the next argument (`--name X`, `-v A:B`,
+/// `--security-opt X`, …): value options are by far the larger set, and a
+/// new one should not turn its value into the image.
+const BOOL_LONG: &[&str] = &[
+    "rm",
+    "detach",
+    "interactive",
+    "tty",
+    "privileged",
+    "init",
+    "read-only",
+    "read-only-tmpfs",
+    "replace",
+    "rmi",
+    "sig-proxy",
+    "oom-kill-disable",
+    "no-healthcheck",
+    "no-hosts",
+    "no-hostname",
+    "publish-all",
+    "quiet",
+    "http-proxy",
+    "env-host",
+    "disable-content-trust",
+    "passwd",
+    "tls-verify",
+    "help",
+];
+
+/// Short options that take no value: `-d -i -t -q -P` (and `-it`, `-dit`).
+const BOOL_SHORT: &[char] = &['d', 'i', 't', 'q', 'P'];
+
+/// The index of the first argument after the image of a `podman run` or
+/// `docker run` (also `… container run`), or `None` when the command has
+/// no such run or no image after its options (#67).
+///
+/// The image is the first word after `run` that is neither an option nor
+/// an option's value, whatever its shape: `name:tag`,
+/// `registry/name@sha256:…`, a bare digest or image id. `--` ends the
+/// options.
+#[must_use]
+pub fn container_flags(args: &[&str]) -> Option<usize> {
+    let engine = args.iter().position(|arg| {
+        let base = arg.rsplit('/').next().unwrap_or(arg);
+        matches!(base, "podman" | "docker")
+    })?;
+    let run = engine + 1 + args[engine + 1..].iter().position(|arg| *arg == "run")?;
+    let mut index = run + 1;
+    while let Some(arg) = args.get(index) {
+        if *arg == "--" {
+            return args.get(index + 1).map(|_| index + 2);
+        }
+        if !arg.starts_with('-') || *arg == "-" {
+            return Some(index + 1);
+        }
+        index += if takes_value(arg) { 2 } else { 1 };
+    }
+    None
+}
+
+/// A `run` option that takes the next argument as its value.
+fn takes_value(arg: &str) -> bool {
+    if let Some(long) = arg.strip_prefix("--") {
+        return !long.contains('=') && !BOOL_LONG.contains(&long);
+    }
+    // A short cluster: booleans, then at most one value option whose value
+    // is the rest of this word (`-eK=V`) or else the next word.
+    let cluster = &arg[1..];
+    for (at, ch) in cluster.char_indices() {
+        if !BOOL_SHORT.contains(&ch) {
+            return at + ch.len_utf8() == cluster.len();
+        }
+    }
+    false
 }
 
 /// The server kind and the index of the first argument after its entry point.
@@ -133,8 +247,9 @@ fn strata_at(args: &[&str], index: usize) -> bool {
     python && !args[before].starts_with('-') && image.starts_with("strata")
 }
 
-/// SGLang or vLLM flags. KV is `auto` unless a dtype is given.
-fn server_flags(backend: Backend, args: &[&str]) -> Launch {
+/// SGLang or vLLM flags and the request cap. KV is `auto` unless a dtype
+/// is given.
+fn server_flags(backend: Backend, args: &[&str]) -> (Option<ModelDetail>, Option<u16>) {
     let (ctx_flag, running_flag) = if backend == Backend::Vllm {
         ("--max-model-len", "--max-num-seqs")
     } else {
@@ -172,18 +287,20 @@ fn server_flags(backend: Backend, args: &[&str]) -> Launch {
     let kv = kv.unwrap_or_else(|| KV_AUTO.to_owned());
     detail.kv_k = Some(kv.clone());
     detail.kv_v = Some(kv);
-    Launch {
-        backend,
-        detail: Some(detail),
-        max_running,
-    }
+    (Some(detail), max_running)
 }
 
 /// Parse the flags this display cares about. Later flags win, as in llama.cpp.
 #[must_use]
 pub fn parse(cmd: &str) -> ModelDetail {
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    parse_args(&args)
+}
+
+/// [`parse`] over words already split.
+fn parse_args(words: &[&str]) -> ModelDetail {
     let mut detail = ModelDetail::default();
-    let mut args = cmd.split_whitespace().peekable();
+    let mut args = words.iter().copied().peekable();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
@@ -562,6 +679,140 @@ mod tests {
                 .ctx,
             None
         );
+    }
+
+    /// #67: a llama.cpp image started by digest, values invented. The
+    /// command names no server; its flags follow the image.
+    const LCPP_IMAGE: &str = "podman run --name lcpp-a --rm --network llama --device nvidia.com/gpu=all --security-opt label=disable --cap-drop ALL --security-opt no-new-privileges -v /srv/models:/models:ro ghcr.io/example/llama.cpp@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --host 0.0.0.0 --port 5850 -fa on --metrics -m /models/invented/Invented-30B-A3B-IQ4_XS.gguf --min-p 0 --chat-template-kwargs '{\"enable_thinking\":true}' -ngl 999 -ncmoe 39 -c 262144 -ctk f16 -ctv f16 -fit off --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --reasoning-budget 26000 -lm none";
+
+    #[test]
+    fn a_known_llamacpp_container_reads_the_flags_after_its_image() {
+        // Unknown: an OpenAI-compatible server, nothing read.
+        let bare = parse_launch(LCPP_IMAGE);
+        assert_eq!(bare.backend, Backend::OpenAi);
+        assert_eq!(bare.detail, None);
+        assert_eq!(
+            parse_launch_as(LCPP_IMAGE, Some(Backend::OpenAi)).detail,
+            None
+        );
+
+        let launch = parse_launch_as(LCPP_IMAGE, Some(Backend::LlamaCpp));
+        assert_eq!(launch.backend, Backend::OpenAi, "the command names none");
+        assert_eq!(launch.max_running, None);
+        let detail = launch.detail.expect("detail");
+        assert_eq!(
+            detail,
+            ModelDetail {
+                ctx: Some(262_144),
+                ncmoe: Some(39),
+                kv_k: Some("f16".to_owned()),
+                kv_v: Some("f16".to_owned()),
+                quant: Some("IQ4_XS".to_owned()),
+                fa: Some(true),
+                kv_block: None,
+                prefix_cache: None,
+            }
+        );
+        let debug = format!("{detail:?}");
+        for leak in ["/models", "/srv", "5850", "sha256", "lcpp-a"] {
+            assert!(!debug.contains(leak), "{leak}: {debug}");
+        }
+    }
+
+    #[test]
+    fn container_flags_find_the_image() {
+        fn at(cmd: &str) -> Option<&str> {
+            let args: Vec<&str> = cmd.split_whitespace().collect();
+            container_flags(&args).map(|index| args.get(index).copied().unwrap_or("<end>"))
+        }
+        let image = LCPP_IMAGE;
+        assert_eq!(at(image), Some("--host"));
+        for (cmd, first) in [
+            // A bare image id or digest, and a registry name with a tag.
+            (
+                "podman run --rm 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef -c 1",
+                Some("-c"),
+            ),
+            ("podman run sha256:0123456789abcdef -c 1", Some("-c")),
+            (
+                "docker run --gpus all registry.example:5000/team/llama.cpp:server-cuda -c 1",
+                Some("-c"),
+            ),
+            ("/usr/bin/podman run -d localhost/llama:b1 -c 1", Some("-c")),
+            ("podman container run --rm img -c 1", Some("-c")),
+            // Value options, spelt every way.
+            (
+                "podman run --name x -v /a:/b -e K=V --network x --device x --security-opt x --shm-size 8g --cap-drop ALL img -c 1",
+                Some("-c"),
+            ),
+            (
+                "podman run --userns=keep-id --network=host --name=x img -c 1",
+                Some("-c"),
+            ),
+            (
+                "podman run -it -eK=V -p8080:80 -w /w -u 1000 img -c 1",
+                Some("-c"),
+            ),
+            ("podman run -dit -v /a:/b img -c 1", Some("-c")),
+            (
+                "docker run --rm --init --read-only --privileged -i -t img -c 1",
+                Some("-c"),
+            ),
+            ("podman --log-level debug run --rm img -c 1", Some("-c")),
+            ("podman run --rm -- img -c 1", Some("-c")),
+            // The image is the last word: no flags after it.
+            ("podman run --rm img", Some("<end>")),
+            // No run, or no image after the options.
+            ("podman run --rm --name x", None),
+            ("podman run --rm --", None),
+            ("podman ps", None),
+            ("llama-server -c 1", None),
+            ("", None),
+        ] {
+            assert_eq!(at(cmd), first, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn known_servers_read_after_the_image_or_the_whole_command() {
+        let known = |cmd: &str, kind| parse_launch_as(cmd, Some(kind));
+        // The wrapper's own options lend nothing: `-c 2` is podman's.
+        let lcpp = known(
+            "podman run -c 2 -m 8g img -c 4096 -m /m/x-Q8_0.gguf",
+            Backend::LlamaCpp,
+        );
+        let detail = lcpp.detail.expect("detail");
+        assert_eq!(detail.ctx, Some(4096));
+        assert_eq!(detail.quant.as_deref(), Some("Q8_0"));
+        // No image found: the whole command, as before.
+        let script = known("/opt/bin/start.sh -c 8192", Backend::LlamaCpp);
+        assert_eq!(script.detail.expect("detail").ctx, Some(8192));
+        // vLLM's official image runs `vllm serve` itself.
+        let vllm = known(
+            "podman run --name v --max-model-len 7 example/vllm-openai:v1 --model /m/x --max-model-len 32768 --max-num-seqs 4",
+            Backend::Vllm,
+        );
+        assert_eq!(vllm.max_running, Some(4));
+        assert_eq!(vllm.detail.expect("detail").ctx, Some(32_768));
+        let sglang = known(
+            "docker run example/sglang:v1 --context-length 65536",
+            Backend::SgLang,
+        );
+        assert_eq!(sglang.detail.expect("detail").ctx, Some(65_536));
+        let strata = known(STRATA_PODMAN, Backend::Strata);
+        assert_eq!(strata.max_running, Some(1));
+        // A command that names its server keeps reading after the entry
+        // point; a llama-server in a container skips the wrapper's flags.
+        let named = parse_launch("podman run -c 2 img llama-server -c 1024");
+        assert_eq!(named.backend, Backend::LlamaCpp);
+        assert_eq!(named.detail.expect("detail").ctx, Some(1024));
+        // Hostile values stay out whichever way the flags are found.
+        let bad = known(
+            "podman run img -ctk ../x -c -5 -m /a/evil.bin",
+            Backend::LlamaCpp,
+        );
+        let detail = bad.detail.expect("detail");
+        assert_eq!((detail.kv_k, detail.ctx, detail.quant), (None, None, None));
     }
 
     #[test]

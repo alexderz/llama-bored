@@ -239,7 +239,11 @@ once while it is loaded and recognises the server by its metric names
 (`vllm:`, `sglang:`, `llamacpp:`), or Strata by the shape of its JSON (an
 object whose `engine` and `live` members are objects). It only ever reads models llama-swap
 reports as `ready`, so it never makes llama-swap load one.
-`[llama.backends]` overrides the detection.
+`[llama.backends]` overrides the detection. Once the server is known either
+way, its flags are read from the arguments after the image of a
+`podman run` / `docker run` command (the whole command when no image is
+found), so a llama.cpp image started by digest still gets its ctx, KV,
+`-ncmoe` and quant in SETUP and on the exporter (#67).
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
 controller are optional; missing sources show "—".
@@ -510,9 +514,11 @@ order = 40                # rows sort by their lowest order, items by theirs
 ```
 
 Sources: `flag:-c,--ctx-size` (`--flag V`, `--flag=V`; the last one wins;
-for a server, only after its entry point), `env:NAME` (`-e NAME=V`,
+for a server, only after its entry point, or after the container image
+when the command names no server but the engine is known from
+`[llama.backends]` or the `/metrics` probe, #67), `env:NAME` (`-e NAME=V`,
 `--env NAME=V`, `--env=NAME=V` or `NAME=V` in the wrapper before the
-entry point, or anywhere when the command names no server),
+entry point or that image, or anywhere when neither is found),
 `json:--speculative-config:num_speculative_tokens` (a key of a JSON
 object given to a flag, one level deep), `live:NAME` (`engine`, `ctx`,
 `kv_dtype`, `kv_block`, `prefix_cache`, `spec_accept`, `spec_len`,
