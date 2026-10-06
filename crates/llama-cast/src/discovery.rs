@@ -4,8 +4,10 @@
 //! - M-SEARCH from a peer in the allowlist is answered by unicast to that
 //!   peer; anything else (another sender, NOTIFY, junk, an oversize
 //!   datagram) is dropped unanswered.
-//! - NOTIFY ssdp:alive goes to the group at start and every 30 s, and
-//!   ssdp:byebye when `stop` is set.
+//! - At start one NOTIFY ssdp:byebye round goes to the group, so a TV drops
+//!   an entry it cached from before a restart (#21), then ssdp:alive, again
+//!   every 30 s; ssdp:byebye again when `stop` is set. Byebye on stop is
+//!   sent twice, as datagrams get lost.
 //! - Answers are rate-capped, so an allowed host cannot use the server as
 //!   a datagram amplifier.
 //!
@@ -23,6 +25,10 @@ use crate::ssdp::{self, GROUP, MAX_DATAGRAM, NOTIFY_INTERVAL_S, PORT};
 
 /// Most answer datagrams sent in one second.
 pub const MAX_REPLIES_PER_S: u32 = 32;
+/// ssdp:byebye rounds sent on stop (`bye`, the unit's `ExecStop=`).
+pub const BYEBYE_ROUNDS: u32 = 2;
+/// Pause between byebye rounds.
+pub const BYEBYE_GAP: Duration = Duration::from_millis(100);
 
 /// What discovery advertises.
 #[derive(Clone, Debug)]
@@ -91,10 +97,20 @@ pub fn announce(socket: &UdpSocket, advert: &Advert) {
 }
 
 /// Send one NOTIFY ssdp:byebye round.
-pub fn byebye(socket: &UdpSocket, udn: &str) {
+pub fn byebye_round(socket: &UdpSocket, udn: &str) {
     for target in ssdp::targets(udn) {
         let text = ssdp::notify_byebye(udn, &target);
         let _ = socket.send_to(text.as_bytes(), group());
+    }
+}
+
+/// Send [`BYEBYE_ROUNDS`] ssdp:byebye rounds, [`BYEBYE_GAP`] apart.
+pub fn byebye(socket: &UdpSocket, udn: &str) {
+    for round in 0..BYEBYE_ROUNDS {
+        if round > 0 {
+            std::thread::sleep(BYEBYE_GAP);
+        }
+        byebye_round(socket, udn);
     }
 }
 
@@ -102,6 +118,7 @@ pub fn byebye(socket: &UdpSocket, udn: &str) {
 pub fn run(socket: &UdpSocket, advert: &Advert, stop: &Arc<AtomicBool>) -> io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
     let interval = Duration::from_secs(NOTIFY_INTERVAL_S);
+    byebye_round(socket, &advert.udn);
     announce(socket, advert);
     let mut last = Instant::now();
     let mut budget = ReplyBudget::new(last);

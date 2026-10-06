@@ -5,7 +5,7 @@ mod common;
 use std::net::Ipv4Addr;
 
 use llama_cast::acl::CidrError;
-use llama_cast::config::{Config, ConfigError, Font, Palette};
+use llama_cast::config::{Config, ConfigError, Font, Palette, expand, host_label};
 use llama_cast::encoder::Settings;
 use llama_cast::service::{Command, parse_args};
 
@@ -14,6 +14,7 @@ listen = "0.0.0.0:19478"
 allow = ["192.168.1.0/24", "127.0.0.1/32"]
 interface_addr = "192.168.1.20"
 name = "llama-bored"
+title = "llama-bored live"
 fps = 2
 max_clients = 2
 bitrate_kbps = 4000
@@ -50,7 +51,11 @@ fn defaults_fill_everything_but_listen_and_allow() {
         .unwrap();
     // interface_addr defaults to the listen address.
     assert_eq!(cfg.interface_addr, Ipv4Addr::new(192, 168, 1, 20));
-    assert_eq!(cfg.name, "llama-bored");
+    // #21: the host name tells servers apart in the TV's list.
+    assert_eq!(cfg.name, "llama-bored ({host})");
+    assert_eq!(cfg.title, "tty11 on {host}");
+    assert_eq!(cfg.friendly_name("box1"), "llama-bored (box1)");
+    assert_eq!(cfg.item_title("box1"), "tty11 on box1");
     assert_eq!(cfg.fps, 2);
     assert_eq!(cfg.max_clients, 2);
     assert_eq!(
@@ -251,6 +256,63 @@ fn name_fps_clients_font_and_ffmpeg_bounds() {
         );
     }
     assert!(with("\"/usr/bin/ffmpeg\"", "\"/opt/ffmpeg/bin/ffmpeg\"").is_ok());
+}
+
+/// #21: `name` and `title` are templates; `{host}` is the only placeholder.
+#[test]
+fn name_and_title_templates() {
+    let cfg = with("\"llama-bored live\"", "\"{host}: dashboard\"").unwrap();
+    assert_eq!(cfg.item_title("box1"), "box1: dashboard");
+    assert_eq!(
+        cfg.friendly_name("box1"),
+        "llama-bored",
+        "no placeholder, kept"
+    );
+    let cfg = with("\"llama-bored\"", "\"AI box {host} / {host}\"").unwrap();
+    assert_eq!(cfg.friendly_name("box1"), "AI box box1 / box1");
+    for bad in [
+        "\"{hostname}\"",
+        "\"a {} b\"",
+        "\"{host\"",
+        "\"x}\"",
+        "\"\"",
+        "\" x\"",
+    ] {
+        assert!(
+            matches!(with("\"llama-bored live\"", bad), Err(ConfigError::Title)),
+            "{bad}"
+        );
+        assert!(
+            matches!(with("\"llama-bored\"", bad), Err(ConfigError::Name)),
+            "{bad}"
+        );
+    }
+    // The expanded text is cut to 64 characters, never left with an
+    // edge space.
+    let long = "h".repeat(32);
+    let name = expand(&format!("{} {{host}}", "n".repeat(40)), &long);
+    assert_eq!(name.chars().count(), 64);
+    assert_eq!(
+        expand(&format!("{} {{host}}", "n".repeat(63)), "box1"),
+        "n".repeat(63)
+    );
+}
+
+/// #21: what goes into `{host}`: the first label of the kernel host name,
+/// letters, digits, `-` and `_` only, at most 32; else a label from the
+/// UDN hash (never the machine id).
+#[test]
+fn host_label_is_sanitised_and_capped() {
+    let udn = common::UDN;
+    assert_eq!(host_label(b"box1", udn), "box1");
+    assert_eq!(host_label(b"box1.example.lan", udn), "box1");
+    assert_eq!(host_label(b"my_box-2", udn), "my_box-2");
+    assert_eq!(host_label(b"b\x1b[2Jox<x>", udn), "b2Joxx");
+    assert_eq!(host_label("t\u{e9}l\u{e9}".as_bytes(), udn), "tl");
+    assert_eq!(host_label(&[b'a'; 80], udn), "a".repeat(32));
+    for empty in [&b""[..], b"(none)", b".lan", b"\xff\xfe"] {
+        assert_eq!(host_label(empty, udn), "host-5a1e0c2d", "{empty:?}");
+    }
 }
 
 /// #20: the stream knobs.

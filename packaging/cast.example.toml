@@ -10,8 +10,8 @@
 # (hashed into the device id) and this file. It opens no other device,
 # writes no file, dials nothing, and runs only `ffmpeg` (one per viewer).
 #
-# On the TV (Roku Media Player): Media type Video -> "llama-bored" ->
-# "llama-bored live".
+# On the TV (Roku Media Player): Media type Video -> "llama-bored (HOST)" ->
+# "tty11 on HOST", HOST being this machine's host name.
 
 # IPv4:PORT for the HTTP server (descriptions, control, the stream).
 # 19478 sits next to llama-metrics' 19477. Changing it needs a unit drop-in
@@ -33,8 +33,15 @@ allow = ["192.168.0.0/16", "127.0.0.1/32"]
 # CHANGE THIS to the address the TVs can reach.
 interface_addr = "192.168.1.20"
 
-# The server name the TV lists. 1..=64 printable characters.
-name = "llama-bored"
+# The server name the TV lists, and the title of its one video. 1..=64
+# printable characters each. {host} is replaced by this machine's host name
+# (its first label, letters, digits, - and _ only, at most 32 characters),
+# so two servers, or a server and a TV's stale entry for it, are told apart
+# in the list (#21). Without {host} the text is used as written. The device
+# id the TV keys the entry on is a hash of /etc/machine-id: stable for this
+# host, different on another.
+name = "llama-bored ({host})"
+title = "tty11 on {host}"
 
 # Frames rendered from tty11 per second, 1..=5. ffmpeg repeats them to
 # 10 fps; each viewer costs one ffmpeg (roughly a fifth of a core at 2).

@@ -77,13 +77,16 @@ fn description_golden() {
 }
 
 #[test]
-fn friendly_name_is_escaped() {
+fn friendly_name_and_title_are_escaped() {
     let mut dev = device();
     dev.name = "Den <tty11> & \"co\"".to_owned();
+    dev.title = "tty11 <on> 'box'".to_owned();
     let desc = dlna::description(&dev);
     assert!(desc.contains("<friendlyName>Den &lt;tty11&gt; &amp; &quot;co&quot;</friendlyName>"));
     let item = dlna::item(&dev);
-    assert!(item.contains("<dc:title>Den &lt;tty11&gt; &amp; &quot;co&quot; live</dc:title>"));
+    assert!(item.contains("<dc:title>tty11 &lt;on&gt; &apos;box&apos;</dc:title>"));
+    // #21: the root container is the server name; the item has its title.
+    assert!(dlna::root_container(&dev).contains("<dc:title>Den &lt;tty11&gt;"));
 }
 
 #[test]

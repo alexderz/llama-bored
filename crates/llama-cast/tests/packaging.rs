@@ -149,7 +149,8 @@ fn example_config_says_it_is_lan_exposed() {
     assert!(text.contains("IPAddressAllow="));
     assert!(text.contains("CHANGE THIS"));
     let cfg = example();
-    assert_eq!(cfg.name, "llama-bored");
+    assert_eq!(cfg.name, "llama-bored ({host})");
+    assert_eq!(cfg.title, "tty11 on {host}");
     assert_eq!(cfg.fps, 2);
     assert_eq!(cfg.max_clients, 2);
     assert_eq!(cfg.bitrate_kbps, 4000);
