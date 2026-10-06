@@ -26,6 +26,26 @@ const WRITE_FILES: &[&str] = &[
     // before setfont. S13 pins its only paths to /dev/tty11, the font dir,
     // setfont and stty.
     "crates/llama-watch/src/tty/setup.rs",
+    // #23: writers the scan missed while it saw only `.write(`-style method
+    // calls. llama-watch's console emitter: `Write::write_all` to the tty
+    // systemd hands it (tty11). S13 fences that crate's tty paths.
+    "crates/llama-watch/src/tty/term.rs",
+    // #23: llama-watch's atomic snapshot publish, `rustix::io::write` into
+    // an O_EXCL temp file under the snapshot directory fd, then renameat.
+    "crates/llama-watch/src/publish.rs",
+    // #23: llama-view paints its own terminal (stdout) with
+    // `Write::write_all`; it opens /dev/vcsa* read-only.
+    "crates/llama-view/src/main.rs",
+    "crates/llama-view/src/render.rs",
+];
+
+/// Writers that also name a `/proc` or `/sys` path, only to read it. The
+/// file-level S3 rule is waived for them; the line-window S3 check
+/// (`s3_path_write`) still applies. Each entry is a review.
+const S3_READ_ONLY_NAMES: &[&str] = &[
+    // #23: llama-view names /proc/sys/kernel/hostname only to read the host
+    // name for its title; its only writes go to its own terminal.
+    "crates/llama-view/src/main.rs",
 ];
 /// S16: llama-metrics and llama-cast are the only crates that may name a
 /// listening or datagram socket, or bind one. Every other crate
@@ -124,6 +144,118 @@ fn scanner_flags_forbidden_tokens_and_sys_writes() {
         "file.write(report.as_bytes())?;\n",
     );
     assert!(allowed.is_empty(), "{allowed:?}");
+}
+
+/// A file outside `WRITE_FILES` with no `/sys` or `/proc` path.
+const UNLISTED: &str = "crates/kraken-lcd/src/render/mod.rs";
+
+fn is_write_hit(hits: &[String]) -> bool {
+    hits.iter().any(|hit| hit.contains("write API outside"))
+}
+
+/// #23: fully qualified, free-function and imported writes are write APIs,
+/// however they are spaced or wrapped.
+#[test]
+fn s1_catches_qualified_and_free_function_writes() {
+    for planted in [
+        "Write::write(&mut out, b\"x\")?;\n",
+        "Write::write_all(&mut out, b\"x\")?;\n",
+        "Write::write_fmt(&mut out, format_args!(\"x\"))?;\n",
+        "Write::write_vectored(&mut out, &bufs)?;\n",
+        "io::Write::write_all(&mut out, b\"x\")?;\n",
+        "std::io::Write::write(&mut out, b\"x\")?;\n",
+        "<File as Write>::write_all(&mut f, b\"x\")?;\n",
+        "<File as std::io::Write>::write(&mut f, b\"x\")?;\n",
+        "<W as io::Write>::write_all(&mut w, b\"x\")?;\n",
+        "Write :: write_all (&mut out, b\"x\")?;\n",
+        "Write::\n    write_all(&mut out, b\"x\")?;\n",
+        "chunks.try_for_each(|c| Write::write_all(&mut out, c))?;\n",
+        "let put = <File as Write>::write_all;\n",
+        "fs::write(path, b\"x\")?;\n",
+        "std::fs::write(path, b\"x\")?;\n",
+        "std :: fs :: write (path, b\"x\")?;\n",
+        "std::fs::copy(from, to)?;\n",
+        "std::io::copy(&mut src, &mut dst)?;\n",
+        "rustix::io::write(&fd, b\"x\")?;\n",
+        "rustix::io::pwrite(&fd, b\"x\", 0)?;\n",
+        "rustix::io::writev(&fd, &bufs)?;\n",
+        "use rustix::io::write;\nwrite(&fd, b\"x\")?;\n",
+        "use rustix::io::write as put;\nput(&fd, b\"x\")?;\n",
+        "use std::fs::write as put;\nput(p, b\"x\")?;\n",
+        "use std::fs::{read, write};\nwrite(p, b\"x\")?;\n",
+        "use rustix::io::{read, write};\nwrite(&fd, b\"x\")?;\n",
+        "out.write_fmt(format_args!(\"x\"))?;\n",
+        "out . write_all (b\"x\")?;\n",
+    ] {
+        let hits = scan_source(UNLISTED, planted);
+        assert!(is_write_hit(&hits), "missed: {planted:?} -> {hits:?}");
+    }
+}
+
+/// #23: the wider S1 still leaves reads, `fmt::Write`, imports of the trait,
+/// look-alike names and comments alone.
+#[test]
+fn s1_qualified_writes_have_no_false_positives() {
+    for clean in [
+        "use std::io::{self, Read, Write};\n",
+        "use std::fmt::Write as _;\n",
+        "fmt::Write::write_str(&mut s, \"x\")?;\n",
+        "Write::write_char(&mut s, 'x')?;\n",
+        "<String as fmt::Write>::write_str(&mut s, \"x\")?;\n",
+        "use rustix::fs::{Mode, OFlags};\n",
+        "let text = std::fs::read_to_string(p)?;\n",
+        "rustix::io::read(&fd, &mut buf)?;\n",
+        "fn write_frame(out: &mut Vec<u8>) {}\nwrite_frame(&mut out);\n",
+        "let writer = BufWriter::new(x);\n",
+        "MyWrite::write_all(&mut x, b\"y\");\n",
+        "procfs::writeback();\n",
+        "// Write::write_all(&mut x, b\"y\");\n// rustix::io::write(fd, b)\n",
+        "/* std::fs::write(p, b) */\nlet x = 1;\n",
+    ] {
+        let hits = scan_source(UNLISTED, clean);
+        assert!(hits.is_empty(), "false positive: {clean:?} -> {hits:?}");
+    }
+}
+
+/// #23: the writers that only UFCS or a free function revealed are seen by
+/// the scanner and allowlisted on purpose, so neither side can go stale.
+#[test]
+fn s1_sees_the_qualified_writers_in_the_tree() {
+    let root = workspace_root();
+    for rel in [
+        "crates/llama-watch/src/tty/term.rs",
+        "crates/llama-watch/src/publish.rs",
+        "crates/llama-view/src/main.rs",
+        "crates/llama-view/src/render.rs",
+    ] {
+        let text = fs::read_to_string(root.join(rel)).expect("read src");
+        let code = strip_comments(&strip_cfg_test(&text));
+        assert!(write_apis(&code), "{rel}: scanner no longer sees its write");
+        assert!(WRITE_FILES.contains(&rel), "{rel}: not allowlisted");
+        let elsewhere = scan_source(UNLISTED, &code);
+        assert!(is_write_hit(&elsewhere), "{rel}: would pass unlisted");
+    }
+}
+
+/// The S3 waiver covers only a listed file; any other writer that names
+/// `/proc` is still a hit.
+#[test]
+fn s3_read_only_waiver_is_per_file() {
+    // Far enough apart that the five-line S3 window does not join them.
+    let planted = format!(
+        "let h = std::fs::read_to_string(\"/proc/sys/kernel/hostname\");\n{}Write::write_all(&mut out, b\"x\")?;\n",
+        "let _ = 0;\n".repeat(6)
+    );
+    let planted = planted.as_str();
+    let waived = scan_source("crates/llama-view/src/main.rs", planted);
+    assert!(waived.is_empty(), "{waived:?}");
+    let other = scan_source("crates/llama-watch/src/tty/term.rs", planted);
+    assert!(other.iter().any(|hit| hit.contains("S3")), "{other:?}");
+    let near = scan_source(
+        "crates/llama-view/src/main.rs",
+        "Write::write_all(&mut f, b\"1\"); let p = \"/proc/sys/vm/x\";\n",
+    );
+    assert!(near.iter().any(|hit| hit.contains("S3")), "{near:?}");
 }
 
 #[test]
@@ -572,10 +704,13 @@ fn scan_source(rel: &str, text: &str) -> Vec<String> {
     let writes = write_apis(&code);
     if writes && !WRITE_FILES.contains(&rel) {
         hits.push(format!(
-            "{rel}: write API outside hid.rs, guard.rs, main.rs, llama-light hidraw.rs, llama-metrics http.rs, and llama-cast http.rs/encoder.rs"
+            "{rel}: write API outside the reviewed WRITE_FILES allowlist"
         ));
     }
-    if writes && (code.contains("\"/sys") || code.contains("\"/proc")) {
+    if writes
+        && !S3_READ_ONLY_NAMES.contains(&rel)
+        && (code.contains("\"/sys") || code.contains("\"/proc"))
+    {
         hits.push(format!(
             "{rel}: S3 write API in a file that names /sys or /proc"
         ));
@@ -634,19 +769,133 @@ fn s3_path_write(code: &str) -> bool {
     false
 }
 
+/// S1: any way to write bytes. Matched on [`squeeze`]d code, so spacing
+/// such as `Write :: write_all (` does not hide a call.
+///
+/// - method calls: `.write(`, `.write_all(`, `.write_fmt(`, ...;
+/// - fully qualified (UFCS) calls and paths: `Write::write_all(&mut x, ..)`,
+///   `io::Write::write`, `std::io::Write::write`, `<T as Write>::write_all`,
+///   also as a function value (`.map(Write::write_all)`) (#23);
+/// - free functions, called or imported: `fs::write`, `fs::copy`,
+///   `io::copy`, `rustix::io::write` / `pwrite` / `writev` / `pwritev`,
+///   including `use std::fs::{read, write}` (#23);
+/// - opening for write: `.append(true)`, `.create(true)`, `.truncate(true)`,
+///   `File::create`.
+///
+/// `fmt::Write`'s `write_str` and `write_char` only format into memory and
+/// are not write APIs.
 fn write_apis(code: &str) -> bool {
+    let code = squeeze(code);
     [
         ".write(",
         ".write_all(",
+        ".write_fmt(",
+        ".write_vectored(",
+        ".write_all_vectored(",
         ".append(true)",
         ".create(true)",
         ".truncate(true)",
-        "std::fs::write",
-        "fs::write(",
         "File::create",
     ]
     .iter()
     .any(|token| code.contains(token))
+        || qualified_write(&code)
+        || free_write_fn(&code)
+}
+
+/// `fs::` and `io::` functions that write: `std::fs::write`, `std::fs::copy`,
+/// `std::io::copy`, and rustix's raw `io::write` family.
+const FS_WRITE_FNS: &[&str] = &["write", "copy"];
+const IO_WRITE_FNS: &[&str] = &["write", "pwrite", "writev", "pwritev", "copy"];
+
+/// Whitespace removed except where it separates two identifier characters
+/// (`as Write`, `write as w`), so a path or call reads the same however it
+/// is spaced or wrapped.
+fn squeeze(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut pending_space = false;
+    for ch in code.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space
+            && is_ident_continue(ch)
+            && out.chars().next_back().is_some_and(is_ident_continue)
+        {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    out
+}
+
+/// `Write::write*` or `Write>::write*` (UFCS through `std::io::Write`), any
+/// method whose name starts with `write` except `fmt::Write`'s in-memory
+/// `write_str` and `write_char`.
+fn qualified_write(code: &str) -> bool {
+    for marker in ["Write::", "Write>::"] {
+        let mut from = 0;
+        while let Some(found) = code[from..].find(marker) {
+            let at = from + found;
+            from = at + marker.len();
+            if code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(is_ident_continue)
+            {
+                continue;
+            }
+            let method = ident_at(&code[from..]);
+            if method.starts_with("write") && !matches!(method, "write_str" | "write_char") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `fs::write` / `io::write` (and the rest of [`FS_WRITE_FNS`],
+/// [`IO_WRITE_FNS`]) as a path, called, imported, or renamed, and the same
+/// names inside a `fs::{...}` / `io::{...}` import group.
+fn free_write_fn(code: &str) -> bool {
+    for (module, names) in [("fs::", FS_WRITE_FNS), ("io::", IO_WRITE_FNS)] {
+        let mut from = 0;
+        while let Some(found) = code[from..].find(module) {
+            let at = from + found;
+            from = at + module.len();
+            if code[..at]
+                .chars()
+                .next_back()
+                .is_some_and(is_ident_continue)
+            {
+                continue;
+            }
+            let rest = &code[from..];
+            if names.contains(&ident_at(rest)) {
+                return true;
+            }
+            if let Some(group) = rest.strip_prefix('{')
+                && let Some(end) = group.find('}')
+                && identifiers(&group[..end])
+                    .iter()
+                    .any(|ident| names.contains(&ident.as_str()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The identifier at the start of `text`, or `""`.
+fn ident_at(text: &str) -> &str {
+    let end = text
+        .char_indices()
+        .find(|&(index, ch)| !(is_ident_continue(ch) && (index > 0 || is_ident_start(ch))))
+        .map_or(text.len(), |(index, _)| index);
+    &text[..end]
 }
 
 fn scan_gpu(text: &str) -> Vec<String> {
