@@ -19,6 +19,7 @@ use thiserror::Error;
 use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
+use crate::localtime::{HostZone, Zone, format_local, local_request_time};
 use crate::metrics::EngineLive;
 use crate::poller::{self, CaptureView, LlamaDetail, ModelEngineLive, ModelSetup, PollLatencies};
 use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
@@ -49,6 +50,13 @@ pub trait Clock {
     fn wall(&self) -> SystemTime;
     /// Wait `d`, or advance a fake clock by `d`.
     fn sleep(&mut self, d: Duration);
+    /// Zone for the header clock, the down label and RECENT's TIME (#48).
+    /// `mono` is now; the host clock rereads its zone at most once a
+    /// minute. Fake clocks keep the default, UTC.
+    fn zone(&mut self, mono: Instant) -> &Zone {
+        let _ = mono;
+        Zone::utc()
+    }
 }
 
 /// sd-notify seam. Unset `NOTIFY_SOCKET` makes the production impl a no-op.
@@ -146,8 +154,11 @@ impl<W: Write> RenderStep for Term<W> {
     }
 }
 
-/// Host clock.
-pub struct RealClock;
+/// Host clock, in the host's local zone.
+#[derive(Default)]
+pub struct RealClock {
+    zone: HostZone,
+}
 
 impl Clock for RealClock {
     fn mono(&self) -> Instant {
@@ -160,6 +171,10 @@ impl Clock for RealClock {
 
     fn sleep(&mut self, d: Duration) {
         std::thread::sleep(d);
+    }
+
+    fn zone(&mut self, mono: Instant) -> &Zone {
+        self.zone.get(mono)
     }
 }
 
@@ -549,7 +564,8 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         .ctx_history
         .record(mono, &running, &state.detail.slots);
     note_stopping(&mut state.stopping_since, &sample.snapshot.models, mono);
-    let model = tty_model(&sample, state, mono, wall, ctx);
+    let zone = input.clock.zone(mono);
+    let model = tty_model(&sample, state, mono, wall, zone, ctx);
     note_draw(input, state, &model, mono);
 }
 
@@ -876,7 +892,7 @@ pub fn run(args: &RunArgs) -> i32 {
         sampler: collector,
         publisher: prepared.publisher,
         render,
-        clock: RealClock,
+        clock: RealClock::default(),
         notify: SdNotify,
         stop: NeverStop,
         log: log::Stderr,
@@ -892,6 +908,7 @@ fn tty_model(
     tick: &mut TickState,
     mono: Instant,
     wall: SystemTime,
+    zone: &Zone,
     ctx: &FrameCtx,
 ) -> TtyModel {
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
@@ -937,7 +954,7 @@ fn tty_model(
         cool_c: temp_i(sample.snapshot.coolant_c),
         cpu_c: temp_i(sample.snapshot.cpu_c),
         gpu_c: temp_i(sample.snapshot.gpu_c),
-        clock: format_wall(wall),
+        clock: format_wall(wall, zone),
         cpu_pct: pct(sample.snapshot.cpu_pct),
         cpu_cores: ctx.cpu_cores,
         gpu_pct: pct(sample.snapshot.gpu_pct),
@@ -968,7 +985,7 @@ fn tty_model(
         } else {
             String::new()
         },
-        requests: layout_requests(&tick.detail.activity, watch),
+        requests: layout_requests(&tick.detail.activity, watch, zone),
         in_title: text.in_title,
         out_title: text.out_title,
         in_lines: text.in_lines,
@@ -978,7 +995,7 @@ fn tty_model(
         show_text: ctx.show_text,
         down_since: tick
             .down_since
-            .map(|since| down_label(since, wall))
+            .map(|since| down_label(since, wall, zone))
             .unwrap_or_default(),
         health: health(sample, &tick.detail, watch),
         snapshot: (tick.published > 0).then_some(tick.published),
@@ -1433,13 +1450,13 @@ fn layout_slots(slots: &[SlotView], history: &CtxBook) -> Vec<Slot> {
         .collect()
 }
 
-fn layout_requests(rows: &[ActivityRow], state: WatchState) -> Vec<Activity> {
+fn layout_requests(rows: &[ActivityRow], state: WatchState, zone: &Zone) -> Vec<Activity> {
     rows.iter()
         .enumerate()
         .map(|(index, row)| Activity {
             live: index == 0 && state == WatchState::Generating,
             id: u32::try_from(row.id).unwrap_or(0),
-            time: row.time.clone(),
+            time: local_request_time(&row.time, zone),
             source: row.source.clone(),
             model: row.model.clone(),
             input_tok: row.input_tokens.unwrap_or(0),
@@ -1739,49 +1756,18 @@ fn host_label(proc_root: &Path) -> String {
     }
 }
 
-fn down_label(since: SystemTime, now: SystemTime) -> String {
-    let stamp = format_wall(since);
+fn down_label(since: SystemTime, now: SystemTime, zone: &Zone) -> String {
+    let stamp = format_wall(since, zone);
     let tod = stamp.get(11..).unwrap_or("--");
     let age = now.duration_since(since).unwrap_or_default();
     format!("{tod} ({})", format_span(age))
 }
 
-fn format_wall(wall: SystemTime) -> String {
+fn format_wall(wall: SystemTime, zone: &Zone) -> String {
     match wall.duration_since(UNIX_EPOCH) {
-        Ok(duration) => format_unix(duration.as_secs()),
+        Ok(duration) => format_local(i64::try_from(duration.as_secs()).unwrap_or(i64::MAX), zone),
         Err(_) => "--".to_owned(),
     }
-}
-
-fn format_unix(secs: u64) -> String {
-    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
-    let tod = secs % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02}",
-        hour = tod / 3600,
-        min = (tod % 3600) / 60,
-        sec = tod % 60
-    )
-}
-
-/// Howard Hinnant's `civil_from_days`. `days` is days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = u64::try_from(z - era * 146_097).unwrap_or(0);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let year = i64::try_from(yoe).unwrap_or(0) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (
-        year,
-        u32::try_from(month).unwrap_or(1),
-        u32::try_from(day).unwrap_or(1),
-    )
 }
 
 fn format_age(duration: Duration) -> String {
@@ -1829,7 +1815,7 @@ mod tests {
         rows[0].engine_gen_tps = Some(9.0);
         rows[1].engine_prompt_tps = Some(2134.4);
         rows[1].engine_gen_tps = Some(41.25);
-        let shown = layout_requests(&rows, WatchState::Ready);
+        let shown = layout_requests(&rows, WatchState::Ready, Zone::utc());
         assert_eq!(shown[0].prompt_tps, Some(1193.6), "llama.cpp keeps its own");
         assert_eq!(shown[0].gen_tps, Some(50.5));
         assert!(!shown[0].prompt_measured && !shown[0].gen_measured);
@@ -1848,6 +1834,47 @@ mod tests {
         );
         assert_eq!(layout::prompt_rate_text(None, false), "--");
         assert_eq!(layout::gen_rate_text(None, false), "--");
+    }
+
+    /// #48: RECENT's TIME and the header clock are in the same zone; a
+    /// timestamp that is not RFC 3339 is shown as it came.
+    #[test]
+    fn recent_time_and_the_header_clock_share_the_host_zone() {
+        let page = br#"{"data":[
+            {"id":2,"timestamp":"2026-10-04T05:52:17Z","model":"m"},
+            {"id":1,"timestamp":"18:47:01","model":"m"}
+        ]}"#;
+        let sample = backend_sample(vec![served("m", "ready", None)]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.activity = crate::activity::parse_activity(page).expect("page");
+        let ctx = frame_ctx(None, true);
+        let wall = UNIX_EPOCH + Duration::from_secs(1_791_093_137);
+        let zone = Zone::fixed(-5 * 3600);
+        let model = tty_model(&sample, &mut tick, Instant::now(), wall, &zone, &ctx);
+        assert_eq!(model.clock, "2026-10-04 00:52:17");
+        assert_eq!(model.requests[0].time, "2026-10-04 00:52:17");
+        assert_eq!(model.requests[1].time, "18:47:01");
+        let grid = layout::layout(&model, 240, 67);
+        let rows: Vec<String> = (0..grid.rows())
+            .map(|row| {
+                (0..grid.cols())
+                    .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                    .collect()
+            })
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("2026-10-04 00:52:17") && !row.contains("COOL")),
+            "RECENT shows local time"
+        );
+        assert!(rows.iter().any(|row| row.contains("18:47:01")));
+        assert!(
+            !rows.iter().any(|row| row.contains("05:52:17")),
+            "no UTC left"
+        );
+        // The raw text stays for sorting and the row fingerprint.
+        assert_eq!(tick.detail.activity[0].time, "2026-10-04T05:52:17Z");
     }
 
     #[test]
@@ -1990,7 +2017,7 @@ mod tests {
 
     #[test]
     fn unix_epoch_is_utc_midnight() {
-        assert_eq!(format_unix(0), "1970-01-01 00:00:00");
+        assert_eq!(format_wall(UNIX_EPOCH, Zone::utc()), "1970-01-01 00:00:00");
     }
 
     #[test]
@@ -2978,7 +3005,7 @@ mod tests {
         ctx.show_text = true;
         let now = Instant::now();
         let wall = SystemTime::now();
-        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.text_note, NO_SLOTS_TEXT, "no capture yet");
         tick.detail.capture = Some(CaptureView {
             model: "flash".to_owned(),
@@ -2987,26 +3014,26 @@ mod tests {
             input_note: String::new(),
             output: cells("An invented answer."),
         });
-        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
         assert_eq!(model.out_title, CAPTURE_OUT_TITLE);
         assert_eq!(model.in_lines, vec!["An invented question?".to_owned()]);
         // #38: a tool loop's IN says what it holds.
         tick.detail.capture.as_mut().expect("capture").input_note = "3 tool results".to_owned();
-        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, "IN (last request \u{00B7} 3 tool results)");
         tick.detail.capture.as_mut().expect("capture").input_note = String::new();
         assert_eq!(model.out_lines, vec!["An invented answer.".to_owned()]);
         assert!(model.text_note.is_empty());
         // A capture of another model is not this header's.
         tick.detail.capture.as_mut().expect("capture").model = "other".to_owned();
-        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.text_note, NO_SLOTS_TEXT);
         assert!(model.in_lines.is_empty());
         // Text off: nothing, whatever the detail holds.
         tick.detail.capture.as_mut().expect("capture").model = "flash".to_owned();
         ctx.show_text = false;
-        let model = tty_model(&sample, &mut tick, now, wall, &ctx);
+        let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert!(model.in_lines.is_empty() && model.out_lines.is_empty());
         assert!(model.text_note.is_empty());
     }

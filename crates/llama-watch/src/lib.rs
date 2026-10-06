@@ -5,6 +5,7 @@ pub mod capture;
 pub mod collector;
 pub mod config;
 mod load;
+pub mod localtime;
 pub mod metrics;
 pub mod poller;
 pub mod publish;
