@@ -106,8 +106,10 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
                 state: ModelState::Ready,
                 full_name: None,
                 detail: None,
-                cache_hit: None,
-                slots_busy: None,
+                max_running: None,
+                id: None,
+                version: None,
+                counters: None,
                 slots_total: None,
                 prompt_tokens: None,
                 prompt_cached_tokens: None,
@@ -511,9 +513,9 @@ fn spec_acceptance_is_the_only_engine_number_read() {
     snapshot.ai.models[0].backend = Some(wire::Backend::Vllm);
     snapshot.ai.models[0].engine = Some(wire::EngineWire {
         spec_accept: Some(0.781),
-        spec_len: Some(2.9),
+        spec_drafts: Some(100),
         preemptions: Some(3),
-        ttft_s: Some(0.4),
+        sleeping: Some(false),
         ..wire::EngineWire::default()
     });
     write_snap(&scratch.snap(), &snapshot);

@@ -320,6 +320,7 @@ fn metrics_extras_reach_the_wire() {
             ..Default::default()
         }),
         suspected_loads: vec![("qwen3.6-35b-a3b".to_owned(), 2)],
+        series: Vec::new(),
     };
     publisher
         .publish_with(&snap, &llama, &extras)
@@ -344,13 +345,17 @@ fn metrics_extras_reach_the_wire() {
     );
     let flash = &wire.ai.models[0];
     assert_eq!(
-        (flash.running, flash.queued, flash.kv_fill, flash.cache_hit),
-        (Some(2), Some(1), Some(0.37), Some(0.8))
+        (flash.running, flash.queued, flash.kv_fill),
+        (Some(2), Some(1), Some(0.37))
     );
-    assert_eq!((flash.slots_busy, flash.slots_total), (None, None));
+    assert_eq!(flash.slots_total, None);
     let bonsai = &wire.ai.models[1];
-    assert_eq!(bonsai.cache_hit, None, "llama.cpp gauges stay off the wire");
-    assert_eq!((bonsai.slots_busy, bonsai.slots_total), (Some(1), Some(4)));
+    assert_eq!(
+        (bonsai.running, bonsai.kv_fill),
+        (None, None),
+        "llama.cpp's BackendInfo gauges stay off the wire"
+    );
+    assert_eq!(bonsai.slots_total, Some(4));
     // #10: prompt counters by display name, slots lowest id first.
     assert_eq!(
         (flash.prompt_tokens, flash.prompt_cached_tokens),
@@ -462,8 +467,8 @@ fn out_of_range_extras_are_left_out_not_fatal() {
     assert_eq!(wire.host.gpu_limit_w, None);
     assert_eq!(wire.host.cpu_w, None);
     assert_eq!(wire.host.vram_used_bytes, None);
-    assert_eq!(wire.ai.models[0].slots_busy, None);
-    assert_eq!(wire.ai.models[0].slots_total, None);
+    // #71: busy slots are no longer on the wire; the total still is.
+    assert_eq!(wire.ai.models[0].slots_total, Some(4));
     assert_eq!(wire.ai.models[0].prompt_cached_tokens, Some(10));
     assert_eq!(
         wire.ai.models[0].slot_ctx,
@@ -873,14 +878,16 @@ fn backend_and_its_gauges_reach_the_wire() {
     );
     assert_eq!(m[3].backend, None);
     let text = std::str::from_utf8(&bytes).expect("utf8");
-    // Since #11 the hit rate is on the wire as `cache_hit`, for llama-metrics.
-    assert_eq!(m[0].cache_hit, Some(0.8));
-    assert_eq!(m[1].cache_hit, None);
-    assert!(!text.contains("max_running"), "{text}");
+    // #71: the hit rate gauge is gone (llama-metrics exports counters);
+    // the request cap of an engine without slots is on the wire.
+    assert!(!text.contains("cache_hit"), "{text}");
+    assert_eq!(m[0].max_running, Some(4));
+    assert_eq!(m[1].max_running, None);
 }
 
-/// #31: a vLLM model's engine numbers reach the wire as seconds, ratios,
-/// counters and (#35) tok/s; an empty set and llama.cpp's are left off.
+/// #31: a vLLM model's engine numbers reach the wire as ratios and
+/// counters (#71: the window means stay on the tty); an empty set and
+/// llama.cpp's are left off.
 #[test]
 fn engine_numbers_reach_the_wire() {
     use llama_core::backend::{Backend, BackendInfo, EngineStats, SpecCounts};
@@ -946,17 +953,11 @@ fn engine_numbers_reach_the_wire() {
         got,
         wire::EngineWire {
             spec_accept: Some(0.78),
-            spec_len: Some(2.9),
             spec_drafts: Some(100),
             spec_draft_tokens: Some(300),
             spec_accepted_tokens: Some(234),
             preemptions: Some(3),
             sleeping: Some(false),
-            ttft_s: Some(0.42),
-            itl_s: Some(0.031),
-            e2e_s: Some(12.5),
-            prefill_tps: Some(2134.5),
-            decode_tps: Some(41.2),
             expert_hit: Some(0.856),
             pcie_share: Some(0.106),
         }
@@ -978,4 +979,106 @@ fn engine_numbers_reach_the_wire() {
         parsed.ai.models[2].engine, None,
         "llama.cpp keeps its slot view"
     );
+}
+
+/// #71: each model's llama-swap id, version and counters reach the wire,
+/// matched by place and display name; llama.cpp's gauges and activity
+/// draft counts come from its series. Counters are capped and seconds are
+/// whole milliseconds.
+#[test]
+fn series_reach_the_wire_by_place_and_name() {
+    use llama_core::backend::{Backend, BackendInfo};
+    use llama_watch::metrics::Hist;
+    use llama_watch::series::ModelSeries;
+
+    let dir = scratch("series");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_millis(1);
+    let backend = |kind| {
+        Some(BackendInfo {
+            kind,
+            max_running: Some(1),
+            running: Some(1),
+            ..BackendInfo::default()
+        })
+    };
+    let models = vec![
+        model("Qwen 35B", backend(Backend::LlamaCpp)),
+        model("flash", backend(Backend::Strata)),
+        model("twin", None),
+    ];
+    let snap = snapshot(wall, Some(1.0), AiState::Loaded, models.clone());
+    let llama = view(AiState::Loaded, models, None);
+    let extras = Extras {
+        series: vec![
+            ModelSeries {
+                model: "Qwen 35B".to_owned(),
+                id: "qwen3.6-35b-a3b".to_owned(),
+                running: Some(2),
+                waiting: Some(3),
+                kv_permille: Some(250),
+                generation_tokens: Some(u64::MAX),
+                prefill_seconds: Some(1.2349),
+                decode_seconds: Some(f64::NAN),
+                requests_ok: Some(5),
+                requests_error: Some(1),
+                e2e: Some(Hist {
+                    sum: 2.5,
+                    count: 6.0,
+                }),
+                spec_draft_tokens: Some(10),
+                spec_accepted_tokens: Some(70),
+                ..ModelSeries::default()
+            },
+            ModelSeries {
+                model: "flash".to_owned(),
+                id: "flash-next".to_owned(),
+                version: Some("0.1.41".to_owned()),
+                running: Some(9),
+                ..ModelSeries::default()
+            },
+            // Out of place, and a name the snapshot does not have.
+            ModelSeries {
+                model: "stale".to_owned(),
+                id: "stale".to_owned(),
+                requests_ok: Some(1),
+                ..ModelSeries::default()
+            },
+        ],
+        ..Extras::default()
+    };
+    publisher
+        .publish_with(&snap, &llama, &extras)
+        .expect("publish");
+    let wire = wire::parse_validated(&std::fs::read(dir.join("snapshot.json")).unwrap())
+        .expect("validates");
+    let qwen = &wire.ai.models[0];
+    assert_eq!(qwen.id.as_deref(), Some("qwen3.6-35b-a3b"));
+    assert_eq!(
+        (qwen.running, qwen.queued, qwen.kv_fill),
+        (Some(2), Some(3), Some(0.25)),
+        "llama.cpp's gauges from its own /metrics"
+    );
+    assert_eq!(qwen.max_running, None, "llama.cpp has slots");
+    let counters = qwen.counters.clone().expect("counters");
+    assert_eq!(counters.gen_tokens, Some(wire::MAX_COUNTER));
+    assert_eq!(counters.prefill_ms, Some(1234));
+    assert_eq!(counters.decode_ms, None, "not a number");
+    assert_eq!((counters.req_ok, counters.req_err), (Some(5), Some(1)));
+    assert_eq!(counters.e2e, Some(wire::SumCountWire { ms: 2500, n: 6 }));
+    let engine = qwen.engine.clone().expect("activity drafts");
+    assert_eq!(
+        (engine.spec_draft_tokens, engine.spec_accepted_tokens),
+        (Some(10), Some(10)),
+        "accepted never above drafted"
+    );
+    assert_eq!(engine.spec_accept, None);
+    let flash = &wire.ai.models[1];
+    assert_eq!(flash.id.as_deref(), Some("flash-next"));
+    assert_eq!(flash.version.as_deref(), Some("0.1.41"));
+    assert_eq!(flash.running, Some(1), "Strata's own gauge wins");
+    assert_eq!(flash.max_running, Some(1));
+    assert_eq!(flash.counters, None);
+    let twin = &wire.ai.models[2];
+    assert_eq!((twin.id.as_ref(), twin.counters.as_ref()), (None, None));
 }
