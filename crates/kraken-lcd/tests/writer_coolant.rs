@@ -76,6 +76,8 @@ fn publish(path: &std::path::Path, t_mono_ns: u64) {
             prompt_total: None,
         },
         fans: Vec::new(),
+        fan_rows: Vec::new(),
+        temps: Vec::new(),
         sources: None,
         suspected_loads: Vec::new(),
     };

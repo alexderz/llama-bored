@@ -20,8 +20,8 @@ use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, CountersWire, EngineWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire,
-    SlotResetsWire, Sources, SumCountWire, Tokens, WireError, WireSnapshot,
+    self, Ai, AiWire, CountersWire, EngineWire, FanRowWire, Host, ModelState, ModelWire,
+    SlotCtxWire, SlotResetsWire, Sources, SumCountWire, TempWire, Tokens, WireError, WireSnapshot,
 };
 
 use crate::resets::ResetCounts;
@@ -76,8 +76,11 @@ pub struct Extras {
     pub prompt_cache: Vec<(String, u64, Option<u64>)>,
     /// llama.cpp slot context (#10), one entry per slot.
     pub slot_ctx: Vec<SlotCtx>,
-    /// Configured fans: `(channel, label, rpm, pwm 0..=255)`.
-    pub fans: Vec<(u32, String, Option<u32>, Option<u8>)>,
+    /// Shown fans (#74).
+    pub fans: Vec<FanExtra>,
+    /// Shown temperatures, most important first: `(chip, sensor, tenths
+    /// of a degree)` (#74).
+    pub temps: Vec<(String, String, i32)>,
     /// The tty health line, as wire sources. `None` while starting.
     pub sources: Option<Sources>,
     /// Suspected model loads per llama-swap id, sanitised (#70).
@@ -86,6 +89,9 @@ pub struct Extras {
     /// snapshot's models; the display name confirms the match.
     pub series: Vec<ModelSeries>,
 }
+
+/// One shown fan: `(chip, channel, label, rpm, pwm 0..=255)` (#74).
+pub type FanExtra = (String, u32, String, Option<u32>, Option<u8>);
 
 /// One llama.cpp slot's context numbers for the wire (#10).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -107,6 +113,7 @@ pub struct Publisher<L> {
     seq: u64,
     max_bytes: usize,
     oversize_logged: bool,
+    trim_logged: bool,
     invalid_logged: bool,
     log: L,
 }
@@ -130,6 +137,7 @@ impl<L: Sink> Publisher<L> {
             seq: 0,
             max_bytes: wire::MAX_BYTES,
             oversize_logged: false,
+            trim_logged: false,
             invalid_logged: false,
             log,
         })
@@ -156,13 +164,26 @@ impl<L: Sink> Publisher<L> {
         extras: &Extras,
     ) -> Result<(), PublishError> {
         let seq = self.seq.saturating_add(1);
-        let wire_snapshot = build(snapshot, llama, extras, self.run_id, seq);
+        let mut wire_snapshot = build(snapshot, llama, extras, self.run_id, seq);
         if let Err(err) = wire::validate(&wire_snapshot) {
             self.log_invalid(&err);
             return Err(PublishError::Invalid(err));
         }
-        let bytes = match wire::to_json(&wire_snapshot) {
-            Ok(bytes) => bytes,
+        let bytes = match fit(&mut wire_snapshot, self.max_bytes) {
+            Ok((bytes, dropped)) => {
+                if dropped > 0 && !self.trim_logged {
+                    self.trim_logged = true;
+                    log::emit(
+                        &mut self.log,
+                        Priority::Warning,
+                        &format!(
+                            "snapshot: dropped {dropped} temperature or fan rows to stay under {} bytes",
+                            self.max_bytes
+                        ),
+                    );
+                }
+                bytes
+            }
             Err(err) => {
                 self.log_invalid(&err);
                 return Err(PublishError::Invalid(err));
@@ -230,6 +251,25 @@ impl<L: Sink> Publisher<L> {
     }
 }
 
+/// Encode `snapshot`; while it is longer than `max_bytes`, drop the last
+/// temperature row, then the last fan row (#74). Both lists are ordered
+/// most important first. Returns the bytes and how many rows went. Only a
+/// pathological snapshot (eight models with every number at its widest)
+/// needs this; a realistic one keeps every row.
+pub fn fit(snapshot: &mut WireSnapshot, max_bytes: usize) -> Result<(Vec<u8>, usize), WireError> {
+    let mut dropped = 0;
+    loop {
+        let bytes = wire::to_json(snapshot)?;
+        if bytes.len() <= max_bytes {
+            return Ok((bytes, dropped));
+        }
+        if snapshot.temps.pop().is_none() && snapshot.fan_rows.pop().is_none() {
+            return Ok((bytes, dropped));
+        }
+        dropped += 1;
+    }
+}
+
 /// Assemble the wire snapshot. Every extra that is out of its wire range is
 /// left out rather than failing [`wire::validate`], so one odd reading never
 /// stops the publish.
@@ -269,7 +309,11 @@ pub fn build(
             decoded_total: llama.decoded_total,
             prompt_total: llama.prompt_total,
         },
-        fans: fans_of(&extras.fans),
+        // #74: `fan_rows` carries the chip; `fans` is left for an older
+        // watcher, as two chips may both have a `fan1`.
+        fans: Vec::new(),
+        fan_rows: fan_rows_of(&extras.fans),
+        temps: temps_of(&extras.temps),
         sources: extras.sources.map(sources_of),
         suspected_loads: suspected_of(&extras.suspected_loads),
     }
@@ -285,10 +329,11 @@ fn mem_bytes(value: Option<u64>) -> Option<u64> {
     value.filter(|b| *b <= wire::MAX_MEM_BYTES)
 }
 
-/// Fans in config order; a channel or label the wire refuses is dropped.
-fn fans_of(fans: &[(u32, String, Option<u32>, Option<u8>)]) -> Vec<FanWire> {
-    let mut out: Vec<FanWire> = Vec::new();
-    for (channel, label, rpm, pwm) in fans {
+/// Fans in panel order; a chip, channel or label the wire refuses is
+/// dropped, and rows past [`wire::MAX_FAN_ROWS`].
+fn fan_rows_of(fans: &[FanExtra]) -> Vec<FanRowWire> {
+    let mut out: Vec<FanRowWire> = Vec::new();
+    for (chip, channel, label, rpm, pwm) in fans {
         let Some(channel) = u8::try_from(*channel)
             .ok()
             .filter(|c| (1..=wire::MAX_FAN_CHANNEL).contains(c))
@@ -296,18 +341,50 @@ fn fans_of(fans: &[(u32, String, Option<u32>, Option<u8>)]) -> Vec<FanWire> {
             continue;
         };
         let label = sanitize(label, wire::MAX_FAN_LABEL_CHARS);
-        if label.is_empty()
+        if !wire::is_temp_chip(chip)
+            || label.trim().is_empty()
             || !label.is_ascii()
-            || out.len() >= wire::MAX_FANS
-            || out.iter().any(|fan| fan.channel == channel)
+            || out.len() >= wire::MAX_FAN_ROWS
+            || out
+                .iter()
+                .any(|fan| fan.chip == *chip && fan.channel == channel)
         {
             continue;
         }
-        out.push(FanWire {
+        out.push(FanRowWire {
+            chip: chip.clone(),
             channel,
             label,
             rpm: rpm.filter(|r| *r <= wire::MAX_FAN_RPM),
-            pwm: pwm.map(|p| f32::from(p) / 255.0),
+            pwm: *pwm,
+        });
+    }
+    out
+}
+
+/// Temperatures in panel order; a row the wire refuses is dropped, and
+/// rows past [`wire::MAX_TEMPS`] (#74).
+fn temps_of(temps: &[(String, String, i32)]) -> Vec<TempWire> {
+    let mut out: Vec<TempWire> = Vec::new();
+    for (chip, sensor, tenths) in temps {
+        let sensor = sanitize(sensor, wire::MAX_TEMP_SENSOR_CHARS);
+        let Some(tenths) = i16::try_from(*tenths)
+            .ok()
+            .filter(|t| wire::TEMP_TENTHS.contains(t))
+        else {
+            continue;
+        };
+        if !wire::is_temp_chip(chip)
+            || !wire::is_temp_sensor(&sensor)
+            || out.len() >= wire::MAX_TEMPS
+            || out.iter().any(|t| t.chip == *chip && t.sensor == sensor)
+        {
+            continue;
+        }
+        out.push(TempWire {
+            chip: chip.clone(),
+            sensor,
+            tenths,
         });
     }
     out

@@ -838,6 +838,17 @@ fn no_prompt_or_output_text_is_exported() {
         "fans.label",
         "fans.rpm",
         "fans.pwm",
+        // #74: hwmon chip and sensor names, numbers.
+        "fan_rows",
+        "fan_rows.c",
+        "fan_rows.n",
+        "fan_rows.l",
+        "fan_rows.r",
+        "fan_rows.p",
+        "temps",
+        "temps.c",
+        "temps.s",
+        "temps.t",
         "sources",
         "sources.llama-swap",
         "sources.llama-swap.up",
@@ -905,6 +916,15 @@ fn no_prompt_or_output_text_is_exported() {
         allowed.insert(fan.channel.to_string());
         allowed.insert(fan.label.clone());
     }
+    for fan in &snap.fan_rows {
+        allowed.insert(fan.chip.clone());
+        allowed.insert(fan.channel.to_string());
+        allowed.insert(fan.label.clone());
+    }
+    for t in &snap.temps {
+        allowed.insert(t.chip.clone());
+        allowed.insert(t.sensor.clone());
+    }
     for (source, _) in wire::Sources::default().entries() {
         allowed.insert(source.to_owned());
     }
@@ -943,6 +963,8 @@ fn no_prompt_or_output_text_is_exported() {
         "status",
         "channel",
         "label",
+        "chip",
+        "sensor",
         "source",
         "slot",
     ]
@@ -1130,6 +1152,14 @@ const EXPORTED: &[(&str, &str)] = &[
     ("fans.label", "llamabored_fan_rpm"),
     ("fans.rpm", "llamabored_fan_rpm"),
     ("fans.pwm", "llamabored_fan_pwm_ratio"),
+    ("fan_rows.c", "llamabored_fan_rpm"),
+    ("fan_rows.n", "llamabored_fan_rpm"),
+    ("fan_rows.l", "llamabored_fan_rpm"),
+    ("fan_rows.r", "llamabored_fan_rpm"),
+    ("fan_rows.p", "llamabored_fan_pwm_ratio"),
+    ("temps.c", "llamabored_temperature_celsius"),
+    ("temps.s", "llamabored_temperature_celsius"),
+    ("temps.t", "llamabored_temperature_celsius"),
     ("sources.*.up", "llamabored_source_up"),
     ("sources.*.latency_s", "llamabored_source_latency_seconds"),
 ];
@@ -1385,4 +1415,51 @@ fn no_model_running_is_a_valid_scrape_without_model_series() {
     }
     let keys: BTreeSet<String> = all.iter().map(|(n, l, _)| format!("{n}{l:?}")).collect();
     assert_eq!(keys.len(), all.len(), "duplicate series");
+}
+
+/// #74: every temperature by chip and sensor, fans with their chip, and the
+/// older coolant / CPU / GPU series kept for the LCD's dashboards.
+#[test]
+fn temperatures_and_chip_fans_are_exported() {
+    let text = render(&Ok(load("snapshot-loaded.json")), T0);
+    let all = samples(&text);
+    let temp = |chip: &str, sensor: &str| {
+        all.iter()
+            .find(|(name, labels, _)| {
+                name == "llamabored_temperature_celsius"
+                    && labels.contains(&("chip".to_owned(), chip.to_owned()))
+                    && labels.contains(&("sensor".to_owned(), sensor.to_owned()))
+            })
+            .map(|(_, _, value)| value.clone())
+    };
+    assert_eq!(temp("k10temp", "Tctl").as_deref(), Some("68.3"));
+    assert_eq!(temp("gpu", "gpu").as_deref(), Some("71.2"));
+    assert_eq!(temp("nvme-317k", "Sensor 2").as_deref(), Some("66.9"));
+    assert_eq!(temp("nct6798", "AUXTIN2").as_deref(), Some("15.5"));
+    assert!(text.contains("# TYPE llamabored_temperature_celsius gauge"));
+    for kept in [
+        "llamabored_coolant_celsius",
+        "llamabored_cpu_celsius",
+        "llamabored_gpu_celsius",
+    ] {
+        assert!(all.iter().any(|(name, _, _)| name == kept), "{kept}");
+    }
+    assert!(
+        text.contains("llamabored_fan_rpm{chip=\"z53\",channel=\"1\",label=\"Pump\"} 2810"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llamabored_fan_pwm_ratio{chip=\"z53\",channel=\"1\",label=\"Pump\"} 0.6"),
+        "{text}"
+    );
+    // An older watcher's fans keep their label set.
+    assert!(
+        text.contains("llamabored_fan_rpm{channel=\"3\",label=\"rad \\\"top\\\"\"} 1450"),
+        "{text}"
+    );
+    // None at all: no family.
+    let mut snap = load("snapshot-loaded.json");
+    snap.temps.clear();
+    let text = render(&Ok(snap), T0);
+    assert!(!text.contains("llamabored_temperature_celsius"));
 }

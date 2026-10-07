@@ -181,8 +181,11 @@ fn watch_config(dir: &Path, cpu_top_k: u32, cpu_window_s: f64) -> ValidWatchConf
     let text = format!(
         "[collector]\ntick_s = 0.1\ncpu_window_s = {cpu_window_s}\ncpu_top_k = {cpu_top_k}\n\
          [llama]\nurl = \"http://127.0.0.1:9\"\n\
-         [load]\nsmooth_s = 0\n"
+         [load]\nsmooth_s = 0\n\
+         [temps]\nenabled = false\n"
     );
+    // TEMPS (#74) has its own tests; its discovery line would join the
+    // log lines these tests count.
     std::fs::write(&path, text).expect("write watch.toml");
     Config::load_validated(&path, 32).expect("valid watch config")
 }

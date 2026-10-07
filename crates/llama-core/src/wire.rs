@@ -26,6 +26,18 @@
 //! latency means and tok/s) and `slots_busy`, which llama-metrics replaced
 //! with counters; every one was optional, so an older reader just does not
 //! see them, and this reader ignores them from an older watcher.
+//!
+//! #74 adds `temps`, every hwmon temperature the watcher shows, as compact
+//! `{"c": chip, "s": sensor, "t": tenths of a degree}` rows, at most
+//! [`MAX_TEMPS`], and `fan_rows`, fans from any hwmon chip as `{"c": chip,
+//! "n": channel, "l": label, "r": rpm, "p": pwm 0..=255}`, at most
+//! [`MAX_FAN_ROWS`]. Both additive on schema 1. `fan_rows` replaces `fans`
+//! on the way out, because two chips may both have a `fan1` and an older
+//! reader refuses a repeated `fans` channel; an older llama-metrics just
+//! sees no fans. This reader still reads `fans` from an older watcher.
+//! Both lists are ordered by importance, and the watcher drops rows from
+//! their ends (temperatures first) when a snapshot would pass
+//! [`MAX_BYTES`] (only a pathological worst case does), so the cap holds.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -76,6 +88,19 @@ pub const MAX_SLOT_CTX: usize = 32;
 pub const MAX_CTX_TOKENS: u64 = u32::MAX as u64;
 /// Most suspected-load rows one snapshot carries (#70).
 pub const MAX_SUSPECTED_LOADS: usize = 8;
+/// Most `fan_rows` one snapshot carries (#74).
+pub const MAX_FAN_ROWS: usize = 16;
+
+/// Most temperature rows one snapshot carries (#74).
+pub const MAX_TEMPS: usize = 32;
+/// Longest temperature chip name, in characters: `[a-z0-9_.-]`.
+pub const MAX_TEMP_CHIP_CHARS: usize = 24;
+/// Longest temperature sensor name, in characters: printable ASCII.
+pub const MAX_TEMP_SENSOR_CHARS: usize = 24;
+/// Range of a temperature row, tenths of a degree: −20..=150 °C, as every
+/// other temperature on the wire.
+pub const TEMP_TENTHS: std::ops::RangeInclusive<i16> = -200..=1500;
+
 /// Top of every [`CountersWire`] number: 2^53 − 1, the largest integer a
 /// Prometheus sample (a float) carries exactly. The watcher never writes
 /// more (#71).
@@ -134,6 +159,17 @@ pub enum WireError {
     /// label that is not short printable ASCII, or an rpm or pwm out of range.
     #[error("snapshot fan is out of range")]
     Fan,
+    /// More than [`MAX_TEMPS`] temperature rows, a chip or sensor name that
+    /// is empty, too long or has a refused character, a repeated
+    /// chip and sensor pair, or a value outside [`TEMP_TENTHS`] (#74).
+    #[error("snapshot temperature is out of range")]
+    Temp,
+    /// More than [`MAX_FAN_ROWS`] fan rows, a chip that is not a
+    /// [`is_temp_chip`] name, a channel outside 1..=[`MAX_FAN_CHANNEL`], a
+    /// repeated chip and channel, a label that is not short printable
+    /// ASCII, or an rpm above [`MAX_FAN_RPM`] (#74).
+    #[error("snapshot fan row is out of range")]
+    FanRow,
     /// The snapshot could not be encoded. Not signalled by an empty buffer.
     #[error("snapshot could not be encoded")]
     Encode,
@@ -164,6 +200,14 @@ pub struct WireSnapshot {
     /// Fan speeds when `[fans]` is on (#11). Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fans: Vec<FanWire>,
+    /// Fans from any hwmon chip (#74), in FANS panel order. Omitted when
+    /// empty, and by an older watcher, which sends `fans`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fan_rows: Vec<FanRowWire>,
+    /// Every temperature tty11's TEMPS panel shows (#74), most important
+    /// first. Omitted when empty, and by an older watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub temps: Vec<TempWire>,
     /// Source health, the tty health line (#11). Omitted by an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Sources>,
@@ -538,6 +582,61 @@ pub struct FanWire {
     pub pwm: Option<f32>,
 }
 
+/// One fan from any hwmon chip (#74), with compact keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanRowWire {
+    /// Stable chip name, as [`TempWire::chip`].
+    #[serde(rename = "c")]
+    pub chip: String,
+    /// Channel `N` of `fanN_input`, 1..=[`MAX_FAN_CHANNEL`].
+    #[serde(rename = "n")]
+    pub channel: u8,
+    /// Display label: 1..=[`MAX_FAN_LABEL_CHARS`] printable ASCII.
+    #[serde(rename = "l")]
+    pub label: String,
+    /// `fanN_input`, rpm, at most [`MAX_FAN_RPM`].
+    #[serde(rename = "r", default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+    /// `pwmN`, 0..=255.
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    pub pwm: Option<u8>,
+}
+
+/// One temperature (#74), with compact keys: a full list is 32 rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TempWire {
+    /// Stable chip name: the hwmon `name`, lowercased to `[a-z0-9_.-]`,
+    /// with a device suffix when two chips share it (`nvme-345a`); `gpu`
+    /// for the GPU.
+    #[serde(rename = "c")]
+    pub chip: String,
+    /// The `tempN_label`, or `tempN` without one; printable ASCII.
+    #[serde(rename = "s")]
+    pub sensor: String,
+    /// Tenths of a degree Celsius, within [`TEMP_TENTHS`].
+    #[serde(rename = "t")]
+    pub tenths: i16,
+}
+
+/// A chip name the wire accepts: 1..=[`MAX_TEMP_CHIP_CHARS`] of `[a-z0-9_.-]`.
+#[must_use]
+pub fn is_temp_chip(chip: &str) -> bool {
+    !chip.is_empty()
+        && chip.len() <= MAX_TEMP_CHIP_CHARS
+        && chip.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// A sensor name the wire accepts: 1..=[`MAX_TEMP_SENSOR_CHARS`] printable
+/// ASCII, not blank.
+#[must_use]
+pub fn is_temp_sensor(sensor: &str) -> bool {
+    !sensor.trim().is_empty()
+        && sensor.len() <= MAX_TEMP_SENSOR_CHARS
+        && sensor.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 /// One source on the tty health line (#11).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceWire {
@@ -666,6 +765,8 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         }
     }
     validate_fans(&snapshot.fans)?;
+    validate_temps(&snapshot.temps)?;
+    validate_fan_rows(&snapshot.fan_rows)?;
     validate_suspected_loads(&snapshot.suspected_loads)?;
     if let Some(sources) = &snapshot.sources {
         for (_, source) in sources.entries() {
@@ -786,6 +887,48 @@ fn validate_fans(fans: &[FanWire]) -> Result<(), WireError> {
     Ok(())
 }
 
+fn validate_fan_rows(rows: &[FanRowWire]) -> Result<(), WireError> {
+    if rows.len() > MAX_FAN_ROWS {
+        return Err(WireError::FanRow);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if !is_temp_chip(&row.chip)
+            || !(1..=MAX_FAN_CHANNEL).contains(&row.channel)
+            || rows[..i]
+                .iter()
+                .any(|other| other.chip == row.chip && other.channel == row.channel)
+            || row.label.trim().is_empty()
+            || row.label.chars().count() > MAX_FAN_LABEL_CHARS
+            || !row
+                .label
+                .chars()
+                .all(|c| ('\u{20}'..='\u{7e}').contains(&c))
+            || row.rpm.is_some_and(|rpm| rpm > MAX_FAN_RPM)
+        {
+            return Err(WireError::FanRow);
+        }
+    }
+    Ok(())
+}
+
+fn validate_temps(temps: &[TempWire]) -> Result<(), WireError> {
+    if temps.len() > MAX_TEMPS {
+        return Err(WireError::Temp);
+    }
+    for (i, row) in temps.iter().enumerate() {
+        if !is_temp_chip(&row.chip)
+            || !is_temp_sensor(&row.sensor)
+            || !TEMP_TENTHS.contains(&row.tenths)
+            || temps[..i]
+                .iter()
+                .any(|other| other.chip == row.chip && other.sensor == row.sensor)
+        {
+            return Err(WireError::Temp);
+        }
+    }
+    Ok(())
+}
+
 fn check_pct(field: &'static str, value: Option<f32>) -> Result<(), WireError> {
     check_range(field, value, 0.0, 100.0)
 }
@@ -894,6 +1037,8 @@ mod tests {
                 prompt_total: None,
             },
             fans: Vec::new(),
+            fan_rows: Vec::new(),
+            temps: Vec::new(),
             sources: None,
             suspected_loads: Vec::new(),
         }

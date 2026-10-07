@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::sources::fans::{FanPanel, FanSource};
 use crate::sources::gpu::{GpuBackend, GpuSource};
 use crate::sources::proc::{self, CpuSample};
+use crate::sources::temps::{TempReading, TempSource};
 use crate::sources::{self, Roots, SourceId};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::names::sanitize_wire;
@@ -81,6 +82,9 @@ pub struct WatchSample {
     /// off. Absent from [`Snapshot`]; the publisher copies rpm and pwm to the
     /// wire (#11).
     pub fans: Option<FanPanel>,
+    /// Every shown temperature, GPU included, most important first (#74).
+    /// `None` when `[temps]` is off. Read at most once a second.
+    pub temps: Option<Vec<TempReading>>,
 }
 
 /// 10 Hz collector. [`Self::sample`] takes the clock and a llama view.
@@ -176,6 +180,8 @@ pub(crate) struct Collector<'a, B, L> {
     llama_enabled: bool,
     /// `[fans]`, read on every tick like the other hwmon sources.
     fans: Option<FanSource>,
+    /// `[temps]` (#74): discovered every 30 s, read at most once a second.
+    temps: Option<TempSource>,
     _config: PhantomData<&'a ()>,
 }
 
@@ -311,6 +317,7 @@ where
             llama: None,
             llama_enabled: config.llama.enabled,
             fans: FanSource::new(&config.fans),
+            temps: TempSource::new(&config.temps),
             _config: PhantomData,
         }
     }
@@ -332,6 +339,10 @@ where
             .as_mut()
             .map(|source| source.read(&self.roots, mono, &mut self.log));
         let (gpu_pct, gpu_c, gpu_failed) = self.read_gpu(&mut errors);
+        let temps = self
+            .temps
+            .as_mut()
+            .map(|source| source.read(&self.roots, mono, gpu_c, &mut self.log));
         let gpu = if gpu_failed {
             GpuExtra::default()
         } else {
@@ -362,6 +373,7 @@ where
             activity_w: activity.device_w,
             load_source: activity.source,
             fans,
+            temps,
         }
     }
 

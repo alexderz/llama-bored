@@ -2,7 +2,8 @@
 //!
 //! `fanN_*` and `pwmN*` are writable on sysfs and drive the cooling. The
 //! watcher only reads them. This fence greps the production code of
-//! `sources/fans.rs` and `sources/hwmon.rs` (everything before a
+//! `sources/fans.rs`, `sources/hwmon.rs`, `sources/temps.rs` and
+//! `sources/chips.rs` (everything before a
 //! `#[cfg(test)]`, comments stripped) for any write-capable file API.
 
 use std::path::PathBuf;
@@ -66,7 +67,13 @@ fn write_hits(rel: &str, text: &str) -> Vec<String> {
 #[test]
 fn fan_and_hwmon_sources_have_no_write_path() {
     let mut hits = Vec::new();
-    for rel in ["sources/fans.rs", "sources/hwmon.rs"] {
+    // #74: the temperature and chip discovery read the same hwmon tree.
+    for rel in [
+        "sources/fans.rs",
+        "sources/hwmon.rs",
+        "sources/temps.rs",
+        "sources/chips.rs",
+    ] {
         hits.extend(write_hits(rel, &source(rel)));
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
@@ -74,6 +81,11 @@ fn fan_and_hwmon_sources_have_no_write_path() {
     assert!(
         fans.contains("std::fs::read_to_string"),
         "fans.rs must read with read_to_string"
+    );
+    let chips = production(&source("sources/chips.rs"));
+    assert!(
+        chips.contains("std::fs::read_to_string"),
+        "chips.rs must read with read_to_string"
     );
 }
 

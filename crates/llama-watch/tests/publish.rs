@@ -309,8 +309,27 @@ fn metrics_extras_reach_the_wire() {
             },
         ],
         fans: vec![
-            (2, "CPU".to_owned(), Some(1200), Some(255)),
-            (3, "fan3".to_owned(), None, Some(0)),
+            (
+                "nct6798".to_owned(),
+                2,
+                "CPU".to_owned(),
+                Some(1200),
+                Some(255),
+            ),
+            ("nct6798".to_owned(), 3, "fan3".to_owned(), None, Some(0)),
+            // #74: another chip's fan1 next to the board's.
+            (
+                "z53".to_owned(),
+                1,
+                "Pump".to_owned(),
+                Some(2810),
+                Some(153),
+            ),
+        ],
+        temps: vec![
+            ("k10temp".to_owned(), "Tctl".to_owned(), 684),
+            ("gpu".to_owned(), "gpu".to_owned(), 712),
+            ("nvme-3c1f".to_owned(), "Composite".to_owned(), 489),
         ],
         sources: Some(wire::Sources {
             llama_swap: Some(wire::SourceWire {
@@ -381,13 +400,37 @@ fn metrics_extras_reach_the_wire() {
             },
         ]
     );
-    assert_eq!(wire.fans.len(), 2);
-    assert_eq!(wire.fans[0].channel, 2);
-    assert_eq!(wire.fans[0].label, "CPU");
-    assert_eq!(wire.fans[0].rpm, Some(1200));
-    assert_eq!(wire.fans[0].pwm, Some(1.0));
-    assert_eq!(wire.fans[1].rpm, None);
-    assert_eq!(wire.fans[1].pwm, Some(0.0));
+    // #74: fans go out as `fan_rows` with their chip; `fans` is left for
+    // an older watcher.
+    assert!(wire.fans.is_empty());
+    let row = |chip: &str, channel, label: &str, rpm, pwm| wire::FanRowWire {
+        chip: chip.to_owned(),
+        channel,
+        label: label.to_owned(),
+        rpm,
+        pwm,
+    };
+    assert_eq!(
+        wire.fan_rows,
+        vec![
+            row("nct6798", 2, "CPU", Some(1200), Some(255)),
+            row("nct6798", 3, "fan3", None, Some(0)),
+            row("z53", 1, "Pump", Some(2810), Some(153)),
+        ]
+    );
+    let temps: Vec<(&str, &str, i16)> = wire
+        .temps
+        .iter()
+        .map(|t| (t.chip.as_str(), t.sensor.as_str(), t.tenths))
+        .collect();
+    assert_eq!(
+        temps,
+        [
+            ("k10temp", "Tctl", 684),
+            ("gpu", "gpu", 712),
+            ("nvme-3c1f", "Composite", 489)
+        ]
+    );
     let sources = wire.sources.expect("sources");
     assert_eq!(
         sources.llama_swap,
@@ -429,13 +472,30 @@ fn out_of_range_extras_are_left_out_not_fatal() {
             resets: new_resets(1),
         })
         .collect(),
-        fans: vec![
-            (0, "zero".to_owned(), None, None),
-            (17, "high".to_owned(), None, None),
-            (1, "\n\t".to_owned(), None, None),
-            (2, "fast".to_owned(), Some(u32::MAX), None),
-            (2, "again".to_owned(), None, None),
-        ],
+        fans: [
+            ("nct", 0, "zero", None),
+            ("nct", 17, "high", None),
+            ("nct", 1, "\n\t", None),
+            ("nct", 2, "fast", Some(u32::MAX)),
+            ("nct", 2, "again", None),
+            ("Not A Chip", 3, "bad chip", None),
+        ]
+        .into_iter()
+        .map(|(chip, n, label, rpm)| (chip.to_owned(), n, label.to_owned(), rpm, None))
+        .collect(),
+        // #74: a bad chip, a blank sensor, out of range, a repeat, and
+        // more rows than the wire carries.
+        temps: [
+            ("Bad Chip", "x", 500),
+            ("k10temp", " ", 500),
+            ("k10temp", "Tctl", 2000),
+            ("k10temp", "Tctl", 600),
+            ("k10temp", "Tctl", 610),
+        ]
+        .into_iter()
+        .map(|(c, s, t)| (c.to_owned(), s.to_owned(), t))
+        .chain((0..40).map(|n| ("nct6798".to_owned(), format!("temp{n}"), 400)))
+        .collect(),
         sources: Some(wire::Sources {
             metrics: Some(wire::SourceWire {
                 up: false,
@@ -478,8 +538,14 @@ fn out_of_range_extras_are_left_out_not_fatal() {
             resets: wire_resets(1)
         }]
     );
-    assert_eq!(wire.fans.len(), 1, "{:?}", wire.fans);
-    assert_eq!((wire.fans[0].channel, wire.fans[0].rpm), (2, None));
+    assert_eq!(wire.fan_rows.len(), 1, "{:?}", wire.fan_rows);
+    assert_eq!((wire.fan_rows[0].channel, wire.fan_rows[0].rpm), (2, None));
+    assert_eq!(wire.temps.len(), wire::MAX_TEMPS);
+    assert_eq!(
+        (wire.temps[0].sensor.as_str(), wire.temps[0].tenths),
+        ("Tctl", 600)
+    );
+    assert_eq!(wire.temps[1].sensor, "temp0");
     assert_eq!(
         wire.sources.and_then(|s| s.metrics),
         Some(wire::SourceWire {
@@ -1081,4 +1147,67 @@ fn series_reach_the_wire_by_place_and_name() {
     assert_eq!(flash.counters, None);
     let twin = &wire.ai.models[2];
     assert_eq!((twin.id.as_ref(), twin.counters.as_ref()), (None, None));
+}
+
+/// #74: a snapshot over the cap drops temperature rows from the end, then
+/// fan rows, and still publishes; one log line.
+#[test]
+fn hardware_rows_are_trimmed_from_the_end_to_fit_the_cap() {
+    let dir = scratch("fit");
+    let log = Capture::default();
+    let mut publisher = Publisher::open(&dir, log.clone()).expect("open");
+    let wall = SystemTime::UNIX_EPOCH;
+    let fans: Vec<llama_watch::publish::FanExtra> = [("z53", 1), ("z53", 2), ("nct6798", 2)]
+        .into_iter()
+        .map(|(chip, n)| (chip.to_owned(), n, format!("fan{n}"), Some(1500), Some(128)))
+        .collect();
+    let temps: Vec<(String, String, i32)> = (1..=32)
+        .map(|n| ("nct6798".to_owned(), format!("temp{n}"), 400 + n))
+        .collect();
+    let path = dir.join("snapshot.json");
+    let size_with = |publisher: &mut Publisher<Capture>, extras: &Extras| {
+        publisher.set_max_bytes(wire::MAX_BYTES);
+        publisher
+            .publish_with(&idle(wall), &idle_view(), extras)
+            .expect("publish");
+        std::fs::read(&path).unwrap().len()
+    };
+    let full = Extras {
+        fans: fans.clone(),
+        temps: temps.clone(),
+        ..Extras::default()
+    };
+    let fans_only = Extras {
+        fans: fans.clone(),
+        ..Extras::default()
+    };
+    let full_len = size_with(&mut publisher, &full);
+    let fans_len = size_with(&mut publisher, &fans_only);
+    assert!(log.lines().is_empty(), "{:?}", log.lines());
+
+    publisher.set_max_bytes(full_len - 1);
+    publisher
+        .publish_with(&idle(wall), &idle_view(), &full)
+        .expect("trimmed");
+    let got = wire::parse_validated(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(got.temps.len(), 31);
+    assert_eq!(got.temps.last().map(|t| t.sensor.as_str()), Some("temp31"));
+    assert_eq!(got.fan_rows.len(), 3);
+
+    publisher.set_max_bytes(fans_len - 1);
+    publisher
+        .publish_with(&idle(wall), &idle_view(), &full)
+        .expect("trimmed");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.len() < fans_len);
+    let got = wire::parse_validated(&bytes).unwrap();
+    assert!(got.temps.is_empty());
+    assert_eq!(got.fan_rows.len(), 2);
+    assert_eq!(got.fan_rows[1].chip, "z53");
+    let lines: Vec<String> = log
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("dropped"))
+        .collect();
+    assert_eq!(lines.len(), 1, "logged once: {:?}", log.lines());
 }

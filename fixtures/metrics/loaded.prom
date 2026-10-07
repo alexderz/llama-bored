@@ -242,13 +242,22 @@ llamabored_slot_context_resets_total{model="qwen3-coder-30b",engine="llamacpp",s
 llamabored_slot_context_resets_total{model="qwen3-coder-30b",engine="llamacpp",slot="1",reason="new"} 2
 llamabored_slot_context_resets_total{model="qwen3-coder-30b",engine="llamacpp",slot="1",reason="evicted"} 1
 llamabored_slot_context_resets_total{model="qwen3-coder-30b",engine="llamacpp",slot="1",reason="unknown"} 4
-# HELP llamabored_fan_rpm Fan speed, rpm, per configured [fans] channel.
+# HELP llamabored_fan_rpm Fan speed, rpm, per fan (read only).
 # TYPE llamabored_fan_rpm gauge
 llamabored_fan_rpm{channel="3",label="rad \"top\""} 1450
-# HELP llamabored_fan_pwm_ratio Fan PWM duty, 0 to 1, per configured [fans] channel (read only).
+llamabored_fan_rpm{chip="nct6798",channel="2",label="rad \"top\""} 1940
+llamabored_fan_rpm{chip="z53",channel="1",label="Pump"} 2810
+# HELP llamabored_fan_pwm_ratio Fan PWM duty, 0 to 1, per fan (read only).
 # TYPE llamabored_fan_pwm_ratio gauge
 llamabored_fan_pwm_ratio{channel="1",label="fan1"} 0.25
 llamabored_fan_pwm_ratio{channel="3",label="rad \"top\""} 0.5
+llamabored_fan_pwm_ratio{chip="z53",channel="1",label="Pump"} 0.6
+# HELP llamabored_temperature_celsius Temperature, degrees Celsius, per hwmon chip and sensor (and the GPU).
+# TYPE llamabored_temperature_celsius gauge
+llamabored_temperature_celsius{chip="k10temp",sensor="Tctl"} 68.3
+llamabored_temperature_celsius{chip="gpu",sensor="gpu"} 71.2
+llamabored_temperature_celsius{chip="nvme-317k",sensor="Sensor 2"} 66.9
+llamabored_temperature_celsius{chip="nct6798",sensor="AUXTIN2"} 15.5
 # HELP llamabored_source_up 1 when a watcher source answered on its last poll, 0 when it failed; absent when not polled.
 # TYPE llamabored_source_up gauge
 llamabored_source_up{source="llama-swap"} 1

@@ -280,7 +280,13 @@ pub enum InvalidWatchConfig {
     #[error("fans: {reason}")]
     Fans {
         /// Which limit failed.
-        reason: &'static str,
+        reason: String,
+    },
+    /// A `[temps]` value is malformed (#74). `reason` names the key.
+    #[error("temps: {reason}")]
+    Temps {
+        /// Which key failed, and how.
+        reason: String,
     },
     /// A `[setup]` field rule is malformed (#52). `field` is its position
     /// in `[[setup.field]]`, from 0; `reason` names the problem.
@@ -595,27 +601,64 @@ pub enum ChartGlyphs {
     Eighths,
 }
 
-/// `[fans]`: read-only fan speeds from one Super-I/O hwmon, for the tty.
+/// `[fans]`: read-only fan speeds, for the tty and llama-metrics.
 ///
-/// Off by default. The watcher only reads `fanN_input`, `pwmN` and
-/// `pwmN_enable`; it never writes them. The snapshot carries rpm and pwm
-/// as numbers for llama-metrics (#11).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// Off by default. The watcher only reads `fanN_input`, `fanN_label`,
+/// `pwmN` and `pwmN_enable`; it never writes them. The snapshot carries rpm
+/// and pwm as numbers for llama-metrics (#11).
+///
+/// Enabled without `hwmon`, every `fanN_input` on every hwmon chip is
+/// discovered (#74), filtered by `allow` and `block` like `[temps]`. The
+/// older `hwmon` + `channels` (+ `labels`) are shorthand for `allow =
+/// ["<hwmon>:fanN", ...]` with those labels, in that order; they cannot be
+/// combined with `allow`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fans {
     /// `true` draws the FANS panel on tty11.
     #[serde(default)]
     pub enabled: bool,
-    /// The hwmon `name` to match, e.g. `nct6798`. Never the `hwmonN` number,
-    /// which changes across reboots.
+    /// Shorthand: the one hwmon `name` to read, e.g. `nct6798`. Never the
+    /// `hwmonN` number, which changes across reboots.
     #[serde(default)]
     pub hwmon: String,
-    /// Fan indices `N` for `fanN_input`, 1..=16, at most 8.
+    /// Shorthand: fan indices `N` for `fanN_input`, 1..=16, at most 8.
     #[serde(default)]
     pub channels: Vec<u32>,
-    /// One label per channel, at most 10 characters. Default `fanN`.
+    /// Shorthand: one label per channel, at most 10 characters. Default
+    /// `fanN`.
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// Empty: every fan discovered. Otherwise only the matches (`chip`,
+    /// `chip:fanN`, `chip:<fanN_label>`), shown even if they never spun.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Hidden, always: beats `allow` and the shorthand.
+    #[serde(default)]
+    pub block: Vec<String>,
+    /// Row labels, at most 10 characters: `"chip:fanN" = "rad top"`. Exact
+    /// keys; wins over `labels`.
+    #[serde(default)]
+    pub rename: BTreeMap<String, String>,
+    /// Keep the built-in junk rule: a discovered fan that has never read
+    /// above 0 rpm this run (an empty header) is hidden.
+    #[serde(default = "defaults::enabled")]
+    pub defaults: bool,
+}
+
+impl Default for Fans {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hwmon: String::new(),
+            channels: Vec::new(),
+            labels: None,
+            allow: Vec::new(),
+            block: Vec::new(),
+            rename: BTreeMap::new(),
+            defaults: true,
+        }
+    }
 }
 
 /// Most fans the panel shows.
@@ -648,7 +691,25 @@ impl Fans {
             .collect()
     }
 
-    fn validate(&self) -> Result<(), &'static str> {
+    /// `true` when the older `hwmon` / `channels` / `labels` keys are set.
+    #[must_use]
+    pub fn uses_shorthand(&self) -> bool {
+        !self.hwmon.is_empty() || !self.channels.is_empty() || self.labels.is_some()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.uses_shorthand() && !self.allow.is_empty() {
+            return Err(
+                "hwmon/channels/labels and allow cannot both be set; hwmon + channels is shorthand for allow = [\"<hwmon>:fanN\", ...]"
+                    .to_owned(),
+            );
+        }
+        check_patterns(&self.allow, &self.block)?;
+        check_rename(&self.rename, MAX_FAN_LABEL)?;
+        self.validate_shorthand().map_err(str::to_owned)
+    }
+
+    fn validate_shorthand(&self) -> Result<(), &'static str> {
         if self.channels.len() > MAX_FANS {
             return Err("at most 8 channels");
         }
@@ -677,12 +738,155 @@ impl Fans {
         {
             return Err("hwmon must be a plain name of printable ASCII, at most 32");
         }
-        if self.enabled {
-            if self.hwmon.is_empty() {
-                return Err("hwmon is required when enabled");
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.hwmon.is_empty() && (!self.channels.is_empty() || self.labels.is_some()) {
+            return Err("channels and labels need hwmon");
+        }
+        if !self.hwmon.is_empty() && self.channels.is_empty() {
+            return Err("hwmon needs channels; for every fan on a chip use allow = [\"<chip>\"]");
+        }
+        Ok(())
+    }
+}
+
+/// `[temps]`: the TEMPS panel and `llamabored_temperature_celsius` (#74).
+///
+/// On by default. Every `/sys/class/hwmon/*/tempN_input` is discovered
+/// (read only), bogus inputs are dropped, and the rest is shown grouped by
+/// device. Patterns are globs (`*` any run, `?` one character) over the
+/// chip (`nct6798`, `nvme-345a`) or `chip:sensor` (`nct6798:AUXTIN*`); a
+/// sensor without a `tempN_label` is `tempN`. See
+/// [`crate::sources::temps`] for the filter order.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Temps {
+    /// `false` reads no temperatures, draws no TEMPS panel and exports no
+    /// `llamabored_temperature_celsius`.
+    #[serde(default = "defaults::enabled")]
+    pub enabled: bool,
+    /// Keep the built-in junk rules: the Super-I/O exclusions
+    /// ([`crate::sources::temps::DEFAULT_BLOCK`]) and the unchanging-input
+    /// rule. The plausible range always applies.
+    #[serde(default = "defaults::enabled")]
+    pub defaults: bool,
+    /// Empty: every sensor discovered. Otherwise only the matches, which
+    /// then pass the built-in junk rules too (never the plausible range).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Hidden, always: beats `allow`.
+    #[serde(default)]
+    pub block: Vec<String>,
+    /// Display names on tty11: `"chip:sensor"` renames one item, `"chip"`
+    /// renames its row. Exact keys, not globs. The export keeps the raw
+    /// names.
+    #[serde(default)]
+    pub rename: BTreeMap<String, String>,
+    /// Warning colour from this many °C, by pattern; the most specific
+    /// (`chip:sensor`) match wins. Default: the chip's `tempN_max`, else
+    /// 80 (45 for coolant).
+    #[serde(default)]
+    pub warn: BTreeMap<String, f64>,
+    /// Critical colour from this many °C, by pattern. Default: the chip's
+    /// `tempN_crit`, else 90 (55 for coolant).
+    #[serde(default)]
+    pub crit: BTreeMap<String, f64>,
+}
+
+impl Default for Temps {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            defaults: true,
+            allow: Vec::new(),
+            block: Vec::new(),
+            rename: BTreeMap::new(),
+            warn: BTreeMap::new(),
+            crit: BTreeMap::new(),
+        }
+    }
+}
+
+/// Most entries in each `[temps]` list or map.
+pub const MAX_TEMP_PATTERNS: usize = 32;
+/// Longest `[temps]` pattern or rename key, in characters.
+pub const MAX_TEMP_PATTERN: usize = 64;
+/// Longest `[temps] rename` value, in characters.
+pub const MAX_TEMP_RENAME: usize = 12;
+
+/// `allow` and `block`: at most [`MAX_TEMP_PATTERNS`] valid globs each.
+fn check_patterns(allow: &[String], block: &[String]) -> Result<(), String> {
+    for (key, list) in [("allow", allow), ("block", block)] {
+        if list.len() > MAX_TEMP_PATTERNS {
+            return Err(format!("{key} has more than {MAX_TEMP_PATTERNS} patterns"));
+        }
+        if let Some(bad) = list.iter().find(|p| !pattern_ok(p)) {
+            return Err(format!(
+                "{key} pattern {bad:?} is not a valid glob: {PATTERN_RULE}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a `[temps]` / `[fans]` pattern must be.
+const PATTERN_RULE: &str = "\"chip\" or \"chip:sensor\", printable ASCII, at most 64 characters, \
+     with * and ? as the only wildcards";
+
+fn pattern_ok(text: &str) -> bool {
+    text.chars().count() <= MAX_TEMP_PATTERN
+        && crate::sources::chips::Pattern::parse(text).is_some()
+}
+
+/// `rename`: exact `chip` or `chip:sensor` keys (no wildcards), values of
+/// 1..=`cap` printable ASCII characters.
+fn check_rename(rename: &BTreeMap<String, String>, cap: usize) -> Result<(), String> {
+    if rename.len() > MAX_TEMP_PATTERNS {
+        return Err(format!("rename has more than {MAX_TEMP_PATTERNS} entries"));
+    }
+    for (key, value) in rename {
+        if !pattern_ok(key) || key.contains(['*', '?']) {
+            return Err(format!(
+                "rename key {key:?} must be an exact \"chip\" or \"chip:sensor\""
+            ));
+        }
+        if value.trim().is_empty()
+            || value.chars().count() > cap
+            || !value.chars().all(|ch| ch == ' ' || ch.is_ascii_graphic())
+        {
+            return Err(format!(
+                "rename {key:?} must be 1..={cap} printable ASCII characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Temps {
+    fn validate(&self) -> Result<(), String> {
+        check_patterns(&self.allow, &self.block)?;
+        check_rename(&self.rename, MAX_TEMP_RENAME)?;
+        for (name, map) in [("warn", &self.warn), ("crit", &self.crit)] {
+            if map.len() > MAX_TEMP_PATTERNS {
+                return Err(format!("{name} has more than {MAX_TEMP_PATTERNS} entries"));
             }
-            if self.channels.is_empty() {
-                return Err("channels is required when enabled");
+            for (key, c) in map {
+                if !pattern_ok(key) {
+                    return Err(format!(
+                        "{name} key {key:?} is not a valid glob: {PATTERN_RULE}"
+                    ));
+                }
+                if !c.is_finite() || !(1.0..=150.0).contains(c) {
+                    return Err(format!("{name} {key:?} must be 1..=150 C"));
+                }
+            }
+        }
+        for (key, warn) in &self.warn {
+            if let Some(crit) = self.crit.get(key)
+                && warn >= crit
+            {
+                return Err(format!("warn {key:?} must be below crit"));
             }
         }
         Ok(())
@@ -725,6 +929,9 @@ pub struct Config {
     /// Read-only fan panel on tty11. Off by default.
     #[serde(default)]
     pub fans: Fans,
+    /// Every hwmon temperature, the TEMPS panel (#74). On by default.
+    #[serde(default)]
+    pub temps: Temps,
     /// Which launch settings tty11's SETUP block shows (#52).
     #[serde(default)]
     pub setup: Setup,
@@ -1209,6 +1416,9 @@ impl Config {
         self.fans
             .validate()
             .map_err(|reason| InvalidWatchConfig::Fans { reason })?;
+        self.temps
+            .validate()
+            .map_err(|reason| InvalidWatchConfig::Temps { reason })?;
         crate::setup_rules::Rules::compile(&self.setup)
             .map_err(|(field, reason)| InvalidWatchConfig::Setup { field, reason })?;
         Ok(())

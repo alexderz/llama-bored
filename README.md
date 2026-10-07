@@ -256,7 +256,8 @@ Host and exporter:
 | `llamabored_gpu_power_watts`, `_gpu_power_limit_watts`, `_cpu_power_watts` | | Power draw and GPU limit |
 | `llamabored_gpu_memory_used_bytes`, `_total_bytes`; `llamabored_memory_used_bytes`, `_total_bytes` | | VRAM and system memory |
 | `llamabored_ai_state` | `state` | down / idle / loaded |
-| `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
+| `llamabored_temperature_celsius` | `chip`, `sensor` | Every temperature TEMPS shows, the GPU as `chip="gpu"` (#74); the coolant, CPU and GPU series stay |
+| `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `chip`, `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
 | `llamabored_source_up`, `llamabored_source_latency_seconds` | `source` | Health of each watcher source (llama-swap, running, slots, metrics, activity, gpu, hwmon, proc) |
 | `llamabored_collector_suspected_loads_total` | `model` | Suspected model loads after an upstream read (#70); absent while there are none |
 | `llamabored_snapshot_up`, `_snapshot_stale`, `_snapshot_age_seconds`, `_snapshot_seq` | | Snapshot freshness |
@@ -614,6 +615,72 @@ pre-step, `llama-watch tty-setup`, which runs `setfont` and `stty` from the
 validated values (restart the unit after a change). Under 48 rows the
 dashboard drops panels to fit: IN/OUT first, then FANS, then the chart
 shrinks; it shows `tty too small` only below 160x26.
+
+**TEMPS and FANS** (`watch.toml`, `[temps]` and `[fans]`, #74): TEMPS shows
+every temperature the host exposes, found in `/sys/class/hwmon` (read only,
+found again every 30 s, read at most once a second) plus the GPU, one row
+per device with short labels, values coloured at the chip's own
+`tempN_max` / `tempN_crit` (else 80 / 90 °C; 45 / 55 for a coolant):
+
+```text
+TEMPS  warn crit
+CPU      Tctl 68 · CCD1 64 · CCD2 62
+GPU      71
+coolant  40
+NVMe0    50 · s1 50 · s2 67
+board    sys 51 · cpu 51 · aux0 27 · aux1 72 · aux2 16 · aux3 27 · aux4 50
+NIC      51
+Wi-Fi    39
+```
+
+Where it goes: from 190 columns, FANS then TEMPS right of IN/OUT; on a
+narrower screen with rows to spare, FANS and TEMPS side by side under
+IN/OUT; at 160x49 (12x22 at 1080p) TEMPS shrinks to one line of each row's
+hottest value (`TEMPS  CPU 68 · GPU 71 · NVMe0 67 ...`) and FANS hides, so
+OUT keeps its three rows. Use the 10x18 font for both panels whole.
+
+Which sensors and fans show, the same way for both:
+
+- `allow`: empty is everything discovered; otherwise only the matches.
+- `block`: always hidden, whatever `allow` says.
+- Built-in junk rules (`defaults = true`) apply to what no `allow` named,
+  so `allow` can force an entry in. TEMPS hides the Super-I/O inputs
+  that are unwired or repeat the CPU (`PCH_*`, `TSI*`, `SMBUSMASTER*`,
+  `PECI*` on `nct*` / `w83*` chips) and any input that has not changed for
+  ten minutes while another on its chip has. FANS hides a discovered fan
+  that has never turned this run (an empty header); once it has spun it
+  stays, so a stall shows.
+- A reading below 5 °C or at 127 °C and above is never a temperature
+  (unwired inputs read 0, -62 or 127) and is always dropped, even when
+  allowed.
+
+Patterns are globs (`*`, `?`; ASCII case ignored) over `chip` or
+`chip:sensor`; a sensor matches by its label (`Composite`, `Pump speed`)
+or its input (`temp3`, `fan2`). The chip is the hwmon `name` in lowercase
+`[a-z0-9_.-]`; two chips of one name get a suffix from the device (the end
+of the NVMe serial, `nvme-317k`; else the PCI address, `nvme-01.00`). List
+them with `cat /sys/class/hwmon/*/name`. `rename` changes what tty11 shows
+(the export keeps the real names):
+
+```toml
+[temps]
+#enabled = true                    # on by default
+#allow = ["k10temp", "nvme*", "nct6798:SYSTIN", "z53"]
+block = ["nct6798:AUXTIN3"]
+rename = { "nct6798:SYSTIN" = "board", "nvme-842p" = "scratch" }
+warn = { "z53" = 42 }              # °C; the chip:sensor match wins over the chip
+crit = { "z53" = 50 }
+
+[fans]
+enabled = true                     # off by default; then every fan on every chip
+block = ["nct6798:fan7"]
+rename = { "nct6798:fan2" = "rad top", "z53:fan1" = "pump" }
+```
+
+The older `hwmon = "nct6798"` + `channels = [2, 3, 5, 6]` (+ `labels`)
+still work, as shorthand for `allow = ["nct6798:fan2", ...]` in that order
+(those fans show even at 0 rpm); setting them together with `allow` is an
+error.
 
 **SETUP rules** (`watch.toml`, `[setup]`): each `[[setup.field]]` puts one
 value on a SETUP row. Built-in rules
