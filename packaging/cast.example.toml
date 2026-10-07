@@ -73,7 +73,7 @@ preroll_s = 3
 # argument list, no shell and an empty environment.
 ffmpeg = "/usr/bin/ffmpeg"
 
-# tty11's console font: "12x24" (default) or "12x22". Must match
+# tty11's console font: "12x24" (default), "12x22" or "10x18". Must match
 # `[tty] font` in watch.toml, or the picture is garbled.
 font = "12x24"
 

@@ -488,9 +488,10 @@ pub struct Tty {
     pub palette: Palette,
 }
 
-/// `tty.font`: which bundled Hack console font tty11 loads. Both have the
-/// same glyphs; 12x22 fits two more rows on a short screen (160x49 on a
-/// 1920x1080 display instead of 160x45).
+/// `tty.font`: which bundled Hack console font tty11 loads. All three have
+/// the same glyphs. At 1920x1080: 12x24 gives 160x45, 12x22 160x49 (two more
+/// rows on a short screen), 10x18 192x60 (#73: a 1080p screen viewed up
+/// close, room for FANS and TEMPS).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub enum TtyFont {
     /// `llama-hack-12x24.psfu` (default).
@@ -500,6 +501,9 @@ pub enum TtyFont {
     /// `llama-hack-12x22.psfu`.
     #[serde(rename = "12x22")]
     Hack12x22,
+    /// `llama-hack-10x18.psfu` (#73).
+    #[serde(rename = "10x18")]
+    Hack10x18,
 }
 
 impl TtyFont {
@@ -510,6 +514,7 @@ impl TtyFont {
         match self {
             Self::Hack12x24 => "llama-hack-12x24.psfu",
             Self::Hack12x22 => "llama-hack-12x22.psfu",
+            Self::Hack10x18 => "llama-hack-10x18.psfu",
         }
     }
 }
@@ -586,7 +591,7 @@ pub enum ChartGlyphs {
     #[default]
     Halves,
     /// Lower eighths `▁`–`▇` and `█`: 8 levels per row. The falling half
-    /// inverts the lower eighths. Needs a llama-hack font (12x24 or 12x22).
+    /// inverts the lower eighths. Needs a llama-hack font (12x24, 12x22 or 10x18).
     Eighths,
 }
 

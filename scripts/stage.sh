@@ -150,7 +150,7 @@ assert_packaging_contract() {
     exit 1
   fi
   local font
-  for font in llama-hack-12x24.psfu llama-hack-12x22.psfu; do
+  for font in llama-hack-12x24.psfu llama-hack-12x22.psfu llama-hack-10x18.psfu; do
     if [[ ! -f "$root/packaging/fonts/$font" ]]; then
       echo "stage self-test: missing packaging/fonts/$font" >&2
       exit 1

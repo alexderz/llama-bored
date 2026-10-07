@@ -29,7 +29,7 @@ fn pixel(frame: &[u8], x: usize, y: usize) -> [u8; 3] {
 
 #[test]
 fn shipped_fonts_parse() {
-    for (size, w, h) in [("12x24", 12, 24), ("12x22", 12, 22)] {
+    for (size, w, h) in [("12x24", 12, 24), ("12x22", 12, 22), ("10x18", 10, 18)] {
         let font = load_font(&shipped_font(size)).expect(size);
         assert_eq!((font.width(), font.height()), (w, h), "{size}");
         assert_eq!(font.count(), 512, "{size}");
@@ -67,7 +67,7 @@ fn slot_of(bytes: &[u8], ch: char) -> usize {
 /// the gap between stacked meters.
 #[test]
 fn meter_glyphs_leave_a_gap_at_the_top_of_the_cell() {
-    for size in ["12x24", "12x22"] {
+    for size in ["12x24", "12x22", "10x18"] {
         let bytes = std::fs::read(shipped_font(size)).unwrap();
         let font = Psf2::parse(&bytes).unwrap();
         let (w, h) = (font.width(), font.height());
@@ -86,7 +86,9 @@ fn meter_glyphs_leave_a_gap_at_the_top_of_the_cell() {
                 exact.round() as usize
             };
             let gap = h - lit;
-            assert!(gap >= 3, "{size} {ch}: a gap of {gap} rows");
+            // 3 rows in 12x24 and 12x22, 2 in 10x18 (#73): an eighth of
+            // the cell either way, still a visible line between meters.
+            assert!(gap >= 2 && gap * 9 >= h, "{size} {ch}: a gap of {gap} rows");
             for y in 0..h {
                 let row: Vec<bool> = (0..w).map(|x| font.pixel(slot, x, y)).collect();
                 if y < gap {

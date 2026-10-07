@@ -73,9 +73,10 @@ fn parse_psf2(bytes: &[u8]) -> Result<Psf, String> {
 }
 
 /// Committed fonts and their cells (`[tty] font`).
-const FONTS: [(&str, (u32, u32)); 2] = [
+const FONTS: [(&str, (u32, u32)); 3] = [
     ("llama-hack-12x24.psfu", (12, 24)),
     ("llama-hack-12x22.psfu", (12, 22)),
+    ("llama-hack-10x18.psfu", (10, 18)),
 ];
 
 fn font(name: &str) -> Psf {
@@ -95,14 +96,17 @@ fn committed_fonts_are_psf2_with_a_unicode_table_at_their_cell() {
     }
 }
 
-/// 12x22 is the same glyph set in a shorter cell: same slots, same table.
+/// 12x22 and 10x18 are the same glyph set in a smaller cell: same slots,
+/// same table.
 #[test]
-fn both_fonts_map_the_same_scalars() {
-    assert_eq!(
-        font(FONTS[0].0).mapped,
-        font(FONTS[1].0).mapped,
-        "12x24 and 12x22 map different scalars"
-    );
+fn all_fonts_map_the_same_scalars() {
+    for (name, _) in &FONTS[1..] {
+        assert_eq!(
+            font(FONTS[0].0).mapped,
+            font(name).mapped,
+            "12x24 and {name} map different scalars"
+        );
+    }
 }
 
 /// Every printable ASCII byte, `?` (the S12 replacement) and every

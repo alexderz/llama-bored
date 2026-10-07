@@ -2642,6 +2642,7 @@ fn in_fills_its_rows_with_the_tail_and_dims_role_labels() {
 // ---- T52: FANS panel ------------------------------------------------------
 
 use llama_watch::sources::fans::{FanPanel, FanReading};
+use llama_watch::tty::layout::FANS_SIDE_COLS;
 
 fn fan(
     channel: u32,
@@ -2686,8 +2687,12 @@ fn fans_model() -> TtyModel {
     model
 }
 
-const FANS_GOLDENS: [(&str, u16, u16); 2] =
-    [("fans-240.json", 240, 67), ("fans-286.json", 286, 60)];
+/// 192x60 is the 10x18 font on a 1920x1080 screen (#73).
+const FANS_GOLDENS: [(&str, u16, u16); 3] = [
+    ("fans-192.json", 192, 60),
+    ("fans-240.json", 240, 67),
+    ("fans-286.json", 286, 60),
+];
 
 #[test]
 fn fans_goldens_match_character_and_colour() {
@@ -2882,7 +2887,7 @@ fn missing_values_draw_dashes_and_absent_chip_says_so() {
 #[test]
 fn narrow_screen_puts_fans_under_in_out_when_rows_allow() {
     let model = fans_model();
-    for (cols, rows) in [(160u16, 67u16), (199, 80)] {
+    for (cols, rows) in [(160u16, 67u16), (FANS_SIDE_COLS - 1, 80)] {
         let at = format!("{cols}x{rows}");
         let grid = draw(&model, cols, rows);
         let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
@@ -2937,7 +2942,7 @@ fn text_off_gives_fans_the_bottom_of_the_freed_rows() {
             is_rule_row(&grid, header - 1),
             "{at}: rule above FANS\n{all}"
         );
-        let (left, _) = if cols >= 200 {
+        let (left, _) = if cols >= FANS_SIDE_COLS {
             (u16::try_from(u32::from(cols) * 58 / 100 + 2).unwrap(), 0)
         } else {
             (2, 0)

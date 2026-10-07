@@ -63,6 +63,8 @@ pub enum Font {
     Hack12x24,
     #[serde(rename = "12x22")]
     Hack12x22,
+    #[serde(rename = "10x18")]
+    Hack10x18,
 }
 
 impl Font {
@@ -72,6 +74,7 @@ impl Font {
         match self {
             Self::Hack12x24 => "llama-hack-12x24.psfu",
             Self::Hack12x22 => "llama-hack-12x22.psfu",
+            Self::Hack10x18 => "llama-hack-10x18.psfu",
         }
     }
 
@@ -81,6 +84,7 @@ impl Font {
         match self {
             Self::Hack12x24 => "12x24",
             Self::Hack12x22 => "12x22",
+            Self::Hack10x18 => "10x18",
         }
     }
 }
