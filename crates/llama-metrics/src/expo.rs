@@ -436,6 +436,19 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         );
         out.sample("llamabored_tokens_prompt_total", &[], &total.to_string());
     }
+    // #70: loads llama-watch suspects its own reads caused. The watcher
+    // sends each id once, so every row is its own series.
+    let suspects: Vec<(Vec<(&str, &str)>, String)> = snap
+        .suspected_loads
+        .iter()
+        .map(|row| (vec![("model", row.model.as_str())], row.count.to_string()))
+        .collect();
+    out.rows(
+        "llamabored_collector_suspected_loads_total",
+        "counter",
+        "Model loads llama-watch suspects its own llama-swap reads caused, by llama-swap model id, since the watcher started.",
+        &suspects,
+    );
 
     out.family(
         "llamabored_ai_state",

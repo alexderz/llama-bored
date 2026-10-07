@@ -71,6 +71,9 @@ llamabored_tokens_decoded_total 1234567
 # HELP llamabored_tokens_prompt_total Prompt tokens processed since the watcher started.
 # TYPE llamabored_tokens_prompt_total counter
 llamabored_tokens_prompt_total 7654321
+# HELP llamabored_collector_suspected_loads_total Model loads llama-watch suspects its own llama-swap reads caused, by llama-swap model id, since the watcher started.
+# TYPE llamabored_collector_suspected_loads_total counter
+llamabored_collector_suspected_loads_total{model="qwen3.6-35b-a3b"} 2
 # HELP llamabored_ai_state llama-swap state; the current state is 1.
 # TYPE llamabored_ai_state gauge
 llamabored_ai_state{state="down"} 0

@@ -108,6 +108,16 @@ struct World {
     /// `/api/captures/<id>` bodies (#5).
     captures: HashMap<String, Vec<u8>>,
     hang: bool,
+    /// `/running` body by call number (1-based), over `running` (#70).
+    script: Option<fn(u32) -> Vec<u8>>,
+    /// Status and `Location` for an upstream path, over the defaults (#70).
+    upstream_status: HashMap<String, (u16, Option<String>)>,
+    /// Upstream paths answered this much later (#70).
+    upstream_delay: HashMap<String, Duration>,
+    /// When each upstream request arrived (#70).
+    upstream_at: Vec<(String, Instant)>,
+    /// Becomes `running_after` once an upstream request is served (#70).
+    after_upstream: Option<Vec<u8>>,
 }
 
 impl World {
@@ -125,6 +135,11 @@ impl World {
             activity: br#"{"data":[]}"#.to_vec(),
             captures: HashMap::new(),
             hang: false,
+            script: None,
+            upstream_status: HashMap::new(),
+            upstream_delay: HashMap::new(),
+            upstream_at: Vec::new(),
+            after_upstream: None,
         }
     }
 }
@@ -204,10 +219,16 @@ fn serve(
         hits.lock()
             .unwrap_or_else(|err| err.into_inner())
             .push(path.clone());
-        let action = {
+        let (action, delay) = {
             let mut world = world.lock().unwrap_or_else(|err| err.into_inner());
-            reply(&mut world, &path)
+            (
+                reply(&mut world, &path),
+                world.upstream_delay.get(&path).copied(),
+            )
         };
+        if let Some(delay) = delay {
+            thread::sleep(delay);
+        }
         match action {
             Action::Respond {
                 status,
@@ -240,7 +261,9 @@ fn reply(world: &mut World, path: &str) -> Action {
     }
     if path.ends_with("/running") {
         world.running_served += 1;
-        let body = if world.running_served == 1 {
+        let body = if let Some(script) = world.script {
+            script(world.running_served)
+        } else if world.running_served == 1 {
             world.running.clone()
         } else {
             world
@@ -282,6 +305,20 @@ fn reply(world: &mut World, path: &str) -> Action {
                 location: None,
             },
         };
+    }
+    if path.starts_with("/upstream/") {
+        world.upstream_at.push((path.to_owned(), Instant::now()));
+        if let Some(body) = world.after_upstream.take() {
+            world.running_after = Some(body);
+        }
+        if let Some((status, location)) = world.upstream_status.get(path) {
+            return Action::Respond {
+                status: *status,
+                reason: "Status",
+                body: b"model x is not loaded; path matches upstream.ignorePaths".to_vec(),
+                location: location.clone(),
+            };
+        }
     }
     if let Some(model) = upstream_model(path, "metrics") {
         let body = world
@@ -672,6 +709,19 @@ fn non_ready_model_gets_no_metrics_or_slots() {
     let log = MemLog::new();
     let config = watch(server.port, 12, 4_194_304, 0.15);
     let (_poller, _rx) = spawn(&config, &log);
+    // #70: a model starting is a swap in progress, so nothing upstream is
+    // read at all, not even for the ready model.
+    thread::sleep(Duration::from_millis(600));
+    let hits = server.hits();
+    assert!(hits.iter().filter(|path| *path == "/running").count() >= 2);
+    assert!(
+        hits.iter().all(|path| !path.contains("/upstream/")),
+        "{hits:?}"
+    );
+    server.update(|world| {
+        world.running = running_model("qwen3.6-35b-a3b", "Qwen", "ready");
+        world.running_after = None;
+    });
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
         if server
@@ -902,6 +952,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 capture: None,
                 setup: Vec::new(),
                 engine_live: Vec::new(),
+                suspected_loads: Vec::new(),
             },
         ));
     }
@@ -960,36 +1011,28 @@ activity_timeout_s = 0.2
     );
 }
 
+/// #70 (a): a model `ready` in one `/running` read but gone from the next
+/// gets no upstream request at all: the gate reads `/running` itself just
+/// before each upstream GET, and a model it does not list as `ready` is
+/// dropped, not retried.
 #[test]
-fn one_running_read_cannot_request_a_model_the_other_response_marks_ready() {
+fn a_model_ready_in_one_read_and_gone_in_the_next_gets_no_upstream_request() {
     let first = serde_json::to_vec(&serde_json::json!({
-        "running": [
-            {"model": "alpha", "state": "ready"},
-            {"model": "beta", "state": "starting"}
-        ]
+        "running": [{"model": "alpha", "state": "ready"}]
     }))
     .expect("json");
     let second = serde_json::to_vec(&serde_json::json!({
-        "running": [
-            {"model": "beta", "state": "ready"},
-            {"model": "alpha", "state": "starting"}
-        ]
+        "running": [{"model": "beta", "state": "ready"}]
     }))
     .expect("json");
     let mut world = World::running(first);
     world.running_after = Some(second);
-    world
-        .metrics
-        .insert("alpha".to_owned(), metrics_body(4, 1.0));
-    world
-        .metrics
-        .insert("beta".to_owned(), metrics_body(4, 1.0));
-    world
-        .slots
-        .insert("alpha".to_owned(), fixture("slots-sample.json"));
-    world
-        .slots
-        .insert("beta".to_owned(), fixture("slots-sample.json"));
+    for id in ["alpha", "beta"] {
+        world.metrics.insert(id.to_owned(), metrics_body(4, 1.0));
+        world
+            .slots
+            .insert(id.to_owned(), fixture("slots-sample.json"));
+    }
     let server = Server::start(world);
     let log = MemLog::new();
     let config = watch(server.port, 12, 4_194_304, 0.15);
@@ -999,34 +1042,32 @@ fn one_running_read_cannot_request_a_model_the_other_response_marks_ready() {
         if server
             .hits()
             .iter()
-            .any(|path| path.contains("/upstream/") && path.ends_with("/metrics"))
+            .any(|path| path == "/upstream/beta/slots")
         {
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
+    thread::sleep(Duration::from_millis(300));
     let hits = server.hits();
-    let metrics_at = hits
+    assert!(
+        hits.iter().any(|path| path == "/upstream/beta/metrics"),
+        "{hits:?}"
+    );
+    assert!(
+        hits.iter().all(|path| !path.contains("alpha")),
+        "a model gone from the fresh read was requested: {hits:?}"
+    );
+    // The first read alone never led to an upstream request.
+    let first_upstream = hits
         .iter()
-        .position(|path| path.contains("/upstream/") && path.ends_with("/metrics"))
-        .expect("a metrics request");
-    let early = &hits[..=metrics_at];
-    let running_before = early
+        .position(|path| path.contains("/upstream/"))
+        .expect("an upstream request");
+    let running_before = hits[..first_upstream]
         .iter()
-        .filter(|path| path.ends_with("/running"))
+        .filter(|path| *path == "/running")
         .count();
-    assert_eq!(
-        running_before, 1,
-        "one /running in the first cycle: {early:?}"
-    );
-    assert!(
-        early.iter().any(|path| path == "/upstream/alpha/metrics"),
-        "{early:?}"
-    );
-    assert!(
-        early.iter().all(|path| !path.contains("beta")),
-        "non-ready id was requested: {early:?}"
-    );
+    assert!(running_before >= 2, "{hits:?}");
 }
 
 #[test]
@@ -1522,17 +1563,22 @@ fn a_llamacpp_image_gets_its_flags_once_its_metrics_say_llamacpp() {
     let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
         lcpp_detail_is_read(view)
     });
-    // The probe's answer re-reads `/running` at once, in the same round
-    // as its metrics read, rather than one `/running` interval later.
+    // The probe's answer is followed by a `/running` read at once (the
+    // fresh gate's check read, #70), so the flags are read as llama.cpp's
+    // in the same round. Every upstream read sits between two `/running`
+    // reads: the gate's, and the check after it.
     let hits = server.hits();
     assert_eq!(
-        hits[..5],
+        hits[..8],
         [
             "/running",
-            "/upstream/lcpp/metrics",
-            "/upstream/lcpp/metrics",
-            "/api/metrics/activity",
             "/running",
+            "/upstream/lcpp/metrics",
+            "/running",
+            "/running",
+            "/upstream/lcpp/metrics",
+            "/running",
+            "/api/metrics/activity",
         ],
         "{hits:?}"
     );
@@ -3127,4 +3173,478 @@ fn no_capture_is_fetched_for_an_old_generation_row() {
             "/api/captures/5".to_owned()
         ]
     );
+}
+
+// ---- #70: polling never makes llama-swap load a model ----
+
+const VLLM_CMD: &str = "vllm serve /models/q --port 5000";
+
+/// Wait until `pred` holds for a sample, asserting `each` on every sample.
+fn wait_each(
+    rx: &poller::SampleRx,
+    timeout: Duration,
+    mut each: impl FnMut(&LlamaView, &LlamaDetail),
+    mut pred: impl FnMut(&LlamaView, &LlamaDetail) -> bool,
+) -> (LlamaView, LlamaDetail) {
+    wait_msg(rx, timeout, |view, detail| {
+        each(view, detail);
+        pred(view, detail)
+    })
+}
+
+fn engine_numbers(view: &LlamaView) -> bool {
+    view.models
+        .first()
+        .and_then(|model| model.backend)
+        .is_some_and(|info| info.running.is_some() && info.engine.spec_permille.is_some())
+}
+
+/// Every upstream request comes right after a `/running` read and is
+/// followed by one: the fresh gate and its self-check (#70).
+fn assert_gated(hits: &[String]) {
+    for (i, path) in hits.iter().enumerate() {
+        if path.contains("/upstream/") {
+            assert_eq!(
+                i.checked_sub(1).map(|j| hits[j].as_str()),
+                Some("/running"),
+                "no fresh /running before {path}: {hits:?}"
+            );
+            if i + 1 < hits.len() {
+                assert_eq!(
+                    hits[i + 1],
+                    "/running",
+                    "no check read after {path}: {hits:?}"
+                );
+            }
+        }
+    }
+}
+
+/// #70 (b): a 409 from `/upstream/<id>/metrics` (llama-swap's
+/// `upstream.ignorePaths` answer) means "not loaded": the engine numbers
+/// go, one log line per change, llama-swap stays up and nothing is a tap
+/// failure, and there is no second read in the same round.
+#[test]
+fn a_409_means_not_loaded_quietly_and_is_not_retried_in_the_round() {
+    let mut world = World::running(running_cmd("v", VLLM_CMD));
+    world
+        .metrics
+        .insert("v".to_owned(), vllm_metrics(42_000, 20_000, 60_000, 38_000));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let up = |view: &LlamaView, _: &LlamaDetail| assert_eq!(view.ai, AiState::Loaded);
+    wait_each(&rx, Duration::from_secs(2), up, |view, _| {
+        engine_numbers(view)
+    });
+
+    let refuse = |world: &mut World| {
+        world
+            .upstream_status
+            .insert("/upstream/v/metrics".to_owned(), (409, None));
+    };
+    server.update(refuse);
+    let refused_at = Instant::now();
+    let (view, _) = wait_each(&rx, Duration::from_secs(2), up, |view, _| {
+        !engine_numbers(view)
+    });
+    // The model is still listed (llama-swap says ready), its numbers absent.
+    assert_eq!(view.models.len(), 1);
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(
+        (info.running, info.queued, info.kv_permille),
+        (None, None, None)
+    );
+    assert_eq!(info.engine, llama_core::backend::EngineStats::default());
+    // Several more rounds of 409s: still up, still absent, still one line.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) {
+        if let Ok((view, _)) = rx.try_recv() {
+            assert_eq!(view.ai, AiState::Loaded);
+            assert!(!engine_numbers(&view));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        lines_count(&log, "llama-swap says not loaded"),
+        1,
+        "{:?}",
+        log.lines()
+    );
+    assert_eq!(
+        lines_count(&log, "v: llama-swap says not loaded; skipping until ready"),
+        1
+    );
+    for quiet in ["metrics:", "no /metrics", "llama: down", "suspected"] {
+        assert_eq!(lines_count(&log, quiet), 0, "{quiet}: {:?}", log.lines());
+    }
+    // No retry within a round: refused reads are a metrics interval apart.
+    let refused: Vec<Instant> = {
+        let world = server.world.lock().unwrap_or_else(|err| err.into_inner());
+        world
+            .upstream_at
+            .iter()
+            .filter(|(path, at)| path == "/upstream/v/metrics" && *at >= refused_at)
+            .map(|(_, at)| *at)
+            .collect()
+    };
+    assert!(refused.len() >= 3, "{refused:?}");
+    for pair in refused.windows(2) {
+        assert!(
+            pair[1].duration_since(pair[0]) >= Duration::from_millis(150),
+            "retried within a round: {refused:?}"
+        );
+    }
+    assert_gated(&server.hits());
+
+    // Loaded again: the numbers come back; a new 409 is a new line.
+    server.update(|world| {
+        world.upstream_status.clear();
+    });
+    wait_each(&rx, Duration::from_secs(2), up, |view, _| {
+        engine_numbers(view)
+    });
+    server.update(refuse);
+    wait_each(&rx, Duration::from_secs(2), up, |view, _| {
+        !engine_numbers(view)
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        lines_count(&log, "llama-swap says not loaded"),
+        2,
+        "{:?}",
+        log.lines()
+    );
+}
+
+/// #70: any other non-2xx answer is "not available now" too: no second
+/// read of that model in the round (`/slots` after a failed `/metrics`).
+#[test]
+fn a_non_2xx_upstream_answer_skips_the_model_for_the_round() {
+    let mut world = World::running(running_model("l", "L", "ready"));
+    world.metrics.insert("l".to_owned(), metrics_body(5, 1.0));
+    world
+        .slots
+        .insert("l".to_owned(), fixture("slots-sample.json"));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, _rx) = spawn(&config, &log);
+    let start = Instant::now();
+    while !server.hits().iter().any(|path| path == "/upstream/l/slots") {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            server.hits()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    server.update(|world| {
+        world
+            .upstream_status
+            .insert("/upstream/l/metrics".to_owned(), (503, None));
+    });
+    let failed_at = Instant::now();
+    thread::sleep(Duration::from_millis(1200));
+    let world = server.world.lock().unwrap_or_else(|err| err.into_inner());
+    let after: Vec<&(String, Instant)> = world
+        .upstream_at
+        .iter()
+        .filter(|(_, at)| *at >= failed_at)
+        .collect();
+    // A `/slots` read never follows a failed `/metrics` read of the same
+    // round (they would be milliseconds apart).
+    for pair in after.windows(2) {
+        if pair[0].0 == "/upstream/l/metrics" && pair[1].0 == "/upstream/l/slots" {
+            assert!(
+                pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(100),
+                "{after:?}"
+            );
+        }
+    }
+    drop(world);
+    assert_eq!(
+        lines_count(&log, "metrics: http status"),
+        1,
+        "{:?}",
+        log.lines()
+    );
+    assert_gated(&server.hits());
+}
+
+/// #70 (c): in every round the order is `/running`, then the upstream
+/// read, then `/running` again, for every backend and every upstream path.
+#[test]
+fn every_upstream_read_is_between_two_running_reads() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "running": [
+            {"model": "l", "state": "ready", "cmd": "llama-server -m /m/x.gguf"},
+            {"model": "v", "state": "ready", "cmd": VLLM_CMD},
+            {"model": "p", "state": "ready", "cmd": CONTAINER_CMD},
+        ]
+    }))
+    .expect("json");
+    let mut world = World::running(body);
+    world.metrics.insert("l".to_owned(), metrics_body(5, 1.0));
+    world
+        .slots
+        .insert("l".to_owned(), fixture("slots-sample.json"));
+    world
+        .metrics
+        .insert("v".to_owned(), vllm_metrics(1, 1, 1, 1));
+    world
+        .metrics
+        .insert("p".to_owned(), vllm_metrics(1, 1, 1, 1));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, _rx) = spawn(&config, &log);
+    let wanted = [
+        "/upstream/l/metrics",
+        "/upstream/l/slots",
+        "/upstream/v/metrics",
+        "/upstream/p/metrics",
+    ];
+    let start = Instant::now();
+    while !wanted
+        .iter()
+        .all(|want| server.hits().iter().filter(|hit| hit == want).count() >= 2)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            server.hits()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_gated(&server.hits());
+    assert_eq!(lines_count(&log, "suspected"), 0, "{:?}", log.lines());
+}
+
+/// `/running` for #70 (d): `p` (probed) is ready only in read 1 and from
+/// read 12 on; `l` (llama.cpp, busy) is gone from every third read. No
+/// model is ever in another state, so no read is a swap.
+fn flapping(n: u32) -> Vec<u8> {
+    let mut models = Vec::new();
+    if n == 1 || n >= 12 {
+        models.push(serde_json::json!({"model": "p", "state": "ready", "cmd": CONTAINER_CMD}));
+    }
+    if !n.is_multiple_of(3) {
+        models.push(
+            serde_json::json!({"model": "l", "state": "ready", "cmd": "llama-server -m /m/x.gguf"}),
+        );
+    }
+    serde_json::to_vec(&serde_json::json!({ "running": models })).expect("json")
+}
+
+/// #70 (d): the backend probe and `/slots` obey the same gate as
+/// `/metrics`: each is sent only right after a `/running` read that lists
+/// its model as `ready`.
+#[test]
+fn the_probe_and_slots_obey_the_fresh_gate() {
+    let mut world = World::running(Vec::new());
+    world.script = Some(flapping);
+    world.metrics.insert("l".to_owned(), metrics_body(5, 1.0));
+    world
+        .slots
+        .insert("l".to_owned(), fixture("slots-sample.json"));
+    world
+        .metrics
+        .insert("p".to_owned(), vllm_metrics(1, 1, 1, 1));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, _rx) = spawn(&config, &log);
+    let start = Instant::now();
+    while !(server.hits().iter().any(|hit| hit == "/upstream/p/metrics")
+        && server
+            .hits()
+            .iter()
+            .filter(|hit| *hit == "/upstream/l/slots")
+            .count()
+            >= 2)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            server.hits()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let hits = server.hits();
+    assert_gated(&hits);
+    // Replay the script: each upstream request's `/running` listed it.
+    let mut served = 0;
+    for (i, path) in hits.iter().enumerate() {
+        if path == "/running" {
+            served += 1;
+            continue;
+        }
+        let Some(rest) = path.strip_prefix("/upstream/") else {
+            continue;
+        };
+        let id = rest.split('/').next().expect("id");
+        let listed: serde_json::Value = serde_json::from_slice(&flapping(served)).expect("json");
+        let ready = listed["running"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|model| model["model"] == id && model["state"] == "ready");
+        assert!(ready, "{path} after /running #{served} (hit {i}): {hits:?}");
+    }
+    // `p` was ready in the first read only, then gone until read 12: no
+    // probe before that.
+    let probe_at = hits
+        .iter()
+        .position(|hit| hit == "/upstream/p/metrics")
+        .expect("probe");
+    let running_before = hits[..probe_at]
+        .iter()
+        .filter(|hit| *hit == "/running")
+        .count();
+    assert!(running_before >= 12, "{hits:?}");
+}
+
+/// #70: a model starting right after one of our upstream reads is a
+/// suspected load: a warning naming the model and path, a 5-minute stop
+/// on that model's upstream reads, and a count on the detail.
+#[test]
+fn a_model_starting_after_our_read_is_a_suspected_load() {
+    let mut world = World::running(running_model("l", "L", "ready"));
+    world.metrics.insert("l".to_owned(), metrics_body(5, 0.0));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let start = Instant::now();
+    while !server.hits().iter().any(|hit| hit == "/upstream/l/metrics") {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Once our next upstream read is served, `x` is starting: as if that
+    // read had loaded it.
+    server.update(|world| {
+        world.after_upstream = Some(
+            serde_json::to_vec(&serde_json::json!({
+                "running": [
+                    {"model": "l", "state": "ready", "cmd": "llama-server"},
+                    {"model": "x", "state": "starting"}
+                ]
+            }))
+            .expect("json"),
+        );
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        !detail.suspected_loads.is_empty()
+    });
+    assert_eq!(detail.suspected_loads, vec![("l".to_owned(), 1)]);
+    let warned = log
+        .lines()
+        .into_iter()
+        .filter(|line| line.contains("suspected model load"))
+        .collect::<Vec<_>>();
+    assert_eq!(warned.len(), 1, "{:?}", log.lines());
+    assert!(
+        warned[0].contains("l: suspected model load after GET /upstream/l/metrics"),
+        "{warned:?}"
+    );
+    assert!(warned[0].contains("300 s"), "{warned:?}");
+    // The swap ends, but `l` stays backed off.
+    server.update(|world| world.running_after = None);
+    let quiet_from = server.hits().len();
+    thread::sleep(Duration::from_millis(800));
+    let hits = server.hits();
+    assert!(
+        hits[quiet_from..]
+            .iter()
+            .all(|hit| !hit.contains("/upstream/")),
+        "{:?}",
+        &hits[quiet_from..]
+    );
+    assert!(hits[quiet_from..].iter().any(|hit| hit == "/running"));
+}
+
+/// #70: an upstream read slower than 2 s may have waited for a load: a
+/// suspected load, and that model is left alone.
+#[test]
+fn a_slow_upstream_read_is_a_suspected_load() {
+    let mut world = World::running(running_model("l", "L", "ready"));
+    world.metrics.insert("l".to_owned(), metrics_body(5, 0.0));
+    world.upstream_delay.insert(
+        "/upstream/l/metrics".to_owned(),
+        Duration::from_millis(2100),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch_with(server.port, 12, 4_194_304, 0.15, "");
+    // A timeout over 2 s needs a longer metrics interval.
+    let path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("watch-{}.toml", server.port));
+    let text = std::fs::read_to_string(&path)
+        .expect("watch.toml")
+        .replace("metrics_interval_s = 0.2", "metrics_interval_s = 2.5")
+        .replace("metrics_timeout_s = 0.1", "metrics_timeout_s = 2.4");
+    std::fs::write(&path, text).expect("write");
+    drop(config);
+    let config = Config::load_validated(&path, 8).expect("valid");
+    let (_poller, rx) = spawn(&config, &log);
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(5), |_, detail| {
+        !detail.suspected_loads.is_empty()
+    });
+    assert_eq!(detail.suspected_loads, vec![("l".to_owned(), 1)]);
+    assert_eq!(
+        lines_count(
+            &log,
+            "l: suspected model load after GET /upstream/l/metrics (it took 2."
+        ),
+        1,
+        "{:?}",
+        log.lines()
+    );
+    let reads = server
+        .hits()
+        .iter()
+        .filter(|hit| *hit == "/upstream/l/metrics")
+        .count();
+    thread::sleep(Duration::from_millis(3000));
+    let later = server
+        .hits()
+        .iter()
+        .filter(|hit| *hit == "/upstream/l/metrics")
+        .count();
+    assert_eq!(reads, later, "backed off: {:?}", server.hits());
+}
+
+/// #70: an upstream redirect is not followed, so it cannot reach another
+/// model's path.
+#[test]
+fn an_upstream_redirect_is_not_followed() {
+    let mut world = World::running(running_model("l", "L", "ready"));
+    world.upstream_status.insert(
+        "/upstream/l/metrics".to_owned(),
+        (302, Some("/upstream/other/metrics".to_owned())),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, _rx) = spawn(&config, &log);
+    let start = Instant::now();
+    while server
+        .hits()
+        .iter()
+        .filter(|hit| *hit == "/upstream/l/metrics")
+        .count()
+        < 3
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            server.hits()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let hits = server.hits();
+    assert!(hits.iter().all(|hit| !hit.contains("other")), "{hits:?}");
+    assert_gated(&hits);
 }

@@ -484,6 +484,7 @@ impl TickState {
                 capture: None,
                 setup: Vec::new(),
                 engine_live: Vec::new(),
+                suspected_loads: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -1683,6 +1684,7 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
             .map(|fan| (fan.channel, fan.label.clone(), fan.rpm, fan.pwm))
             .collect(),
         sources: wire_sources(&health(sample, &tick.detail, watch), &tick.detail.latencies),
+        suspected_loads: tick.detail.suspected_loads.clone(),
     }
 }
 
@@ -2272,6 +2274,7 @@ mod tests {
                     capture: None,
                     setup: Vec::new(),
                     engine_live: Vec::new(),
+                    suspected_loads: Vec::new(),
                 },
             ))
         }
@@ -2419,6 +2422,7 @@ mod tests {
                     capture: None,
                     setup: Vec::new(),
                     engine_live: Vec::new(),
+                    suspected_loads: Vec::new(),
                 },
             ))
         }

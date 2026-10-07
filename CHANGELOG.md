@@ -6,6 +6,16 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- llama-watch's polling can no longer make llama-swap load or swap a model (#70). `/running` was read every 0.5 s and `/upstream/<id>/metrics` every 0.25 s, so a read could act on a ready list up to 0.5 s old: if a client asked for another model in that window, our upstream read made llama-swap load ours back. Every upstream read (`/metrics`, `/slots`, the engine probe) now goes through one function, the fresh gate: it reads `/running` as the request just before the GET, and sends it only for a model that read lists as `ready`; a model that is not is dropped, not retried. If that read lists any model as `starting`, `stopping` or in another state, a swap is in progress and the round makes no upstream request at all. A `409` (llama-swap's `upstream.ignorePaths` answer for a model that is not loaded) or any other non-2xx from an upstream read means "not available now": the model's engine numbers are dropped as on unload, it gets no second read that round, llama-swap stays up, and a 409 is logged once per change (`<id>: llama-swap says not loaded; skipping until ready`) and counts as no tap failure. Redirects are still never followed, now pinned by S17. Cost: two small `/running` reads per upstream read
+- README: "Never swaps models" under the engines, with llama-swap's `upstream.ignorePaths` block (the default pattern kept, since listing `ignorePaths` replaces it) as optional extra protection for the short window that remains between our `/running` read and our upstream read (#70)
+
+### Added
+
+- Self-check for suspected loads (#70). `/running` is read again right after each upstream read; a model `starting` there, or an upstream read slower than 2 s, is a suspected load: a warning names the model id and path, that model gets no upstream reads for 5 minutes, and it is counted. The counter rides the snapshot as the optional `suspected_loads` list (`model`, `count`; at most 8 rows, additive on schema 1) and llama-metrics exports it as `llamabored_collector_suspected_loads_total{model}`, absent while there are none
+- llama-metrics test: a snapshot with no model running is a 200 with valid exposition, `llamabored_ai_state` and no model series (#70)
+
 ## 0.4.1 — 2026-10-06
 
 ### Fixed

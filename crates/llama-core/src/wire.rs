@@ -64,6 +64,8 @@ pub const MAX_LATENCY_S: f32 = 600.0;
 pub const MAX_SLOT_CTX: usize = 32;
 /// Top of a slot's context tokens (#10).
 pub const MAX_CTX_TOKENS: u64 = u32::MAX as u64;
+/// Most suspected-load rows one snapshot carries (#70).
+pub const MAX_SUSPECTED_LOADS: usize = 8;
 
 /// Canonical model-name width, including the trailing `…`.
 ///
@@ -105,7 +107,8 @@ pub enum WireError {
     /// `kv_fill` is non-finite or outside 0..=1, its engine numbers are out
     /// of range ([`EngineWire::is_valid`]), its cached prompt tokens
     /// exceed its prompt tokens, or a slot context row is out of range,
-    /// repeated, or past [`MAX_SLOT_CTX`] (#10).
+    /// repeated, or past [`MAX_SLOT_CTX`] (#10). Also a suspected-load row
+    /// that is repeated, zero, or past [`MAX_SUSPECTED_LOADS`] (#70).
     #[error("snapshot model gauge is out of range")]
     Gauge,
     /// A full name is not canonical, or a detail token is not allowlisted.
@@ -148,6 +151,20 @@ pub struct WireSnapshot {
     /// Source health, the tty health line (#11). Omitted by an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Sources>,
+    /// Model loads the watcher suspects its own llama-swap reads caused
+    /// this run (#70), per llama-swap model id. Omitted when there were
+    /// none, and by an older watcher.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspected_loads: Vec<SuspectedLoadWire>,
+}
+
+/// One model's suspected-load counter (#70).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuspectedLoadWire {
+    /// The llama-swap model id, sanitised like a full name.
+    pub model: String,
+    /// Suspected loads since the watcher started; at least 1.
+    pub count: u64,
 }
 
 /// Host numbers. Percents are 0..=100, except `activity_pct`, which is
@@ -585,6 +602,7 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         }
     }
     validate_fans(&snapshot.fans)?;
+    validate_suspected_loads(&snapshot.suspected_loads)?;
     if let Some(sources) = &snapshot.sources {
         for (_, source) in sources.entries() {
             check_range(
@@ -640,6 +658,19 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
             return Err(WireError::Gauge);
         }
         validate_slot_ctx(&model.slot_ctx)?;
+    }
+    Ok(())
+}
+
+fn validate_suspected_loads(rows: &[SuspectedLoadWire]) -> Result<(), WireError> {
+    if rows.len() > MAX_SUSPECTED_LOADS {
+        return Err(WireError::Gauge);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        validate_full_name(&row.model)?;
+        if row.count == 0 || rows[..i].iter().any(|other| other.model == row.model) {
+            return Err(WireError::Gauge);
+        }
     }
     Ok(())
 }
@@ -789,6 +820,7 @@ mod tests {
             },
             fans: Vec::new(),
             sources: None,
+            suspected_loads: Vec::new(),
         }
     }
 

@@ -1,12 +1,16 @@
-//! #31: llama-swap loads a model on any `/upstream/<id>/…` request, so the
-//! watcher may request one only for a model that `/running` lists as
-//! `ready`. A fake llama-swap records every path in order, and for each
-//! upstream request checks the id against the `ready` set of the newest
-//! `/running` body it served (the poller is one thread making one request
-//! at a time, so that body is the one the poller acted on). The script runs
-//! models through starting, ready, stopping, gone, a failed `/running` and
-//! back, with backends that take every upstream read: the `/metrics`
-//! detection probe, vLLM and llama.cpp `/metrics`, and `/slots`.
+//! #31, #70: llama-swap loads a model on any `/upstream/<id>/…` request,
+//! so the watcher may request one only for a model that `/running` lists
+//! as `ready`, in a `/running` read made just before it. A fake llama-swap
+//! records every path in order, and an upstream request is a violation
+//! unless the request just before it was a good `/running` (the fresh
+//! gate), that body listed the id as `ready`, and it listed no model in
+//! any other state (no swap in progress). Every upstream request must also
+//! be followed at once by a `/running` read (the self-check). The poller
+//! is one thread making one request at a time, so the order the fake sees
+//! is the order the poller acted in. The script runs models through
+//! starting, ready, stopping, gone, a failed `/running` and back, with
+//! backends that take every upstream read: the `/metrics` detection probe,
+//! vLLM and llama.cpp `/metrics`, and `/slots`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -32,6 +36,10 @@ struct Fake {
     /// `ready` ids of the newest `/running` the fake served; empty after a
     /// failed one (the poller then reads nothing upstream).
     ready: HashSet<String>,
+    /// That `/running` listed a model in a state other than `ready`.
+    swapping: bool,
+    /// The last request was a `/running` read.
+    fresh: bool,
     metrics: HashMap<String, Vec<u8>>,
     hits: Vec<String>,
     /// Upstream requests for a model that was not ready.
@@ -123,19 +131,21 @@ fn serve(mut stream: TcpStream, fake: &Mutex<Fake>) {
     let (status, body) = {
         let mut fake = fake.lock().unwrap_or_else(|err| err.into_inner());
         fake.hits.push(path.clone());
+        let fresh = std::mem::replace(&mut fake.fresh, path == "/running");
         if path == "/running" {
             fake.ready = if fake.status == 200 {
                 ready_ids(&fake.running)
             } else {
                 HashSet::new()
             };
+            fake.swapping = fake.status == 200 && swapping(&fake.running);
             (
                 fake.status,
                 serde_json::to_vec(&fake.running).expect("json"),
             )
         } else if let Some(rest) = path.strip_prefix("/upstream/") {
             let (id, leaf) = rest.split_once('/').unwrap_or((rest, ""));
-            if !fake.ready.contains(id) {
+            if !fresh || fake.swapping || !fake.ready.contains(id) {
                 fake.violations.push(path.clone());
             }
             match leaf {
@@ -174,6 +184,14 @@ fn ready_ids(running: &serde_json::Value) -> HashSet<String> {
         .filter(|model| model["state"] == "ready")
         .filter_map(|model| model["model"].as_str().map(str::to_owned))
         .collect()
+}
+
+fn swapping(running: &serde_json::Value) -> bool {
+    running["running"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|model| model["state"] != "ready")
 }
 
 fn slots_body() -> Vec<u8> {
@@ -229,12 +247,24 @@ impl Sink for NoLog {
     fn write_line(&mut self, _line: &str) {}
 }
 
+fn upstream_hits(fake: &Fake) -> usize {
+    fake.hits
+        .iter()
+        .filter(|path| path.starts_with("/upstream/"))
+        .count()
+}
+
 #[test]
 fn no_upstream_request_for_a_model_that_is_not_ready() {
-    let phase1 = running(&[
+    // A swap in progress: two ready models, one loading, one unloading.
+    let swap = running(&[
         ("vllm-a", "ready", CONTAINER),
         ("boot-b", "starting", CONTAINER),
         ("stop-c", "stopping", LLAMA),
+        ("gone-d", "ready", LLAMA),
+    ]);
+    let steady = running(&[
+        ("vllm-a", "ready", CONTAINER),
         ("gone-d", "ready", LLAMA),
         ("tabby-e", "ready", "python3 main.py --port 5000"),
     ]);
@@ -247,8 +277,10 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
     }
     let server = Server::start(Fake {
         status: 200,
-        running: phase1.clone(),
+        running: swap.clone(),
         ready: HashSet::new(),
+        swapping: false,
+        fresh: false,
         metrics,
         hits: Vec::new(),
         violations: Vec::new(),
@@ -256,7 +288,19 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
     let config = config(server.port);
     let (poller, _rx) = poller::spawn(&config, NoLog).expect("spawn");
 
-    // Phase 1 runs until every ready model was read, /slots included.
+    // #70: while any model is loading or unloading, nothing upstream at
+    // all, not even for the two ready models.
+    server.set_running(200, swap.clone());
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        server.with(|fake| upstream_hits(fake)),
+        0,
+        "{:?}",
+        server.with(|f| f.hits.clone())
+    );
+
+    // Every model ready: each is read, /slots included.
+    server.set_running(200, steady.clone());
     let start = Instant::now();
     let wanted = [
         "/upstream/vllm-a/metrics",
@@ -273,18 +317,22 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
         thread::sleep(Duration::from_millis(20));
     }
     thread::sleep(Duration::from_millis(300));
-    // gone-d disappears, vllm-a stops, boot-b is ready (and gets probed).
+    // gone-d disappears, vllm-a stops, boot-b is ready: a swap, so nothing.
     server.set_running(
         200,
         running(&[
             ("vllm-a", "stopping", CONTAINER),
             ("boot-b", "ready", CONTAINER),
-            ("stop-c", "stopping", LLAMA),
         ]),
     );
+    let before = server.with(|fake| upstream_hits(fake));
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(server.with(|fake| upstream_hits(fake)), before);
+    // The swap is over: boot-b is probed and read.
+    server.set_running(200, running(&[("boot-b", "ready", CONTAINER)]));
     thread::sleep(Duration::from_millis(400));
     // llama-swap fails: nothing upstream until it answers again.
-    server.set_running(500, phase1.clone());
+    server.set_running(500, steady.clone());
     thread::sleep(Duration::from_millis(400));
     // Back with only loading and unloading models, then an empty list.
     server.set_running(
@@ -300,7 +348,7 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
     drop(poller);
 
     let (hits, violations) = server.with(|fake| (fake.hits.clone(), fake.violations.clone()));
-    assert!(violations.is_empty(), "not ready: {violations:?}\n{hits:?}");
+    assert!(violations.is_empty(), "not gated: {violations:?}\n{hits:?}");
     assert!(
         hits.iter().all(|path| !path.contains("stop-c")),
         "a stopping model is never read: {hits:?}"
@@ -319,4 +367,14 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
         .position(|path| path == "/upstream/boot-b/metrics")
         .expect("boot-b read");
     assert!(gone_at < switched, "{hits:?}");
+    // The self-check: every upstream request is followed by `/running`.
+    for (i, path) in hits.iter().enumerate() {
+        if path.starts_with("/upstream/") {
+            assert_eq!(
+                hits.get(i + 1).map(String::as_str),
+                Some("/running"),
+                "no check read after {path}: {hits:?}"
+            );
+        }
+    }
 }

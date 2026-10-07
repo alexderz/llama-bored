@@ -593,6 +593,10 @@ fn no_prompt_or_output_text_is_exported() {
         "sources.hwmon.up",
         "sources.proc",
         "sources.proc.up",
+        // #70: a sanitised llama-swap model id and a count, no text.
+        "suspected_loads",
+        "suspected_loads.model",
+        "suspected_loads.count",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -643,6 +647,10 @@ fn no_prompt_or_output_text_is_exported() {
         allowed.insert(source.to_owned());
     }
     allowed.insert(wire::SCHEMA.to_string());
+    // #70: suspected loads carry the sanitised llama-swap model id.
+    for row in &snap.suspected_loads {
+        allowed.insert(row.model.clone());
+    }
     for model in &snap.ai.models {
         for row in &model.slot_ctx {
             allowed.insert(row.slot.to_string());
@@ -682,6 +690,7 @@ fn no_prompt_or_output_text_is_exported() {
         "label",
         "source",
         "slot",
+        "model",
     ]
     .into_iter()
     .collect();
@@ -825,6 +834,14 @@ const EXPORTED: &[(&str, &str)] = &[
     ),
     ("tokens.decoded_total", "llamabored_tokens_decoded_total"),
     ("tokens.prompt_total", "llamabored_tokens_prompt_total"),
+    (
+        "suspected_loads.model",
+        "llamabored_collector_suspected_loads_total",
+    ),
+    (
+        "suspected_loads.count",
+        "llamabored_collector_suspected_loads_total",
+    ),
     ("fans.channel", "llamabored_fan_rpm"),
     ("fans.label", "llamabored_fan_rpm"),
     ("fans.rpm", "llamabored_fan_rpm"),
@@ -1002,4 +1019,51 @@ fn slot_and_prompt_counters_pass_through_and_restart_with_the_watcher() {
     assert!(text.contains("# TYPE llamabored_slot_ctx_resets_total counter"));
     assert!(text.contains("# TYPE llamabored_model_prompt_cached_tokens_total counter"));
     assert!(text.contains("# TYPE llamabored_slot_ctx_used_tokens gauge"));
+}
+
+/// #70: llama-metrics renders only what the snapshot holds. With no model
+/// running (llama-swap idle, or every model unloaded), no model series is
+/// exported, the exposition still parses, `llamabored_ai_state` is there,
+/// and the scrape is a 200.
+#[test]
+fn no_model_running_is_a_valid_scrape_without_model_series() {
+    let mut snap = load("snapshot-loaded.json");
+    snap.ai.state = wire::AiWire::Idle;
+    snap.ai.models.clear();
+    snap.suspected_loads.clear();
+    snap.tokens.decoded_total = Some(0);
+    wire::validate(&snap).expect("an idle snapshot validates");
+    let dir = common::scratch("no-models");
+    let path = dir.join("snapshot.json");
+    std::fs::write(&path, wire::to_json(&snap).expect("encode")).expect("write");
+    let body = SnapshotMetrics::new(SnapshotFile::at(&path), STALE, Box::new(|| T0));
+    let harness = common::spawn(
+        &["127.0.0.1/32"],
+        4,
+        llama_metrics::http::Limits::default(),
+        std::sync::Arc::new(body),
+    );
+    let resp = common::exchange(harness.addr, b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(common::status_line(&resp), "HTTP/1.1 200 OK", "{resp}");
+    let text = resp.split_once("\r\n\r\n").expect("body").1;
+    let all = samples(text);
+    assert!(text.contains("llamabored_snapshot_stale 0\n"), "{text}");
+    assert!(
+        text.contains("llamabored_ai_state{state=\"idle\"} 1\n"),
+        "{text}"
+    );
+    for (name, labels, _) in &all {
+        assert!(
+            !name.starts_with("llamabored_model_") && !name.starts_with("llamabored_slot"),
+            "{name} with no model running"
+        );
+        assert!(
+            labels
+                .iter()
+                .all(|(key, _)| key != "name" && key != "model"),
+            "{name} has a model label: {labels:?}"
+        );
+    }
+    let keys: BTreeSet<String> = all.iter().map(|(n, l, _)| format!("{n}{l:?}")).collect();
+    assert_eq!(keys.len(), all.len(), "duplicate series");
 }
