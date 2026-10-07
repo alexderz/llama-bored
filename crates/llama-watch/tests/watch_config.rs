@@ -307,6 +307,7 @@ enum Rule {
     CpuLimit,
     IdleWatts,
     Fans,
+    Temps,
     Setup,
     TtySize,
 }
@@ -341,6 +342,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::CpuLimit { .. }) => Rule::CpuLimit,
         Err(InvalidWatchConfig::IdleWatts { .. }) => Rule::IdleWatts,
         Err(InvalidWatchConfig::Fans { .. }) => Rule::Fans,
+        Err(InvalidWatchConfig::Temps { .. }) => Rule::Temps,
         Err(InvalidWatchConfig::Setup { .. }) => Rule::Setup,
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
     }
@@ -1474,6 +1476,124 @@ fn cases() -> &'static [Case] {
             },
             expect: Rule::Fans,
         },
+        // #74: discovery, allow/block and the shorthand conflict.
+        Case {
+            name: "fans enabled with nothing else discovers every fan",
+            nproc: 32,
+            mutate: |cfg| cfg.fans.enabled = true,
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "fans allow and block",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.fans.enabled = true;
+                cfg.fans.allow = vec!["nct6798:fan?".into(), "z53".into()];
+                cfg.fans.block = vec!["nct6798:fan7".into()];
+                cfg.fans.rename = [("z53:fan1".to_owned(), "pump".to_owned())].into();
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "fans shorthand and allow together",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.fans = ref_fans();
+                cfg.fans.allow = vec!["z53".into()];
+            },
+            expect: Rule::Fans,
+        },
+        Case {
+            name: "fans shorthand with block and rename",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.fans = ref_fans();
+                cfg.fans.block = vec!["nct6798:fan6".into()];
+                cfg.fans.rename = [("nct6798:fan2".to_owned(), "rad top".to_owned())].into();
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "fans invalid glob",
+            nproc: 32,
+            mutate: |cfg| cfg.fans.block = vec!["nct[0-9]".into()],
+            expect: Rule::Fans,
+        },
+        Case {
+            name: "fans rename of 11 chars",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.fans.rename = [("z53:fan1".to_owned(), "abcdefghijk".to_owned())].into();
+            },
+            expect: Rule::Fans,
+        },
+        Case {
+            name: "temps allow, block, rename, warn and crit",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.temps.allow = vec!["k10temp".into(), "nvme*".into(), "nct6798:SYSTIN".into()];
+                cfg.temps.block = vec!["nvme*:Sensor 2".into()];
+                cfg.temps.rename = [("nct6798:SYSTIN".to_owned(), "board".to_owned())].into();
+                cfg.temps.warn = [("z53".to_owned(), 45.0)].into();
+                cfg.temps.crit = [("z53".to_owned(), 55.0)].into();
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "temps glob with two colons",
+            nproc: 32,
+            mutate: |cfg| cfg.temps.allow = vec!["a:b:c".into()],
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps empty sensor side",
+            nproc: 32,
+            mutate: |cfg| cfg.temps.block = vec!["nct6798:".into()],
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps 33 patterns",
+            nproc: 32,
+            mutate: |cfg| cfg.temps.block = (0..33).map(|n| format!("chip{n}")).collect(),
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps rename key with a wildcard",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.temps.rename = [("nvme*".to_owned(), "disk".to_owned())].into();
+            },
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps rename of 13 chars",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.temps.rename = [("z53".to_owned(), "abcdefghijklm".to_owned())].into();
+            },
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps warn not below crit",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.temps.warn = [("z53".to_owned(), 55.0)].into();
+                cfg.temps.crit = [("z53".to_owned(), 55.0)].into();
+            },
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps crit above 150",
+            nproc: 32,
+            mutate: |cfg| cfg.temps.crit = [("gpu".to_owned(), 151.0)].into(),
+            expect: Rule::Temps,
+        },
+        Case {
+            name: "temps warn not finite",
+            nproc: 32,
+            mutate: |cfg| cfg.temps.warn = [("gpu".to_owned(), f64::NAN)].into(),
+            expect: Rule::Temps,
+        },
     ]
 }
 
@@ -1487,6 +1607,7 @@ fn ref_fans() -> llama_watch::config::Fans {
                 .map(str::to_owned)
                 .to_vec(),
         ),
+        ..llama_watch::config::Fans::default()
     }
 }
 

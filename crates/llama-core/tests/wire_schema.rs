@@ -82,6 +82,8 @@ fn valid() -> WireSnapshot {
             prompt_total: None,
         },
         fans: Vec::new(),
+        fan_rows: Vec::new(),
+        temps: Vec::new(),
         sources: None,
         suspected_loads: Vec::new(),
     }
@@ -1113,8 +1115,9 @@ fn slot_ctx_and_prompt_counters_are_bounded() {
     }
 }
 
-#[test]
-fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
+/// Eight models with every number at its widest, every slot row, eight
+/// legacy fans: the largest snapshot without #74's hardware rows.
+fn worst_case() -> WireSnapshot {
     const MAX: u64 = wire::MAX_COUNTER;
     let pair = wire::SumCountWire { ms: MAX, n: MAX };
     let mut snap = full();
@@ -1183,6 +1186,12 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
         })
         .collect();
     snap.host.load_pct = Some(12.345_678);
+    snap
+}
+
+#[test]
+fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
+    let snap = worst_case();
     let bytes = to_json(&snap).expect("encode");
     assert!(
         bytes.len() < wire::MAX_BYTES - 512,
@@ -1332,4 +1341,184 @@ fn counters_and_ids_are_additive_and_bounded() {
         r#","counters":{"gen_tokens":-1}"#,
     );
     assert_eq!(parse_validated(&json), Err(WireError::Parse));
+}
+
+fn temp_row(chip: &str, sensor: &str, tenths: i16) -> wire::TempWire {
+    wire::TempWire {
+        chip: chip.to_owned(),
+        sensor: sensor.to_owned(),
+        tenths,
+    }
+}
+
+fn fan_row(chip: &str, channel: u8, label: &str) -> wire::FanRowWire {
+    wire::FanRowWire {
+        chip: chip.to_owned(),
+        channel,
+        label: label.to_owned(),
+        rpm: Some(1940),
+        pwm: Some(224),
+    }
+}
+
+/// #74: `temps` and `fan_rows` are optional keys with compact members; an
+/// older watcher sends neither, and nothing writes them empty.
+#[test]
+fn temps_and_fan_rows_are_additive_on_schema_v1() {
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#74 snapshot");
+    assert!(old.temps.is_empty() && old.fan_rows.is_empty());
+    let text = String::from_utf8(to_json(&valid()).expect("encode")).expect("utf8");
+    assert!(
+        !text.contains("temps") && !text.contains("fan_rows"),
+        "{text}"
+    );
+    let mut snap = valid();
+    snap.temps = vec![temp_row("nvme-317k", "Sensor 2", 669)];
+    snap.fan_rows = vec![fan_row("z53", 1, "Pump"), fan_row("nct6798", 1, "fan1")];
+    let text = String::from_utf8(to_json(&snap).expect("encode")).expect("utf8");
+    assert!(
+        text.contains(r#""temps":[{"c":"nvme-317k","s":"Sensor 2","t":669}]"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"{"c":"z53","n":1,"l":"Pump","r":1940,"p":224}"#),
+        "{text}"
+    );
+    assert_eq!(parse_validated(text.as_bytes()).expect("round trip"), snap);
+    // A reader that knows only `fans` sees an unknown key and no repeat.
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(json.get("fans").is_none());
+}
+
+#[test]
+fn temps_and_fan_rows_are_bounded() {
+    let with_temps = |temps: Vec<wire::TempWire>| {
+        let mut snap = valid();
+        snap.temps = temps;
+        validate(&snap)
+    };
+    let ok = temp_row("k10temp", "Tctl", 683);
+    assert_eq!(with_temps(vec![ok.clone()]), Ok(()));
+    assert_eq!(
+        with_temps(
+            (0..wire::MAX_TEMPS)
+                .map(|n| temp_row("c", &format!("temp{n}"), 1))
+                .collect()
+        ),
+        Ok(())
+    );
+    let too_many = (0..=wire::MAX_TEMPS)
+        .map(|n| temp_row("c", &format!("temp{n}"), 1))
+        .collect();
+    assert_eq!(with_temps(too_many), Err(WireError::Temp));
+    for bad in [
+        temp_row("K10temp", "Tctl", 1),
+        temp_row("nvme 0", "Tctl", 1),
+        temp_row("", "Tctl", 1),
+        temp_row(&"c".repeat(wire::MAX_TEMP_CHIP_CHARS + 1), "Tctl", 1),
+        temp_row("k10temp", " ", 1),
+        temp_row("k10temp", "T\u{e9}", 1),
+        temp_row("k10temp", "a\nb", 1),
+        temp_row("k10temp", &"s".repeat(wire::MAX_TEMP_SENSOR_CHARS + 1), 1),
+        temp_row("k10temp", "Tctl", 1501),
+        temp_row("k10temp", "Tctl", -201),
+    ] {
+        assert_eq!(
+            with_temps(vec![bad.clone()]),
+            Err(WireError::Temp),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        with_temps(vec![ok.clone(), ok]),
+        Err(WireError::Temp),
+        "repeat"
+    );
+
+    let with_fans = |rows: Vec<wire::FanRowWire>| {
+        let mut snap = valid();
+        snap.fan_rows = rows;
+        validate(&snap)
+    };
+    assert_eq!(
+        with_fans(vec![
+            fan_row("z53", 1, "Pump"),
+            fan_row("nct6798", 1, "fan1")
+        ]),
+        Ok(()),
+        "two chips may both have fan1"
+    );
+    let full = |n: usize| (0..n).map(|i| fan_row(&format!("c{i}"), 1, "f")).collect();
+    assert_eq!(with_fans(full(wire::MAX_FAN_ROWS)), Ok(()));
+    assert_eq!(
+        with_fans(full(wire::MAX_FAN_ROWS + 1)),
+        Err(WireError::FanRow)
+    );
+    let mut fast = fan_row("z53", 2, "Fan");
+    fast.rpm = Some(wire::MAX_FAN_RPM + 1);
+    for bad in [
+        fan_row("z53", 0, "Pump"),
+        fan_row("z53", 17, "Pump"),
+        fan_row("Z53", 1, "Pump"),
+        fan_row("z53", 1, ""),
+        fan_row("z53", 1, "abcdefghijk"),
+        fan_row("z53", 1, "\u{1b}[2J"),
+        fast,
+    ] {
+        assert_eq!(
+            with_fans(vec![bad.clone()]),
+            Err(WireError::FanRow),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        with_fans(vec![fan_row("z53", 1, "Pump"), fan_row("z53", 1, "again")]),
+        Err(WireError::FanRow)
+    );
+}
+
+/// #74: a realistic host (two models, every hardware row a reference
+/// board with an AIO has, and the 32-row temperature cap at its widest)
+/// sits far under the cap. Only the pathological worst case above, plus
+/// every hardware row at its widest, passes it; the watcher then drops
+/// temperature rows, then fan rows (llama-watch `publish::fit`, tested
+/// there), so the cap holds.
+#[test]
+fn hardware_rows_fit_a_realistic_snapshot_and_pass_only_the_worst_case() {
+    let widest_temps: Vec<wire::TempWire> = (0..wire::MAX_TEMPS)
+        .map(|n| {
+            let chip = format!("{n:0>width$}", width = wire::MAX_TEMP_CHIP_CHARS);
+            temp_row(&chip, &"s".repeat(wire::MAX_TEMP_SENSOR_CHARS), -200)
+        })
+        .collect();
+    let widest_fans: Vec<wire::FanRowWire> = (0..wire::MAX_FAN_ROWS)
+        .map(|n| {
+            let chip = format!("{n:0>width$}", width = wire::MAX_TEMP_CHIP_CHARS);
+            let mut row = fan_row(&chip, 16, &"l".repeat(wire::MAX_FAN_LABEL_CHARS));
+            row.rpm = Some(wire::MAX_FAN_RPM);
+            row
+        })
+        .collect();
+    let mut realistic = valid();
+    realistic.temps = widest_temps.clone();
+    realistic.fan_rows = widest_fans.clone();
+    let bytes = to_json(&realistic).expect("encode");
+    assert!(
+        bytes.len() < wire::MAX_BYTES / 2,
+        "realistic is {} bytes",
+        bytes.len()
+    );
+    assert!(parse_validated(&bytes).is_ok());
+
+    let mut worst = worst_case();
+    let base = to_json(&worst).expect("encode").len();
+    worst.temps = widest_temps;
+    worst.fan_rows = widest_fans;
+    let bytes = to_json(&worst).expect("encode");
+    assert!(
+        bytes.len() > wire::MAX_BYTES,
+        "worst case {} + rows {} now fits; the trimming note can go",
+        base,
+        bytes.len() - base
+    );
 }

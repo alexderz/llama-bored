@@ -1,9 +1,11 @@
+pub mod chips;
 pub mod cmdline;
 pub mod fans;
 pub mod gpu;
 pub mod hwmon;
 pub mod llamaswap;
 pub mod proc;
+pub mod temps;
 
 use std::path::PathBuf;
 

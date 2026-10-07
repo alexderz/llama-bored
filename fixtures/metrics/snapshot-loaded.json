@@ -230,6 +230,16 @@
       "pwm": 0.25
     }
   ],
+  "fan_rows": [
+    { "c": "z53", "n": 1, "l": "Pump", "r": 2810, "p": 153 },
+    { "c": "nct6798", "n": 2, "l": "rad \"top\"", "r": 1940 }
+  ],
+  "temps": [
+    { "c": "k10temp", "s": "Tctl", "t": 683 },
+    { "c": "gpu", "s": "gpu", "t": 712 },
+    { "c": "nvme-317k", "s": "Sensor 2", "t": 669 },
+    { "c": "nct6798", "s": "AUXTIN2", "t": 155 }
+  ],
   "sources": {
     "llama-swap": {
       "up": true,

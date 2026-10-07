@@ -3,7 +3,9 @@
 //! Every metric is named `llamabored_*`. The only strings exported are
 //! llama-swap model ids, model display names and their allowlisted tuning
 //! and version tokens, the five engine words, fan labels (short printable
-//! ASCII from `[fans]`) and fixed source names, as label values. The
+//! ASCII from `[fans]`), hwmon chip and sensor names (#74: the chip's
+//! `name` and `tempN_label`, short printable ASCII) and fixed source names,
+//! as label values. The
 //! snapshot carries no prompt or output text, and nothing here could
 //! export it: every value is a number from a typed field.
 //!
@@ -35,8 +37,8 @@ use std::time::Duration;
 
 use llama_core::detail::{self, KV_DEFAULT, ModelDetail};
 use llama_core::wire::{
-    self, AiWire, EngineWire, FanWire, ModelState, ModelWire, SlotCtxWire, SumCountWire,
-    WireSnapshot,
+    self, AiWire, EngineWire, FanRowWire, FanWire, ModelState, ModelWire, SlotCtxWire,
+    SumCountWire, TempWire, WireSnapshot,
 };
 
 use crate::snapshot::ReadError;
@@ -563,7 +565,8 @@ pub fn render(scrape: &Scrape<'_>) -> String {
     let models = keyed(&snap.ai.models);
     per_model(&mut out, &models);
     per_slot(&mut out, &models);
-    fans(&mut out, &snap.fans);
+    fans(&mut out, &snap.fans, &snap.fan_rows);
+    temperatures(&mut out, &snap.temps);
 
     if let Some(sources) = &snap.sources {
         let entries = sources.entries();
@@ -841,33 +844,88 @@ fn per_slot(out: &mut Out, models: &[Keyed<'_>]) {
     );
 }
 
-/// Fans: the wire already refuses a repeated channel, so each label set is
-/// unique; the channel is the key and the label rides along.
-fn fans(out: &mut Out, fans: &[FanWire]) {
-    let mut fans: Vec<&FanWire> = fans.iter().collect();
-    fans.sort_by_key(|fan| fan.channel);
-    let channels: Vec<String> = fans.iter().map(|fan| fan.channel.to_string()).collect();
-    let fan_rows = |value: fn(&FanWire) -> Option<String>| -> Vec<Row<'_>> {
-        fans.iter()
-            .zip(&channels)
-            .filter_map(|(fan, channel)| {
-                Some((
-                    vec![("channel", channel.as_str()), ("label", fan.label.as_str())],
-                    value(fan)?,
-                ))
+/// Fans: `fan_rows` (#74) carry their chip; `fans` from an older watcher do
+/// not, and keep their old label set. The wire refuses a repeated channel
+/// (per chip), so each label set is unique.
+fn fans(out: &mut Out, fans: &[FanWire], fan_rows: &[FanRowWire]) {
+    struct Fan<'a> {
+        chip: Option<&'a str>,
+        channel: String,
+        label: &'a str,
+        rpm: Option<u32>,
+        pwm: Option<f32>,
+    }
+    let mut all: Vec<Fan<'_>> = fans
+        .iter()
+        .map(|fan| Fan {
+            chip: None,
+            channel: fan.channel.to_string(),
+            label: &fan.label,
+            rpm: fan.rpm,
+            pwm: fan.pwm.filter(|v| v.is_finite()),
+        })
+        .chain(fan_rows.iter().map(|fan| Fan {
+            chip: Some(&fan.chip),
+            channel: fan.channel.to_string(),
+            label: &fan.label,
+            rpm: fan.rpm,
+            pwm: fan.pwm.map(|p| f32::from(p) / 255.0),
+        }))
+        .collect();
+    all.sort_by(|a, b| {
+        (a.chip, a.channel.len(), &a.channel).cmp(&(b.chip, b.channel.len(), &b.channel))
+    });
+    let fan_rows = |value: &dyn Fn(&Fan<'_>) -> Option<String>| -> Vec<Row<'_>> {
+        all.iter()
+            .filter_map(|fan| {
+                let mut labels = Vec::with_capacity(3);
+                if let Some(chip) = fan.chip {
+                    labels.push(("chip", chip));
+                }
+                labels.extend([("channel", fan.channel.as_str()), ("label", fan.label)]);
+                Some((labels, value(fan)?))
             })
             .collect()
     };
     out.rows(
         "llamabored_fan_rpm",
         "gauge",
-        "Fan speed, rpm, per configured [fans] channel.",
-        &fan_rows(|fan| fan.rpm.map(|rpm| rpm.to_string())),
+        "Fan speed, rpm, per fan (read only).",
+        &fan_rows(&|fan| fan.rpm.map(|rpm| rpm.to_string())),
     );
     out.rows(
         "llamabored_fan_pwm_ratio",
         "gauge",
-        "Fan PWM duty, 0 to 1, per configured [fans] channel (read only).",
-        &fan_rows(|fan| fan.pwm.filter(|v| v.is_finite()).map(num)),
+        "Fan PWM duty, 0 to 1, per fan (read only).",
+        &fan_rows(&|fan| fan.pwm.map(num)),
     );
+}
+
+/// Every temperature the watcher shows (#74), by chip and sensor; the wire
+/// refuses a repeated pair. The coolant, CPU and GPU series stay as well.
+fn temperatures(out: &mut Out, temps: &[TempWire]) {
+    let values: Vec<String> = temps.iter().map(|t| tenths(t.tenths)).collect();
+    let rows: Vec<Row<'_>> = temps
+        .iter()
+        .zip(&values)
+        .map(|(t, value)| {
+            (
+                vec![("chip", t.chip.as_str()), ("sensor", t.sensor.as_str())],
+                value.clone(),
+            )
+        })
+        .collect();
+    out.rows(
+        "llamabored_temperature_celsius",
+        "gauge",
+        "Temperature, degrees Celsius, per hwmon chip and sensor (and the GPU).",
+        &rows,
+    );
+}
+
+/// Tenths of a degree as an exact decimal: `-25` is `-2.5`.
+fn tenths(t: i16) -> String {
+    let sign = if t < 0 { "-" } else { "" };
+    let abs = t.unsigned_abs();
+    format!("{sign}{}.{}", abs / 10, abs % 10)
 }

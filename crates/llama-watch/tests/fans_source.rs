@@ -78,6 +78,7 @@ fn fans_config(hwmon: &str, channels: &[u32], labels: Option<&[&str]>) -> Fans {
         hwmon: hwmon.to_owned(),
         channels: channels.to_vec(),
         labels: labels.map(|l| l.iter().map(|s| (*s).to_owned()).collect()),
+        ..Fans::default()
     }
 }
 
@@ -107,6 +108,7 @@ fn ref_panel(labels: [&str; 4]) -> FanPanel {
             .iter()
             .zip(labels)
             .map(|((n, rpm, pwm), label)| FanReading {
+                chip: "nct6798".to_owned(),
                 channel: *n,
                 label: label.to_owned(),
                 rpm: Some(rpm.parse().unwrap()),

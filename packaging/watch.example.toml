@@ -127,15 +127,47 @@ prompt_view = "clean"
 palette = "llama"
 
 # Read-only fan panel on tty11 (off by default). The watcher reads
-# fanN_input, pwmN and pwmN_enable from the hwmon whose `name` matches
-# `hwmon`, and never writes them. Match by name, not by hwmonN: the number
-# changes across reboots. List the names with: cat /sys/class/hwmon/*/name
-# Channels are 1..=16, at most 8; labels (optional) are <= 10 characters.
+# fanN_input, fanN_label, pwmN and pwmN_enable and never writes them.
+# Enabled alone, every fan on every hwmon chip shows (the AIO's pump and fan
+# too), except a header that has never turned this run. allow / block /
+# rename work as in [temps] below, with sensors named "chip:fanN" or by
+# their label ("z53:Pump speed"); renames are <= 10 characters.
 #[fans]
 #enabled = true
+#block = ["nct6798:fan7"]
+#rename = { "nct6798:fan2" = "rad top", "z53:fan1" = "pump" }
+#defaults = true    # false also shows headers that never turned
+# The older form still works: one hwmon by `name` (never hwmonN, which
+# changes across reboots) and its channels 1..=16, at most 8, with optional
+# labels. It is shorthand for allow = ["nct6798:fan2", ...], those fans show
+# even at 0 rpm, and it cannot be combined with allow.
 #hwmon = "nct6798"
 #channels = [2, 3, 5, 6]
 #labels = ["front1", "front2", "rear", "top"]
+
+# TEMPS panel and llamabored_temperature_celsius (#74; on by default): every
+# /sys/class/hwmon/*/tempN_input, read only, plus the GPU. List the chips
+# with: cat /sys/class/hwmon/*/name (two of one name, such as two NVMe
+# drives, get a device suffix: nvme-317k). Patterns are globs ("*", "?")
+# over "chip" or "chip:sensor", the sensor by its label or tempN.
+#   allow    empty: everything; else only the matches, which also pass
+#            the built-in rules below
+#   block    always hidden; beats allow
+#   defaults built-in rules: hide the Super-I/O PCH_*, TSI*, SMBUSMASTER*
+#            and PECI* inputs (nct*, w83*), and an input unchanged for ten
+#            minutes while its chip's others move
+# Below 5 C or at 127 C and above is never shown, allowed or not.
+# rename "chip:sensor" (an item) or "chip" (a row), <= 12 characters;
+# warn / crit in C by pattern override the chip's own max / crit (default
+# 80 / 90, 45 / 55 for a coolant).
+[temps]
+enabled = true
+#allow = []
+#block = []
+#defaults = true
+#rename = { "nct6798:SYSTIN" = "board" }
+#warn = { "z53" = 42 }
+#crit = { "z53" = 50 }
 
 # tty11's SETUP block (#52): the settings of the model generating now (or
 # the one used last) under the meters. Rules pick each value from the

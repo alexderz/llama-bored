@@ -409,6 +409,7 @@ where
         llama_enabled: input.config.llama.enabled,
         show_text: input.config.tty.show_text,
         setup: Rules::compile(&input.config.setup).unwrap_or_default(),
+        temps_look: crate::sources::temps::TempLook::new(&input.config.temps),
     };
     let mut state = TickState::new(
         input.config.tty.chart_bucket_s,
@@ -519,6 +520,8 @@ struct FrameCtx {
     show_text: bool,
     /// `[setup]` rules, for the SETUP rows (#52).
     setup: Rules,
+    /// `[temps]` renames and thresholds, for the TEMPS panel (#74).
+    temps_look: crate::sources::temps::TempLook,
 }
 
 fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
@@ -1012,6 +1015,10 @@ fn tty_model(
         chart_bucket_s: ctx.chart_bucket_s,
         chart_glyphs: ctx.chart_glyphs,
         fans: sample.fans.clone(),
+        temps: sample
+            .temps
+            .as_ref()
+            .map(|readings| crate::sources::temps::panel(readings, &ctx.temps_look)),
         ctx_history_h: ctx.ctx_history_h,
         setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
     }
@@ -1682,7 +1689,21 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
             .fans
             .iter()
             .flat_map(|panel| &panel.fans)
-            .map(|fan| (fan.channel, fan.label.clone(), fan.rpm, fan.pwm))
+            .map(|fan| {
+                (
+                    fan.chip.clone(),
+                    fan.channel,
+                    fan.label.clone(),
+                    fan.rpm,
+                    fan.pwm,
+                )
+            })
+            .collect(),
+        temps: sample
+            .temps
+            .iter()
+            .flatten()
+            .map(|t| (t.chip.clone(), t.sensor.clone(), t.tenths))
             .collect(),
         sources: wire_sources(&health(sample, &tick.detail, watch), &tick.detail.latencies),
         suspected_loads: tick.detail.suspected_loads.clone(),
@@ -2640,6 +2661,7 @@ mod tests {
             llama_enabled,
             show_text: false,
             setup: Rules::builtin(),
+            temps_look: crate::sources::temps::TempLook::default(),
         }
     }
 
@@ -2659,6 +2681,7 @@ mod tests {
             chip: "nct6798".to_owned(),
             present: true,
             fans: vec![crate::sources::fans::FanReading {
+                chip: "nct6798".to_owned(),
                 channel: 2,
                 label: "CPU".to_owned(),
                 rpm: Some(1100),
@@ -2696,7 +2719,13 @@ mod tests {
         );
         assert_eq!(
             extras.fans,
-            vec![(2, "CPU".to_owned(), Some(1100), Some(128))]
+            vec![(
+                "nct6798".to_owned(),
+                2,
+                "CPU".to_owned(),
+                Some(1100),
+                Some(128)
+            )]
         );
         let sources = extras.sources.expect("sources");
         let names: Vec<(&str, Option<bool>)> = sources
@@ -3151,6 +3180,7 @@ mod tests {
                 activity_w: None,
                 load_source: crate::collector::LoadSource::Util,
                 fans: None,
+                temps: None,
             }
         }
     }

@@ -51,6 +51,8 @@ pub fn snap(seq: u64, t_mono_ns: u64) -> SnapshotV1 {
             prompt_total: None,
         },
         fans: Vec::new(),
+        fan_rows: Vec::new(),
+        temps: Vec::new(),
         sources: None,
         suspected_loads: Vec::new(),
     }

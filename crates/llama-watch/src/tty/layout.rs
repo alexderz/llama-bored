@@ -12,6 +12,7 @@ use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
 use crate::sources::fans::{FanPanel, FanReading, mode_word};
+use crate::sources::temps::{Level, TempGroup, TempPanel};
 
 /// How many of `new_chars` are visible on frame `frame` of a 10-frame second.
 ///
@@ -195,6 +196,8 @@ pub struct TtyModel {
     pub chart_glyphs: ChartGlyphs,
     /// FANS panel. `None` when `[fans]` is off, and nothing is drawn.
     pub fans: Option<FanPanel>,
+    /// TEMPS panel (#74). `None` when `[temps]` is off, and nothing is drawn.
+    pub temps: Option<TempPanel>,
     /// Hours the SLOTS sparklines span (`tty.ctx_history_h`).
     pub ctx_history_h: u32,
     /// SETUP block under the meters (#52). `None` collapses it.
@@ -1893,14 +1896,19 @@ fn text_off_rows(req_header: u16, rows: u16, reserve: u16) -> TextOffRows {
 
 /// `tty.show_text = false`: RECENT, the chart and blank rows. No IN/OUT.
 fn draw_text_off(grid: &mut Grid, model: &TtyModel, g: &Geom, req_header: u16) {
-    // FANS sits at the bottom of the freed rows, above the health rule.
-    // RECENT keeps its floor first; without room FANS is hidden.
-    let reserve = model
-        .fans
-        .as_ref()
-        .map(|panel| 1 + fans_block_rows(panel))
-        .filter(|need| text_off_rows(req_header, g.rows, 0).recent >= RECENT_FLOOR + need)
-        .unwrap_or(0);
+    // FANS and TEMPS sit at the bottom of the freed rows, above the health
+    // rule. RECENT keeps its floor first; without room they shrink to the
+    // TEMPS line, or hide.
+    let (fans, temps) = (model.fans.as_ref(), model.temps.as_ref());
+    let spare = text_off_rows(req_header, g.rows, 0)
+        .recent
+        .saturating_sub(RECENT_FLOOR);
+    let strip = strip_plan(fans, temps, spare);
+    let reserve = match strip {
+        Some(Strip::Block(height)) => 1 + height,
+        Some(Strip::Line) => 1,
+        None => 0,
+    };
     let plan = text_off_rows(req_header, g.rows, reserve);
     draw_requests(grid, model, g, req_header, plan.recent);
     let req_rule = req_header + 1 + plan.recent + 1;
@@ -1908,11 +1916,18 @@ fn draw_text_off(grid: &mut Grid, model: &TtyModel, g: &Geom, req_header: u16) {
     if plan.chart >= CHART_MIN {
         draw_chart(grid, model, g, req_rule + 1, plan.chart);
     }
-    if let Some(panel) = model.fans.as_ref().filter(|_| reserve > 0) {
-        let fans_rule = g.rows - 3 - reserve;
-        draw_rule(grid, fans_rule, g.cols);
-        let (left, right) = fans_span(g);
-        draw_fans(grid, panel, left, right, fans_rule + 1, reserve - 1);
+    match strip {
+        Some(Strip::Block(height)) => {
+            let strip_rule = g.rows - 3 - reserve;
+            draw_rule(grid, strip_rule, g.cols);
+            draw_strip(grid, g, fans, temps, strip_rule + 1, height);
+        }
+        Some(Strip::Line) => {
+            if let Some(panel) = temps {
+                draw_temps_line(grid, panel, 2, g.cols - 3, g.rows - 4);
+            }
+        }
+        None => {}
     }
     let note = match model.state {
         WatchState::NoLlama => {
@@ -2766,9 +2781,10 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
     if health_rule <= in_label + 4 {
         return;
     }
-    // Last column of IN/OUT text. The FANS panel may take the right side.
+    // Last column of IN/OUT text. FANS and TEMPS may take the right side.
     let mut right = g.cols - 3;
-    if let Some(panel) = &model.fans {
+    let (fans, temps) = (model.fans.as_ref(), model.temps.as_ref());
+    if fans.is_some() || temps.is_some() {
         if g.cols >= FANS_SIDE_COLS {
             let split = fans_split(g.cols);
             right = split - 2;
@@ -2776,16 +2792,32 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
                 paint(grid, split, row, '|', C16::BrightBlack, C16::Black);
             }
             let (left, end) = fans_span(g);
-            draw_fans(grid, panel, left, end, in_label, health_rule - in_label);
+            draw_side_column(
+                grid,
+                fans,
+                temps,
+                left,
+                end,
+                in_label,
+                health_rule - in_label,
+            );
         } else {
-            // Under IN/OUT: a rule, then the block, if IN and OUT keep
-            // three rows each.
-            let need = 1 + fans_block_rows(panel);
-            if health_rule >= in_label + TEXT_FLOOR_SPAN + need {
-                health_rule -= need;
-                draw_rule(grid, health_rule, g.cols);
-                let (left, end) = fans_span(g);
-                draw_fans(grid, panel, left, end, health_rule + 1, need - 1);
+            // Under IN/OUT: a rule, then the blocks side by side, if IN and
+            // OUT keep three rows each; else TEMPS on one line (#74).
+            let spare = health_rule.saturating_sub(in_label + TEXT_FLOOR_SPAN);
+            match strip_plan(fans, temps, spare) {
+                Some(Strip::Block(height)) => {
+                    health_rule -= 1 + height;
+                    draw_rule(grid, health_rule, g.cols);
+                    draw_strip(grid, g, fans, temps, health_rule + 1, height);
+                }
+                Some(Strip::Line) => {
+                    health_rule -= 1;
+                    if let Some(panel) = temps {
+                        draw_temps_line(grid, panel, 2, g.cols - 3, health_rule);
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -2888,6 +2920,269 @@ fn fans_span(g: &Geom) -> (u16, u16) {
     }
 }
 
+/// How FANS and TEMPS fit under IN/OUT (or RECENT, text off).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Strip {
+    /// A rule, then this many rows with the blocks side by side.
+    Block(u16),
+    /// TEMPS as one line (the hottest of each row); FANS hidden.
+    Line,
+}
+
+/// Rows FANS and TEMPS can have: `spare` counts the rule. The full blocks;
+/// else FANS whole with TEMPS cut to its height; else (no FANS) a cut
+/// TEMPS block of at least three rows; else the TEMPS line; else nothing.
+fn strip_plan(fans: Option<&FanPanel>, temps: Option<&TempPanel>, spare: u16) -> Option<Strip> {
+    let fans_need = fans.map(fans_block_rows);
+    let temps_need = temps.map(temps_block_rows);
+    let full = fans_need.unwrap_or(0).max(temps_need.unwrap_or(0));
+    if full > 0 && full < spare {
+        return Some(Strip::Block(full));
+    }
+    if let (Some(need), Some(_)) = (fans_need, temps)
+        && need < spare
+    {
+        return Some(Strip::Block(need));
+    }
+    if temps.is_some() && fans.is_none() && spare > TEMPS_CUT_MIN {
+        return Some(Strip::Block(spare - 1));
+    }
+    temps
+        .is_some()
+        .then_some(Strip::Line)
+        .filter(|_| spare >= 1)
+}
+
+/// The fewest rows a cut TEMPS block takes: the header, a row and the
+/// summary of the rest.
+const TEMPS_CUT_MIN: u16 = 3;
+
+/// Under IN/OUT or RECENT: FANS left, TEMPS right, with a `|` between. On
+/// a wide screen (text off) FANS keeps its right-hand place and TEMPS takes
+/// the left. Alone, each takes its usual span.
+fn draw_strip(
+    grid: &mut Grid,
+    g: &Geom,
+    fans: Option<&FanPanel>,
+    temps: Option<&TempPanel>,
+    top: u16,
+    rows: u16,
+) {
+    let wide = g.cols >= FANS_SIDE_COLS;
+    match (fans, temps) {
+        (Some(fans), Some(temps)) => {
+            let (fans_span, temps_span, sep) = if wide {
+                let split = fans_split(g.cols);
+                ((split + 2, g.cols - 3), (2, split - 2), split)
+            } else {
+                let width = (u32::from(g.cols - 4) * 55 / 100).min(u32::from(FAN_PANEL_MAX));
+                let fans_end = 2 + u16::try_from(width).unwrap_or(FAN_PANEL_MAX) - 1;
+                ((2, fans_end), (fans_end + 4, g.cols - 3), fans_end + 2)
+            };
+            for row in top..top + rows {
+                paint(grid, sep, row, '|', C16::BrightBlack, C16::Black);
+            }
+            draw_fans(grid, fans, fans_span.0, fans_span.1, top, rows);
+            draw_temps(grid, temps, temps_span.0, temps_span.1, top, rows);
+        }
+        (Some(fans), None) => {
+            let (left, right) = fans_span(g);
+            draw_fans(grid, fans, left, right, top, rows);
+        }
+        (None, Some(temps)) => draw_temps(grid, temps, 2, g.cols - 3, top, rows),
+        (None, None) => {}
+    }
+}
+
+/// Wide screens, right of IN/OUT: FANS, a blank row, then TEMPS in the
+/// rows left (cut to fit).
+fn draw_side_column(
+    grid: &mut Grid,
+    fans: Option<&FanPanel>,
+    temps: Option<&TempPanel>,
+    left: u16,
+    right: u16,
+    top: u16,
+    rows: u16,
+) {
+    let mut used = 0;
+    if let Some(panel) = fans {
+        used = fans_block_rows(panel).min(rows);
+        draw_fans(grid, panel, left, right, top, used);
+        used += 1;
+    }
+    if let Some(panel) = temps {
+        let left_rows = rows.saturating_sub(used);
+        if left_rows >= 2 {
+            draw_temps(grid, panel, left, right, top + used, left_rows);
+        }
+    }
+}
+
+/// Header plus one row per TEMPS row, or one note row when there is none.
+fn temps_block_rows(panel: &TempPanel) -> u16 {
+    1 + u16::try_from(panel.groups.len()).unwrap_or(u16::MAX).max(1)
+}
+
+/// TEMPS row names take this many cells, then a gap.
+const TEMP_NAME_W: u16 = 8;
+
+/// Colour of a TEMPS value.
+fn level_fg(level: Level) -> C16 {
+    match level {
+        Level::Normal => C16::BrightWhite,
+        Level::Warn => C16::Yellow,
+        Level::Crit => C16::BrightRed,
+    }
+}
+
+/// `TEMPS`, then one row per device: its name, then `label value` items
+/// with ` · ` between, cut at a whole item. Too many rows for `rows`: the
+/// last row sums up the rest as `+ name hottest · ...`.
+fn draw_temps(grid: &mut Grid, panel: &TempPanel, left: u16, right: u16, top: u16, rows: u16) {
+    if rows == 0 || right <= left {
+        return;
+    }
+    let width = usize::from(right - left) + 1;
+    paint_fit(grid, left, top, "TEMPS", C16::White, C16::Black, width);
+    // The colour key: values turn these colours at the warn and crit marks.
+    if width >= 17 {
+        paint_str(
+            grid,
+            left + 7,
+            top,
+            "warn",
+            level_fg(Level::Warn),
+            C16::Black,
+        );
+        paint_str(
+            grid,
+            left + 12,
+            top,
+            "crit",
+            level_fg(Level::Crit),
+            C16::Black,
+        );
+    }
+    if panel.groups.is_empty() {
+        if rows > 1 {
+            paint_fit(
+                grid,
+                left,
+                top + 1,
+                "no temperature inputs found",
+                C16::BrightBlack,
+                C16::Black,
+                width,
+            );
+        }
+        return;
+    }
+    let body = usize::from(rows - 1);
+    let whole = if panel.groups.len() <= body {
+        panel.groups.len()
+    } else {
+        body.saturating_sub(1)
+    };
+    let mut row = top + 1;
+    for group in &panel.groups[..whole] {
+        draw_temp_group(grid, group, left, right, row);
+        row += 1;
+    }
+    if whole < panel.groups.len() && body > 0 {
+        paint_str(grid, left, row, "+", C16::BrightBlack, C16::Black);
+        paint_summary(grid, &panel.groups[whole..], left + 2, right, row);
+    }
+}
+
+fn draw_temp_group(grid: &mut Grid, group: &TempGroup, left: u16, right: u16, row: u16) {
+    let name_w = usize::from(TEMP_NAME_W).min(usize::from(right - left) + 1);
+    paint_fit(grid, left, row, &group.name, C16::White, C16::Black, name_w);
+    let items: Vec<Vec<(String, C16)>> = group
+        .items
+        .iter()
+        .map(|item| {
+            let mut parts = Vec::new();
+            if !item.label.is_empty() {
+                parts.push((format!("{} ", item.label), C16::BrightBlack));
+            }
+            parts.push((celsius(item.tenths), level_fg(item.level)));
+            parts
+        })
+        .collect();
+    paint_items(grid, &items, left + TEMP_NAME_W + 1, right, row);
+}
+
+/// One TEMPS line: `TEMPS  CPU 68 · GPU 71 · NVMe0 67 ...`, the hottest
+/// value of each row.
+fn draw_temps_line(grid: &mut Grid, panel: &TempPanel, left: u16, right: u16, row: u16) {
+    if right <= left + 7 {
+        return;
+    }
+    paint_str(grid, left, row, "TEMPS", C16::White, C16::Black);
+    paint_summary(grid, &panel.groups, left + 7, right, row);
+}
+
+fn paint_summary(grid: &mut Grid, groups: &[TempGroup], left: u16, right: u16, row: u16) {
+    let items: Vec<Vec<(String, C16)>> = groups
+        .iter()
+        .filter_map(|group| {
+            let hot = group.hottest()?;
+            Some(vec![
+                (format!("{} ", group.name), C16::BrightBlack),
+                (celsius(hot.tenths), level_fg(hot.level)),
+            ])
+        })
+        .collect();
+    paint_items(grid, &items, left, right, row);
+}
+
+/// Items with ` · ` between, from `left` up to `right`; an item that does
+/// not fit whole ends the row with `…`.
+fn paint_items(grid: &mut Grid, items: &[Vec<(String, C16)>], left: u16, right: u16, row: u16) {
+    const SEP: &str = " \u{00B7} ";
+    let end = usize::from(right) + 1;
+    let mut col = usize::from(left);
+    for (i, parts) in items.iter().enumerate() {
+        let sep = if i == 0 { 0 } else { SEP.chars().count() };
+        let len: usize = parts.iter().map(|(t, _)| t.chars().count()).sum();
+        if col + sep + len > end {
+            if col + 2 <= end && i > 0 {
+                paint_at(
+                    grid,
+                    col + 1,
+                    usize::from(row),
+                    '\u{2026}',
+                    C16::BrightBlack,
+                    C16::Black,
+                );
+            }
+            return;
+        }
+        if sep > 0 {
+            // `·` is a console glyph the text painter would replace.
+            paint(
+                grid,
+                col_u16(col + 1),
+                row,
+                '\u{00B7}',
+                C16::BrightBlack,
+                C16::Black,
+            );
+            col += sep;
+        }
+        for (text, fg) in parts {
+            paint_str(grid, col_u16(col), row, text, *fg, C16::Black);
+            col += text.chars().count();
+        }
+    }
+}
+
+/// Whole degrees: `68`.
+fn celsius(tenths: i32) -> String {
+    format!("{}", (f64::from(tenths) / 10.0).round() as i64)
+}
+
 /// Header plus one row per fan, or one note row when the chip is absent.
 fn fans_block_rows(panel: &FanPanel) -> u16 {
     let body = if panel.present {
@@ -2917,7 +3212,11 @@ fn draw_fans(grid: &mut Grid, panel: &FanPanel, left: u16, right: u16, top: u16,
     );
     if !panel.present {
         if rows > 1 {
-            let note = format!("no single hwmon named {}", panel.chip);
+            let note = if panel.chip.is_empty() {
+                "no fan inputs found".to_owned()
+            } else {
+                format!("no single hwmon named {}", panel.chip)
+            };
             paint_fit(
                 grid,
                 left,

@@ -1893,6 +1893,7 @@ fn sample(state: WatchState) -> TtyModel {
         chart_bucket_s: 2,
         chart_glyphs: ChartGlyphs::Halves,
         fans: None,
+        temps: None,
         ctx_history_h: 6,
         setup: match state {
             WatchState::Generating | WatchState::Ready => Some(qwen_setup()),
@@ -2652,6 +2653,7 @@ fn fan(
     mode: Option<u32>,
 ) -> FanReading {
     FanReading {
+        chip: "nct6798".to_string(),
         channel,
         label: label.to_string(),
         rpm,
@@ -4289,5 +4291,220 @@ fn print_setup_corner() {
     let grid = draw(&setup_model(), 160, 49);
     for line in left_rows(&grid, 0, 18) {
         println!("{line}");
+    }
+}
+
+// ---- #74: TEMPS panel ------------------------------------------------------
+
+use llama_watch::sources::temps::{Level, TempGroup, TempItem, TempPanel};
+
+fn temp_item(label: &str, c: i32, level: Level) -> TempItem {
+    TempItem {
+        label: label.to_string(),
+        tenths: c * 10,
+        level,
+    }
+}
+
+/// The reference host's TEMPS rows (invented values), one warm NVMe sensor
+/// and one hot board input to show the colours.
+fn ref_temps() -> TempPanel {
+    use Level::{Crit, Normal, Warn};
+    let group = |name: &str, items: Vec<TempItem>| TempGroup {
+        name: name.to_string(),
+        items,
+    };
+    TempPanel {
+        groups: vec![
+            group(
+                "CPU",
+                vec![
+                    temp_item("Tctl", 68, Normal),
+                    temp_item("CCD1", 64, Normal),
+                    temp_item("CCD2", 62, Normal),
+                ],
+            ),
+            group("GPU", vec![temp_item("", 71, Normal)]),
+            group("coolant", vec![temp_item("", 40, Normal)]),
+            group(
+                "NVMe0",
+                vec![
+                    temp_item("", 50, Normal),
+                    temp_item("s1", 50, Normal),
+                    temp_item("s2", 82, Warn),
+                ],
+            ),
+            group(
+                "NVMe1",
+                vec![
+                    temp_item("", 57, Normal),
+                    temp_item("s1", 57, Normal),
+                    temp_item("s2", 66, Normal),
+                ],
+            ),
+            group(
+                "board",
+                vec![
+                    temp_item("sys", 51, Normal),
+                    temp_item("cpu", 51, Normal),
+                    temp_item("aux0", 27, Normal),
+                    temp_item("aux1", 92, Crit),
+                    temp_item("aux2", 16, Normal),
+                    temp_item("aux3", 27, Normal),
+                    temp_item("aux4", 50, Normal),
+                ],
+            ),
+            group("NIC", vec![temp_item("", 51, Normal)]),
+            group("Wi-Fi", vec![temp_item("", 39, Normal)]),
+        ],
+    }
+}
+
+/// The fans golden model with TEMPS on, and the 10x18 font's eighths.
+fn temps_model() -> TtyModel {
+    let mut model = fans_model();
+    model.temps = Some(ref_temps());
+    model
+}
+
+/// #74 goldens: 192x60 is the 10x18 font at 1920x1080 (FANS and TEMPS
+/// beside IN/OUT), 240x67 a wider screen, 160x49 the 12x22 font (TEMPS on
+/// one line, FANS hidden).
+const TEMPS_GOLDENS: [(&str, u16, u16); 3] = [
+    ("temps-192.json", 192, 60),
+    ("temps-240.json", 240, 67),
+    ("temps-160x49.json", 160, 49),
+];
+
+#[test]
+fn temps_goldens_match_character_and_colour() {
+    for (name, _, _) in TEMPS_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &temps_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #74 temps goldens"]
+fn dump_temps_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in TEMPS_GOLDENS {
+        let grid = draw(&temps_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write temps golden");
+    }
+}
+
+#[test]
+fn wide_screens_stack_fans_then_temps_right_of_in_out() {
+    for (cols, rows) in [(192u16, 60u16), (240, 67), (286, 60)] {
+        let at = format!("{cols}x{rows}");
+        let grid = draw(&temps_model(), cols, rows);
+        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
+        let fans = row_with(&grid, "FANS  nct6798");
+        let temps = row_with(&grid, "TEMPS  warn crit");
+        assert_eq!(fans, row_with(&grid, "IN "), "{at}\n{all}");
+        assert_eq!(temps, fans + 6, "{at}: FANS, a blank row, TEMPS\n{all}");
+        let split = u16::try_from(u32::from(cols) * 58 / 100).unwrap();
+        assert_eq!(col_of(&grid, temps, "TEMPS"), split + 2, "{at}");
+        for (offset, name) in [
+            "CPU", "GPU", "coolant", "NVMe0", "NVMe1", "board", "NIC", "Wi-Fi",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let row = temps + 1 + u16::try_from(offset).unwrap();
+            assert_eq!(col_of(&grid, row, name), split + 2, "{at}: {name}\n{all}");
+        }
+        assert!(
+            row_string(&grid, temps + 6).contains("aux4 50"),
+            "{at}: board whole\n{all}"
+        );
+        assert_blank_edges(&grid);
+    }
+}
+
+#[test]
+fn temps_values_take_their_level_colours() {
+    let grid = draw(&temps_model(), 192, 60);
+    let temps = row_with(&grid, "TEMPS  warn crit");
+    let fg_at = |row: u16, needle: &str| {
+        let col = col_of(&grid, row, needle);
+        grid.get(col, row).expect("cell").fg
+    };
+    assert_eq!(fg_at(temps, "warn"), C16::Yellow);
+    assert_eq!(fg_at(temps, "crit"), C16::BrightRed);
+    let nvme = temps + 4;
+    assert_eq!(fg_at(nvme, "82"), C16::Yellow, "NVMe0 s2 is warm");
+    assert_eq!(fg_at(nvme, "s1"), C16::BrightBlack, "labels are dim");
+    assert_eq!(fg_at(nvme, "50"), C16::BrightWhite);
+    assert_eq!(fg_at(temps + 6, "92"), C16::BrightRed, "board aux1 is hot");
+}
+
+#[test]
+fn at_160x49_temps_is_one_line_above_the_health_rule_and_fans_hide() {
+    let grid = draw(&temps_model(), 160, 49);
+    let all: String = (0..49).map(|row| row_string(&grid, row) + "\n").collect();
+    let line = row_with(&grid, "TEMPS");
+    assert_eq!(line, 49 - 4, "{all}");
+    assert_eq!(
+        row_string(&grid, line).trim(),
+        "TEMPS  CPU 68 \u{b7} GPU 71 \u{b7} coolant 40 \u{b7} NVMe0 82 \u{b7} NVMe1 66 \u{b7} board 92 \u{b7} NIC 51 \u{b7} Wi-Fi 39"
+    );
+    assert!(!all.contains("FANS"), "{all}");
+    // OUT keeps its three rows.
+    let out = row_with(&grid, "OUT ");
+    assert!(line >= out + 4, "{all}");
+    assert_blank_edges(&grid);
+}
+
+#[test]
+fn narrow_tall_screens_put_fans_and_temps_side_by_side_under_in_out() {
+    let grid = draw(&temps_model(), 160, 67);
+    let all: String = (0..67).map(|row| row_string(&grid, row) + "\n").collect();
+    let fans = row_with(&grid, "FANS  nct6798");
+    assert_eq!(fans, row_with(&grid, "TEMPS  warn crit"), "{all}");
+    assert!(is_rule_row(&grid, fans - 1), "{all}");
+    assert_eq!(
+        fans + 9,
+        67 - 3,
+        "TEMPS (8 rows) ends on the health rule\n{all}"
+    );
+    assert_eq!(col_of(&grid, fans, "FANS"), 2);
+    assert_eq!(col_of(&grid, fans, "TEMPS"), 90, "{all}");
+    assert_blank_edges(&grid);
+}
+
+#[test]
+fn text_off_short_of_rows_cuts_temps_to_the_fans_height_with_a_summary() {
+    let mut model = temps_model();
+    model.show_text = false;
+    let grid = draw(&model, 160, 49);
+    let all: String = (0..49).map(|row| row_string(&grid, row) + "\n").collect();
+    let header = row_with(&grid, "TEMPS  warn crit");
+    assert_eq!(header, row_with(&grid, "FANS  nct6798"), "{all}");
+    assert_eq!(header + 5, 49 - 3, "{all}");
+    let last = row_string(&grid, header + 4);
+    assert!(
+        last.contains("+ NVMe0 82 \u{b7} NVMe1 66 \u{b7} board 92 \u{b7} NIC 51 \u{b7} Wi-Fi 39"),
+        "{last}"
+    );
+    assert_blank_edges(&grid);
+}
+
+#[test]
+fn temps_alone_and_temps_off() {
+    let mut model = temps_model();
+    model.fans = None;
+    let grid = draw(&model, 192, 60);
+    assert_eq!(row_with(&grid, "TEMPS  warn crit"), row_with(&grid, "IN "));
+    model.temps = Some(TempPanel::default());
+    let grid = draw(&model, 192, 60);
+    let header = row_with(&grid, "TEMPS");
+    assert!(row_string(&grid, header + 1).contains("no temperature inputs found"));
+    model.temps = None;
+    for (cols, rows) in [(160u16, 49u16), (192, 60), (240, 67)] {
+        let grid = draw(&model, cols, rows);
+        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
+        assert!(!all.contains("TEMPS"), "{cols}x{rows}");
     }
 }
