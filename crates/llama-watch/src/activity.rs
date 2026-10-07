@@ -42,6 +42,11 @@ pub struct ActivityRow {
     pub duration_ms: Option<u64>,
     /// HTTP status of the upstream response.
     pub status: Option<u16>,
+    /// Speculative draft tokens llama.cpp's timings gave (#71). `None`
+    /// when llama-swap sent `-1` (no draft model) or nothing.
+    pub draft_tokens: Option<u64>,
+    /// Of [`Self::draft_tokens`], those accepted.
+    pub draft_accepted: Option<u64>,
     /// llama-swap kept this request's bodies (`has_capture`, #5).
     pub captured: bool,
 }
@@ -89,6 +94,8 @@ impl From<ActivityJson> for ActivityRow {
             engine_prompt_tps: None,
             engine_gen_tps: None,
             duration_ms: nonneg_u64(row.duration_ms),
+            draft_tokens: nonneg_u64(tokens.draft_tokens),
+            draft_accepted: nonneg_u64(tokens.draft_acc_tokens),
             captured: row.has_capture,
             status: row.resp_status_code.and_then(|code| {
                 if (0.0..65536.0).contains(&code) && code.fract() == 0.0 {
@@ -171,6 +178,10 @@ struct TokensJson {
     prompt_per_second: Option<f64>,
     #[serde(default)]
     tokens_per_second: Option<f64>,
+    #[serde(default)]
+    draft_tokens: Option<f64>,
+    #[serde(default)]
+    draft_acc_tokens: Option<f64>,
 }
 
 #[cfg(test)]

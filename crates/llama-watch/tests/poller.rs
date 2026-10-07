@@ -953,6 +953,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 setup: Vec::new(),
                 engine_live: Vec::new(),
                 suspected_loads: Vec::new(),
+                series: Vec::new(),
             },
         ));
     }
@@ -3647,4 +3648,149 @@ fn an_upstream_redirect_is_not_followed() {
     let hits = server.hits();
     assert!(hits.iter().all(|hit| !hit.contains("other")), "{hits:?}");
     assert_gated(&hits);
+}
+
+/// One activity row with a status, a duration and llama.cpp draft fields.
+fn activity_row(
+    id: i64,
+    model: &str,
+    status: u16,
+    ms: u64,
+    drafts: (i64, i64),
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "timestamp": format!("2026-10-07T10:00:{id:02}Z"),
+        "model": model,
+        "tokens": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_tokens": 2,
+            "draft_tokens": drafts.0,
+            "draft_acc_tokens": drafts.1,
+            "prompt_per_second": 100.0,
+            "tokens_per_second": 50.0
+        },
+        "duration_ms": ms,
+        "resp_status_code": status
+    })
+}
+
+/// `fixtures/llama/llamacpp-metrics.txt` with the request-end counters moved.
+fn llamacpp_metrics(predicted: u64, prompt_s: f64, predicted_s: f64) -> Vec<u8> {
+    String::from_utf8(fixture("llamacpp-metrics.txt"))
+        .expect("utf-8")
+        .replace(
+            "llamacpp:tokens_predicted_total 2048",
+            &format!("llamacpp:tokens_predicted_total {predicted}"),
+        )
+        .replace(
+            "llamacpp:prompt_seconds_total 4.312",
+            &format!("llamacpp:prompt_seconds_total {prompt_s}"),
+        )
+        .replace(
+            "llamacpp:tokens_predicted_seconds_total 40.96",
+            &format!("llamacpp:tokens_predicted_seconds_total {predicted_s}"),
+        )
+        .into_bytes()
+}
+
+/// #71: a llama.cpp model's cumulative numbers come from its request-end
+/// counters and llama-swap's activity rows, by llama-swap id.
+#[test]
+fn llamacpp_series_are_cumulative_and_count_activity_rows() {
+    let id = "qwen3.6-35b-a3b";
+    let mut world = World::running(running_model(id, "Qwen 35B", "ready"));
+    world
+        .metrics
+        .insert(id.to_owned(), llamacpp_metrics(2048, 4.312, 40.96));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .series
+            .first()
+            .is_some_and(|s| s.generation_tokens == Some(0) && s.requests_ok == Some(0))
+    });
+    let series = &detail.series[0];
+    assert_eq!(series.id, id);
+    assert_eq!(series.model, "Qwen 35B");
+    assert_eq!(series.running, Some(1), "requests_processing");
+    assert_eq!(series.waiting, Some(2), "requests_deferred");
+    assert_eq!(series.kv_permille, Some(250));
+    assert_eq!(
+        series.prefill_seconds,
+        Some(0.0),
+        "first read is a baseline"
+    );
+    assert_eq!(series.ttft, None, "llama.cpp reports no TTFT");
+
+    server.update(|world| {
+        world
+            .metrics
+            .insert(id.to_owned(), llamacpp_metrics(2148, 5.312, 42.96));
+        world.activity = serde_json::to_vec(&serde_json::json!({ "data": [
+            activity_row(1, id, 200, 1000, (10, 7)),
+            activity_row(2, id, 500, 500, (-1, -1)),
+        ]}))
+        .expect("json");
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .series
+            .first()
+            .is_some_and(|s| s.generation_tokens == Some(100) && s.requests_error == Some(1))
+    });
+    let series = &detail.series[0];
+    assert_eq!(series.requests_ok, Some(1));
+    let close = |got: Option<f64>, want: f64| got.is_some_and(|v| (v - want).abs() < 1e-9);
+    assert!(close(series.prefill_seconds, 1.0), "{series:?}");
+    assert!(close(series.decode_seconds, 2.0), "{series:?}");
+    assert_eq!(series.spec_draft_tokens, Some(10));
+    assert_eq!(series.spec_accepted_tokens, Some(7));
+    let e2e = series.e2e.expect("activity durations");
+    assert_eq!((e2e.sum, e2e.count), (1.5, 2.0));
+}
+
+/// #71: vLLM's numbers fill the same fields from its own counters and
+/// histograms; its live gauges stay on `BackendInfo`, not the series.
+#[test]
+fn vllm_series_fill_the_same_fields() {
+    let id = "qwen3.8-27b-vllm";
+    let mut world = World::running(running_cmd(id, VLLM_CMD));
+    world
+        .metrics
+        .insert(id.to_owned(), vllm_metrics(42_000, 20_000, 60_000, 38_000));
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .series
+            .first()
+            .is_some_and(|s| s.generation_tokens == Some(0))
+    });
+    server.update(|world| {
+        world
+            .metrics
+            .insert(id.to_owned(), vllm_metrics(42_340, 20_100, 60_300, 38_240));
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, detail| {
+        detail
+            .series
+            .first()
+            .is_some_and(|s| s.generation_tokens == Some(340))
+    });
+    let series = &detail.series[0];
+    assert_eq!(series.running, None);
+    assert_eq!(series.prefill_seconds, Some(0.0));
+    assert_eq!(series.decode_seconds, Some(0.0));
+    for hist in [series.ttft, series.itl, series.e2e] {
+        let hist = hist.expect("engine histogram");
+        assert_eq!((hist.sum, hist.count), (0.0, 0.0), "baseline, unchanged");
+    }
+    assert_eq!(series.spec_draft_tokens, None, "vLLM's are engine counters");
 }

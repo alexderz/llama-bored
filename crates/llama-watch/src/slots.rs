@@ -1109,6 +1109,8 @@ mod tests {
             engine_gen_tps: None,
             duration_ms: None,
             status: Some(200),
+            draft_tokens: None,
+            draft_accepted: None,
             captured: false,
         }
     }
