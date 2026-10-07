@@ -553,6 +553,7 @@ mod tests {
             n_decoded: decoded,
             n_ctx: Some(262_144),
             ctx_prompt: Some(prompt),
+            prompt_cached: None,
             ctx_used: None,
             resets: Default::default(),
             last_reset: None,

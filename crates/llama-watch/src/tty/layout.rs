@@ -66,7 +66,7 @@ pub struct Slot {
     pub ctx_history: Vec<CtxPoint>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Activity {
     pub live: bool,
     pub id: u32,
@@ -86,6 +86,24 @@ pub struct Activity {
     pub gen_measured: bool,
     pub dur: String,
     pub err: bool,
+    /// The model's context size (#75): the bar's full width. `None` scales
+    /// the bar to the largest row shown and marks it `~`.
+    pub n_ctx: Option<u64>,
+    /// A request still running (#75), from live per-request numbers.
+    /// `input_tok` is then its whole prompt, `output_tok` the tokens so far.
+    pub inflight: Option<InFlight>,
+}
+
+/// The live half of an in-flight RECENT row (#75).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InFlight {
+    /// Decoding (`gen`); else still in prefill (`pp`).
+    pub decoding: bool,
+    /// Prompt tokens computed so far, beyond the cached part.
+    pub processed: u64,
+    /// A context reset just before this request, which started it from
+    /// zero: its letter shows after `pp`, as in SLOTS.
+    pub reset: Option<ResetReason>,
 }
 
 /// One item on a SETUP row (#52): `kv q8_0`, drawn after `sep`.
@@ -1799,6 +1817,281 @@ const LEGEND_NARROW: &str = "PROMPT = prompt processing (prefill) · GEN = token
 const LEGEND_WIDE: &str = "PROMPT tok/s = prompt processing speed · GEN tok/s = generation speed";
 /// Added to the legend while a shown row has an engine-measured rate (#35).
 const LEGEND_MEASURED: &str = " · ~ = engine-measured";
+/// #75: the bar's colours, painted over the `█`s.
+const LEGEND_KEY: &str = " · █cached █new █out";
+/// #75: a bar without a context size is scaled to the largest row.
+const LEGEND_RELATIVE: &str = " · ~bar = vs largest row";
+/// #75: the rainbow strip, painted over the `▁`s.
+const LEGEND_RAINBOW: &str = " · ▁▁▁▁▁▁▁▁ per 1/8";
+
+/// The RECENT legend: the column words, then what fits of the measured
+/// note, the bar's colour key, the relative note and the rainbow order,
+/// dropped in reverse order of that list when the row is short.
+fn paint_legend(
+    grid: &mut Grid,
+    row: u16,
+    cols: u16,
+    base: &str,
+    measured: bool,
+    relative: bool,
+    glyphs: ChartGlyphs,
+) {
+    let room = usize::from(cols.saturating_sub(3));
+    let mut items: Vec<&str> = Vec::new();
+    if measured {
+        items.push(LEGEND_MEASURED);
+    }
+    items.push(LEGEND_KEY);
+    if relative {
+        items.push(LEGEND_RELATIVE);
+    }
+    items.push(LEGEND_RAINBOW);
+    let len = |items: &[&str]| {
+        base.chars().count() + items.iter().map(|i| i.chars().count()).sum::<usize>()
+    };
+    while !items.is_empty() && len(&items) > room {
+        let drop = [LEGEND_RAINBOW, LEGEND_RELATIVE, LEGEND_MEASURED, LEGEND_KEY]
+            .iter()
+            .find_map(|d| items.iter().position(|i| i == d));
+        match drop {
+            Some(at) => {
+                items.remove(at);
+            }
+            None => break,
+        }
+    }
+    let mut col = 2u16;
+    paint_fixed(grid, col, row, base, C16::BrightBlack);
+    col += u16_from(base.chars().count());
+    for item in items {
+        let mut rainbow = 0usize;
+        let mut key = 0usize;
+        for ch in item.chars() {
+            match ch {
+                '█' => {
+                    let fg = [C16::Blue, C16::BrightCyan, C16::BrightMagenta][key.min(2)];
+                    paint(grid, col, row, '█', fg, C16::Black);
+                    key += 1;
+                }
+                '▁' => {
+                    let glyph = track_glyph(glyphs);
+                    paint(
+                        grid,
+                        col,
+                        row,
+                        glyph,
+                        RAINBOW[rainbow % RAINBOW.len()],
+                        C16::Black,
+                    );
+                    rainbow += 1;
+                }
+                _ => paint_fixed(grid, col, row, &ch.to_string(), C16::BrightBlack),
+            }
+            col = col.saturating_add(1);
+        }
+    }
+}
+
+/// #75: the order of the remainder cell's colours, by palette slot. Under
+/// the llama palette it runs around the hue wheel: violet, indigo, blue,
+/// sky, green, light green, light yellow, orange. It skips the warning
+/// yellow and reds and the output magenta; blue and sky are also the
+/// cached and new colours, told apart by the cell's place (the first of a
+/// run). The same slots in every mode (tty11, llama-view 16 / 256 /
+/// truecolor, llama-cast), so the order reads the same everywhere.
+pub const RAINBOW: [C16; 8] = [
+    C16::Magenta,
+    C16::BrightBlue,
+    C16::Blue,
+    C16::BrightCyan,
+    C16::Green,
+    C16::BrightGreen,
+    C16::BrightYellow,
+    C16::Cyan,
+];
+
+/// Which part of a RECENT context bar a cell draws (#75).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CtxPart {
+    /// Cached input.
+    Cached,
+    /// New input (input minus cached, never below 0).
+    New,
+    /// In flight: prompt not yet computed, the target the new part fills.
+    Pending,
+    /// Output tokens.
+    Out,
+    /// Empty: the dim baseline.
+    Track,
+}
+
+/// One cell of a context bar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CtxCell {
+    /// What it shows.
+    pub part: CtxPart,
+    /// Height in eighths, 1..=8 (8 is a full cell).
+    pub eighths: u8,
+    /// A segment's remainder cell: its index in [`RAINBOW`].
+    pub shade: Option<u8>,
+}
+
+/// The cells of a context bar `width` cells wide where the full width is
+/// `scale` tokens (#75). Each segment is `value / scale × width` cells,
+/// in order. A segment with a fractional part (or under one cell) starts
+/// with its remainder cell: `e = ⌊frac × 8⌋` eighths high (at least one)
+/// and coloured `RAINBOW[⌊(frac × 8 − e) × 8⌋]`; then its whole cells.
+/// Exact integer maths: the same counts always give the same cells.
+/// Pending draws its cells (rounded up) as a low track. The rest is
+/// [`CtxPart::Track`], and nothing passes `width`.
+#[must_use]
+pub fn ctx_cells(parts: &[(CtxPart, u64)], scale: u64, width: usize) -> Vec<CtxCell> {
+    const K: u128 = RAINBOW.len() as u128;
+    let scale = u128::from(scale.max(1));
+    let mut cells: Vec<CtxCell> = Vec::with_capacity(width);
+    for (part, value) in parts {
+        if *value == 0 {
+            continue;
+        }
+        // Sub-steps: one cell is 8 eighths of K colours each.
+        let units = u128::from(*value) * width as u128 * 8 * K / scale;
+        let whole = usize::try_from(units / (8 * K)).unwrap_or(usize::MAX);
+        let rem = units % (8 * K);
+        if *part == CtxPart::Pending {
+            let n = whole.saturating_add(usize::from(rem > 0));
+            cells.extend(std::iter::repeat_n(
+                CtxCell {
+                    part: *part,
+                    eighths: 1,
+                    shade: None,
+                },
+                n.min(width),
+            ));
+        } else {
+            if rem > 0 || whole == 0 {
+                let e = u8::try_from(rem / K).unwrap_or(0).max(1);
+                let s = u8::try_from(rem % K).unwrap_or(0);
+                cells.push(CtxCell {
+                    part: *part,
+                    eighths: e,
+                    shade: Some(s),
+                });
+            }
+            cells.extend(std::iter::repeat_n(
+                CtxCell {
+                    part: *part,
+                    eighths: 8,
+                    shade: None,
+                },
+                whole.min(width),
+            ));
+        }
+        if cells.len() >= width {
+            break;
+        }
+    }
+    cells.truncate(width);
+    cells.resize(
+        width,
+        CtxCell {
+            part: CtxPart::Track,
+            eighths: 1,
+            shade: None,
+        },
+    );
+    cells
+}
+
+/// A row's bar segments: cached, new (computed so far, in flight), the
+/// prompt still to compute (in flight), output.
+fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
+    let cached = req.cached_tok.min(req.input_tok);
+    let new = req.input_tok - cached;
+    let (done, pending) = match req.inflight {
+        Some(flight) if !flight.decoding => {
+            let done = flight.processed.min(new);
+            (done, new - done)
+        }
+        _ => (new, 0),
+    };
+    [
+        (CtxPart::Cached, cached),
+        (CtxPart::New, done),
+        (CtxPart::Pending, pending),
+        (CtxPart::Out, req.output_tok),
+    ]
+}
+
+/// The low line of an empty or pending cell.
+fn track_glyph(glyphs: ChartGlyphs) -> char {
+    match glyphs {
+        ChartGlyphs::Eighths => '\u{2581}',
+        ChartGlyphs::Halves => '_',
+    }
+}
+
+/// `e` eighths: `▁`..`▇`, `█`; halves: `▄` up to four, else `█`.
+fn eighth_glyph(eighths: u8, glyphs: ChartGlyphs) -> char {
+    match glyphs {
+        ChartGlyphs::Eighths if eighths < 8 => {
+            char::from_u32(0x2580 + u32::from(eighths.max(1))).unwrap_or('\u{2588}')
+        }
+        ChartGlyphs::Halves if eighths <= 4 => '\u{2584}',
+        _ => '\u{2588}',
+    }
+}
+
+/// RECENT's bar (#75): the request's context, cached / new / output,
+/// against the model's context size; `~` before a bar scaled to the
+/// largest row instead; a yellow `!` after one at 90 % of the context.
+fn draw_ctx_bar(
+    grid: &mut Grid,
+    req: &Activity,
+    span: Span,
+    row: u16,
+    relative_scale: u64,
+    dim: bool,
+    glyphs: ChartGlyphs,
+) {
+    let parts = ctx_parts(req);
+    let total: u64 = parts.iter().map(|(_, v)| *v).sum();
+    let n_ctx = req.n_ctx.filter(|n| *n > 0);
+    let scale = n_ctx.unwrap_or(relative_scale);
+    let width = usize::from(span.w);
+    let cells = ctx_cells(&parts, scale, width);
+    for (i, cell) in cells.iter().enumerate() {
+        let (ch, fg) = match cell.part {
+            CtxPart::Track => (track_glyph(glyphs), C16::BrightBlack),
+            CtxPart::Pending => (track_glyph(glyphs), C16::BrightCyan),
+            part => {
+                let base = match part {
+                    CtxPart::Cached => C16::Blue,
+                    CtxPart::New => C16::BrightCyan,
+                    _ => C16::BrightMagenta,
+                };
+                let fg = cell.shade.map_or(base, |s| RAINBOW[usize::from(s)]);
+                (eighth_glyph(cell.eighths, glyphs), fg)
+            }
+        };
+        let fg = if dim { C16::BrightBlack } else { fg };
+        paint(grid, span.x + u16_from(i), row, ch, fg, C16::Black);
+    }
+    if n_ctx.is_none() && span.x > 0 {
+        paint(grid, span.x - 1, row, '~', C16::BrightBlack, C16::Black);
+    }
+    if let Some(n) = n_ctx
+        && u128::from(total) * 10 >= u128::from(n) * 9
+        && width > 0
+    {
+        let used = cells
+            .iter()
+            .rposition(|c| c.part != CtxPart::Track)
+            .map_or(0, |i| i + 1);
+        let at = used.min(width - 1);
+        let fg = if dim { C16::BrightBlack } else { C16::Yellow };
+        paint(grid, span.x + u16_from(at), row, '!', fg, C16::Black);
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Grow {
@@ -2221,12 +2514,21 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         .iter()
         .take(usize::from(slots))
         .any(|req| req.prompt_measured || req.gen_measured);
-    let legend = if measured && model.state != WatchState::Starting {
-        format!("{legend}{LEGEND_MEASURED}")
-    } else {
-        legend.to_owned()
-    };
-    paint_fixed(grid, 2, header + 1 + slots, &legend, C16::BrightBlack);
+    let relative = model
+        .requests
+        .iter()
+        .take(usize::from(slots))
+        .any(|req| req.n_ctx.is_none_or(|n| n == 0));
+    let starting = model.state == WatchState::Starting;
+    paint_legend(
+        grid,
+        header + 1 + slots,
+        g.cols,
+        legend,
+        measured && !starting,
+        relative && !starting,
+        model.chart_glyphs,
+    );
     if model.state == WatchState::Starting {
         paint_str(
             grid,
@@ -2245,15 +2547,36 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
     } else {
         C16::BrightWhite
     };
-    for (i, req) in model.requests.iter().take(usize::from(slots)).enumerate() {
+    // #75: in-flight rows first, at most half the rows, so finished rows
+    // still show.
+    let flight_cap = usize::from(slots / 2).max(1);
+    let shown: Vec<&Activity> = model
+        .requests
+        .iter()
+        .filter(|req| req.inflight.is_some())
+        .take(flight_cap)
+        .chain(model.requests.iter().filter(|req| req.inflight.is_none()))
+        .take(usize::from(slots))
+        .collect();
+    let relative_scale = shown
+        .iter()
+        .filter(|req| req.n_ctx.is_none_or(|n| n == 0))
+        .map(|req| ctx_parts(req).iter().map(|(_, v)| *v).sum::<u64>())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    for (i, req) in shown.into_iter().enumerate() {
         let Ok(offset) = u16::try_from(i) else {
             break;
         };
         let row = header + 1 + offset;
-        if req.live && !dim {
+        if (req.live || req.inflight.is_some()) && !dim {
             paint(grid, 0, row, '>', C16::BrightRed, C16::Black);
         }
-        paint_span_right(grid, plan.id, row, &req.id.to_string(), plain, C16::Black);
+        // An in-flight request has no llama-swap id yet (#75).
+        if req.inflight.is_none() {
+            paint_span_right(grid, plan.id, row, &req.id.to_string(), plain, C16::Black);
+        }
         let time = format_request_time(&req.time, plan.full_time);
         paint_span_left(grid, plan.time, row, &time, plain, C16::Black);
         paint_ellipsis(grid, plan.source, row, &format_source(&req.source), plain);
@@ -2299,28 +2622,24 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             C16::Black,
         );
         paint_span_right(grid, plan.dur, row, &req.dur, plain, C16::Black);
-        let frac = rate_frac(req.gen_tps, model.gen_ceiling);
-        let ink = if dim {
-            BarInk::Fixed(C16::BrightBlack, C16::BrightBlack)
-        } else {
-            BarInk::Spectrum {
-                hot: frac.is_some_and(|frac| frac >= 1.0),
-            }
-        };
-        draw_h_bar(
+        draw_ctx_bar(
             grid,
-            HBar {
-                x: plan.bar.x,
-                row,
-                width: plan.bar.w,
-                frac,
-                ink,
-                rows: 1,
-                cells: None,
-            },
+            req,
+            plan.bar,
+            row,
+            relative_scale,
+            dim,
+            model.chart_glyphs,
         );
         if req.err {
             paint_span_left(grid, plan.status, row, " ERR ", C16::Black, C16::Yellow);
+        } else if let Some(flight) = req.inflight.filter(|_| !dim) {
+            let word = if flight.decoding { "gen" } else { "pp" };
+            paint_span_left(grid, plan.status, row, word, C16::BrightRed, C16::Black);
+            if let (false, Some(reason)) = (flight.decoding, flight.reset) {
+                let (mark, fg) = reset_mark(Some(reason));
+                paint(grid, plan.status.x + 3, row, mark, fg, C16::Black);
+            }
         } else if req.live && !dim {
             paint_span_left(grid, plan.status, row, "gen", C16::BrightRed, C16::Black);
         }

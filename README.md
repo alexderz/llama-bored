@@ -77,7 +77,7 @@ llama-swap's own speeds.
 
 ## Features
 
-**llama-watch and tty11** (10 fps, bundled Hack 12x24 console font)
+**llama-watch and tty11** (10 fps, bundled Hack console fonts: 12x24, 12x22, 10x18)
 
 - Spectrum meters for CPU, GPU, VRAM, MEM, POWER and LOAD, and an **ACTIVITY** row that
   names its source (`gpu`, `cpu` or `util`).
@@ -89,16 +89,57 @@ llama-swap's own speeds.
   reason from token counts: `c` compacted (same conversation, mostly
   cached), `n` new conversation, `e` evicted (a conversation came back with
   nothing cached), red `v` unknown.
-- **RECENT:** the last requests across the full width, with timestamps.
+- **RECENT:** the last requests across the full width, with timestamps, a
+  context bar per request, and in-flight rows while a request runs (below).
 - **IN / OUT:** the live prompt and output tails of the busy slot. IN strips
   chat-template tokens by default. For SGLang, vLLM and other servers
   without `/slots`, IN/OUT show the last finished exchange from llama-swap's
   request captures (when its `captureBuffer` is on; read up to 2 MiB per
   capture). Turn all text off, captures included, with `show_text = false`.
-- **FANS** (optional): read-only rpm and pwm of motherboard fans from a
-  Super-I/O hwmon chosen by name.
+- **TEMPS:** every temperature the host exposes, one row per device, with
+  allow and block lists (see **TEMPS and FANS** under Configuration).
+- **FANS** (optional): read-only rpm and pwm of discovered fans, with the
+  same allow and block lists.
 - The model's full name and engine in the header, and a **SETUP** block with
   the loaded model's settings (below).
+
+**Context bar.** RECENT's bar (#75) shows how much of the model's
+context each request used, as three runs in a row: cached input (blue),
+new input (input minus cached; sky blue) and output (magenta). The full
+width is the model's context size (`n_ctx` from the engine or the launch
+command, remembered after the model unloads), so a cell is `n_ctx / width`
+tokens, linearly. Each run starts with its remainder cell: its height is
+the fraction of a cell in eighths (`▁`..`▇`, at least `▁` for any tokens at
+all), and its colour the fraction of an eighth, in this fixed order of
+eight palette slots, the same on tty11, in llama-view (16, 256 and
+truecolor) and on llama-cast: violet, indigo, blue, sky, green, light
+green, light yellow, orange (slots 5, 12, 4, 14, 2, 10, 11, 6). At 30
+cells and a 262,144-token context one colour step is about 136 tokens.
+The colours are a function of the counts only: a finished row never
+changes. Empty cells are a dim baseline. A request at 90 % of the context
+or more gets a yellow `!` after its bar. Without a context size the bar is
+scaled to the largest such row shown and marked `~`. With `chart_glyphs =
+"halves"` the heights fall back to `▄` and `█` and the colours carry the
+rest. Engines that report no cached count show all input as new.
+
+```text
+   4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▁███████████▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+>       18:47:20              Qwen 35B  120,000        0     0  ...  36.4s ▁██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp c
+```
+
+**In-flight rows.** Where the engine reports a request while it runs, it
+is RECENT's top row until llama-swap's finished row replaces it (never
+both): llama.cpp from `/slots` (one row per busy slot, at most half the
+rows), Strata from its `live` report. IN is the whole prompt, CACHED the
+reused part, OUT the tokens so far, DUR the time since it was first seen;
+PROMPT and GEN are the live rates, marked `~`. During prefill the new run
+fills, poll by poll, toward the rest of the prompt drawn as a sky-blue low
+line, and the row is marked `pp`, with the SLOTS reset letter (`c`, `n`,
+`e`) when a context reset just made it start from zero; then `gen` while
+it decodes. The row holds the latest poll's numbers, nothing in between.
+vLLM, SGLang and OpenAI-compatible servers report no per-request
+progress: their newest finished row is marked `gen` while the model
+generates, as before.
 
 **SETUP.** Under the meters (one per row since #52), tty11 shows the
 settings of the model generating now, or else the one RECENT saw last:

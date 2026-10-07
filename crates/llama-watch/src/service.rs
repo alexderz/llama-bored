@@ -8,7 +8,7 @@
 //! tty writer thread and returns, so a console write that blocks (unblank,
 //! Scroll Lock) never holds back publish or the watchdog (#42).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,7 @@ use crate::tty::chart::TokenChart;
 use crate::tty::ctx_history::CtxBook;
 use crate::tty::grid::Cell;
 use crate::tty::layout::{
-    self, Activity, HealthSeg, HealthStatus, SetupView, Slot, TtyModel, WatchState,
+    self, Activity, HealthSeg, HealthStatus, InFlight, SetupView, Slot, TtyModel, WatchState,
 };
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
@@ -464,6 +464,11 @@ struct TickState {
     ctx_history: CtxBook,
     /// When each model (by name) entered llama-swap `stopping`.
     stopping_since: HashMap<String, Instant>,
+    /// Requests still running, for RECENT (#75).
+    flights: crate::inflight::Tracker,
+    /// Each model's context size by llama-swap key, kept after it unloads
+    /// so its RECENT rows keep their scale (#75).
+    ctx_sizes: BTreeMap<String, u64>,
 }
 
 impl TickState {
@@ -498,6 +503,8 @@ impl TickState {
             chart: TokenChart::new(chart_bucket_s),
             ctx_history: CtxBook::new(ctx_history_h),
             stopping_since: HashMap::new(),
+            flights: crate::inflight::Tracker::default(),
+            ctx_sizes: BTreeMap::new(),
         }
     }
 }
@@ -544,7 +551,9 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         state.llama = view;
         state.detail = detail;
         state.heard = true;
+        note_poll(state, mono, wall);
     }
+    state.flights.retire(mono);
     let sample = input.sampler.sample(mono, wall, &state.llama);
     let extras = publish_extras(&sample, state, ctx);
     note_publish(input, state, &sample, &extras, mono);
@@ -991,7 +1000,16 @@ fn tty_model(
         } else {
             String::new()
         },
-        requests: layout_requests(&tick.detail.activity, watch, zone),
+        requests: layout_requests(
+            &tick.detail.activity,
+            watch,
+            zone,
+            &RecentCtx {
+                flights: &tick.flights.flights(),
+                ctx_sizes: &tick.ctx_sizes,
+                ids: &model_ids(&tick.llama, &tick.detail),
+            },
+        ),
         in_title: text.in_title,
         out_title: text.out_title,
         in_lines: text.in_lines,
@@ -1460,29 +1478,122 @@ fn layout_slots(slots: &[SlotView], history: &CtxBook) -> Vec<Slot> {
         .collect()
 }
 
-fn layout_requests(rows: &[ActivityRow], state: WatchState, zone: &Zone) -> Vec<Activity> {
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| Activity {
-            live: index == 0 && state == WatchState::Generating,
-            id: u32::try_from(row.id).unwrap_or(0),
-            time: local_request_time(&row.time, zone),
-            source: row.source.clone(),
-            model: row.model.clone(),
-            input_tok: row.input_tokens.unwrap_or(0),
-            cached_tok: row.cached_tokens.unwrap_or(0),
-            output_tok: row.output_tokens.unwrap_or(0),
-            prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
-            gen_tps: row.gen_tps.or(row.engine_gen_tps),
-            prompt_measured: row.prompt_tps.is_none() && row.engine_prompt_tps.is_some(),
-            gen_measured: row.gen_tps.is_none() && row.engine_gen_tps.is_some(),
-            dur: match row.duration_ms {
-                Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
-                None => "--".to_owned(),
-            },
-            err: row.status.is_some_and(|code| !(200..300).contains(&code)),
-        })
+/// Most context sizes remembered (#75).
+const MAX_CTX_SIZES: usize = 64;
+
+/// `(display name, llama-swap key)` of each loaded model, when the poller's
+/// SETUP list pairs with the view's models.
+fn model_ids(llama: &LlamaView, detail: &LlamaDetail) -> Vec<(String, String)> {
+    if detail.setup.len() != llama.models.len() {
+        return Vec::new();
+    }
+    llama
+        .models
+        .iter()
+        .zip(&detail.setup)
+        .map(|(model, setup)| (model.name.clone(), setup.key.clone()))
         .collect()
+}
+
+/// A new poll arrived: feed the in-flight rows and learn context sizes
+/// (#75).
+fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
+    let ids = model_ids(&state.llama, &state.detail);
+    for (model, (name, key)) in state.llama.models.iter().zip(&ids) {
+        let from_slots = state
+            .detail
+            .slots
+            .iter()
+            .filter(|slot| slot.model == *name)
+            .filter_map(|slot| slot.n_ctx)
+            .max();
+        let size = model
+            .detail
+            .as_ref()
+            .and_then(|d| d.ctx)
+            .map(u64::from)
+            .or(from_slots)
+            .filter(|n| *n > 0);
+        if let Some(size) = size {
+            if state.ctx_sizes.len() >= MAX_CTX_SIZES && !state.ctx_sizes.contains_key(key) {
+                state.ctx_sizes.pop_first();
+            }
+            state.ctx_sizes.insert(key.clone(), size);
+        }
+    }
+    let poll = crate::inflight::Poll {
+        slots: &state.detail.slots,
+        engine_live: &state.detail.engine_live,
+        activity: &state.detail.activity,
+        ids: &ids,
+        prompt_tps: state.detail.prompt_tps,
+        gen_tps: state.detail.gen_tps,
+    };
+    state.flights.poll(&poll, mono, wall);
+}
+
+/// What RECENT needs beyond the activity rows (#75).
+struct RecentCtx<'a> {
+    flights: &'a [&'a crate::inflight::Flight],
+    ctx_sizes: &'a BTreeMap<String, u64>,
+    ids: &'a [(String, String)],
+}
+
+fn layout_requests(
+    rows: &[ActivityRow],
+    state: WatchState,
+    zone: &Zone,
+    recent: &RecentCtx<'_>,
+) -> Vec<Activity> {
+    let flights = recent.flights.iter().map(|flight| {
+        let key = crate::inflight::model_key(recent.ids, &flight.model);
+        let elapsed = flight.polled.saturating_duration_since(flight.started_mono);
+        Activity {
+            live: false,
+            id: 0,
+            time: format_wall(flight.started_wall, zone),
+            source: String::new(),
+            n_ctx: flight.n_ctx.or_else(|| recent.ctx_sizes.get(&key).copied()),
+            model: key,
+            input_tok: flight.prompt,
+            cached_tok: flight.cached,
+            output_tok: flight.decoded,
+            prompt_tps: flight.prompt_tps,
+            gen_tps: flight.gen_tps,
+            prompt_measured: flight.prompt_tps.is_some(),
+            gen_measured: flight.gen_tps.is_some(),
+            dur: format!("{:.1}s", elapsed.as_secs_f64()),
+            err: false,
+            inflight: Some(InFlight {
+                decoding: flight.decoding,
+                processed: flight.processed,
+                reset: flight.reset,
+            }),
+        }
+    });
+    let flying = !recent.flights.is_empty();
+    let finished = rows.iter().enumerate().map(|(index, row)| Activity {
+        n_ctx: recent.ctx_sizes.get(&row.model).copied(),
+        inflight: None,
+        live: !flying && index == 0 && state == WatchState::Generating,
+        id: u32::try_from(row.id).unwrap_or(0),
+        time: local_request_time(&row.time, zone),
+        source: row.source.clone(),
+        model: row.model.clone(),
+        input_tok: row.input_tokens.unwrap_or(0),
+        cached_tok: row.cached_tokens.unwrap_or(0),
+        output_tok: row.output_tokens.unwrap_or(0),
+        prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
+        gen_tps: row.gen_tps.or(row.engine_gen_tps),
+        prompt_measured: row.prompt_tps.is_none() && row.engine_prompt_tps.is_some(),
+        gen_measured: row.gen_tps.is_none() && row.engine_gen_tps.is_some(),
+        dur: match row.duration_ms {
+            Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
+            None => "--".to_owned(),
+        },
+        err: row.status.is_some_and(|code| !(200..300).contains(&code)),
+    });
+    flights.chain(finished).collect()
 }
 
 fn prompt_last(slots: &[SlotView]) -> Option<u64> {
@@ -1829,6 +1940,67 @@ mod tests {
 
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
     /// none, and marks them; a llama.cpp row keeps its own.
+    /// #75: a busy slot is RECENT's first row, keyed and scaled like the
+    /// finished rows, and the newest finished row loses the `gen` mark.
+    #[test]
+    fn inflight_rows_lead_recent_with_their_model_key_and_context() {
+        let mut busy = slot(0, 41, true, "", "");
+        busy.model = "Qwen 35B".to_owned();
+        (busy.n_prompt_tokens, busy.n_prompt_tokens_processed) = (50_000, 20_000);
+        busy.prompt_cached = Some(0);
+        busy.n_ctx = None;
+        let ids = vec![("Qwen 35B".to_owned(), "qwen3.6-35b-a3b".to_owned())];
+        let page = br#"{"data":[{"id":7,"timestamp":"2026-10-03T10:00:07Z","model":"qwen3.6-35b-a3b","tokens":{"input_tokens":900}}]}"#;
+        let rows = crate::activity::parse_activity(page).expect("page");
+        let mut tracker = crate::inflight::Tracker::default();
+        let now = Instant::now();
+        tracker.poll(
+            &crate::inflight::Poll {
+                slots: &[busy],
+                engine_live: &[],
+                activity: &rows,
+                ids: &ids,
+                prompt_tps: Some(2_000.0),
+                gen_tps: None,
+            },
+            now,
+            UNIX_EPOCH,
+        );
+        let flights = tracker.flights();
+        let sizes: BTreeMap<String, u64> = [("qwen3.6-35b-a3b".to_owned(), 262_144)].into();
+        let recent = RecentCtx {
+            flights: &flights,
+            ctx_sizes: &sizes,
+            ids: &ids,
+        };
+        let shown = layout_requests(&rows, WatchState::Generating, Zone::utc(), &recent);
+        assert_eq!(shown.len(), 2);
+        let live = &shown[0];
+        assert_eq!(live.model, "qwen3.6-35b-a3b");
+        assert_eq!(
+            (live.input_tok, live.cached_tok, live.output_tok),
+            (50_000, 0, 0)
+        );
+        assert_eq!(live.n_ctx, Some(262_144));
+        assert_eq!(
+            live.inflight.map(|f| (f.decoding, f.processed)),
+            Some((false, 20_000))
+        );
+        assert_eq!(
+            (live.prompt_tps, live.prompt_measured),
+            (Some(2_000.0), true)
+        );
+        assert!(!shown[1].live, "the gen mark moved to the in-flight row");
+        assert_eq!(shown[1].n_ctx, Some(262_144));
+        // Without flights the newest finished row keeps today's mark.
+        let none = RecentCtx {
+            flights: &[],
+            ctx_sizes: &sizes,
+            ids: &ids,
+        };
+        assert!(layout_requests(&rows, WatchState::Generating, Zone::utc(), &none)[0].live);
+    }
+
     #[test]
     fn recent_rows_use_engine_speeds_only_where_llama_swap_had_none() {
         let page = br#"{"data":[
@@ -1841,7 +2013,12 @@ mod tests {
         rows[0].engine_gen_tps = Some(9.0);
         rows[1].engine_prompt_tps = Some(2134.4);
         rows[1].engine_gen_tps = Some(41.25);
-        let shown = layout_requests(&rows, WatchState::Ready, Zone::utc());
+        let recent = RecentCtx {
+            flights: &[],
+            ctx_sizes: &BTreeMap::new(),
+            ids: &[],
+        };
+        let shown = layout_requests(&rows, WatchState::Ready, Zone::utc(), &recent);
         assert_eq!(shown[0].prompt_tps, Some(1193.6), "llama.cpp keeps its own");
         assert_eq!(shown[0].gen_tps, Some(50.5));
         assert!(!shown[0].prompt_measured && !shown[0].gen_measured);
@@ -1915,6 +2092,7 @@ mod tests {
             n_decoded: 816,
             n_ctx: Some(262_144),
             ctx_prompt: Some(91_000),
+            prompt_cached: None,
             ctx_used: None,
             resets: Default::default(),
             last_reset: None,
@@ -1938,6 +2116,7 @@ mod tests {
             n_decoded: 0,
             n_ctx: None,
             ctx_prompt: None,
+            prompt_cached: None,
             ctx_used: None,
             resets: Default::default(),
             last_reset: None,
@@ -2283,6 +2462,7 @@ mod tests {
                         n_decoded: 42,
                         n_ctx: Some(32_768),
                         ctx_prompt: Some(9_000),
+                        prompt_cached: None,
                         ctx_used: None,
                         resets: Default::default(),
                         last_reset: None,
@@ -2586,6 +2766,7 @@ mod tests {
             n_decoded: 0,
             n_ctx: None,
             ctx_prompt: None,
+            prompt_cached: None,
             ctx_used: None,
             resets: Default::default(),
             last_reset: None,
