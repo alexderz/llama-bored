@@ -316,12 +316,10 @@ fn real_ffmpeg_starts_at_an_idr_and_bursts_the_preroll() {
         return;
     }
     assert!(out.len() >= want, "short stream: {} bytes", out.len());
-    // Paced, four seconds of video take about 3.5 s (ffmpeg runs up to
-    // half an input frame ahead); the burst brings them at once.
-    assert!(
-        took < Duration::from_millis(2500),
-        "four seconds of video took {took:?}: no pre-roll burst"
-    );
+    // No wall-clock bound here (#64): on a loaded host the encode itself can
+    // take longer than the paced stream would. The burst is proven exactly by
+    // `preroll_writes_the_first_frame_at_once`; this test checks the stream.
+    eprintln!("four seconds of video took {took:?}");
     let packets = out.as_chunks::<188>().0;
     assert!(packets.iter().all(|p| p[0] == 0x47), "not MPEG-TS");
 
