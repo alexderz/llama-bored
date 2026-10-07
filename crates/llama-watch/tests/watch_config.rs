@@ -1556,7 +1556,7 @@ fn text_off_override_clears_show_text_and_keeps_the_rest() {
     assert_eq!(back, *cfg);
 }
 
-/// #7: `[tty] size = "COLSxROWS"` and `font = "12x24" | "12x22"`.
+/// #7: `[tty] size = "COLSxROWS"` and `font = "12x24" | "12x22" | "10x18"` (#73).
 #[test]
 fn tty_size_and_font_parse_strictly() {
     let cfg = Config::default();
@@ -1576,6 +1576,10 @@ fn tty_size_and_font_parse_strictly() {
     assert_eq!(cfg.tty.font, TtyFont::Hack12x24);
     assert_eq!(TtyFont::Hack12x24.file_name(), "llama-hack-12x24.psfu");
     assert_eq!(TtyFont::Hack12x22.file_name(), "llama-hack-12x22.psfu");
+    let cfg = Config::from_toml("[tty]\nsize = \"192x60\"\nfont = \"10x18\"\n").expect("10x18");
+    assert_eq!(cfg.tty.font, TtyFont::Hack10x18);
+    assert!(cfg.validate(8).is_ok());
+    assert_eq!(TtyFont::Hack10x18.file_name(), "llama-hack-10x18.psfu");
     for bad in [
         "\"160X49\"",
         "\"160x\"",

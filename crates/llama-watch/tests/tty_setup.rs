@@ -117,6 +117,23 @@ fn font_then_size_from_the_config() {
     );
 }
 
+/// #73: the 10x18 font for a 1080p screen viewed up close.
+#[test]
+fn ten_by_eighteen_font_then_192x60() {
+    let tty = Tty {
+        font: TtyFont::Hack10x18,
+        size: Some(TtySize {
+            cols: 192,
+            rows: 60,
+        }),
+        ..Tty::default()
+    };
+    assert_eq!(
+        steps(&tty),
+        [setfont("llama-hack-10x18.psfu"), stty("192", "60")]
+    );
+}
+
 #[test]
 fn run_setup_validates_then_runs_font_and_size() {
     let cfg = TempConfig::new("ok", "[tty]\nfont = \"12x22\"\nsize = \"160x49\"\n");

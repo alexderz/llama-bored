@@ -233,6 +233,10 @@ fn name_fps_clients_font_and_ffmpeg_bounds() {
         with("\"12x24\"", "\"12x22\"").unwrap().font,
         Font::Hack12x22
     );
+    let ten = with("\"12x24\"", "\"10x18\"").unwrap().font;
+    assert_eq!(ten, Font::Hack10x18);
+    assert_eq!(ten.file_name(), "llama-hack-10x18.psfu");
+    assert_eq!(ten.label(), "10x18");
     assert!(matches!(
         with("\"12x24\"", "\"8x16\""),
         Err(ConfigError::Parse(_))

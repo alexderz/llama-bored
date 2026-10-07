@@ -596,16 +596,24 @@ tty11's top-left corner. Size tty11 for the smallest screen:
 
 ```toml
 [tty]
-font = "12x22"     # "12x24" (default) or "12x22": same glyphs, two more rows
-size = "160x49"    # COLSxROWS, 160x26 to 1024x512; unset keeps the boot size
+font = "10x18"     # "12x24" (default), "12x22" or "10x18": same glyphs
+size = "192x60"    # COLSxROWS, 160x26..=1024x512; unset keeps the boot size
 ```
 
-At 1920x1080 the 12x24 font gives 160x45 and the 12x22 font 160x49.
-`llama-watch.service` applies both before the watcher starts, through a root
-pre-step (`llama-watch tty-setup`) that runs `setfont` and `stty` from the
-validated values; restart the unit after a change. Under 48 rows the
-dashboard drops panels to fit (IN/OUT first, then FANS, then the chart
-shrinks) and shows `tty too small` only below 160x26.
+Which font suits which screen, at 1920x1080 (#73):
+
+| Font | Console | Suits |
+|---|---|---|
+| `12x24` | 160x45 | a large screen at a distance |
+| `12x22` | 160x49 | a 1080p screen at desk distance; FANS does not fit |
+| `10x18` | 192x60 | a 1080p screen viewed up close: eight RECENT rows, and FANS (with TEMPS) beside IN/OUT |
+
+From 190 columns FANS sits right of IN/OUT instead of under it.
+`llama-watch.service` applies both before the watcher starts with a root
+pre-step, `llama-watch tty-setup`, which runs `setfont` and `stty` from the
+validated values (restart the unit after a change). Under 48 rows the
+dashboard drops panels to fit: IN/OUT first, then FANS, then the chart
+shrinks; it shows `tty too small` only below 160x26.
 
 **SETUP rules** (`watch.toml`, `[setup]`): each `[[setup.field]]` puts one
 value on a SETUP row. Built-in rules

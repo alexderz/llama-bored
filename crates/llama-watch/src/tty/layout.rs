@@ -2862,8 +2862,10 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
     }
 }
 
-/// From this width the FANS panel sits beside IN/OUT, not under it.
-pub const FANS_SIDE_COLS: u16 = 200;
+/// From this width the FANS panel sits beside IN/OUT, not under it. 190
+/// takes in 192x60, the 10x18 font on a 1920x1080 screen (#73): IN/OUT
+/// keep 109 columns and FANS gets 77.
+pub const FANS_SIDE_COLS: u16 = 190;
 /// IN/OUT rows kept under FANS on a narrow screen: two titles and 3 + 3 text
 /// rows, plus the row under the IN title.
 const TEXT_FLOOR_SPAN: u16 = 9;

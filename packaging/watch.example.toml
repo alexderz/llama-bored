@@ -88,9 +88,12 @@ chart_glyphs = "eighths"            # "eighths" needs a llama-hack font on tty11
 # keys and runs setfont, then stty). Every display on a GPU shows the same
 # console, sized at boot for the largest; on a smaller screen tty11 shows
 # only its top-left corner. Size tty11 to the smallest screen:
-#   font  "12x24" (default) or "12x22" (same glyphs, two more rows at 1080p).
+#   font  "12x24" (default), "12x22" or "10x18": same glyphs, smaller cells.
+#         12x22 suits a 1080p screen at desk distance (160x49); 10x18 a
+#         1080p screen viewed up close (192x60, room for FANS and TEMPS).
 #   size  "COLSxROWS", 160x26..=1024x512; unset keeps the kernel's size.
-#         Pixels / cell: 1920x1080 is 160x45 in 12x24, 160x49 in 12x22.
+#         Pixels / cell: 1920x1080 is 160x45 in 12x24, 160x49 in 12x22,
+#         192x60 in 10x18.
 # Under 48 rows the dashboard drops panels to fit: IN/OUT first, then FANS,
 # then the chart shrinks. 160x26 is the floor ("tty too small" below it).
 # Takes effect on the next start: systemctl restart llama-watch.
