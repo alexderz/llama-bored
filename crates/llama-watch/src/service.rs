@@ -1686,6 +1686,7 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
             .collect(),
         sources: wire_sources(&health(sample, &tick.detail, watch), &tick.detail.latencies),
         suspected_loads: tick.detail.suspected_loads.clone(),
+        series: tick.detail.series.clone(),
     }
 }
 

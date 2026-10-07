@@ -17,12 +17,9 @@ llamabored_snapshot_seq 9
 # HELP llamabored_snapshot_age_seconds Seconds since the watcher sampled the snapshot.
 # TYPE llamabored_snapshot_age_seconds gauge
 llamabored_snapshot_age_seconds 1.000
-# HELP llamabored_cpu_pct Mean CPU percent.
-# TYPE llamabored_cpu_pct gauge
-llamabored_cpu_pct 5
-# HELP llamabored_mem_pct Memory percent.
-# TYPE llamabored_mem_pct gauge
-llamabored_mem_pct 20
+# HELP llamabored_cpu_utilization_ratio Mean CPU utilization, 0 to 1.
+# TYPE llamabored_cpu_utilization_ratio gauge
+llamabored_cpu_utilization_ratio 0.05
 # HELP llamabored_ai_state llama-swap state; the current state is 1.
 # TYPE llamabored_ai_state gauge
 llamabored_ai_state{state="down"} 1

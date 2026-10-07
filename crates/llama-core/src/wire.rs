@@ -16,6 +16,16 @@
 //! dropped at the parse, so it reaches no display and no export. A change
 //! that an older reader must not misread (a renamed field, a new meaning, a
 //! tighter range the old reader would not enforce) needs a new schema number.
+//!
+//! 0.5 (#71) stays on schema 1. It adds the llama-swap id, the engine
+//! version, the request cap and the per-model [`CountersWire`]. It fills
+//! `running`, `queued`, `kv_fill` and the engine's speculative token
+//! counters for llama.cpp too: the same quantities as before, from one
+//! more engine, so an older reader that sees them reads them right. It
+//! stops sending the window means (`cache_hit`, the engine's `spec_len`,
+//! latency means and tok/s) and `slots_busy`, which llama-metrics replaced
+//! with counters; every one was optional, so an older reader just does not
+//! see them, and this reader ignores them from an older watcher.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -66,6 +76,10 @@ pub const MAX_SLOT_CTX: usize = 32;
 pub const MAX_CTX_TOKENS: u64 = u32::MAX as u64;
 /// Most suspected-load rows one snapshot carries (#70).
 pub const MAX_SUSPECTED_LOADS: usize = 8;
+/// Top of every [`CountersWire`] number: 2^53 − 1, the largest integer a
+/// Prometheus sample (a float) carries exactly. The watcher never writes
+/// more (#71).
+pub const MAX_COUNTER: u64 = (1 << 53) - 1;
 
 /// Canonical model-name width, including the trailing `…`.
 ///
@@ -103,15 +117,17 @@ pub enum WireError {
     /// A model name is empty, too long, or not canonical.
     #[error("snapshot model name is not canonical")]
     Name,
-    /// A model's `running` or `queued` is above [`MAX_REQS`], its
-    /// `kv_fill` is non-finite or outside 0..=1, its engine numbers are out
-    /// of range ([`EngineWire::is_valid`]), its cached prompt tokens
-    /// exceed its prompt tokens, or a slot context row is out of range,
+    /// A model's `running`, `queued` or `max_running` is above
+    /// [`MAX_REQS`], its `kv_fill` is non-finite or outside 0..=1, its
+    /// engine numbers are out of range ([`EngineWire::is_valid`]), its
+    /// cached prompt tokens exceed its prompt tokens, a counter is above
+    /// [`MAX_COUNTER`] (#71), or a slot context row is out of range,
     /// repeated, or past [`MAX_SLOT_CTX`] (#10). Also a suspected-load row
     /// that is repeated, zero, or past [`MAX_SUSPECTED_LOADS`] (#70).
     #[error("snapshot model gauge is out of range")]
     Gauge,
-    /// A full name is not canonical, or a detail token is not allowlisted.
+    /// A full name or llama-swap id is not canonical, or a detail or
+    /// version token is not allowlisted.
     #[error("snapshot model detail is not canonical")]
     Detail,
     /// More than [`MAX_FANS`] fans, a repeated or out-of-range channel, a
@@ -251,6 +267,15 @@ pub struct ModelWire {
     pub name: String,
     /// Upstream lifecycle word.
     pub state: ModelState,
+    /// The llama-swap model id, sanitised like a full name (#71): the
+    /// stable key llama-metrics labels the model's series with. Omitted by
+    /// an older watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The engine's version, a detail token, when the engine reports one
+    /// (Strata, #71).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Untruncated display name, at most [`MAX_FULL_NAME_CHARS`]. Omitted
     /// by an older watcher and when it equals [`Self::name`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,24 +292,25 @@ pub struct ModelWire {
         skip_serializing_if = "Option::is_none"
     )]
     pub backend: Option<Backend>,
-    /// Requests running, from a backend without `/slots`. At most [`MAX_REQS`].
+    /// Requests running now, at most [`MAX_REQS`]. From the engine's
+    /// `/metrics`; llama.cpp's `requests_processing` since 0.5 (#71).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<u16>,
-    /// Requests waiting, from a backend without `/slots`. At most [`MAX_REQS`].
+    /// Requests waiting, at most [`MAX_REQS`]; llama.cpp's
+    /// `requests_deferred` since 0.5 (#71).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued: Option<u16>,
-    /// KV cache fill 0..=1, from a backend without `/slots`.
+    /// KV cache fill 0..=1, from any engine that reports one.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub kv_fill: Option<f32>,
-    /// Prefix cache hit ratio 0..=1, from a backend without `/slots` (#11).
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub cache_hit: Option<f32>,
-    /// llama.cpp slots busy now, at most [`Self::slots_total`] (#11).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slots_busy: Option<u16>,
     /// llama.cpp slots the server has, at most [`MAX_SLOTS`] (#11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots_total: Option<u16>,
+    /// Most requests an engine without `/slots` runs at once, from its
+    /// launch command (`--max-num-seqs`, `--max-running-requests`; Strata
+    /// is 1), at most [`MAX_REQS`] (#71).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_running: Option<u16>,
     /// Prompt tokens of the model's finished requests since the watcher
     /// started, cached ones included (#10). A counter: it restarts with the
     /// watcher. Omitted when not measured.
@@ -298,23 +324,89 @@ pub struct ModelWire {
     /// the whole snapshot. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slot_ctx: Vec<SlotCtxWire>,
-    /// Engine numbers from a backend without `/slots` (#31): speculative
-    /// decoding, preemptions, sleep, latency means. Omitted when none.
+    /// Engine numbers (#31): speculative decoding, preemptions, sleep.
+    /// llama.cpp's speculative token counters come from llama-swap's
+    /// activity rows (#71). Omitted when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<EngineWire>,
+    /// Counters since the watcher started that every engine fills where
+    /// it can (#71). Omitted when none, and by an older watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counters: Option<CountersWire>,
 }
 
-/// A server's own engine numbers (#31). Every field is optional. Window
-/// means cover the latest metrics poll window that saw activity; counters
+/// A model's counters since the watcher started (#71), each at most
+/// [`MAX_COUNTER`]. They only go back to zero when the watcher restarts:
+/// an engine restart or an unload and reload carries on from the total.
+/// Seconds are whole milliseconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountersWire {
+    /// Tokens generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_tokens: Option<u64>,
+    /// Milliseconds of prompt processing (prefill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_ms: Option<u64>,
+    /// Milliseconds of generation (decode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<u64>,
+    /// Finished requests answered 2xx, from llama-swap's activity rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_ok: Option<u64>,
+    /// Finished requests answered otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_err: Option<u64>,
+    /// Time to first token, summed, and the requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft: Option<SumCountWire>,
+    /// Inter-token latency, summed, and the tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itl: Option<SumCountWire>,
+    /// Request duration, summed, and the requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e: Option<SumCountWire>,
+}
+
+impl CountersWire {
+    /// True when every number is at most [`MAX_COUNTER`].
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let pairs = [self.ttft, self.itl, self.e2e]
+            .into_iter()
+            .flatten()
+            .flat_map(|pair| [pair.ms, pair.n]);
+        [
+            self.gen_tokens,
+            self.prefill_ms,
+            self.decode_ms,
+            self.req_ok,
+            self.req_err,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(pairs)
+        .all(|n| n <= MAX_COUNTER)
+    }
+}
+
+/// A latency's milliseconds summed over `n` observations (#71): a
+/// histogram's `_sum` and `_count`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SumCountWire {
+    /// Milliseconds, summed.
+    pub ms: u64,
+    /// Observations.
+    pub n: u64,
+}
+
+/// A server's own engine numbers (#31). Every field is optional. The
+/// acceptance covers the latest metrics poll window with drafts; counters
 /// count since the watcher started.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct EngineWire {
     /// Speculative acceptance, accepted / draft tokens, 0..=1.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub spec_accept: Option<f32>,
-    /// Mean tokens per speculative step, 1..=[`MAX_SPEC_LEN`].
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub spec_len: Option<f32>,
     /// Speculative draft rounds since the watcher started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_drafts: Option<u64>,
@@ -330,22 +422,6 @@ pub struct EngineWire {
     /// The engine is asleep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleeping: Option<bool>,
-    /// Mean time to first token, seconds, 0..=[`MAX_ENGINE_LATENCY_S`].
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub ttft_s: Option<f32>,
-    /// Mean inter-token latency, seconds.
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub itl_s: Option<f32>,
-    /// Mean end-to-end request latency, seconds.
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub e2e_s: Option<f32>,
-    /// Prefill tokens per second of the requests that finished in the
-    /// latest metrics window with any (#35), 0..=[`MAX_ENGINE_TPS`].
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub prefill_tps: Option<f32>,
-    /// Decode tokens per second over the same window, 0..=[`MAX_ENGINE_TPS`].
-    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
-    pub decode_tps: Option<f32>,
     /// Expert cache hit rate of the newest finished request, 0..=1 (#54,
     /// Strata). Omitted by an older watcher and by other engines.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
@@ -356,25 +432,13 @@ pub struct EngineWire {
 }
 
 impl EngineWire {
-    /// True when the numbers are in range: ratios in 0..=1, a step length
-    /// in 1..=[`MAX_SPEC_LEN`], accepted tokens not above draft tokens,
-    /// latencies in 0..=[`MAX_ENGINE_LATENCY_S`], and speeds in
-    /// 0..=[`MAX_ENGINE_TPS`].
+    /// True when the numbers are in range: ratios in 0..=1 and accepted
+    /// tokens not above draft tokens.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        let in_range = |value: Option<f32>, low: f64, high: f64| {
-            value.is_none_or(|v| v.is_finite() && (low..=high).contains(&f64::from(v)))
-        };
         [self.spec_accept, self.expert_hit, self.pcie_share]
             .into_iter()
-            .all(|ratio| in_range(ratio, 0.0, 1.0))
-            && in_range(self.spec_len, 1.0, MAX_SPEC_LEN)
-            && [self.ttft_s, self.itl_s, self.e2e_s]
-                .into_iter()
-                .all(|latency| in_range(latency, 0.0, MAX_ENGINE_LATENCY_S))
-            && [self.prefill_tps, self.decode_tps]
-                .into_iter()
-                .all(|tps| in_range(tps, 0.0, MAX_ENGINE_TPS))
+            .all(|ratio| ratio.is_none_or(|v| v.is_finite() && (0.0..=1.0).contains(&v)))
             && self
                 .spec_accepted_tokens
                 .is_none_or(|accepted| self.spec_draft_tokens.is_some_and(|all| accepted <= all))
@@ -628,6 +692,16 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         if let Some(full) = &model.full_name {
             validate_full_name(full)?;
         }
+        if let Some(id) = &model.id {
+            validate_full_name(id)?;
+        }
+        if model
+            .version
+            .as_deref()
+            .is_some_and(|v| !crate::detail::is_token(v))
+        {
+            return Err(WireError::Detail);
+        }
         if let Some(detail) = &model.detail
             && !crate::detail::is_valid(detail)
         {
@@ -638,12 +712,13 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         };
         if model.running.is_some_and(|n| n > MAX_REQS)
             || model.queued.is_some_and(|n| n > MAX_REQS)
+            || model.max_running.is_some_and(|n| n > MAX_REQS)
             || not_ratio(model.kv_fill)
-            || not_ratio(model.cache_hit)
             || model.slots_total.is_some_and(|n| n > MAX_SLOTS)
             || model
-                .slots_busy
-                .is_some_and(|busy| model.slots_total.is_none_or(|total| busy > total))
+                .counters
+                .as_ref()
+                .is_some_and(|counters| !counters.is_valid())
             || model
                 .prompt_cached_tokens
                 .is_some_and(|cached| model.prompt_tokens.is_none_or(|all| cached > all))

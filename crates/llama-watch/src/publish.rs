@@ -20,11 +20,12 @@ use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, EngineWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire,
-    SlotResetsWire, Sources, Tokens, WireError, WireSnapshot,
+    self, Ai, AiWire, CountersWire, EngineWire, FanWire, Host, ModelState, ModelWire, SlotCtxWire,
+    SlotResetsWire, Sources, SumCountWire, Tokens, WireError, WireSnapshot,
 };
 
 use crate::resets::ResetCounts;
+use crate::series::ModelSeries;
 use thiserror::Error;
 
 const TMP_NAME: &str = "snapshot.json.tmp";
@@ -81,6 +82,9 @@ pub struct Extras {
     pub sources: Option<Sources>,
     /// Suspected model loads per llama-swap id, sanitised (#70).
     pub suspected_loads: Vec<(String, u64)>,
+    /// Each model's id and cumulative numbers (#71), in the order of the
+    /// snapshot's models; the display name confirms the match.
+    pub series: Vec<ModelSeries>,
 }
 
 /// One llama.cpp slot's context numbers for the wire (#10).
@@ -323,7 +327,7 @@ fn suspected_of(rows: &[(String, u64)]) -> Vec<wire::SuspectedLoadWire> {
         }
         out.push(wire::SuspectedLoadWire {
             model,
-            count: *count,
+            count: (*count).min(wire::MAX_COUNTER),
         });
     }
     out
@@ -361,45 +365,67 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                 .models
                 .iter()
                 .take(wire::MAX_MODELS)
-                .map(|model| {
-                    let slot_counts = slots
+                .enumerate()
+                .map(|(index, model)| {
+                    let slot_total = slots
                         .iter()
                         .find(|(owner, _, total)| *owner == model.name && *total > 0)
-                        .and_then(|(_, busy, total)| {
-                            let total = u16::try_from(*total)
-                                .ok()
-                                .filter(|t| *t <= wire::MAX_SLOTS)?;
-                            let busy = u16::try_from(*busy).ok().filter(|b| *b <= total)?;
-                            Some((busy, total))
+                        .and_then(|(_, _, total)| {
+                            u16::try_from(*total).ok().filter(|t| *t <= wire::MAX_SLOTS)
                         });
                     let name = sanitize_wire(&model.name);
+                    let series = series_of(&extras.series, index, &name);
                     // Gauges only for a backend without `/slots`; llama.cpp
-                    // keeps its slot view on the tty.
+                    // keeps its slot view on the tty, and its gauges come
+                    // from the series (#71).
                     let gauges = model.backend.filter(|info| !info.kind.has_slots());
                     let (prompt_tokens, prompt_cached_tokens) = extras
                         .prompt_cache
                         .iter()
                         .find(|(owner, _, _)| *owner == model.name)
                         .map_or((None, None), |(_, prompt, cached)| {
-                            (Some(*prompt), cached.map(|cached| cached.min(*prompt)))
+                            let prompt = counter(*prompt);
+                            (
+                                Some(prompt),
+                                cached.map(|cached| counter(cached).min(prompt)),
+                            )
                         });
                     let slot_ctx = slot_ctx_of(&extras.slot_ctx, &model.name, &mut slot_rows_left);
+                    let engine = match gauges {
+                        Some(info) => engine_of(&info.engine),
+                        None => series.and_then(activity_spec),
+                    };
                     ModelWire {
                         full_name: wire_full_name(model.full_name.as_deref(), &name),
                         detail: model.detail.clone().filter(detail::is_valid),
+                        id: series
+                            .map(|series| sanitize(&series.id, MAX_FULL_NAME_CHARS))
+                            .filter(|id| !id.is_empty()),
+                        version: series
+                            .and_then(|series| series.version.clone())
+                            .filter(|version| detail::is_token(version)),
                         name,
                         state: model_state(&model.state),
                         backend: model.backend.map(|info| info.kind),
-                        running: gauges.and_then(|info| info.running).map(cap_reqs),
-                        queued: gauges.and_then(|info| info.queued).map(cap_reqs),
-                        kv_fill: gauges.and_then(|info| info.kv_permille).and_then(ratio),
-                        cache_hit: gauges.and_then(|info| info.hit_permille).and_then(ratio),
-                        slots_busy: slot_counts.map(|(busy, _)| busy),
-                        slots_total: slot_counts.map(|(_, total)| total),
+                        running: gauges
+                            .and_then(|info| info.running)
+                            .or_else(|| series.and_then(|series| series.running))
+                            .map(cap_reqs),
+                        queued: gauges
+                            .and_then(|info| info.queued)
+                            .or_else(|| series.and_then(|series| series.waiting))
+                            .map(cap_reqs),
+                        kv_fill: gauges
+                            .and_then(|info| info.kv_permille)
+                            .or_else(|| series.and_then(|series| series.kv_permille))
+                            .and_then(ratio),
+                        slots_total: slot_total,
+                        max_running: gauges.and_then(|info| info.max_running).map(cap_reqs),
                         prompt_tokens,
                         prompt_cached_tokens,
                         slot_ctx,
-                        engine: gauges.and_then(|info| engine_of(&info.engine)),
+                        engine,
+                        counters: series.and_then(counters_of),
                     }
                 })
                 .collect(),
@@ -413,6 +439,62 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
             models: Vec::new(),
         },
     }
+}
+
+/// The series of the snapshot's `index`-th model, named `name`: the entry
+/// at that place when its name matches, else the first with that name.
+fn series_of<'a>(series: &'a [ModelSeries], index: usize, name: &str) -> Option<&'a ModelSeries> {
+    let named = |entry: &&ModelSeries| sanitize_wire(&entry.model) == name;
+    series
+        .get(index)
+        .filter(named)
+        .or_else(|| series.iter().find(named))
+}
+
+/// A counter as the wire carries it: at most [`wire::MAX_COUNTER`].
+fn counter(value: u64) -> u64 {
+    value.min(wire::MAX_COUNTER)
+}
+
+/// Seconds as whole milliseconds, at most [`wire::MAX_COUNTER`]. Rounding
+/// down keeps a growing total from ever reading lower.
+fn millis(seconds: f64) -> Option<u64> {
+    (seconds.is_finite() && seconds >= 0.0)
+        .then(|| counter((seconds * 1000.0).floor().min(wire::MAX_COUNTER as f64) as u64))
+}
+
+/// The wire form of a model's counters (#71); `None` when it has none.
+fn counters_of(series: &ModelSeries) -> Option<CountersWire> {
+    let pair = |hist: Option<crate::metrics::Hist>| {
+        let hist = hist?;
+        Some(SumCountWire {
+            ms: millis(hist.sum)?,
+            n: (hist.count.is_finite() && hist.count >= 0.0)
+                .then(|| counter(hist.count.min(wire::MAX_COUNTER as f64) as u64))?,
+        })
+    };
+    let counters = CountersWire {
+        gen_tokens: series.generation_tokens.map(counter),
+        prefill_ms: series.prefill_seconds.and_then(millis),
+        decode_ms: series.decode_seconds.and_then(millis),
+        req_ok: series.requests_ok.map(counter),
+        req_err: series.requests_error.map(counter),
+        ttft: pair(series.ttft),
+        itl: pair(series.itl),
+        e2e: pair(series.e2e),
+    };
+    (counters != CountersWire::default()).then_some(counters)
+}
+
+/// llama.cpp's speculative token counters from llama-swap's activity
+/// rows (#71), as the engine numbers carry them.
+fn activity_spec(series: &ModelSeries) -> Option<EngineWire> {
+    let draft = counter(series.spec_draft_tokens?);
+    Some(EngineWire {
+        spec_draft_tokens: Some(draft),
+        spec_accepted_tokens: Some(counter(series.spec_accepted_tokens.unwrap_or(0)).min(draft)),
+        ..EngineWire::default()
+    })
 }
 
 /// `model`'s slots, lowest id first, at most `left` of them; `left` goes
@@ -430,10 +512,10 @@ fn slot_ctx_of(rows: &[SlotCtx], model: &str, left: &mut usize) -> Vec<SlotCtxWi
                 slot,
                 used: row.used?.min(wire::MAX_CTX_TOKENS),
                 resets: SlotResetsWire {
-                    compacted: row.resets.compacted,
-                    new: row.resets.new,
-                    evicted: row.resets.evicted,
-                    unknown: row.resets.unknown,
+                    compacted: counter(row.resets.compacted),
+                    new: counter(row.resets.new),
+                    evicted: counter(row.resets.evicted),
+                    unknown: counter(row.resets.unknown),
                 },
             })
         })
@@ -447,41 +529,21 @@ fn slot_ctx_of(rows: &[SlotCtx], model: &str, left: &mut usize) -> Vec<SlotCtxWi
 
 /// The wire form of a model's engine numbers (#31); `None` when it has
 /// none. Values outside the wire's ranges are left out, and accepted spec
-/// tokens never exceed drafted ones.
+/// tokens never exceed drafted ones. The window means stay on the tty
+/// (#71): llama-metrics exports counters instead.
 fn engine_of(stats: &EngineStats) -> Option<EngineWire> {
-    let seconds = |us: Option<u32>| {
-        us.map(|us| (f64::from(us) / 1e6) as f32)
-            .filter(|s| (0.0..=wire::MAX_ENGINE_LATENCY_S as f32).contains(s))
-    };
     let counts = stats.spec_counts;
     let engine = EngineWire {
         spec_accept: stats.spec_permille.and_then(ratio),
-        spec_len: stats
-            .spec_len_centi
-            .map(|centi| f32::from(centi) / 100.0)
-            .filter(|len| (1.0..=wire::MAX_SPEC_LEN as f32).contains(len)),
-        spec_drafts: counts.and_then(|c| c.drafts),
-        spec_draft_tokens: counts.map(|c| c.draft_tokens),
-        spec_accepted_tokens: counts.map(|c| c.accepted.min(c.draft_tokens)),
-        preemptions: stats.preemptions,
+        spec_drafts: counts.and_then(|c| c.drafts).map(counter),
+        spec_draft_tokens: counts.map(|c| counter(c.draft_tokens)),
+        spec_accepted_tokens: counts.map(|c| counter(c.accepted.min(c.draft_tokens))),
+        preemptions: stats.preemptions.map(counter),
         sleeping: stats.sleeping,
-        ttft_s: seconds(stats.ttft_us),
-        itl_s: seconds(stats.itl_us),
-        e2e_s: seconds(stats.e2e_us),
-        prefill_tps: tps(stats.prefill_tps_tenths),
-        decode_tps: tps(stats.decode_tps_tenths),
         expert_hit: stats.expert_hit_permille.and_then(ratio),
         pcie_share: stats.pcie_share_permille.and_then(ratio),
     };
     (engine != EngineWire::default()).then_some(engine)
-}
-
-/// Tenths of a token per second as the wire's tok/s, inside
-/// 0..=[`wire::MAX_ENGINE_TPS`] (#35).
-fn tps(tenths: Option<u32>) -> Option<f32> {
-    tenths
-        .map(|tenths| (f64::from(tenths) / 10.0) as f32)
-        .filter(|tps| (0.0..=wire::MAX_ENGINE_TPS as f32).contains(tps))
 }
 
 fn ratio(permille: u16) -> Option<f32> {

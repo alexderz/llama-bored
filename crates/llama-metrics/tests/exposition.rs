@@ -42,43 +42,97 @@ fn golden(name: &str, got: &str) {
     );
 }
 
-/// Minimal 0.0.4 parser: every line is a comment (`# HELP` / `# TYPE`) or
-/// `name{labels} value`. Returns `(name, labels, value)`.
+/// Strict 0.0.4 parser. Every line is `# HELP`, `# TYPE` or
+/// `name{labels} value`. It checks that names match
+/// `[a-zA-Z_:][a-zA-Z0-9_:]*` (and are lowercase `llamabored_*`), that
+/// each family has its HELP then its TYPE before any sample and is typed
+/// once, that only counters end in `_total` and every counter does, that
+/// a summary has only `_sum` and `_count` samples, and that no series
+/// repeats. Returns `(name, labels, value)`.
 type Sample = (String, Vec<(String, String)>, String);
+
+fn is_metric_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b':')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+}
 
 fn samples(text: &str) -> Vec<Sample> {
     let mut out = Vec::new();
-    let mut typed: BTreeSet<String> = BTreeSet::new();
+    let mut typed: std::collections::BTreeMap<String, String> = Default::default();
+    let mut helped: BTreeSet<String> = BTreeSet::new();
+    let mut series: BTreeSet<String> = BTreeSet::new();
     assert!(text.ends_with('\n'), "exposition must end with a newline");
     for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, help) = rest.split_once(' ').expect("HELP line");
+            assert!(is_metric_name(name), "{name} is not a metric name");
+            assert!(!help.is_empty(), "{name} has no help");
+            assert!(helped.insert(name.to_owned()), "{name} has two HELP lines");
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# TYPE ") {
             let (name, kind) = rest.split_once(' ').expect("TYPE line");
             assert!(
-                ["gauge", "counter"].contains(&kind),
+                ["gauge", "counter", "summary"].contains(&kind),
                 "unexpected type {kind}"
             );
-            assert!(typed.insert(name.to_owned()), "{name} typed twice");
-            continue;
-        }
-        if line.starts_with("# HELP ") {
+            assert!(helped.contains(name), "{name} typed before its HELP");
+            assert_eq!(
+                name.ends_with("_total"),
+                kind == "counter",
+                "{name}: only counters end in _total, and every counter does"
+            );
+            assert!(
+                typed.insert(name.to_owned(), kind.to_owned()).is_none(),
+                "{name} typed twice"
+            );
             continue;
         }
         assert!(!line.starts_with('#'), "stray comment {line:?}");
-        let (series, value) = line.rsplit_once(' ').expect("sample line");
+        let (key, value) = line.rsplit_once(' ').expect("sample line");
         value
             .parse::<f64>()
             .unwrap_or_else(|_| panic!("value {value:?} is not a float"));
-        let (name, labels) = match series.split_once('{') {
+        let (name, labels) = match key.split_once('{') {
             Some((name, rest)) => (name, parse_labels(rest.strip_suffix('}').expect("}"))),
-            None => (series, Vec::new()),
+            None => (key, Vec::new()),
         };
+        assert!(is_metric_name(name), "{name} is not a metric name");
         assert!(name.starts_with("llamabored_"), "{name} lacks the prefix");
         assert!(
             name.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-            "{name} is not a metric name"
+            "{name} is not a lowercase metric name"
         );
-        assert!(typed.contains(name), "{name} sampled before its TYPE");
+        let family = match typed.get(name).map(String::as_str) {
+            Some("summary") => panic!("{name}: a summary has only _sum and _count samples"),
+            Some(_) => name,
+            None => {
+                let base = name
+                    .strip_suffix("_sum")
+                    .or_else(|| name.strip_suffix("_count"))
+                    .unwrap_or_else(|| panic!("{name} sampled before its TYPE"));
+                assert_eq!(
+                    typed.get(base).map(String::as_str),
+                    Some("summary"),
+                    "{name} sampled before its TYPE"
+                );
+                base
+            }
+        };
+        let _ = family;
+        let mut keys: Vec<&str> = labels.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "{line}: a label repeats");
+        assert!(
+            series.insert(format!("{name}{labels:?}")),
+            "duplicate series {line}"
+        );
         out.push((name.to_owned(), labels, value.to_owned()));
     }
     out
@@ -130,11 +184,11 @@ fn down_snapshot_matches_the_golden() {
     golden("down.prom", &text);
     samples(&text);
     assert!(
-        !text.contains("llamabored_gpu_pct"),
+        !text.contains("llamabored_gpu_utilization_ratio"),
         "absent host field was exported"
     );
-    assert!(!text.contains("llamabored_tokens_decoded_total"));
-    assert!(!text.contains("llamabored_model_loaded"));
+    assert!(text.contains("llamabored_cpu_utilization_ratio 0.05\n"));
+    assert!(!text.contains("llamabored_model_"));
     assert!(text.contains("llamabored_ai_state{state=\"down\"} 1\n"));
 }
 
@@ -144,7 +198,7 @@ fn stale_snapshot_keeps_seq_and_age_and_drops_values() {
     // Exactly the limit is fresh; one nanosecond more is stale.
     let edge = render(&read, T0 + 5_000_000_000);
     assert!(edge.contains("llamabored_snapshot_stale 0\n"), "{edge}");
-    assert!(edge.contains("llamabored_gpu_pct 97\n"));
+    assert!(edge.contains("llamabored_gpu_utilization_ratio 0.97\n"));
 
     let text = render(&read, T0 + 5_000_000_001);
     golden("stale.prom", &text);
@@ -154,13 +208,13 @@ fn stale_snapshot_keeps_seq_and_age_and_drops_values() {
     assert!(text.contains("llamabored_snapshot_seq 4242\n"));
     assert!(text.contains("llamabored_snapshot_age_seconds 5.000\n"));
     for gone in [
-        "llamabored_gpu_pct",
-        "llamabored_activity_pct",
+        "llamabored_gpu_utilization_ratio",
+        "llamabored_activity_ratio",
         "llamabored_coolant_celsius",
-        "llamabored_tokens_decoded_total",
         "llamabored_ai_state",
-        "llamabored_model_loaded",
-        "llamabored_model_ctx_size_tokens",
+        "llamabored_model_info",
+        "llamabored_model_context_size_tokens",
+        "llamabored_model_generation_tokens_total",
     ] {
         assert!(!text.contains(gone), "stale scrape still exports {gone}");
     }
@@ -230,6 +284,7 @@ fn file_reader_refuses_symlinks_oversize_and_bad_json() {
     let text = std::fs::read_to_string(&good)
         .unwrap()
         .replace("\"gpu_pct\": 97", "\"gpu_pct\": 170");
+    assert!(text.contains("\"gpu_pct\": 170"));
     std::fs::write(&bad, text).unwrap();
     assert_eq!(
         SnapshotFile::at(&bad).read(),
@@ -348,122 +403,324 @@ fn label_values_are_escaped_and_bounded() {
     assert!(escaped.starts_with("\\\""));
 }
 
-#[test]
-fn model_labels_round_trip_through_the_parser() {
-    let read = Ok(load("snapshot-loaded.json"));
-    let text = render(&read, T0);
-    let models: Vec<Vec<(String, String)>> = samples(&text)
-        .into_iter()
-        .filter(|(n, _, _)| n == "llamabored_model_loaded")
-        .map(|(_, l, _)| l)
-        .collect();
-    assert_eq!(models.len(), 5);
-    let qwen = models
-        .iter()
-        .find(|l| l[0].1 == "Qwen3-Coder\u{2026}")
-        .expect("qwen");
-    let keys: Vec<&str> = qwen.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(
-        keys,
-        ["name", "full_name", "quant", "kv", "ctx", "moe", "backend"]
-    );
-    assert_eq!(qwen[6].1, "llamacpp", "no backend on the wire is llama.cpp");
-    assert_eq!(qwen[1].1, "Qwen3-Coder-30B \"fast\" \\ build");
-    assert_eq!(qwen[2].1, "UD-Q4_K_M");
-    assert_eq!(qwen[3].1, "q8_0");
-    assert_eq!(qwen[4].1, "262144");
-    assert_eq!(qwen[5].1, "16");
-    let bonsai = models
-        .iter()
-        .find(|l| l[0].1 == "Bonsai 8B")
-        .expect("bonsai");
-    assert_eq!(
-        bonsai[1].1, "Bonsai 8B",
-        "absent full_name repeats the name"
-    );
-    assert_eq!(bonsai[3].1, "q8_0/q4_0");
-    assert_eq!(bonsai[5].1, "all");
-    assert_eq!(bonsai[6].1, "sglang");
-    let tiny = models.iter().find(|l| l[0].1 == "tiny").expect("tiny");
-    assert!(tiny[2..6].iter().all(|(_, v)| v.is_empty()), "{tiny:?}");
-    // #31: a vLLM model's KV dtype from cache_config_info is its kv label.
-    let vllm = models
-        .iter()
-        .find(|l| l[0].1 == "qwen3.8-27b")
-        .expect("vllm");
-    assert_eq!(vllm[3].1, "fp8_e4m3");
-    assert_eq!(vllm[6].1, "vllm");
-    // #54: a Strata model's ctx and KV come from its own report.
-    let strata = models
-        .iter()
-        .find(|l| l[0].1 == "flash-next")
-        .expect("strata");
-    assert_eq!(strata[3].1, "q8");
-    assert_eq!(strata[4].1, "262144");
-    assert_eq!(strata[6].1, "strata");
+/// The labels of `name`'s sample for `model`, when there is one.
+fn find<'a>(all: &'a [Sample], name: &str, model: &str) -> Option<&'a Sample> {
+    all.iter()
+        .find(|(n, l, _)| n == name && l.first().is_some_and(|(k, v)| k == "model" && v == model))
 }
 
-/// #54: Strata's expert cache ratios are two gauges of its model, and its
-/// spec counters have no rounds series.
+fn value(all: &[Sample], name: &str, model: &str) -> Option<String> {
+    find(all, name, model).map(|(_, _, v)| v.clone())
+}
+
+/// #71: one info series per model with its descriptive strings; every
+/// other per-model series has `model` and `engine` only, first.
 #[test]
-fn strata_expert_cache_gauges() {
-    let text = render(&Ok(load("snapshot-loaded.json")), T0);
+fn model_info_carries_the_strings_and_every_series_is_keyed() {
+    let read = Ok(load("snapshot-loaded.json"));
+    let text = render(&read, T0);
     let all = samples(&text);
-    let value = |name: &str, model: &str| {
-        all.iter()
-            .find(|(n, l, _)| n == name && l[0].1 == model)
-            .map(|(_, _, v)| v.clone())
+    let infos: Vec<&Vec<(String, String)>> = all
+        .iter()
+        .filter(|(n, _, _)| n == "llamabored_model_info")
+        .map(|(_, l, _)| l)
+        .collect();
+    assert_eq!(infos.len(), 6);
+    let info = |model: &str| -> Vec<(&str, &str)> {
+        infos
+            .iter()
+            .find(|l| l[0].1 == model)
+            .unwrap_or_else(|| panic!("{model}"))
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
     };
     assert_eq!(
-        value("llamabored_model_expert_cache_hit_ratio", "flash-next").as_deref(),
+        info("qwen3-coder-30b"),
+        [
+            ("model", "qwen3-coder-30b"),
+            ("engine", "llamacpp"),
+            ("display_name", "Qwen3-Coder-30B \"fast\" \\ build"),
+            ("quant", "UD-Q4_K_M"),
+            ("kv_type", "q8_0"),
+            ("version", ""),
+        ],
+        "no backend on the wire is llama.cpp"
+    );
+    assert_eq!(
+        info("bonsai-8b")[2..5],
+        [
+            ("display_name", "Bonsai 8B"),
+            ("quant", "PTQ1_0"),
+            ("kv_type", "q8_0/q4_0"),
+        ]
+    );
+    assert_eq!(info("bonsai-8b")[1], ("engine", "sglang"));
+    // An older watcher's model has no id: its display name keys it, and
+    // unknown strings are empty.
+    assert_eq!(
+        info("tiny"),
+        [
+            ("model", "tiny"),
+            ("engine", "llamacpp"),
+            ("display_name", "tiny"),
+            ("quant", ""),
+            ("kv_type", ""),
+            ("version", ""),
+        ]
+    );
+    assert_eq!(info("qwen3.8-27b-vllm")[4], ("kv_type", "fp8_e4m3"));
+    assert_eq!(info("qwen3.8-27b-vllm")[2], ("display_name", "qwen3.8-27b"));
+    assert_eq!(info("flash-next")[1], ("engine", "strata"));
+    assert_eq!(info("flash-next")[5], ("version", "0.1.41"));
+    assert_eq!(info("tabby-exl3")[1], ("engine", "openai"));
+
+    for (name, labels, _) in all.iter().filter(|(n, _, _)| {
+        (n.starts_with("llamabored_model_") || n.starts_with("llamabored_slot_"))
+            && n != "llamabored_model_info"
+    }) {
+        let keys: Vec<&str> = labels.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys[..2], ["model", "engine"], "{name}");
+        assert!(
+            keys[2..]
+                .iter()
+                .all(|k| ["state", "status", "slot", "reason"].contains(k)),
+            "{name} {keys:?}"
+        );
+    }
+}
+
+/// #71: the same series names for every engine that has the quantity;
+/// what an engine cannot report is absent, not zero.
+#[test]
+fn every_engine_gets_the_same_series_names() {
+    let text = render(&Ok(load("snapshot-loaded.json")), T0);
+    let all = samples(&text);
+    let engines = [
+        ("qwen3-coder-30b", "llamacpp"),
+        ("bonsai-8b", "sglang"),
+        ("qwen3.8-27b-vllm", "vllm"),
+        ("flash-next", "strata"),
+        ("tabby-exl3", "openai"),
+    ];
+    let has = |name: &str, model: &str| find(&all, name, model).is_some();
+    // name: the engines whose source has it.
+    let table: [(&str, &[&str]); 16] = [
+        (
+            "llamabored_model_info",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_state",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_generation_tokens_total",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_prompt_tokens_total",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_requests_total",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_request_duration_seconds_count",
+            &["llamacpp", "sglang", "vllm", "strata", "openai"],
+        ),
+        (
+            "llamabored_model_prompt_cached_tokens_total",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_requests_running",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_requests_waiting",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_slots",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_prefill_seconds_total",
+            &["llamacpp", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_decode_seconds_total",
+            &["llamacpp", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_spec_draft_tokens_total",
+            &["llamacpp", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_time_to_first_token_seconds_sum",
+            &["sglang", "vllm"],
+        ),
+        (
+            "llamabored_model_inter_token_latency_seconds_count",
+            &["sglang", "vllm"],
+        ),
+        ("llamabored_model_kv_cache_usage_ratio", &["sglang", "vllm"]),
+    ];
+    for (name, want) in table {
+        for (model, engine) in engines {
+            assert_eq!(
+                has(name, model),
+                want.contains(&engine),
+                "{name} for {engine}"
+            );
+        }
+    }
+    // One name for one quantity: requests by status, latencies as summaries.
+    assert_eq!(
+        value(
+            &all,
+            "llamabored_model_generation_tokens_total",
+            "qwen3-coder-30b"
+        )
+        .as_deref(),
+        Some("52000")
+    );
+    assert_eq!(
+        value(
+            &all,
+            "llamabored_model_prefill_seconds_total",
+            "qwen3.8-27b-vllm"
+        )
+        .as_deref(),
+        Some("50.000")
+    );
+    assert_eq!(
+        value(&all, "llamabored_model_decode_seconds_total", "flash-next").as_deref(),
+        Some("81.000")
+    );
+    let status = |model: &str, status: &str| {
+        all.iter()
+            .find(|(n, l, _)| {
+                n == "llamabored_model_requests_total"
+                    && l[0].1 == model
+                    && l.iter().any(|(k, v)| k == "status" && v == status)
+            })
+            .map(|(_, _, v)| v.clone())
+    };
+    assert_eq!(status("tabby-exl3", "ok").as_deref(), Some("2"));
+    assert_eq!(status("tabby-exl3", "error").as_deref(), Some("1"));
+    assert_eq!(
+        value(
+            &all,
+            "llamabored_model_time_to_first_token_seconds_sum",
+            "qwen3.8-27b-vllm"
+        )
+        .as_deref(),
+        Some("31.500")
+    );
+    assert_eq!(
+        value(
+            &all,
+            "llamabored_model_time_to_first_token_seconds_count",
+            "qwen3.8-27b-vllm"
+        )
+        .as_deref(),
+        Some("42")
+    );
+    for summary in [
+        "llamabored_model_time_to_first_token_seconds",
+        "llamabored_model_inter_token_latency_seconds",
+        "llamabored_model_request_duration_seconds",
+    ] {
+        assert!(
+            text.contains(&format!("# TYPE {summary} summary\n")),
+            "{summary}"
+        );
+    }
+    // Strata counts no draft rounds; vLLM does.
+    assert!(has(
+        "llamabored_model_spec_drafts_total",
+        "qwen3.8-27b-vllm"
+    ));
+    assert!(!has("llamabored_model_spec_drafts_total", "flash-next"));
+    assert!(!has(
+        "llamabored_model_spec_drafts_total",
+        "qwen3-coder-30b"
+    ));
+    assert_eq!(
+        value(
+            &all,
+            "llamabored_model_expert_cache_hit_ratio",
+            "flash-next"
+        )
+        .as_deref(),
         Some("0.875")
     );
     assert_eq!(
-        value("llamabored_model_pcie_share_ratio", "flash-next").as_deref(),
+        value(&all, "llamabored_model_pcie_share_ratio", "flash-next").as_deref(),
         Some("0.09375")
     );
+    assert!(!has(
+        "llamabored_model_expert_cache_hit_ratio",
+        "qwen3.8-27b-vllm"
+    ));
     assert_eq!(
-        value("llamabored_model_spec_draft_tokens_total", "flash-next").as_deref(),
-        Some("2400")
+        value(&all, "llamabored_model_slots", "qwen3-coder-30b").as_deref(),
+        Some("4"),
+        "llama.cpp slots"
     );
     assert_eq!(
-        value("llamabored_model_spec_drafts_total", "flash-next"),
-        None
+        value(&all, "llamabored_model_slots", "qwen3.8-27b-vllm").as_deref(),
+        Some("8"),
+        "vLLM --max-num-seqs"
     );
-    assert_eq!(
-        value("llamabored_model_spec_accepted_length", "flash-next"),
-        None
-    );
-    assert_eq!(
-        value("llamabored_model_expert_cache_hit_ratio", "qwen3.8-27b"),
-        None
-    );
-    assert!(text.contains("# TYPE llamabored_model_pcie_share_ratio gauge\n"));
+    // A starting model still has its series; `tiny` (no counters) has none.
+    assert!(has("llamabored_model_generation_tokens_total", "bonsai-8b"));
+    assert!(!has("llamabored_model_generation_tokens_total", "tiny"));
 }
 
+/// #71: host percents are 0..1 ratios; old names, `name` and `full_name`
+/// labels, the memory percent and the box token totals are gone.
 #[test]
-fn strata_is_one_more_backend_label_value() {
-    let mut snap = load("snapshot-loaded.json");
-    snap.ai.models[2].backend = Some(wire::Backend::Strata);
-    snap.ai.models[2].running = Some(1);
-    snap.ai.models[2].queued = Some(0);
-    let text = render(&Ok(snap), T0);
-    let all = samples(&text);
-    let tiny = all
-        .iter()
-        .find(|(n, l, _)| n == "llamabored_model_loaded" && l[0].1 == "tiny")
-        .expect("tiny");
-    assert_eq!(tiny.1[6], ("backend".to_owned(), "strata".to_owned()));
-    let running = all
-        .iter()
-        .find(|(n, l, _)| n == "llamabored_model_requests_running" && l[0].1 == "tiny")
-        .expect("running");
-    assert_eq!(running.2, "1");
-    assert!(
-        !all.iter()
-            .any(|(n, l, _)| n == "llamabored_model_kv_cache_usage_ratio" && l[0].1 == "tiny"),
-        "Strata has no KV fill"
-    );
+fn host_ratios_replace_percents_and_old_names_are_gone() {
+    let text = render(&Ok(load("snapshot-loaded.json")), T0);
+    for line in [
+        "llamabored_activity_ratio 1.1225\n",
+        "llamabored_load_ratio 0.645\n",
+        "llamabored_cpu_utilization_ratio 0.235\n",
+        "llamabored_cpu_topk_utilization_ratio 0.645\n",
+        "llamabored_gpu_utilization_ratio 0.97\n",
+    ] {
+        assert!(text.contains(line), "{line}");
+    }
+    for gone in [
+        "_pct",
+        "llamabored_tokens_",
+        "llamabored_model_loaded",
+        "llamabored_slots_",
+        "llamabored_slot_ctx_",
+        "llamabored_model_ctx_size_tokens",
+        "llamabored_model_requests_queued",
+        "llamabored_model_cache_hit_ratio",
+        "llamabored_model_spec_acceptance_ratio",
+        "llamabored_model_spec_accepted_length",
+        "llamabored_model_ttft_seconds",
+        "llamabored_model_itl_seconds",
+        "llamabored_model_e2e_latency_seconds",
+        "_tokens_per_second",
+    ] {
+        assert!(!text.contains(gone), "{gone} is still exported");
+    }
+    for (name, labels, _) in samples(&text) {
+        for (key, _) in labels {
+            assert!(
+                !["name", "full_name", "backend", "moe", "kv", "ctx"].contains(&key.as_str()),
+                "{name} still has label {key}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -472,24 +729,19 @@ fn duplicate_models_export_one_series() {
     let first = snap.ai.models[0].clone();
     snap.ai.models.push(first);
     let text = render(&Ok(snap), T0);
-    let loaded = text
-        .lines()
-        .filter(|l| l.starts_with("llamabored_model_loaded{"))
-        .count();
-    assert_eq!(loaded, 5);
-    let ctx = text
-        .lines()
-        .filter(|l| l.starts_with("llamabored_model_ctx_size_tokens{"))
-        .count();
-    assert_eq!(ctx, 3);
+    samples(&text);
+    let count = |prefix: &str| text.lines().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("llamabored_model_info{"), 6);
+    assert_eq!(count("llamabored_model_context_size_tokens{"), 3);
+    assert_eq!(count("llamabored_slot_context_used_tokens{"), 2);
 }
 
 /// The wire carries no prompt or output text, and the exporter exports none.
 ///
 /// Two halves. (1) The snapshot's JSON keys are pinned: a new wire field
 /// (such as a prompt tail) fails here and forces a review of this exporter.
-/// (2) Every exported string is a model name or an allowlisted token from
-/// the snapshot, or one of the exporter's fixed label values.
+/// (2) Every exported string is a model id, name or an allowlisted token
+/// from the snapshot, or one of the exporter's fixed label values.
 #[test]
 fn no_prompt_or_output_text_is_exported() {
     let snap = load("snapshot-loaded.json");
@@ -525,6 +777,8 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models",
         "ai.models.name",
         "ai.models.state",
+        "ai.models.id",
+        "ai.models.version",
         "ai.models.full_name",
         "ai.models.detail",
         "ai.models.detail.ctx",
@@ -539,9 +793,8 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.running",
         "ai.models.queued",
         "ai.models.kv_fill",
-        "ai.models.cache_hit",
-        "ai.models.slots_busy",
         "ai.models.slots_total",
+        "ai.models.max_running",
         "ai.models.prompt_tokens",
         "ai.models.prompt_cached_tokens",
         "ai.models.slot_ctx",
@@ -554,19 +807,29 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.slot_ctx.resets.unknown",
         "ai.models.engine",
         "ai.models.engine.spec_accept",
-        "ai.models.engine.spec_len",
         "ai.models.engine.spec_drafts",
         "ai.models.engine.spec_draft_tokens",
         "ai.models.engine.spec_accepted_tokens",
         "ai.models.engine.preemptions",
         "ai.models.engine.sleeping",
-        "ai.models.engine.ttft_s",
-        "ai.models.engine.itl_s",
-        "ai.models.engine.e2e_s",
-        "ai.models.engine.prefill_tps",
-        "ai.models.engine.decode_tps",
         "ai.models.engine.expert_hit",
         "ai.models.engine.pcie_share",
+        // #71: numbers only.
+        "ai.models.counters",
+        "ai.models.counters.gen_tokens",
+        "ai.models.counters.prefill_ms",
+        "ai.models.counters.decode_ms",
+        "ai.models.counters.req_ok",
+        "ai.models.counters.req_err",
+        "ai.models.counters.ttft",
+        "ai.models.counters.ttft.ms",
+        "ai.models.counters.ttft.n",
+        "ai.models.counters.itl",
+        "ai.models.counters.itl.ms",
+        "ai.models.counters.itl.n",
+        "ai.models.counters.e2e",
+        "ai.models.counters.e2e.ms",
+        "ai.models.counters.e2e.n",
         "tokens",
         "tokens.decoded_total",
         "tokens.prompt_total",
@@ -608,9 +871,8 @@ fn no_prompt_or_output_text_is_exported() {
     // A token count is not text: `prompt_total` (#11) and the per-model
     // prompt counters (#10) are u64 counters, typed on the wire, so they are
     // the keys allowed to say "prompt".
-    const COUNTS: [&str; 6] = [
+    const COUNTS: [&str; 5] = [
         "tokens.prompt_total",
-        "llamabored_tokens_prompt_total",
         "ai.models.prompt_tokens",
         "ai.models.prompt_cached_tokens",
         "llamabored_model_prompt_tokens_total",
@@ -625,16 +887,16 @@ fn no_prompt_or_output_text_is_exported() {
         }
     }
 
-    // The only strings allowed out are snapshot names and tokens, and the
-    // exporter's own fixed label values.
+    // The only strings allowed out are snapshot ids, names and tokens, and
+    // the exporter's own fixed label values.
     let text = render(&Ok(snap.clone()), T0);
-    let mut allowed: BTreeSet<String> =
-        ["", "down", "idle", "loaded", "busy", "denied", "all", "f16"]
-            .into_iter()
-            .chain(["llamacpp", "sglang", "vllm", "strata", "openai"])
-            .chain(["compacted", "new", "evicted", "unknown"])
-            .map(str::to_owned)
-            .collect();
+    let mut allowed: BTreeSet<String> = ["", "down", "idle", "loaded", "busy", "denied", "f16"]
+        .into_iter()
+        .chain(["llamacpp", "sglang", "vllm", "strata", "openai"])
+        .chain(["compacted", "new", "evicted", "unknown"])
+        .chain(["ok", "error"])
+        .map(str::to_owned)
+        .collect();
     allowed.insert(env!("CARGO_PKG_VERSION").to_owned());
     for state in ["ready", "starting", "stopping", "other"] {
         allowed.insert(state.to_owned());
@@ -656,21 +918,15 @@ fn no_prompt_or_output_text_is_exported() {
             allowed.insert(row.slot.to_string());
         }
         allowed.insert(model.name.clone());
-        if let Some(full) = &model.full_name {
-            allowed.insert(full.clone());
-        }
+        allowed.extend(model.full_name.clone());
+        allowed.extend(model.id.clone());
+        allowed.extend(model.version.clone());
         if let Some(d) = &model.detail {
             for token in [&d.quant, &d.kv_k, &d.kv_v].into_iter().flatten() {
                 allowed.insert(token.clone());
             }
             if let (Some(k), Some(v)) = (&d.kv_k, &d.kv_v) {
                 allowed.insert(format!("{k}/{v}"));
-            }
-            if let Some(ctx) = d.ctx {
-                allowed.insert(ctx.to_string());
-            }
-            if let Some(n) = d.ncmoe {
-                allowed.insert(n.to_string());
             }
         }
     }
@@ -679,25 +935,25 @@ fn no_prompt_or_output_text_is_exported() {
         "wire_schema",
         "reason",
         "state",
-        "name",
-        "full_name",
+        "model",
+        "engine",
+        "display_name",
         "quant",
-        "kv",
-        "ctx",
-        "moe",
-        "backend",
+        "kv_type",
+        "status",
         "channel",
         "label",
         "source",
         "slot",
-        "model",
     ]
     .into_iter()
     .collect();
     for (name, labels, _) in samples(&text) {
+        // A context size is a token count (#71): "context" is not "text".
+        let plain = name.replace("context", "");
         for word in ["prompt", "output", "input", "text", "content", "message"] {
             assert!(
-                COUNTS.contains(&name.as_str()) || !name.contains(word),
+                COUNTS.contains(&name.as_str()) || !plain.contains(word),
                 "{name} looks like a text metric"
             );
         }
@@ -719,12 +975,11 @@ fn no_prompt_or_output_text_is_exported() {
 const EXPORTED: &[(&str, &str)] = &[
     ("seq", "llamabored_snapshot_seq"),
     ("t_mono_ns", "llamabored_snapshot_age_seconds"),
-    ("host.load_pct", "llamabored_load_pct"),
-    ("host.activity_pct", "llamabored_activity_pct"),
-    ("host.cpu_pct", "llamabored_cpu_pct"),
-    ("host.cpu_topk_pct", "llamabored_cpu_topk_pct"),
-    ("host.gpu_pct", "llamabored_gpu_pct"),
-    ("host.mem_pct", "llamabored_mem_pct"),
+    ("host.load_pct", "llamabored_load_ratio"),
+    ("host.activity_pct", "llamabored_activity_ratio"),
+    ("host.cpu_pct", "llamabored_cpu_utilization_ratio"),
+    ("host.cpu_topk_pct", "llamabored_cpu_topk_utilization_ratio"),
+    ("host.gpu_pct", "llamabored_gpu_utilization_ratio"),
     ("host.coolant_c", "llamabored_coolant_celsius"),
     ("host.cpu_c", "llamabored_cpu_celsius"),
     ("host.gpu_c", "llamabored_gpu_celsius"),
@@ -736,21 +991,24 @@ const EXPORTED: &[(&str, &str)] = &[
     ("host.mem_used_bytes", "llamabored_memory_used_bytes"),
     ("host.mem_total_bytes", "llamabored_memory_total_bytes"),
     ("ai.state", "llamabored_ai_state"),
-    ("ai.models.name", "llamabored_model_loaded"),
-    ("ai.models.full_name", "llamabored_model_loaded"),
+    ("ai.models.id", "llamabored_model_info"),
+    ("ai.models.name", "llamabored_model_info"),
+    ("ai.models.full_name", "llamabored_model_info"),
+    ("ai.models.version", "llamabored_model_info"),
+    ("ai.models.backend", "llamabored_model_info"),
+    ("ai.models.detail.kv_k", "llamabored_model_info"),
+    ("ai.models.detail.kv_v", "llamabored_model_info"),
+    ("ai.models.detail.quant", "llamabored_model_info"),
     ("ai.models.state", "llamabored_model_state"),
-    ("ai.models.backend", "llamabored_model_loaded"),
-    ("ai.models.detail.ctx", "llamabored_model_ctx_size_tokens"),
-    ("ai.models.detail.ncmoe", "llamabored_model_loaded"),
-    ("ai.models.detail.kv_k", "llamabored_model_loaded"),
-    ("ai.models.detail.kv_v", "llamabored_model_loaded"),
-    ("ai.models.detail.quant", "llamabored_model_loaded"),
+    (
+        "ai.models.detail.ctx",
+        "llamabored_model_context_size_tokens",
+    ),
     ("ai.models.running", "llamabored_model_requests_running"),
-    ("ai.models.queued", "llamabored_model_requests_queued"),
+    ("ai.models.queued", "llamabored_model_requests_waiting"),
+    ("ai.models.slots_total", "llamabored_model_slots"),
+    ("ai.models.max_running", "llamabored_model_slots"),
     ("ai.models.kv_fill", "llamabored_model_kv_cache_usage_ratio"),
-    ("ai.models.cache_hit", "llamabored_model_cache_hit_ratio"),
-    ("ai.models.slots_busy", "llamabored_slots_busy"),
-    ("ai.models.slots_total", "llamabored_slots_total"),
     (
         "ai.models.prompt_tokens",
         "llamabored_model_prompt_tokens_total",
@@ -760,20 +1018,48 @@ const EXPORTED: &[(&str, &str)] = &[
         "llamabored_model_prompt_cached_tokens_total",
     ),
     (
-        "ai.models.detail.kv_block",
-        "llamabored_model_kv_block_size_tokens",
+        "ai.models.counters.gen_tokens",
+        "llamabored_model_generation_tokens_total",
     ),
     (
-        "ai.models.detail.prefix_cache",
-        "llamabored_model_prefix_caching",
+        "ai.models.counters.prefill_ms",
+        "llamabored_model_prefill_seconds_total",
     ),
     (
-        "ai.models.engine.spec_accept",
-        "llamabored_model_spec_acceptance_ratio",
+        "ai.models.counters.decode_ms",
+        "llamabored_model_decode_seconds_total",
     ),
     (
-        "ai.models.engine.spec_len",
-        "llamabored_model_spec_accepted_length",
+        "ai.models.counters.req_ok",
+        "llamabored_model_requests_total",
+    ),
+    (
+        "ai.models.counters.req_err",
+        "llamabored_model_requests_total",
+    ),
+    (
+        "ai.models.counters.ttft.ms",
+        "llamabored_model_time_to_first_token_seconds_sum",
+    ),
+    (
+        "ai.models.counters.ttft.n",
+        "llamabored_model_time_to_first_token_seconds_count",
+    ),
+    (
+        "ai.models.counters.itl.ms",
+        "llamabored_model_inter_token_latency_seconds_sum",
+    ),
+    (
+        "ai.models.counters.itl.n",
+        "llamabored_model_inter_token_latency_seconds_count",
+    ),
+    (
+        "ai.models.counters.e2e.ms",
+        "llamabored_model_request_duration_seconds_sum",
+    ),
+    (
+        "ai.models.counters.e2e.n",
+        "llamabored_model_request_duration_seconds_count",
     ),
     (
         "ai.models.engine.spec_drafts",
@@ -792,19 +1078,13 @@ const EXPORTED: &[(&str, &str)] = &[
         "llamabored_model_preemptions_total",
     ),
     ("ai.models.engine.sleeping", "llamabored_model_sleeping"),
-    ("ai.models.engine.ttft_s", "llamabored_model_ttft_seconds"),
-    ("ai.models.engine.itl_s", "llamabored_model_itl_seconds"),
     (
-        "ai.models.engine.e2e_s",
-        "llamabored_model_e2e_latency_seconds",
+        "ai.models.detail.kv_block",
+        "llamabored_model_kv_block_size_tokens",
     ),
     (
-        "ai.models.engine.prefill_tps",
-        "llamabored_model_prefill_tokens_per_second",
-    ),
-    (
-        "ai.models.engine.decode_tps",
-        "llamabored_model_decode_tokens_per_second",
+        "ai.models.detail.prefix_cache",
+        "llamabored_model_prefix_caching",
     ),
     (
         "ai.models.engine.expert_hit",
@@ -814,26 +1094,30 @@ const EXPORTED: &[(&str, &str)] = &[
         "ai.models.engine.pcie_share",
         "llamabored_model_pcie_share_ratio",
     ),
-    ("ai.models.slot_ctx.slot", "llamabored_slot_ctx_used_tokens"),
-    ("ai.models.slot_ctx.used", "llamabored_slot_ctx_used_tokens"),
+    (
+        "ai.models.slot_ctx.slot",
+        "llamabored_slot_context_used_tokens",
+    ),
+    (
+        "ai.models.slot_ctx.used",
+        "llamabored_slot_context_used_tokens",
+    ),
     (
         "ai.models.slot_ctx.resets.compacted",
-        "llamabored_slot_ctx_resets_total",
+        "llamabored_slot_context_resets_total",
     ),
     (
         "ai.models.slot_ctx.resets.new",
-        "llamabored_slot_ctx_resets_total",
+        "llamabored_slot_context_resets_total",
     ),
     (
         "ai.models.slot_ctx.resets.evicted",
-        "llamabored_slot_ctx_resets_total",
+        "llamabored_slot_context_resets_total",
     ),
     (
         "ai.models.slot_ctx.resets.unknown",
-        "llamabored_slot_ctx_resets_total",
+        "llamabored_slot_context_resets_total",
     ),
-    ("tokens.decoded_total", "llamabored_tokens_decoded_total"),
-    ("tokens.prompt_total", "llamabored_tokens_prompt_total"),
     (
         "suspected_loads.model",
         "llamabored_collector_suspected_loads_total",
@@ -861,6 +1145,26 @@ const NOT_EXPORTED: &[(&str, &str)] = &[
         "random per watcher start; a label would be unbounded, a value meaningless",
     ),
     ("t_wall_ms", "wall clock for logs; age comes from t_mono_ns"),
+    (
+        "host.mem_pct",
+        "#71: derived; memory_used_bytes / memory_total_bytes",
+    ),
+    (
+        "tokens.decoded_total",
+        "#71: the LCD's box counter; sum of llamabored_model_generation_tokens_total",
+    ),
+    (
+        "tokens.prompt_total",
+        "#71: box total; sum of llamabored_model_prompt_tokens_total",
+    ),
+    (
+        "ai.models.engine.spec_accept",
+        "#71: the LCD's window acceptance; rate(spec_accepted) / rate(spec_draft)",
+    ),
+    (
+        "ai.models.detail.ncmoe",
+        "#71: launch tuning shown on the LCD and tty; not a model_info string",
+    ),
     (
         "ai.models.detail.fa",
         "flash attention flag; carried on the wire but drawn by no dashboard",
@@ -968,18 +1272,19 @@ fn value_of(text: &str, metric: &str, slot: Option<&str>) -> Option<String> {
             name == metric
                 && labels
                     .iter()
-                    .any(|(k, v)| k == "name" && v == "Qwen3-Coder…")
+                    .any(|(k, v)| k == "model" && v == "qwen3-coder-30b")
                 && slot.is_none_or(|slot| labels.iter().any(|(k, v)| k == "slot" && v == slot))
                 && labels.iter().all(|(k, v)| k != "reason" || v == "new")
+                && labels.iter().all(|(k, v)| k != "status" || v == "ok")
         })
         .map(|(_, _, value)| value)
 }
 
-/// #10: the counters are the watcher's, passed through. A watcher restart
-/// (new run_id) starts them at 0 again, which Prometheus reads as a counter
-/// reset; the exporter neither holds nor stitches them.
+/// #10, #71: the counters are the watcher's, passed through. A watcher
+/// restart (new run_id) starts them at 0 again, which Prometheus reads as a
+/// counter reset; the exporter neither holds nor stitches them.
 #[test]
-fn slot_and_prompt_counters_pass_through_and_restart_with_the_watcher() {
+fn counters_pass_through_and_restart_with_the_watcher() {
     let first = load("snapshot-loaded.json");
     let text = render(&Ok(first.clone()), T0);
     let counters = [
@@ -989,8 +1294,11 @@ fn slot_and_prompt_counters_pass_through_and_restart_with_the_watcher() {
             None,
             "1500000",
         ),
-        ("llamabored_slot_ctx_resets_total", Some("1"), "2"),
-        ("llamabored_slot_ctx_used_tokens", Some("1"), "91500"),
+        ("llamabored_model_generation_tokens_total", None, "52000"),
+        ("llamabored_model_requests_total", None, "120"),
+        ("llamabored_model_decode_seconds_total", None, "1040.250"),
+        ("llamabored_slot_context_resets_total", Some("1"), "2"),
+        ("llamabored_slot_context_used_tokens", Some("1"), "91500"),
     ];
     for (metric, slot, want) in counters {
         assert_eq!(
@@ -1005,20 +1313,31 @@ fn slot_and_prompt_counters_pass_through_and_restart_with_the_watcher() {
     let qwen = &mut restarted.ai.models[0];
     qwen.prompt_tokens = Some(0);
     qwen.prompt_cached_tokens = Some(0);
+    qwen.counters = Some(wire::CountersWire {
+        gen_tokens: Some(0),
+        req_ok: Some(0),
+        decode_ms: Some(0),
+        ..wire::CountersWire::default()
+    });
     for row in &mut qwen.slot_ctx {
         row.resets = wire::SlotResetsWire::default();
     }
     let text = render(&Ok(restarted), T0);
-    for (metric, slot, _) in &counters[..3] {
+    for (metric, slot, _) in &counters[..6] {
+        let want = if metric.contains("seconds") {
+            "0.000"
+        } else {
+            "0"
+        };
         assert_eq!(
             value_of(&text, metric, *slot).as_deref(),
-            Some("0"),
+            Some(want),
             "{metric}"
         );
     }
-    assert!(text.contains("# TYPE llamabored_slot_ctx_resets_total counter"));
+    assert!(text.contains("# TYPE llamabored_slot_context_resets_total counter"));
     assert!(text.contains("# TYPE llamabored_model_prompt_cached_tokens_total counter"));
-    assert!(text.contains("# TYPE llamabored_slot_ctx_used_tokens gauge"));
+    assert!(text.contains("# TYPE llamabored_slot_context_used_tokens gauge"));
 }
 
 /// #70: llama-metrics renders only what the snapshot holds. With no model
@@ -1054,13 +1373,13 @@ fn no_model_running_is_a_valid_scrape_without_model_series() {
     );
     for (name, labels, _) in &all {
         assert!(
-            !name.starts_with("llamabored_model_") && !name.starts_with("llamabored_slot"),
+            !name.starts_with("llamabored_model_") && !name.starts_with("llamabored_slot_"),
             "{name} with no model running"
         );
         assert!(
             labels
                 .iter()
-                .all(|(key, _)| key != "name" && key != "model"),
+                .all(|(key, _)| key != "model" && key != "engine"),
             "{name} has a model label: {labels:?}"
         );
     }

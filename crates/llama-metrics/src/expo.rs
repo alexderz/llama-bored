@@ -1,22 +1,42 @@
 //! Prometheus text exposition format 0.0.4, from one snapshot read.
 //!
-//! Every metric is named `llamabored_*`. The only strings exported are model
-//! display names and their allowlisted tuning tokens, fan labels (short
-//! printable ASCII from `[fans]`) and fixed source names, as label values.
-//! The snapshot carries no prompt or output text, and nothing here could
+//! Every metric is named `llamabored_*`. The only strings exported are
+//! llama-swap model ids, model display names and their allowlisted tuning
+//! and version tokens, the five engine words, fan labels (short printable
+//! ASCII from `[fans]`) and fixed source names, as label values. The
+//! snapshot carries no prompt or output text, and nothing here could
 //! export it: every value is a number from a typed field.
 //!
 //! A stale or unreadable snapshot exports only the exporter's own series,
 //! `llamabored_snapshot_up`, `llamabored_snapshot_stale`, and (when it could be
 //! read) its seq and age. The value series disappear rather than freeze.
+//!
+//! # Normalized series (#71)
+//!
+//! Every per-model series has the labels `model` (the llama-swap id, the
+//! join key) and `engine` (`llamacpp`, `vllm`, `sglang`, `strata`,
+//! `openai`), and the same name for every engine that has the quantity;
+//! an engine that cannot report one leaves its series absent. Descriptive
+//! strings live on `llamabored_model_info` only. Names carry their unit,
+//! ratios are 0 to 1, and only counters end in `_total`. A model that is
+//! not loaded has no series; host series stay.
+//!
+//! Latencies are exported as `summary` families with no quantiles: a
+//! `<name>_sum` and a `<name>_count` sample under one `# TYPE <name>
+//! summary`. That is valid 0.0.4 exposition, and the honest shape of what
+//! the engines report (a histogram's sum and count); Prometheus and its
+//! tools read the pair as one family, and both parts are counters to
+//! `rate()`. Two separate counter families would each need a `_total`
+//! name and would lose the pairing.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use llama_core::detail::{self, KV_DEFAULT, ModelDetail, NCMOE_ALL};
+use llama_core::detail::{self, KV_DEFAULT, ModelDetail};
 use llama_core::wire::{
-    self, AiWire, EngineWire, FanWire, ModelState, ModelWire, SlotCtxWire, WireSnapshot,
+    self, AiWire, EngineWire, FanWire, ModelState, ModelWire, SlotCtxWire, SumCountWire,
+    WireSnapshot,
 };
 
 use crate::snapshot::ReadError;
@@ -89,6 +109,9 @@ struct Out {
     text: String,
 }
 
+/// One sample: its labels and its value text.
+type Row<'a> = (Vec<(&'a str, &'a str)>, String);
+
 impl Out {
     fn family(&mut self, name: &str, kind: &str, help: &str) {
         let _ = writeln!(self.text, "# HELP {name} {help}");
@@ -110,6 +133,7 @@ impl Out {
         let _ = writeln!(self.text, " {value}");
     }
 
+    /// One unlabelled gauge, when the value is known and finite.
     fn gauge_opt(&mut self, name: &str, help: &str, value: Option<f32>) {
         if let Some(value) = value.filter(|v| v.is_finite()) {
             self.family(name, "gauge", help);
@@ -124,8 +148,8 @@ impl Out {
         }
     }
 
-    /// One family of `(labels, value)` rows; nothing when `rows` is empty.
-    fn rows(&mut self, name: &str, kind: &str, help: &str, rows: &[(Vec<(&str, &str)>, String)]) {
+    /// One family of rows; nothing when `rows` is empty.
+    fn rows(&mut self, name: &str, kind: &str, help: &str, rows: &[Row<'_>]) {
         if rows.is_empty() {
             return;
         }
@@ -134,11 +158,37 @@ impl Out {
             self.sample(name, labels, value);
         }
     }
+
+    /// A summary with no quantiles: `<name>_sum` and `<name>_count` per
+    /// label set, under one `# TYPE <name> summary`.
+    fn summary(&mut self, name: &str, help: &str, rows: &[(Vec<(&str, &str)>, SumCountWire)]) {
+        if rows.is_empty() {
+            return;
+        }
+        self.family(name, "summary", help);
+        let sum = format!("{name}_sum");
+        let count = format!("{name}_count");
+        for (labels, pair) in rows {
+            self.sample(&sum, labels, &seconds(pair.ms));
+            self.sample(&count, labels, &pair.n.to_string());
+        }
+    }
 }
 
-/// An `f32` sample value, printed like [`Out::gauge_opt`] prints one.
+/// An `f32` sample value, as Rust prints it.
 fn num(value: f32) -> String {
     format!("{value}")
+}
+
+/// Whole milliseconds as seconds, exactly: `1234` is `1.234`.
+fn seconds(ms: u64) -> String {
+    format!("{}.{:03}", ms / 1000, ms % 1000)
+}
+
+/// A 0..=100 percent as a 0..=1 ratio (0..=1.25 for activity), printed
+/// as the shortest decimal that reads back as the same `f32`.
+fn ratio_of_pct(pct: Option<f32>) -> Option<f32> {
+    pct.filter(|v| v.is_finite()).map(|v| v / 100.0)
 }
 
 /// `1` or `0`.
@@ -146,94 +196,12 @@ fn flag(on: bool) -> String {
     if on { "1" } else { "0" }.to_owned()
 }
 
-/// A model's engine numbers (#31), when the watcher sent any.
-fn engine(model: &ModelWire) -> Option<&EngineWire> {
-    model.engine.as_ref()
-}
-
-/// Picks one model's value for a per-model family.
-type ModelValue = fn(&ModelWire) -> Option<String>;
-
-/// One value per model, keyed by `(name, full_name)` like
-/// `llamabored_model_ctx_size_tokens`: sorted, and the first model with a
-/// given key wins, so a repeated name never repeats a label set.
-fn per_model(
-    models: &[ModelWire],
-    value: impl Fn(&ModelWire) -> Option<String>,
-) -> Vec<(String, String, String)> {
-    let mut rows: BTreeSet<(String, String, String)> = BTreeSet::new();
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for model in models {
-        let Some(value) = value(model) else {
-            continue;
-        };
-        let labels = ModelLabels::of(model);
-        if seen.insert((labels.name.clone(), labels.full_name.clone())) {
-            rows.insert((labels.name, labels.full_name, value));
-        }
-    }
-    rows.into_iter().collect()
-}
-
-/// Model labels, in export order.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ModelLabels {
-    pub name: String,
-    pub full_name: String,
-    pub quant: String,
-    pub kv: String,
-    pub ctx: String,
-    pub moe: String,
-    /// One of four fixed words (T72); an older watcher's model is `llamacpp`.
-    pub backend: &'static str,
-}
-
-impl ModelLabels {
-    /// Labels for one wire model. Absent detail is an empty value.
-    #[must_use]
-    pub fn of(model: &ModelWire) -> Self {
-        let detail = model.detail.as_ref();
-        Self {
-            name: model.name.clone(),
-            full_name: model
-                .full_name
-                .clone()
-                .unwrap_or_else(|| model.name.clone()),
-            quant: detail
-                .and_then(|d| d.quant.as_deref())
-                .filter(|q| detail::is_token(q))
-                .unwrap_or("")
-                .to_owned(),
-            kv: detail.map(kv_label).unwrap_or_default(),
-            ctx: detail
-                .and_then(|d| d.ctx)
-                .filter(|c| *c > 0)
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            moe: match detail.and_then(|d| d.ncmoe) {
-                None => String::new(),
-                Some(NCMOE_ALL) => "all".to_owned(),
-                Some(n) => n.to_string(),
-            },
-            backend: model.backend.unwrap_or_default().as_str(),
-        }
-    }
-
-    fn pairs(&self) -> [(&str, &str); 7] {
-        [
-            ("name", &self.name),
-            ("full_name", &self.full_name),
-            ("quant", &self.quant),
-            ("kv", &self.kv),
-            ("ctx", &self.ctx),
-            ("moe", &self.moe),
-            ("backend", self.backend),
-        ]
-    }
-}
-
-/// `q8_0` when K and V match, else `q8_0/q4_0`. Absent is `f16`.
-fn kv_label(detail: &ModelDetail) -> String {
+/// `q8_0` when K and V match, else `q8_0/q4_0`. Absent is `f16`, llama.cpp's
+/// default; no detail at all is empty.
+fn kv_type(detail: Option<&ModelDetail>) -> String {
+    let Some(detail) = detail else {
+        return String::new();
+    };
     let token = |value: &Option<String>| -> String {
         value
             .as_deref()
@@ -263,11 +231,233 @@ fn ai_label(state: AiWire) -> &'static str {
     }
 }
 
+/// One exported model: the wire entry and its two key labels.
+struct Keyed<'a> {
+    wire: &'a ModelWire,
+    /// The llama-swap id. An older watcher sends none; its full display
+    /// name stands in.
+    model: String,
+    /// One of five fixed words; an older watcher's model is `llamacpp`.
+    engine: &'static str,
+}
+
+impl Keyed<'_> {
+    fn labels(&self) -> Vec<(&str, &str)> {
+        vec![("model", self.model.as_str()), ("engine", self.engine)]
+    }
+}
+
+/// The models to export, sorted by `model`; the first with a given id
+/// wins, so a repeated id never repeats a label set.
+fn keyed(models: &[ModelWire]) -> Vec<Keyed<'_>> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<Keyed<'_>> = Vec::new();
+    for wire in models {
+        let model = wire
+            .id
+            .clone()
+            .or_else(|| wire.full_name.clone())
+            .unwrap_or_else(|| wire.name.clone());
+        if seen.insert(model.clone()) {
+            out.push(Keyed {
+                wire,
+                model,
+                engine: wire.backend.unwrap_or_default().as_str(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
+}
+
+/// Picks one model's value for a per-model family.
+type ModelValue = fn(&ModelWire) -> Option<String>;
+
+fn engine(model: &ModelWire) -> Option<&EngineWire> {
+    model.engine.as_ref()
+}
+
+fn counters(model: &ModelWire) -> Option<&wire::CountersWire> {
+    model.counters.as_ref()
+}
+
+/// Per-model families with one sample per model, in export order: the
+/// first ten, then the requests and the latency summaries, then the rest.
+const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 19] = [
+    (
+        "llamabored_model_context_size_tokens",
+        "gauge",
+        "Configured context size, tokens.",
+        |m| {
+            m.detail
+                .as_ref()
+                .and_then(|d| d.ctx)
+                .filter(|c| *c > 0)
+                .map(|c| c.to_string())
+        },
+    ),
+    (
+        "llamabored_model_requests_running",
+        "gauge",
+        "Requests the engine is running now.",
+        |m| m.running.map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_requests_waiting",
+        "gauge",
+        "Requests waiting for the engine (llama.cpp: deferred).",
+        |m| m.queued.map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_slots",
+        "gauge",
+        "Requests the engine can run at once: llama.cpp slots, else its configured cap.",
+        |m| m.slots_total.or(m.max_running).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_kv_cache_usage_ratio",
+        "gauge",
+        "KV cache fill, 0 to 1.",
+        |m| m.kv_fill.filter(|v| v.is_finite()).map(num),
+    ),
+    (
+        "llamabored_model_prompt_tokens_total",
+        "counter",
+        "Prompt tokens of finished requests, cached ones included.",
+        |m| m.prompt_tokens.map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_prompt_cached_tokens_total",
+        "counter",
+        "Prompt tokens served from the prompt or prefix cache.",
+        |m| m.prompt_cached_tokens.map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_generation_tokens_total",
+        "counter",
+        "Tokens generated.",
+        |m| {
+            counters(m)
+                .and_then(|c| c.gen_tokens)
+                .map(|n| n.to_string())
+        },
+    ),
+    (
+        "llamabored_model_prefill_seconds_total",
+        "counter",
+        "Seconds spent on prompt processing (prefill).",
+        |m| counters(m).and_then(|c| c.prefill_ms).map(seconds),
+    ),
+    (
+        "llamabored_model_decode_seconds_total",
+        "counter",
+        "Seconds spent generating (decode).",
+        |m| counters(m).and_then(|c| c.decode_ms).map(seconds),
+    ),
+    (
+        "llamabored_model_spec_draft_tokens_total",
+        "counter",
+        "Speculative decoding: tokens drafted.",
+        |m| {
+            engine(m)
+                .and_then(|e| e.spec_draft_tokens)
+                .map(|n| n.to_string())
+        },
+    ),
+    (
+        "llamabored_model_spec_accepted_tokens_total",
+        "counter",
+        "Speculative decoding: drafted tokens accepted.",
+        |m| {
+            engine(m)
+                .and_then(|e| e.spec_accepted_tokens)
+                .map(|n| n.to_string())
+        },
+    ),
+    (
+        "llamabored_model_spec_drafts_total",
+        "counter",
+        "Speculative decoding: draft rounds, where the engine counts them.",
+        |m| engine(m).and_then(|e| e.spec_drafts).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_preemptions_total",
+        "counter",
+        "Requests the engine preempted; a rising count means KV cache pressure.",
+        |m| engine(m).and_then(|e| e.preemptions).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_sleeping",
+        "gauge",
+        "1 when the engine is asleep, 0 when awake.",
+        |m| engine(m).and_then(|e| e.sleeping).map(flag),
+    ),
+    (
+        "llamabored_model_kv_block_size_tokens",
+        "gauge",
+        "KV cache block size, tokens.",
+        |m| {
+            m.detail
+                .as_ref()
+                .and_then(|d| d.kv_block)
+                .map(|n| n.to_string())
+        },
+    ),
+    (
+        "llamabored_model_prefix_caching",
+        "gauge",
+        "1 when prefix caching is on, 0 when off.",
+        |m| m.detail.as_ref().and_then(|d| d.prefix_cache).map(flag),
+    ),
+    (
+        "llamabored_model_expert_cache_hit_ratio",
+        "gauge",
+        "Expert cache hit rate of the newest finished request, 0 to 1.",
+        |m| {
+            engine(m)
+                .and_then(|e| e.expert_hit)
+                .filter(|v| v.is_finite())
+                .map(num)
+        },
+    ),
+    (
+        "llamabored_model_pcie_share_ratio",
+        "gauge",
+        "Share of the newest finished request's expert reads served over PCIe, 0 to 1.",
+        |m| {
+            engine(m)
+                .and_then(|e| e.pcie_share)
+                .filter(|v| v.is_finite())
+                .map(num)
+        },
+    ),
+];
+
+/// Latency summaries: name, help, and the pair a model carries.
+type ModelPair = fn(&ModelWire) -> Option<SumCountWire>;
+const SUMMARIES: [(&str, &str, ModelPair); 3] = [
+    (
+        "llamabored_model_time_to_first_token_seconds",
+        "Time to first token: seconds summed, and requests.",
+        |m| counters(m).and_then(|c| c.ttft),
+    ),
+    (
+        "llamabored_model_inter_token_latency_seconds",
+        "Inter-token latency: seconds summed, and tokens.",
+        |m| counters(m).and_then(|c| c.itl),
+    ),
+    (
+        "llamabored_model_request_duration_seconds",
+        "Request duration: seconds summed, and requests.",
+        |m| counters(m).and_then(|c| c.e2e),
+    ),
+];
+
 /// Render one scrape.
 #[must_use]
 pub fn render(scrape: &Scrape<'_>) -> String {
     let mut out = Out {
-        text: String::with_capacity(4096),
+        text: String::with_capacity(8192),
     };
     out.family(
         "llamabored_exporter_build_info",
@@ -345,29 +535,96 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         return out.text;
     }
 
+    host(&mut out, snap);
+    // #70: loads llama-watch suspects its own reads caused. The watcher
+    // sends each id once, so every row is its own series.
+    let suspects: Vec<Row<'_>> = snap
+        .suspected_loads
+        .iter()
+        .map(|row| (vec![("model", row.model.as_str())], row.count.to_string()))
+        .collect();
+    out.rows(
+        "llamabored_collector_suspected_loads_total",
+        "counter",
+        "Model loads llama-watch suspects its own llama-swap reads caused, by llama-swap model id.",
+        &suspects,
+    );
+
+    out.family(
+        "llamabored_ai_state",
+        "gauge",
+        "llama-swap state; the current state is 1.",
+    );
+    for state in [AiWire::Down, AiWire::Idle, AiWire::Loaded] {
+        let value = if snap.ai.state == state { "1" } else { "0" };
+        out.sample("llamabored_ai_state", &[("state", ai_label(state))], value);
+    }
+
+    let models = keyed(&snap.ai.models);
+    per_model(&mut out, &models);
+    per_slot(&mut out, &models);
+    fans(&mut out, &snap.fans);
+
+    if let Some(sources) = &snap.sources {
+        let entries = sources.entries();
+        let up: Vec<Row<'_>> = entries
+            .iter()
+            .filter_map(|(name, source)| {
+                let source = (*source)?;
+                Some((vec![("source", *name)], flag(source.up)))
+            })
+            .collect();
+        out.rows(
+            "llamabored_source_up",
+            "gauge",
+            "1 when a watcher source answered on its last poll, 0 when it failed; absent when not polled.",
+            &up,
+        );
+        let latency: Vec<Row<'_>> = entries
+            .iter()
+            .filter_map(|(name, source)| {
+                let seconds = (*source)?.latency_s.filter(|v| v.is_finite())?;
+                Some((vec![("source", *name)], num(seconds)))
+            })
+            .collect();
+        out.rows(
+            "llamabored_source_latency_seconds",
+            "gauge",
+            "Duration of a watcher source's last poll, seconds.",
+            &latency,
+        );
+    }
+    out.text
+}
+
+/// Host series: ratios 0 to 1, temperatures, power and bytes.
+fn host(out: &mut Out, snap: &WireSnapshot) {
     let host = &snap.host;
     out.gauge_opt(
-        "llamabored_activity_pct",
-        "Power-weighted activity percent, 0..125; 100 is nominal sustained load.",
-        host.activity_pct,
+        "llamabored_activity_ratio",
+        "Power-weighted activity, 0 to 1.25; 1 is nominal sustained load.",
+        ratio_of_pct(host.activity_pct),
     );
     out.gauge_opt(
-        "llamabored_load_pct",
-        "Composite load percent, max(gpu, cpu top-k).",
-        host.load_pct,
-    );
-    out.gauge_opt("llamabored_cpu_pct", "Mean CPU percent.", host.cpu_pct);
-    out.gauge_opt(
-        "llamabored_cpu_topk_pct",
-        "Mean of the busiest CPUs, percent.",
-        host.cpu_topk_pct,
+        "llamabored_load_ratio",
+        "Composite load, max(GPU, CPU top-k utilization), 0 to 1.",
+        ratio_of_pct(host.load_pct),
     );
     out.gauge_opt(
-        "llamabored_gpu_pct",
-        "GPU utilisation percent.",
-        host.gpu_pct,
+        "llamabored_cpu_utilization_ratio",
+        "Mean CPU utilization, 0 to 1.",
+        ratio_of_pct(host.cpu_pct),
     );
-    out.gauge_opt("llamabored_mem_pct", "Memory percent.", host.mem_pct);
+    out.gauge_opt(
+        "llamabored_cpu_topk_utilization_ratio",
+        "Mean utilization of the busiest CPUs, 0 to 1.",
+        ratio_of_pct(host.cpu_topk_pct),
+    );
+    out.gauge_opt(
+        "llamabored_gpu_utilization_ratio",
+        "GPU utilization, 0 to 1.",
+        ratio_of_pct(host.gpu_pct),
+    );
     out.gauge_opt(
         "llamabored_coolant_celsius",
         "Coolant temperature, degrees Celsius.",
@@ -383,7 +640,6 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         "GPU temperature, degrees Celsius.",
         host.gpu_c,
     );
-
     out.gauge_opt(
         "llamabored_gpu_power_watts",
         "GPU power draw, watts.",
@@ -419,376 +675,179 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         "System memory total, bytes.",
         host.mem_total_bytes,
     );
+}
 
-    if let Some(total) = snap.tokens.decoded_total {
-        out.family(
-            "llamabored_tokens_decoded_total",
-            "counter",
-            "Tokens decoded since the watcher started.",
-        );
-        out.sample("llamabored_tokens_decoded_total", &[], &total.to_string());
+/// Every per-model family (#71), labelled `model` and `engine`.
+fn per_model(out: &mut Out, models: &[Keyed<'_>]) {
+    if models.is_empty() {
+        return;
     }
-    if let Some(total) = snap.tokens.prompt_total {
-        out.family(
-            "llamabored_tokens_prompt_total",
-            "counter",
-            "Prompt tokens processed since the watcher started.",
-        );
-        out.sample("llamabored_tokens_prompt_total", &[], &total.to_string());
-    }
-    // #70: loads llama-watch suspects its own reads caused. The watcher
-    // sends each id once, so every row is its own series.
-    let suspects: Vec<(Vec<(&str, &str)>, String)> = snap
-        .suspected_loads
+    // Descriptive strings, once per model.
+    let infos: Vec<[String; 4]> = models
         .iter()
-        .map(|row| (vec![("model", row.model.as_str())], row.count.to_string()))
+        .map(|m| {
+            let detail = m.wire.detail.as_ref();
+            [
+                m.wire
+                    .full_name
+                    .clone()
+                    .unwrap_or_else(|| m.wire.name.clone()),
+                detail
+                    .and_then(|d| d.quant.clone())
+                    .filter(|q| detail::is_token(q))
+                    .unwrap_or_default(),
+                kv_type(detail),
+                m.wire
+                    .version
+                    .clone()
+                    .filter(|v| detail::is_token(v))
+                    .unwrap_or_default(),
+            ]
+        })
         .collect();
-    out.rows(
-        "llamabored_collector_suspected_loads_total",
-        "counter",
-        "Model loads llama-watch suspects its own llama-swap reads caused, by llama-swap model id, since the watcher started.",
-        &suspects,
-    );
-
-    out.family(
-        "llamabored_ai_state",
-        "gauge",
-        "llama-swap state; the current state is 1.",
-    );
-    for state in [AiWire::Down, AiWire::Idle, AiWire::Loaded] {
-        let value = if snap.ai.state == state { "1" } else { "0" };
-        out.sample("llamabored_ai_state", &[("state", ai_label(state))], value);
-    }
-
-    // Sorted and de-duplicated: a repeated label set would fail the scrape.
-    let models: BTreeSet<ModelLabels> = snap.ai.models.iter().map(ModelLabels::of).collect();
-    if !models.is_empty() {
-        out.family(
-            "llamabored_model_loaded",
-            "gauge",
-            "A model llama-swap has loaded, with its tuning detail.",
-        );
-        for labels in &models {
-            out.sample("llamabored_model_loaded", &labels.pairs(), "1");
-        }
-    }
-    let models = &snap.ai.models;
-    let states = per_model(models, |m| Some(model_state_label(m.state).to_owned()));
-    if !states.is_empty() {
-        out.family(
-            "llamabored_model_state",
-            "gauge",
-            "Lifecycle of a loaded model; the current state is 1.",
-        );
-        for (name, full_name, current) in &states {
-            for state in ["ready", "starting", "stopping", "other"] {
-                out.sample(
-                    "llamabored_model_state",
-                    &[("name", name), ("full_name", full_name), ("state", state)],
-                    if state == current { "1" } else { "0" },
-                );
-            }
-        }
-    }
-    let model_families: [(&str, &str, &str, ModelValue); 25] = [
-        (
-            "llamabored_model_ctx_size_tokens",
-            "gauge",
-            "Configured context size of a loaded model, tokens.",
-            |m| {
-                m.detail
-                    .as_ref()
-                    .and_then(|d| d.ctx)
-                    .filter(|c| *c > 0)
-                    .map(|c| c.to_string())
-            },
-        ),
-        (
-            "llamabored_model_requests_running",
-            "gauge",
-            "Requests a loaded model is running now (SGLang, vLLM and other backends without slots).",
-            |m| m.running.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_requests_queued",
-            "gauge",
-            "Requests waiting for a loaded model (SGLang, vLLM and other backends without slots).",
-            |m| m.queued.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_kv_cache_usage_ratio",
-            "gauge",
-            "KV cache fill of a loaded model, 0 to 1 (SGLang, vLLM and other backends without slots).",
-            |m| m.kv_fill.filter(|v| v.is_finite()).map(num),
-        ),
-        (
-            "llamabored_model_cache_hit_ratio",
-            "gauge",
-            "Prefix cache hit ratio of a loaded model, 0 to 1 (SGLang, vLLM).",
-            |m| m.cache_hit.filter(|v| v.is_finite()).map(num),
-        ),
-        (
-            "llamabored_slots_busy",
-            "gauge",
-            "llama.cpp slots of a loaded model that are processing.",
-            |m| m.slots_busy.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_slots_total",
-            "gauge",
-            "llama.cpp slots of a loaded model.",
-            |m| m.slots_total.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_prompt_tokens_total",
-            "counter",
-            "Prompt tokens of a model's finished requests since the watcher started, cached ones included.",
-            |m| m.prompt_tokens.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_prompt_cached_tokens_total",
-            "counter",
-            "Prompt tokens served from the prompt cache since the watcher started; hit ratio = rate of this / rate of prompt_tokens_total.",
-            |m| m.prompt_cached_tokens.map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_kv_block_size_tokens",
-            "gauge",
-            "KV cache block size of a loaded model, tokens (vLLM cache_config_info).",
-            |m| {
-                m.detail
-                    .as_ref()
-                    .and_then(|d| d.kv_block)
-                    .map(|n| n.to_string())
-            },
-        ),
-        (
-            "llamabored_model_prefix_caching",
-            "gauge",
-            "1 when a loaded model has prefix caching on, 0 when off (vLLM cache_config_info).",
-            |m| m.detail.as_ref().and_then(|d| d.prefix_cache).map(flag),
-        ),
-        (
-            "llamabored_model_spec_acceptance_ratio",
-            "gauge",
-            "Speculative decoding: accepted / draft tokens, 0 to 1, over the latest metrics window with drafts (vLLM, Strata; SGLang's gauge).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.spec_accept)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_spec_accepted_length",
-            "gauge",
-            "Speculative decoding: mean tokens per step (1 + accepted / drafts) over the same window.",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.spec_len)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_spec_drafts_total",
-            "counter",
-            "Speculative decoding draft rounds since the watcher started (vLLM).",
-            |m| engine(m).and_then(|e| e.spec_drafts).map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_spec_draft_tokens_total",
-            "counter",
-            "Speculative decoding tokens drafted since the watcher started (vLLM, Strata).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.spec_draft_tokens)
-                    .map(|n| n.to_string())
-            },
-        ),
-        (
-            "llamabored_model_spec_accepted_tokens_total",
-            "counter",
-            "Drafted tokens accepted since the watcher started (vLLM, Strata); acceptance = rate of this / rate of draft_tokens_total.",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.spec_accepted_tokens)
-                    .map(|n| n.to_string())
-            },
-        ),
-        (
-            "llamabored_model_preemptions_total",
-            "counter",
-            "Requests a loaded model preempted since the watcher started (vLLM); a rising count means KV cache pressure.",
-            |m| engine(m).and_then(|e| e.preemptions).map(|n| n.to_string()),
-        ),
-        (
-            "llamabored_model_sleeping",
-            "gauge",
-            "1 when a loaded model's engine is asleep, 0 when awake (vLLM engine_sleep_state).",
-            |m| engine(m).and_then(|e| e.sleeping).map(flag),
-        ),
-        (
-            "llamabored_model_ttft_seconds",
-            "gauge",
-            "Mean time to first token, seconds, over the latest metrics window with requests (vLLM, SGLang).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.ttft_s)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_itl_seconds",
-            "gauge",
-            "Mean inter-token latency, seconds, over the latest metrics window with tokens (vLLM, SGLang).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.itl_s)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_e2e_latency_seconds",
-            "gauge",
-            "Mean end-to-end request latency, seconds, over the latest metrics window with finished requests (vLLM, SGLang).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.e2e_s)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_prefill_tokens_per_second",
-            "gauge",
-            "Prefill tok/s: uncached prompt tokens over prefill time of the requests finished in the latest metrics window with any (vLLM, Strata).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.prefill_tps)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_decode_tokens_per_second",
-            "gauge",
-            "Decode tok/s: tokens after the first over decode time, spec decoding included, same requests and window (vLLM; Strata counts every output token).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.decode_tps)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_expert_cache_hit_ratio",
-            "gauge",
-            "Expert cache hit rate of the newest finished request, 0 to 1 (Strata).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.expert_hit)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-        (
-            "llamabored_model_pcie_share_ratio",
-            "gauge",
-            "Share of the newest finished request's expert reads served over PCIe, 0 to 1 (Strata).",
-            |m| {
-                engine(m)
-                    .and_then(|e| e.pcie_share)
-                    .filter(|v| v.is_finite())
-                    .map(num)
-            },
-        ),
-    ];
-    for (name, kind, help, value) in model_families {
-        let keyed = per_model(models, value);
-        let rows: Vec<(Vec<(&str, &str)>, String)> = keyed
-            .iter()
-            .map(|(model, full, value)| {
-                (
-                    vec![("name", model.as_str()), ("full_name", full.as_str())],
-                    value.clone(),
-                )
-            })
-            .collect();
-        out.rows(name, kind, help, &rows);
-    }
-
-    // Per-slot context (#10): the first model with a given (name,
-    // full_name) wins, as in `per_model`; the wire keeps slot ids unique.
-    let mut slot_rows: Vec<(ModelLabels, &SlotCtxWire)> = Vec::new();
-    let mut slot_models: BTreeSet<(String, String)> = BTreeSet::new();
-    for model in models.iter().filter(|m| !m.slot_ctx.is_empty()) {
-        let labels = ModelLabels::of(model);
-        if !slot_models.insert((labels.name.clone(), labels.full_name.clone())) {
-            continue;
-        }
-        slot_rows.extend(model.slot_ctx.iter().map(|row| (labels.clone(), row)));
-    }
-    slot_rows.sort_by(|a, b| {
-        (&a.0.name, &a.0.full_name, a.1.slot).cmp(&(&b.0.name, &b.0.full_name, b.1.slot))
-    });
-    let slot_ids: Vec<String> = slot_rows
+    let info_rows: Vec<Row<'_>> = models
         .iter()
-        .map(|(_, row)| row.slot.to_string())
-        .collect();
-    let used: Vec<(Vec<(&str, &str)>, String)> = slot_rows
-        .iter()
-        .zip(&slot_ids)
-        .map(|((labels, row), slot)| {
-            (
-                vec![
-                    ("name", labels.name.as_str()),
-                    ("full_name", labels.full_name.as_str()),
-                    ("slot", slot.as_str()),
-                ],
-                row.used.to_string(),
-            )
+        .zip(&infos)
+        .map(|(m, [display, quant, kv, version])| {
+            let mut labels = m.labels();
+            labels.extend([
+                ("display_name", display.as_str()),
+                ("quant", quant.as_str()),
+                ("kv_type", kv.as_str()),
+                ("version", version.as_str()),
+            ]);
+            (labels, "1".to_owned())
         })
         .collect();
     out.rows(
-        "llamabored_slot_ctx_used_tokens",
+        "llamabored_model_info",
         "gauge",
-        "Context tokens a llama.cpp slot holds (prompt plus decoded; an idle slot keeps its last value).",
+        "A model llama-swap lists, with its descriptive strings; always 1.",
+        &info_rows,
+    );
+    let state_rows: Vec<Row<'_>> = models
+        .iter()
+        .flat_map(|m| {
+            let current = model_state_label(m.wire.state);
+            ["ready", "starting", "stopping", "other"].map(|state| {
+                let mut labels = m.labels();
+                labels.push(("state", state));
+                (labels, flag(state == current))
+            })
+        })
+        .collect();
+    out.rows(
+        "llamabored_model_state",
+        "gauge",
+        "Lifecycle of a listed model; the current state is 1.",
+        &state_rows,
+    );
+    for (name, kind, help, value) in MODEL_FAMILIES.iter().take(10) {
+        model_family(out, models, name, kind, help, *value);
+    }
+    // Requests by outcome, from llama-swap's activity rows.
+    let status_rows: Vec<Row<'_>> = models
+        .iter()
+        .flat_map(|m| {
+            let c = counters(m.wire);
+            [
+                ("ok", c.and_then(|c| c.req_ok)),
+                ("error", c.and_then(|c| c.req_err)),
+            ]
+            .into_iter()
+            .filter_map(|(status, count)| {
+                let mut labels = m.labels();
+                labels.push(("status", status));
+                Some((labels, count?.to_string()))
+            })
+            .collect::<Vec<_>>()
+        })
+        .collect();
+    out.rows(
+        "llamabored_model_requests_total",
+        "counter",
+        "Finished requests by outcome: ok (2xx) or error.",
+        &status_rows,
+    );
+    for (name, help, pair) in SUMMARIES {
+        let rows: Vec<(Vec<(&str, &str)>, SumCountWire)> = models
+            .iter()
+            .filter_map(|m| Some((m.labels(), pair(m.wire)?)))
+            .collect();
+        out.summary(name, help, &rows);
+    }
+    for (name, kind, help, value) in MODEL_FAMILIES.iter().skip(10) {
+        model_family(out, models, name, kind, help, *value);
+    }
+}
+
+fn model_family(
+    out: &mut Out,
+    models: &[Keyed<'_>],
+    name: &str,
+    kind: &str,
+    help: &str,
+    value: ModelValue,
+) {
+    let rows: Vec<Row<'_>> = models
+        .iter()
+        .filter_map(|m| Some((m.labels(), value(m.wire)?)))
+        .collect();
+    out.rows(name, kind, help, &rows);
+}
+
+/// Per-slot context (#10), labelled `model`, `engine` and `slot`; the wire
+/// keeps slot ids unique within a model.
+fn per_slot(out: &mut Out, models: &[Keyed<'_>]) {
+    let slot_rows: Vec<(&Keyed<'_>, &SlotCtxWire, String)> = models
+        .iter()
+        .flat_map(|m| {
+            let mut rows: Vec<&SlotCtxWire> = m.wire.slot_ctx.iter().collect();
+            rows.sort_by_key(|row| row.slot);
+            rows.into_iter()
+                .map(move |row| (m, row, row.slot.to_string()))
+        })
+        .collect();
+    let used: Vec<Row<'_>> = slot_rows
+        .iter()
+        .map(|(m, row, slot)| {
+            let mut labels = m.labels();
+            labels.push(("slot", slot.as_str()));
+            (labels, row.used.to_string())
+        })
+        .collect();
+    out.rows(
+        "llamabored_slot_context_used_tokens",
+        "gauge",
+        "Context tokens a llama.cpp slot holds (prompt plus generated; an idle slot keeps its last value).",
         &used,
     );
     // #9: every reason on every slot, so a rate starts from 0.
-    let resets: Vec<(Vec<(&str, &str)>, String)> = slot_rows
+    let resets: Vec<Row<'_>> = slot_rows
         .iter()
-        .zip(&slot_ids)
-        .flat_map(|((labels, row), slot)| {
+        .flat_map(|(m, row, slot)| {
             row.resets.entries().map(|(reason, count)| {
-                (
-                    vec![
-                        ("name", labels.name.as_str()),
-                        ("full_name", labels.full_name.as_str()),
-                        ("slot", slot.as_str()),
-                        ("reason", reason),
-                    ],
-                    count.to_string(),
-                )
+                let mut labels = m.labels();
+                labels.extend([("slot", slot.as_str()), ("reason", reason)]);
+                (labels, count.to_string())
             })
         })
         .collect();
     out.rows(
-        "llamabored_slot_ctx_resets_total",
+        "llamabored_slot_context_resets_total",
         "counter",
-        "Context drops of a llama.cpp slot since the watcher started, by best-guess reason.",
+        "Context drops of a llama.cpp slot, by best-guess reason.",
         &resets,
     );
+}
 
-    // Fans: the wire already refuses a repeated channel, so each label set
-    // is unique; the channel is the key and the label rides along.
-    let mut fans: Vec<&FanWire> = snap.fans.iter().collect();
+/// Fans: the wire already refuses a repeated channel, so each label set is
+/// unique; the channel is the key and the label rides along.
+fn fans(out: &mut Out, fans: &[FanWire]) {
+    let mut fans: Vec<&FanWire> = fans.iter().collect();
     fans.sort_by_key(|fan| fan.channel);
     let channels: Vec<String> = fans.iter().map(|fan| fan.channel.to_string()).collect();
-    let fan_rows = |value: fn(&FanWire) -> Option<String>| -> Vec<(Vec<(&str, &str)>, String)> {
+    let fan_rows = |value: fn(&FanWire) -> Option<String>| -> Vec<Row<'_>> {
         fans.iter()
             .zip(&channels)
             .filter_map(|(fan, channel)| {
@@ -811,38 +870,4 @@ pub fn render(scrape: &Scrape<'_>) -> String {
         "Fan PWM duty, 0 to 1, per configured [fans] channel (read only).",
         &fan_rows(|fan| fan.pwm.filter(|v| v.is_finite()).map(num)),
     );
-
-    if let Some(sources) = &snap.sources {
-        let entries = sources.entries();
-        let up: Vec<(Vec<(&str, &str)>, String)> = entries
-            .iter()
-            .filter_map(|(name, source)| {
-                let source = (*source)?;
-                Some((
-                    vec![("source", *name)],
-                    if source.up { "1" } else { "0" }.to_owned(),
-                ))
-            })
-            .collect();
-        out.rows(
-            "llamabored_source_up",
-            "gauge",
-            "1 when a watcher source answered on its last poll, 0 when it failed; absent when not polled.",
-            &up,
-        );
-        let latency: Vec<(Vec<(&str, &str)>, String)> = entries
-            .iter()
-            .filter_map(|(name, source)| {
-                let seconds = (*source)?.latency_s.filter(|v| v.is_finite())?;
-                Some((vec![("source", *name)], num(seconds)))
-            })
-            .collect();
-        out.rows(
-            "llamabored_source_latency_seconds",
-            "gauge",
-            "Duration of a watcher source's last poll, seconds.",
-            &latency,
-        );
-    }
-    out.text
 }

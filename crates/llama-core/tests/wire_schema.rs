@@ -46,8 +46,10 @@ fn valid() -> WireSnapshot {
                     state: ModelState::Ready,
                     full_name: None,
                     detail: None,
-                    cache_hit: None,
-                    slots_busy: None,
+                    max_running: None,
+                    id: None,
+                    version: None,
+                    counters: None,
                     slots_total: None,
                     prompt_tokens: None,
                     prompt_cached_tokens: None,
@@ -63,8 +65,10 @@ fn valid() -> WireSnapshot {
                     state: ModelState::Starting,
                     full_name: None,
                     detail: None,
-                    cache_hit: None,
-                    slots_busy: None,
+                    max_running: None,
+                    id: None,
+                    version: None,
+                    counters: None,
                     slots_total: None,
                     prompt_tokens: None,
                     prompt_cached_tokens: None,
@@ -128,8 +132,10 @@ fn sanitize_wire_names_pass_validate() {
             state: ModelState::Ready,
             full_name: None,
             detail: None,
-            cache_hit: None,
-            slots_busy: None,
+            max_running: None,
+            id: None,
+            version: None,
+            counters: None,
             slots_total: None,
             prompt_tokens: None,
             prompt_cached_tokens: None,
@@ -451,8 +457,10 @@ fn model_count_and_loaded_state() {
             state: ModelState::Other,
             full_name: None,
             detail: None,
-            cache_hit: None,
-            slots_busy: None,
+            max_running: None,
+            id: None,
+            version: None,
+            counters: None,
             slots_total: None,
             prompt_tokens: None,
             prompt_cached_tokens: None,
@@ -471,8 +479,10 @@ fn model_count_and_loaded_state() {
         state: ModelState::Stopping,
         full_name: None,
         detail: None,
-        cache_hit: None,
-        slots_busy: None,
+        max_running: None,
+        id: None,
+        version: None,
+        counters: None,
         slots_total: None,
         prompt_tokens: None,
         prompt_cached_tokens: None,
@@ -500,8 +510,10 @@ fn name_length_and_canonical_form() {
         state: ModelState::Ready,
         full_name: None,
         detail: None,
-        cache_hit: None,
-        slots_busy: None,
+        max_running: None,
+        id: None,
+        version: None,
+        counters: None,
         slots_total: None,
         prompt_tokens: None,
         prompt_cached_tokens: None,
@@ -741,10 +753,7 @@ fn full() -> WireSnapshot {
     snap.host.mem_used_bytes = Some(0);
     snap.host.mem_total_bytes = Some(134_217_728_000);
     snap.tokens.prompt_total = Some(u64::MAX);
-    snap.ai.models[0].cache_hit = Some(1.0);
-    snap.ai.models[0].slots_busy = Some(wire::MAX_SLOTS);
     snap.ai.models[0].slots_total = Some(wire::MAX_SLOTS);
-    snap.ai.models[1].slots_busy = Some(0);
     snap.ai.models[1].slots_total = Some(4);
     snap.fans = (1..=8)
         .map(|channel| wire::FanWire {
@@ -847,7 +856,6 @@ fn metrics_fields_are_additive_on_schema_v1() {
         "cpu_w",
         "_bytes",
         "prompt_total",
-        "cache_hit",
         "slots_",
         "fans",
         "sources",
@@ -883,13 +891,15 @@ fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
         running: Some(wire::MAX_REQS),
         queued: Some(wire::MAX_REQS),
         kv_fill: Some(0.123_456_7),
-        cache_hit: Some(0.123_456_7),
-        slots_busy: Some(wire::MAX_SLOTS),
         slots_total: Some(wire::MAX_SLOTS),
+        max_running: Some(wire::MAX_REQS),
+        id: Some("i".repeat(wire::MAX_FULL_NAME_CHARS)),
+        version: Some("v".repeat(16)),
         prompt_tokens: None,
         prompt_cached_tokens: None,
         slot_ctx: Vec::new(),
         engine: None,
+        counters: None,
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
     snap.host.load_pct = Some(12.345_678);
@@ -930,16 +940,9 @@ fn metrics_fields_are_bounded() {
         assert_eq!(validate(&snap), Err(WireError::OutOfRange { field }));
     }
 
-    let gauge_cases: [Mutate; 6] = [
-        |s| s.ai.models[0].cache_hit = Some(1.01),
-        |s| s.ai.models[0].cache_hit = Some(f32::NAN),
-        |s| s.ai.models[1].slots_busy = Some(5),
-        |s| s.ai.models[1].slots_total = None,
+    let gauge_cases: [Mutate; 2] = [
         |s| s.ai.models[0].slots_total = Some(wire::MAX_SLOTS + 1),
-        |s| {
-            s.ai.models[0].slots_busy = None;
-            s.ai.models[0].slots_total = Some(wire::MAX_SLOTS + 1);
-        },
+        |s| s.ai.models[1].max_running = Some(wire::MAX_REQS + 1),
     ];
     for (i, bad) in gauge_cases.into_iter().enumerate() {
         let mut snap = full();
@@ -1112,6 +1115,8 @@ fn slot_ctx_and_prompt_counters_are_bounded() {
 
 #[test]
 fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
+    const MAX: u64 = wire::MAX_COUNTER;
+    let pair = wire::SumCountWire { ms: MAX, n: MAX };
     let mut snap = full();
     let model = ModelWire {
         name: "Qwen3-Coder…".to_owned(),
@@ -1131,30 +1136,37 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
         running: Some(wire::MAX_REQS),
         queued: Some(wire::MAX_REQS),
         kv_fill: Some(0.123_456_7),
-        cache_hit: Some(0.123_456_7),
-        slots_busy: Some(wire::MAX_SLOTS),
         slots_total: Some(wire::MAX_SLOTS),
-        prompt_tokens: Some(u64::MAX),
-        prompt_cached_tokens: Some(u64::MAX),
+        // #71: the id, version and request cap at their widest.
+        max_running: Some(wire::MAX_REQS),
+        id: Some("i".repeat(wire::MAX_FULL_NAME_CHARS)),
+        version: Some("v".repeat(16)),
+        // The watcher writes no counter above MAX_COUNTER (#71).
+        prompt_tokens: Some(MAX),
+        prompt_cached_tokens: Some(MAX),
         slot_ctx: Vec::new(),
         // #31: every engine number, at its widest.
         engine: Some(wire::EngineWire {
             spec_accept: Some(0.123_456_7),
-            spec_len: Some(12.345_678),
-            spec_drafts: Some(u64::MAX),
-            spec_draft_tokens: Some(u64::MAX),
-            spec_accepted_tokens: Some(u64::MAX),
-            preemptions: Some(u64::MAX),
+            spec_drafts: Some(MAX),
+            spec_draft_tokens: Some(MAX),
+            spec_accepted_tokens: Some(MAX),
+            preemptions: Some(MAX),
             sleeping: Some(false),
-            ttft_s: Some(1_234.567_8),
-            itl_s: Some(0.012_345_67),
-            e2e_s: Some(3_599.123_4),
-            // #35: both speeds at their widest.
-            prefill_tps: Some(987_654.3),
-            decode_tps: Some(123_456.79),
             // #54: Strata's expert cache ratios.
             expert_hit: Some(0.123_456_7),
             pcie_share: Some(0.123_456_7),
+        }),
+        // #71: every counter.
+        counters: Some(wire::CountersWire {
+            gen_tokens: Some(MAX),
+            prefill_ms: Some(MAX),
+            decode_ms: Some(MAX),
+            req_ok: Some(MAX),
+            req_err: Some(MAX),
+            ttft: Some(pair),
+            itl: Some(pair),
+            e2e: Some(pair),
         }),
     };
     snap.ai.models = vec![model; wire::MAX_MODELS];
@@ -1163,17 +1175,17 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
             slot: wire::MAX_SLOTS - 1 - id,
             used: wire::MAX_CTX_TOKENS,
             resets: wire::SlotResetsWire {
-                compacted: u64::MAX,
-                new: u64::MAX,
-                evicted: u64::MAX,
-                unknown: u64::MAX,
+                compacted: MAX,
+                new: MAX,
+                evicted: MAX,
+                unknown: MAX,
             },
         })
         .collect();
     snap.host.load_pct = Some(12.345_678);
     let bytes = to_json(&snap).expect("encode");
     assert!(
-        bytes.len() < wire::MAX_BYTES - 1024,
+        bytes.len() < wire::MAX_BYTES - 512,
         "worst case is {} bytes",
         bytes.len()
     );
@@ -1186,17 +1198,11 @@ fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
 fn engine_numbers_are_optional_and_bounded() {
     let engine = || wire::EngineWire {
         spec_accept: Some(0.78),
-        spec_len: Some(2.9),
         spec_drafts: Some(100),
         spec_draft_tokens: Some(300),
         spec_accepted_tokens: Some(234),
         preemptions: Some(3),
         sleeping: Some(false),
-        ttft_s: Some(0.42),
-        itl_s: Some(0.031),
-        e2e_s: Some(12.5),
-        prefill_tps: Some(2134.5),
-        decode_tps: Some(41.25),
         expert_hit: Some(0.856),
         pcie_share: Some(0.106),
     };
@@ -1206,9 +1212,7 @@ fn engine_numbers_are_optional_and_bounded() {
     let text = std::str::from_utf8(&bytes).expect("utf8");
     assert!(text.contains(r#""engine":{"spec_accept":0.78"#), "{text}");
     assert!(
-        text.contains(
-            r#""prefill_tps":2134.5,"decode_tps":41.25,"expert_hit":0.856,"pcie_share":0.106}"#
-        ),
+        text.contains(r#""sleeping":false,"expert_hit":0.856,"pcie_share":0.106}"#),
         "{text}"
     );
     assert_eq!(parse_validated(&bytes).expect("valid"), snap);
@@ -1223,20 +1227,11 @@ fn engine_numbers_are_optional_and_bounded() {
         read.ai.models[0].engine.as_ref().and_then(|e| e.sleeping),
         Some(true)
     );
-    let cases: [Mutate; 18] = [
+    let cases: [Mutate; 10] = [
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(1.01),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accept = Some(f32::NAN),
-        |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(0.5),
-        |s| s.ai.models[0].engine.as_mut().unwrap().spec_len = Some(65.0),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_accepted_tokens = Some(301),
         |s| s.ai.models[0].engine.as_mut().unwrap().spec_draft_tokens = None,
-        |s| s.ai.models[0].engine.as_mut().unwrap().ttft_s = Some(-0.1),
-        |s| s.ai.models[0].engine.as_mut().unwrap().e2e_s = Some(3600.5),
-        // #35: speeds are 0..=MAX_ENGINE_TPS and finite.
-        |s| s.ai.models[0].engine.as_mut().unwrap().prefill_tps = Some(-1.0),
-        |s| s.ai.models[0].engine.as_mut().unwrap().prefill_tps = Some(1_000_001.0),
-        |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(f32::INFINITY),
-        |s| s.ai.models[0].engine.as_mut().unwrap().decode_tps = Some(-0.5),
         // #54: the expert cache ratios are 0..=1 and finite.
         |s| s.ai.models[0].engine.as_mut().unwrap().expert_hit = Some(1.01),
         |s| s.ai.models[0].engine.as_mut().unwrap().expert_hit = Some(-0.01),
@@ -1261,4 +1256,80 @@ fn engine_numbers_are_optional_and_bounded() {
     assert_eq!(validate(&snap), Ok(()));
     snap.ai.models[0].detail.as_mut().unwrap().kv_block = Some(0);
     assert_eq!(validate(&snap), Err(WireError::Detail));
+}
+
+/// #71: the id, version, request cap and counters are optional, bounded,
+/// and stay on schema 1; the fields 0.5 stopped sending still parse from
+/// an older watcher, and are dropped.
+#[test]
+fn counters_and_ids_are_additive_and_bounded() {
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#71 snapshot");
+    assert_eq!(old.ai.models[0].id, None);
+    assert_eq!(old.ai.models[0].counters, None);
+    let text = String::from_utf8(to_json(&valid()).expect("encode")).expect("utf8");
+    for key in ["\"id\"", "version", "max_running", "counters"] {
+        assert!(!text.contains(key), "{key}: {text}");
+    }
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","id":"qwen3.6-35b-a3b","version":"0.1.41","max_running":4,"counters":{"gen_tokens":12,"req_ok":3,"req_err":0,"ttft":{"ms":1500,"n":3},"next":1},"cache_hit":0.5,"slots_busy":1,"engine":{"spec_len":2.5,"ttft_s":0.1,"prefill_tps":10.0}"#,
+    );
+    let read = parse_validated(&json).expect("new keys read, retired keys ignored");
+    let model = &read.ai.models[0];
+    assert_eq!(model.id.as_deref(), Some("qwen3.6-35b-a3b"));
+    assert_eq!(model.version.as_deref(), Some("0.1.41"));
+    assert_eq!(model.max_running, Some(4));
+    let counters = model.counters.as_ref().expect("counters");
+    assert_eq!(counters.gen_tokens, Some(12));
+    assert_eq!(counters.ttft, Some(wire::SumCountWire { ms: 1500, n: 3 }));
+    assert_eq!(counters.prefill_ms, None);
+    assert_eq!(model.engine, Some(wire::EngineWire::default()));
+
+    let gauge_cases: [Mutate; 4] = [
+        |s| s.ai.models[0].max_running = Some(wire::MAX_REQS + 1),
+        |s| {
+            s.ai.models[0].counters = Some(wire::CountersWire {
+                gen_tokens: Some(wire::MAX_COUNTER + 1),
+                ..wire::CountersWire::default()
+            })
+        },
+        |s| {
+            s.ai.models[0].counters = Some(wire::CountersWire {
+                e2e: Some(wire::SumCountWire {
+                    ms: 1,
+                    n: wire::MAX_COUNTER + 1,
+                }),
+                ..wire::CountersWire::default()
+            })
+        },
+        |s| {
+            s.ai.models[0].counters = Some(wire::CountersWire {
+                req_err: Some(u64::MAX),
+                ..wire::CountersWire::default()
+            })
+        },
+    ];
+    for (i, bad) in gauge_cases.into_iter().enumerate() {
+        let mut snap = valid();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+    let detail_cases: [Mutate; 4] = [
+        |s| s.ai.models[0].id = Some(String::new()),
+        |s| s.ai.models[0].id = Some("a\nb".to_owned()),
+        |s| s.ai.models[0].id = Some("x".repeat(wire::MAX_FULL_NAME_CHARS + 1)),
+        |s| s.ai.models[0].version = Some("0.1 beta".to_owned()),
+    ];
+    for (i, bad) in detail_cases.into_iter().enumerate() {
+        let mut snap = valid();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Detail), "case {i}");
+    }
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","counters":{"gen_tokens":-1}"#,
+    );
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
 }
