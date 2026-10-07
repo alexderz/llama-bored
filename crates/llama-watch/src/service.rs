@@ -485,6 +485,7 @@ impl TickState {
                 setup: Vec::new(),
                 engine_live: Vec::new(),
                 suspected_loads: Vec::new(),
+                series: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -2275,6 +2276,7 @@ mod tests {
                     setup: Vec::new(),
                     engine_live: Vec::new(),
                     suspected_loads: Vec::new(),
+                    series: Vec::new(),
                 },
             ))
         }
@@ -2423,6 +2425,7 @@ mod tests {
                     setup: Vec::new(),
                     engine_live: Vec::new(),
                     suspected_loads: Vec::new(),
+                    series: Vec::new(),
                 },
             ))
         }
@@ -2531,6 +2534,8 @@ mod tests {
             engine_gen_tps: None,
             duration_ms: None,
             status: None,
+            draft_tokens: None,
+            draft_accepted: None,
             captured: false,
         };
         detail.activity = vec![row.clone()];

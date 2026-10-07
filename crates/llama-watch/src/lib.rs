@@ -11,6 +11,7 @@ pub mod poller;
 pub mod publish;
 pub mod recent;
 pub mod resets;
+pub mod series;
 pub mod service;
 pub mod setup_rules;
 pub mod slots;

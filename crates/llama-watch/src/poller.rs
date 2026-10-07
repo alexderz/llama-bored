@@ -117,6 +117,7 @@ use crate::metrics::{
     PromptCache, detect_backend, parse_metrics_full,
 };
 use crate::recent::{Merged, Recent};
+use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::llamaswap;
@@ -185,6 +186,9 @@ pub struct LlamaDetail {
     /// Suspected model loads this run (#70): `(llama-swap id, sanitised,
     /// count)`, at most [`MAX_SUSPECTS`] ids. Empty when there were none.
     pub suspected_loads: Vec<(String, u64)>,
+    /// Each listed model's cumulative numbers for llama-metrics (#71), in
+    /// the order of the view's models.
+    pub series: Vec<ModelSeries>,
 }
 
 /// One ready model's [`EngineLive`] (#54).
@@ -501,6 +505,8 @@ struct State<L> {
     engines: EngineBook,
     /// Engine-measured speeds given to RECENT rows (#35).
     speeds: SpeedBook,
+    /// Per-model cumulative numbers for llama-metrics (#71).
+    series: SeriesBook,
     /// Server kind `/metrics` gave each loaded model the launch command did
     /// not name (#31); `openai` when it gave none. Dropped when the model
     /// leaves `ready`, so the next load is probed again.
@@ -593,6 +599,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         prompt_cache: PromptCache::default(),
         engines: EngineBook::default(),
         speeds: SpeedBook::default(),
+        series: SeriesBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
         running_due: false,
@@ -839,6 +846,7 @@ impl<L: Sink> State<L> {
     fn forget_engine(&mut self, id: &str) {
         self.engines.forget(id);
         self.speeds.forget(id);
+        self.series.forget_gauges(id);
     }
 
     /// `id`'s process is gone: the next one starts its counters at 0 and
@@ -849,6 +857,7 @@ impl<L: Sink> State<L> {
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
+        self.series.forget_process(id);
     }
 
     /// `[llama.backends]` first, then the launch command, then what this
@@ -975,6 +984,10 @@ impl<L: Sink> State<L> {
                 }
                 sample
             });
+            if let Ok(sample) = &read {
+                self.series
+                    .observe_metrics(&model.id, model.backend, sample, now);
+            }
             let decoded = match &read {
                 Ok(sample) => sample.n_decode_total,
                 Err(_) => None,
@@ -1333,6 +1346,7 @@ impl<L: Sink> State<L> {
         for model in &self.ready {
             self.prompt_cache
                 .touch(&model.id, model.backend.has_slots());
+            self.series.touch(&model.id);
         }
         let now = Instant::now();
         if merged.baseline {
@@ -1358,6 +1372,8 @@ impl<L: Sink> State<L> {
             for row in rows.iter().filter(|row| row.model == key) {
                 self.prompt_cache
                     .add_row(&model.id, row.input_tokens, row.cached_tokens);
+                self.series
+                    .add_row(&model.id, row, model.backend.has_slots());
             }
         }
         let window = self.limits.activity_interval + self.limits.activity_timeout;
@@ -1369,6 +1385,7 @@ impl<L: Sink> State<L> {
                 .filter_map(|row| row.output_tokens)
                 .fold(0u64, u64::saturating_add);
             self.counter.add(id, tokens, now, window);
+            self.series.add_generation(id, tokens);
             let prompt = new_rows()
                 .filter_map(|row| row.input_tokens)
                 .fold(0u64, u64::saturating_add);
@@ -1532,6 +1549,7 @@ impl<L: Sink> State<L> {
                     )
                 })
                 .collect(),
+            series: self.model_series(now),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());
@@ -1549,6 +1567,24 @@ impl<L: Sink> State<L> {
             }
         }
         setup
+    }
+
+    /// Each listed model's cumulative numbers (#71), in the order of
+    /// [`Self::models`], with the version its engine reports.
+    fn model_series(&self, now: Instant) -> Vec<ModelSeries> {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        self.models
+            .iter()
+            .zip(&self.model_ids)
+            .map(|(model, id)| ModelSeries {
+                model: model.name.clone(),
+                version: self
+                    .engine_facts
+                    .get(id)
+                    .and_then(|facts| facts.values.get("version").cloned()),
+                ..self.series.get(id, now, fresh)
+            })
+            .collect()
     }
 
     /// Each ready model's engine `live` report from a fresh read (#54).
