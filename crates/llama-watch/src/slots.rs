@@ -38,6 +38,9 @@ pub struct SlotView {
     /// Prompt tokens that occupy context: `n_prompt_tokens` when that key is
     /// present, otherwise `n_prompt_tokens_cache`. `None` when both are absent.
     pub ctx_prompt: Option<u64>,
+    /// `n_prompt_tokens_cache`: prompt tokens this task reused from the
+    /// cache, when the server sends it (#75).
+    pub prompt_cached: Option<u64>,
     /// Sanitised prompt tail. Unchanged when this body skipped text.
     pub input: Vec<Cell>,
     /// Sanitised generated tail from this poll, or the previous tail when
@@ -81,6 +84,7 @@ struct Tracked {
     n_decoded: u64,
     n_ctx: Option<u64>,
     ctx_prompt: Option<u64>,
+    prompt_cached: Option<u64>,
     input: Vec<Cell>,
     output: Vec<Cell>,
     captured_task: Option<i64>,
@@ -505,6 +509,7 @@ impl SlotBook {
                 n_decoded: row.n_decoded,
                 n_ctx: row.n_ctx,
                 ctx_prompt: row.ctx_prompt,
+                prompt_cached: row.prompt_cached,
                 input: row.input.clone(),
                 output: row.output.clone(),
                 ctx_used: self.ctx_of(row).and_then(|track| track.held),
@@ -546,6 +551,7 @@ fn tracked(
         n_decoded: slot.n_decoded,
         n_ctx: slot.n_ctx,
         ctx_prompt: slot.ctx_prompt,
+        prompt_cached: slot.n_prompt_tokens_cache,
         input,
         output,
         captured_task,

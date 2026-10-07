@@ -4,6 +4,7 @@ pub mod activity;
 pub mod capture;
 pub mod collector;
 pub mod config;
+pub mod inflight;
 mod load;
 pub mod localtime;
 pub mod metrics;

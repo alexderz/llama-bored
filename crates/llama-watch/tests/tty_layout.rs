@@ -474,7 +474,7 @@ fn recent_time_is_complete_and_columns_do_not_overlap() {
             .chars()
             .collect::<Vec<_>>()
             .iter()
-            .rposition(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
+            .rposition(|ch| is_bar_char(*ch))
             .expect("bar");
         assert!(
             bar_end > usize::from(cols) * 3 / 4,
@@ -488,10 +488,7 @@ fn recent_time_is_complete_and_columns_do_not_overlap() {
             !header.contains("PP t/s") && !header.contains("TG t/s"),
             "{cols}: old speed headers remain: {header}"
         );
-        let bar = data
-            .chars()
-            .filter(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
-            .count();
+        let bar = data.chars().filter(|ch| is_bar_char(*ch)).count();
         bars.push(bar);
         gaps.push(source_at - (time_at + shown.chars().count()));
     }
@@ -650,15 +647,12 @@ fn recent_duration_sits_between_the_numbers_and_the_bar() {
             let dur_at = find_chars(&header, dur_label).expect("dur header");
             let dur_end = dur_at + dur_label.len();
             let value_at = find_chars(&data, "13.2s").expect("dur value");
-            let bar_at = data
-                .chars()
-                .position(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
-                .expect("bar");
+            let bar_at = data.chars().position(is_bar_char).expect("bar");
             let bar_end = data
                 .chars()
                 .collect::<Vec<_>>()
                 .iter()
-                .rposition(|ch| matches!(ch, '█' | '▌' | '▐' | '░'))
+                .rposition(|ch| is_bar_char(*ch))
                 .expect("bar end");
             let after_bar: String = data.chars().skip(bar_end + 1).collect();
             let tag = format!("{cols} text {show_text}");
@@ -674,6 +668,11 @@ fn recent_duration_sits_between_the_numbers_and_the_bar() {
             );
         }
     }
+}
+
+/// A RECENT bar cell (#75): blocks, eighths, the `_` / `▁` track.
+fn is_bar_char(ch: char) -> bool {
+    matches!(ch, '█' | '▌' | '▐' | '░' | '▄' | '_') || ('\u{2581}'..='\u{2587}').contains(&ch)
 }
 
 fn recent_model() -> TtyModel {
@@ -2270,6 +2269,13 @@ fn activity(
         gen_measured: false,
         dur: dur.to_string(),
         err,
+        // #75: the context the bar is drawn against.
+        n_ctx: match model {
+            "Qwen 35B" => Some(262_144),
+            "Gemma 4B" | "Gemma 27B" => Some(131_072),
+            _ => None,
+        },
+        ..Activity::default()
     }
 }
 
@@ -4507,4 +4513,404 @@ fn temps_alone_and_temps_off() {
         let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
         assert!(!all.contains("TEMPS"), "{cols}x{rows}");
     }
+}
+// ---- #75: RECENT context bar and in-flight rows ---------------------------
+
+use llama_watch::tty::layout::{CtxCell, CtxPart, InFlight, RAINBOW, ctx_cells};
+
+const K: u64 = RAINBOW.len() as u64;
+
+/// 30 cells of 6,400 tokens: an eighth is 800 tokens, a rainbow step 100.
+const W: usize = 30;
+const SCALE: u64 = 30 * 8 * K * 100;
+
+fn one(value: u64) -> Vec<CtxCell> {
+    ctx_cells(&[(CtxPart::Cached, value)], SCALE, W)
+}
+
+fn lit(cells: &[CtxCell]) -> Vec<CtxCell> {
+    cells
+        .iter()
+        .copied()
+        .filter(|c| c.part != CtxPart::Track)
+        .collect()
+}
+
+fn full(part: CtxPart) -> CtxCell {
+    CtxCell {
+        part,
+        eighths: 8,
+        shade: None,
+    }
+}
+
+fn rem(part: CtxPart, eighths: u8, shade: u8) -> CtxCell {
+    CtxCell {
+        part,
+        eighths,
+        shade: Some(shade),
+    }
+}
+
+#[test]
+fn ctx_cells_are_linear_with_eighths_and_rainbow_steps_at_the_boundaries() {
+    use CtxPart::Cached;
+    assert_eq!(
+        one(0),
+        vec![
+            CtxCell {
+                part: CtxPart::Track,
+                eighths: 1,
+                shade: None
+            };
+            W
+        ]
+    );
+    // Exactly one cell: no remainder cell.
+    assert_eq!(lit(&one(6_400)), [full(Cached)]);
+    // One step short of a cell: 7 eighths, the last rainbow colour.
+    assert_eq!(lit(&one(6_399)), [rem(Cached, 7, 7)]);
+    // One step past a cell: the remainder first, then the whole cell.
+    assert_eq!(lit(&one(6_500)), [rem(Cached, 1, 1), full(Cached)]);
+    assert_eq!(lit(&one(800)), [rem(Cached, 1, 0)]);
+    assert_eq!(lit(&one(1_600)), [rem(Cached, 2, 0)]);
+    assert_eq!(lit(&one(799)), [rem(Cached, 1, 7)]);
+    // A non-zero segment is at least a ▁, whatever its size.
+    assert_eq!(lit(&one(1)), [rem(Cached, 1, 0)]);
+    assert_eq!(
+        lit(&ctx_cells(&[(Cached, 200)], 262_144, W)),
+        [rem(Cached, 1, 1)]
+    );
+    // 13 cells and 5/8 and 3 steps.
+    let cells = lit(&one(13 * 6_400 + 5 * 800 + 300));
+    assert_eq!(cells.len(), 14);
+    assert_eq!(cells[0], rem(Cached, 5, 3));
+    assert!(cells[1..].iter().all(|c| *c == full(Cached)));
+    // Over the scale: clipped to the width, no track left.
+    assert_eq!(lit(&one(SCALE * 2)).len(), W);
+}
+
+#[test]
+fn growing_counts_cycle_the_rainbow_then_step_an_eighth() {
+    for units in 1..64u64 {
+        let cells = lit(&one(units * 100));
+        assert_eq!(cells.len(), 1, "{units}");
+        assert_eq!(
+            cells[0].shade,
+            Some(u8::try_from(units % K).unwrap()),
+            "{units}"
+        );
+        assert_eq!(
+            cells[0].eighths,
+            u8::try_from((units / K).max(1)).unwrap(),
+            "{units}"
+        );
+    }
+    // The same counts always give the same cells.
+    let parts = [
+        (CtxPart::Cached, 88_960),
+        (CtxPart::New, 2_244),
+        (CtxPart::Out, 612),
+    ];
+    assert_eq!(
+        ctx_cells(&parts, 262_144, 24),
+        ctx_cells(&parts, 262_144, 24)
+    );
+}
+
+#[test]
+fn each_segment_starts_with_its_own_remainder_cell() {
+    use CtxPart::{Cached, New, Out};
+    // 2 cells + 3/8 + 2 steps, 1 cell + 6/8 + 5 steps, 0 cells + 1/8 + 4.
+    let cells = lit(&ctx_cells(
+        &[
+            (Cached, 2 * 6_400 + 3 * 800 + 200),
+            (New, 6_400 + 6 * 800 + 500),
+            (Out, 800 + 400),
+        ],
+        SCALE,
+        W,
+    ));
+    assert_eq!(
+        cells,
+        [
+            rem(Cached, 3, 2),
+            full(Cached),
+            full(Cached),
+            rem(New, 6, 5),
+            full(New),
+            rem(Out, 1, 4),
+        ]
+    );
+}
+
+/// A Qwen row of known context, drawn at `cols`.
+fn bar_model(rows: Vec<Activity>, glyphs: ChartGlyphs) -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    model.requests = rows;
+    model.chart_glyphs = glyphs;
+    model
+}
+
+fn bar_of(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<(char, C16)> {
+    // The bar is the run of bar cells before the status column.
+    let cells: Vec<(char, C16)> = (0..grid.cols())
+        .map(|col| {
+            let cell = grid.get(col, row).unwrap();
+            (cell.ch, cell.fg)
+        })
+        .collect();
+    let end = cells
+        .iter()
+        .rposition(|(ch, _)| is_bar_char(*ch) || *ch == '!')
+        .unwrap();
+    let mut start = end;
+    while start > 0 && (is_bar_char(cells[start - 1].0) || cells[start - 1].0 == '!') {
+        start -= 1;
+    }
+    cells[start..=end].to_vec()
+}
+
+#[test]
+fn bar_colours_eighths_and_the_halves_fallback() {
+    let row = |n_ctx| {
+        let mut req = recent_model().requests[0].clone();
+        (req.input_tok, req.cached_tok, req.output_tok) = (60_000, 40_000, 3_000);
+        req.n_ctx = n_ctx;
+        req
+    };
+    let grid = draw(
+        &bar_model(vec![row(Some(262_144))], ChartGlyphs::Eighths),
+        240,
+        67,
+    );
+    let header = row_with(&grid, "RECENT");
+    let bar = bar_of(&grid, header + 1);
+    let first = bar[0];
+    assert!(('\u{2581}'..='\u{2587}').contains(&first.0), "{bar:?}");
+    assert!(
+        RAINBOW.contains(&first.1),
+        "remainder in a rainbow colour: {bar:?}"
+    );
+    let fulls: Vec<C16> = bar
+        .iter()
+        .filter(|(ch, _)| *ch == '█')
+        .map(|(_, fg)| *fg)
+        .collect();
+    assert!(
+        fulls.contains(&C16::Blue) && fulls.contains(&C16::BrightCyan),
+        "{bar:?}"
+    );
+    assert!(
+        bar.iter()
+            .any(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightBlack),
+        "track"
+    );
+    // Halves: ▄ or █ only, `_` for the track; colours unchanged.
+    let grid = draw(
+        &bar_model(vec![row(Some(262_144))], ChartGlyphs::Halves),
+        240,
+        67,
+    );
+    let halves = bar_of(&grid, header + 1);
+    assert!(
+        halves.iter().all(|(ch, _)| matches!(ch, '▄' | '█' | '_')),
+        "{halves:?}"
+    );
+    assert_eq!(halves.len(), bar.len());
+    for ((_, a), (_, b)) in bar.iter().zip(&halves) {
+        assert_eq!(a, b, "same colours in both glyph sets");
+    }
+}
+
+#[test]
+fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
+    let row = |input: u64, n_ctx: Option<u64>| {
+        let mut req = recent_model().requests[1].clone();
+        (req.input_tok, req.cached_tok, req.output_tok) = (input, 0, 0);
+        req.n_ctx = n_ctx;
+        req
+    };
+    let warn_at = |req: Activity| {
+        let grid = draw(&bar_model(vec![req], ChartGlyphs::Eighths), 240, 67);
+        let header = row_with(&grid, "RECENT");
+        bar_of(&grid, header + 1)
+            .iter()
+            .any(|(ch, fg)| *ch == '!' && *fg == C16::Yellow)
+    };
+    assert!(warn_at(row(90_000, Some(100_000))));
+    assert!(!warn_at(row(89_999, Some(100_000))));
+    assert!(
+        !warn_at(row(1_000_000, None)),
+        "no context size, no warning"
+    );
+    // Relative: the largest unknown row fills the bar; `~` before each.
+    let grid = draw(
+        &bar_model(
+            vec![row(40_000, None), row(10_000, None)],
+            ChartGlyphs::Eighths,
+        ),
+        240,
+        67,
+    );
+    let header = row_with(&grid, "RECENT");
+    let big = bar_of(&grid, header + 1);
+    assert!(big.iter().all(|(ch, _)| *ch == '█'), "{big:?}");
+    let small = bar_of(&grid, header + 2);
+    assert!(
+        small.iter().any(|(_, fg)| *fg == C16::BrightBlack),
+        "{small:?}"
+    );
+    for r in [header + 1, header + 2] {
+        let line = row_string(&grid, r);
+        let tilde = line.chars().position(|c| c == '~').expect("~");
+        let start = line
+            .chars()
+            .position(|c| c == '█' || ('\u{2581}'..='\u{2587}').contains(&c))
+            .unwrap();
+        assert_eq!(tilde + 1, start, "{line}");
+    }
+    assert!(row_string(&grid, legend_row(&grid)).contains("~bar = vs largest row"));
+}
+
+fn legend_row(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    (0..grid.rows())
+        .find(|r| row_string(grid, *r).contains("PROMPT") && row_string(grid, *r).contains(" = "))
+        .expect("legend")
+}
+
+#[test]
+fn legend_keeps_its_items_in_order_and_fits_160_columns() {
+    let mut model = recent_model();
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    let grid = draw(&model, 240, 67);
+    let legend = row_string(&grid, legend_row(&grid));
+    assert!(
+        legend.contains("\u{2588}cached \u{2588}new \u{2588}out"),
+        "{legend}"
+    );
+    assert!(legend.contains("per 1/8"), "{legend}");
+    let at = legend_row(&grid);
+    let strip = col_of(&grid, at, "per 1/8") - 9;
+    let colours: Vec<C16> = (0..8u16)
+        .map(|i| grid.get(strip + i, at).unwrap().fg)
+        .collect();
+    assert_eq!(colours, RAINBOW);
+    // 160 columns with every note: items drop, nothing passes the edge.
+    model.requests[0].gen_measured = true;
+    model.requests[0].n_ctx = None;
+    let grid = draw(&model, 160, 48);
+    let legend = row_string(&grid, legend_row(&grid));
+    assert!(legend.trim_end().chars().count() <= 158, "{legend}");
+    assert!(legend.contains("cached"), "the colour key stays: {legend}");
+    assert!(
+        !legend.contains("per 1/8"),
+        "the rainbow goes first: {legend}"
+    );
+}
+
+fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activity {
+    let mut req = recent_model().requests[0].clone();
+    req.id = 0;
+    req.model = "Qwen 35B".to_string();
+    req.time = "18:47:20".to_string();
+    req.source = String::new();
+    req.input_tok = 120_000;
+    req.cached_tok = 0;
+    req.output_tok = decoded;
+    req.dur = "36.4s".to_string();
+    req.live = false;
+    req.n_ctx = Some(262_144);
+    req.prompt_measured = true;
+    req.gen_measured = decoded > 0;
+    req.inflight = Some(InFlight {
+        decoding: decoded > 0,
+        processed,
+        reset,
+    });
+    req
+}
+
+/// #75 golden: a compaction prefill at 40 % (cached 0), a second slot
+/// decoding, then the finished rows; the 10x18 font at 1080p.
+fn inflight_model() -> TtyModel {
+    let mut model = temps_model();
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    let mut decoding = flight_row(31_500, 1_204, None);
+    (decoding.input_tok, decoding.cached_tok) = (31_500, 29_800);
+    decoding.time = "18:47:02".to_string();
+    decoding.dur = "18.0s".to_string();
+    let mut rows = vec![
+        flight_row(48_000, 0, Some(ResetReason::Compacted)),
+        decoding,
+    ];
+    rows.extend(model.requests.iter().cloned().map(|mut r| {
+        r.live = false;
+        r
+    }));
+    model.requests = rows;
+    model
+}
+
+const INFLIGHT_GOLDENS: [(&str, u16, u16); 1] = [("recent-inflight-192.json", 192, 60)];
+
+#[test]
+fn inflight_golden_matches_character_and_colour() {
+    for (name, _, _) in INFLIGHT_GOLDENS {
+        assert_frame(name, &load(name), &inflight_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #75 in-flight golden"]
+fn dump_inflight_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in INFLIGHT_GOLDENS {
+        let grid = draw(&inflight_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write in-flight golden");
+    }
+}
+
+#[test]
+fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
+    let grid = draw(&inflight_model(), 192, 60);
+    let header = row_with(&grid, "RECENT");
+    let prefill = row_string(&grid, header + 1);
+    let decode = row_string(&grid, header + 2);
+    assert!(
+        prefill.starts_with('>') && decode.starts_with('>'),
+        "{prefill}\n{decode}"
+    );
+    assert!(prefill.trim_end().ends_with("pp c"), "{prefill}");
+    assert!(decode.trim_end().ends_with("gen"), "{decode}");
+    assert!(
+        prefill.contains("120,000") && prefill.contains("36.4s"),
+        "{prefill}"
+    );
+    // Prefill: new input so far, then the pending prompt as a cyan low line.
+    let bar = bar_of(&grid, header + 1);
+    let pending = bar
+        .iter()
+        .filter(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightCyan)
+        .count();
+    let done = bar
+        .iter()
+        .filter(|(ch, fg)| *ch == '█' && *fg == C16::BrightCyan)
+        .count();
+    assert!(pending > done && done > 0, "40 % done: {bar:?}");
+    // No finished row is marked `gen` while in-flight rows are shown.
+    let third = row_string(&grid, header + 3);
+    assert!(
+        !third.starts_with('>') && !third.contains(" gen"),
+        "{third}"
+    );
+    // At most half the rows are in flight.
+    let mut model = inflight_model();
+    let extra = model.requests[0].clone();
+    model.requests.splice(0..0, std::iter::repeat_n(extra, 6));
+    let grid = draw(&model, 192, 60);
+    let flying = (header + 1..header + 9)
+        .filter(|r| row_string(&grid, *r).starts_with('>'))
+        .count();
+    assert_eq!(flying, 4);
 }
