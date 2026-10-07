@@ -6,15 +6,56 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
-### Fixed
+Ships as 0.5.0: the exporter's series change incompatibly (#71).
 
-- llama-watch's polling can no longer make llama-swap load or swap a model (#70). `/running` was read every 0.5 s and `/upstream/<id>/metrics` every 0.25 s, so a read could act on a ready list up to 0.5 s old: if a client asked for another model in that window, our upstream read made llama-swap load ours back. Every upstream read (`/metrics`, `/slots`, the engine probe) now goes through one function, the fresh gate: it reads `/running` as the request just before the GET, and sends it only for a model that read lists as `ready`; a model that is not is dropped, not retried. If that read lists any model as `starting`, `stopping` or in another state, a swap is in progress and the round makes no upstream request at all. A `409` (llama-swap's `upstream.ignorePaths` answer for a model that is not loaded) or any other non-2xx from an upstream read means "not available now": the model's engine numbers are dropped as on unload, it gets no second read that round, llama-swap stays up, and a 409 is logged once per change (`<id>: llama-swap says not loaded; skipping until ready`) and counts as no tap failure. Redirects are still never followed, now pinned by S17. Cost: two small `/running` reads per upstream read
-- README: "Never swaps models" under the engines, with llama-swap's `upstream.ignorePaths` block (the default pattern kept, since listing `ignorePaths` replaces it) as optional extra protection for the short window that remains between our `/running` read and our upstream read (#70)
+### Upgrading
+
+- Dashboards and alerts on llama-metrics need a migration: every per-model series is now labelled `model` (the llama-swap id) and `engine` instead of `name` and `full_name`, and many names changed. Use the table below. Install all binaries together (`install.sh`) and restart `llama-watch` and `llama-metrics`; the wire stays schema 1, so the LCD and RGB keep working through the restart.
+
+### Changed (breaking)
+
+- llama-metrics exports one normalized series per quantity for every engine (#71), told apart by `model` and `engine` (`llamacpp`, `vllm`, `sglang`, `strata`, `openai`); descriptive strings move to `llamabored_model_info`; names carry units, ratios are 0 to 1, only counters end in `_total`; window means and rates give way to counters for `rate()`. README (**llama-metrics** under Features) has the full list and PromQL. Old to new:
+
+| Old | New |
+|---|---|
+| `llamabored_activity_pct` | `llamabored_activity_ratio` (÷ 100, 0 to 1.25) |
+| `llamabored_load_pct` | `llamabored_load_ratio` |
+| `llamabored_cpu_pct` | `llamabored_cpu_utilization_ratio` |
+| `llamabored_cpu_topk_pct` | `llamabored_cpu_topk_utilization_ratio` |
+| `llamabored_gpu_pct` | `llamabored_gpu_utilization_ratio` |
+| `llamabored_mem_pct` | dropped: `llamabored_memory_used_bytes / llamabored_memory_total_bytes` |
+| `llamabored_tokens_decoded_total` | dropped: `sum(llamabored_model_generation_tokens_total)` |
+| `llamabored_tokens_prompt_total` | dropped: `sum(llamabored_model_prompt_tokens_total)` |
+| `llamabored_model_loaded{name, full_name, quant, kv, ctx, moe, backend}` | `llamabored_model_info{model, engine, display_name, quant, kv_type, version}`; `ctx` is `llamabored_model_context_size_tokens`; `moe` is dropped |
+| `llamabored_model_state{name, full_name, state}` | `llamabored_model_state{model, engine, state}` |
+| `llamabored_model_ctx_size_tokens` | `llamabored_model_context_size_tokens` |
+| `llamabored_model_requests_running` | same name; llama.cpp now fills it too (`requests_processing`) |
+| `llamabored_model_requests_queued` | `llamabored_model_requests_waiting` (llama.cpp: `requests_deferred`) |
+| `llamabored_slots_busy` | `llamabored_model_requests_running` |
+| `llamabored_slots_total` | `llamabored_model_slots` (vLLM, SGLang and Strata: their request cap) |
+| `llamabored_model_cache_hit_ratio` | dropped: `rate(llamabored_model_prompt_cached_tokens_total[5m]) / rate(llamabored_model_prompt_tokens_total[5m])` |
+| `llamabored_model_spec_acceptance_ratio` | dropped: `rate(…_spec_accepted_tokens_total[5m]) / rate(…_spec_draft_tokens_total[5m])`; SGLang, which reports only a gauge, has none |
+| `llamabored_model_spec_accepted_length` | dropped: `1 + rate(…_spec_accepted_tokens_total[5m]) / rate(…_spec_drafts_total[5m])` (vLLM) |
+| `llamabored_model_ttft_seconds` | `llamabored_model_time_to_first_token_seconds` summary: `rate(_sum) / rate(_count)` |
+| `llamabored_model_itl_seconds` | `llamabored_model_inter_token_latency_seconds` summary |
+| `llamabored_model_e2e_latency_seconds` | `llamabored_model_request_duration_seconds` summary (every engine) |
+| `llamabored_model_prefill_tokens_per_second` | `rate(prompt_tokens_total − prompt_cached_tokens_total) / rate(llamabored_model_prefill_seconds_total)` |
+| `llamabored_model_decode_tokens_per_second` | `rate(llamabored_model_generation_tokens_total) / rate(llamabored_model_decode_seconds_total)` |
+| `llamabored_slot_ctx_used_tokens{name, full_name, slot}` | `llamabored_slot_context_used_tokens{model, engine, slot}` |
+| `llamabored_slot_ctx_resets_total{…, reason}` | `llamabored_slot_context_resets_total{model, engine, slot, reason}` |
+| `llamabored_model_prompt_tokens_total`, `…_prompt_cached_tokens_total`, `…_spec_drafts_total`, `…_spec_draft_tokens_total`, `…_spec_accepted_tokens_total`, `…_preemptions_total`, `…_sleeping`, `…_kv_cache_usage_ratio`, `…_kv_block_size_tokens`, `…_prefix_caching`, `…_expert_cache_hit_ratio`, `…_pcie_share_ratio` | same names, labels `model` and `engine` |
 
 ### Added
 
+- New per-model series (#71): `llamabored_model_generation_tokens_total` (every engine; llama.cpp's `tokens_predicted_total`, an OpenAI-compatible server's activity rows), `llamabored_model_prefill_seconds_total` and `…_decode_seconds_total` (llama.cpp, vLLM, Strata), `llamabored_model_requests_total{status="ok"|"error"}` (llama-swap's activity rows), the TTFT and ITL summaries (vLLM, SGLang), request duration for every engine (engine e2e histograms, else activity durations), llama.cpp's speculative draft and accepted tokens (activity draft fields), `llamabored_model_slots` and `llamabored_model_info{version}` (Strata). Every counter counts since llama-watch started and stays monotonic across engine restarts and unloads within the run
+- Snapshot (schema 1, additive; older readers ignore the new keys): each model's llama-swap `id`, engine `version`, `max_running`, and a `counters` object (`gen_tokens`, `prefill_ms`, `decode_ms`, `req_ok`, `req_err`, `ttft` / `itl` / `e2e` as `{ms, n}`), each at most 2^53 − 1. `running`, `queued`, `kv_fill` and the speculative token counters are filled for llama.cpp too. No longer sent, since nothing but the old exporter read them: `cache_hit`, `slots_busy` and the engine window means (`spec_len`, `ttft_s`, `itl_s`, `e2e_s`, `prefill_tps`, `decode_tps`); tty11 still shows them. The worst-case snapshot is 15.5 KiB of the 16 KiB cap
 - Self-check for suspected loads (#70). `/running` is read again right after each upstream read; a model `starting` there, or an upstream read slower than 2 s, is a suspected load: a warning names the model id and path, that model gets no upstream reads for 5 minutes, and it is counted. The counter rides the snapshot as the optional `suspected_loads` list (`model`, `count`; at most 8 rows, additive on schema 1) and llama-metrics exports it as `llamabored_collector_suspected_loads_total{model}`, absent while there are none
 - llama-metrics test: a snapshot with no model running is a 200 with valid exposition, `llamabored_ai_state` and no model series (#70)
+
+### Fixed
+
+- llama-watch's polling can no longer make llama-swap load or swap a model (#70). `/running` was read every 0.5 s and `/upstream/<id>/metrics` every 0.25 s, so a read could act on a ready list up to 0.5 s old: if a client asked for another model in that window, our upstream read made llama-swap load ours back. Every upstream read (`/metrics`, `/slots`, the engine probe) now goes through one function, the fresh gate: it reads `/running` as the request just before the GET, and sends it only for a model that read lists as `ready`; a model that is not is dropped, not retried. If that read lists any model as `starting`, `stopping` or in another state, a swap is in progress and the round makes no upstream request at all. A `409` (llama-swap's `upstream.ignorePaths` answer for a model that is not loaded) or any other non-2xx from an upstream read means "not available now": the model's engine numbers are dropped as on unload, it gets no second read that round, llama-swap stays up, and a 409 is logged once per change (`<id>: llama-swap says not loaded; skipping until ready`) and counts as no tap failure. Redirects are still never followed, now pinned by S17. Cost: two small `/running` reads per upstream read
+- README: "Never swaps models" under "Backends behind llama-swap", with llama-swap's `upstream.ignorePaths` block (the default pattern kept, since listing `ignorePaths` replaces it) as optional extra protection for the short window that remains between our `/running` read and our upstream read (#70)
 
 ## 0.4.1 — 2026-10-06
 

@@ -113,16 +113,19 @@ The workspace crates:
   a dim grey. On a splitter (`fans = "mirrored"`) the frame is
   `leds_per_fan` long and every fan shows it; on a daisy chain
   (`fans = "chain"`) fan k is LEDs `k × leds_per_fan` onwards.
-- **llama-metrics** reads the snapshot per scrape and renders gauges
-  (`llamabored_activity_pct`, `_load_pct`, `_cpu_pct`, `_cpu_topk_pct`,
-  `_gpu_pct`, `_mem_pct`, `_coolant_celsius`, `_cpu_celsius`,
-  `_gpu_celsius`, `_ai_state`, `_model_loaded`, `_model_ctx_size_tokens`),
-  the counter `llamabored_tokens_decoded_total`, and health series
-  (`_snapshot_up`, `_snapshot_stale`, `_snapshot_age_seconds`,
-  `_snapshot_seq`, `_exporter_build_info`,
-  `_exporter_rejected_connections_total`). A stale snapshot drops the value
-  series. Labels carry only model display names and allowlisted tuning
-  tokens.
+- **llama-metrics** reads the snapshot per scrape and renders host gauges
+  (`llamabored_activity_ratio`, `_load_ratio`, `_cpu_utilization_ratio`,
+  `_cpu_topk_utilization_ratio`, `_gpu_utilization_ratio`,
+  `_coolant_celsius`, `_cpu_celsius`, `_gpu_celsius`, `_ai_state`), one
+  normalized set of per-model series for every engine (labels `model`, the
+  llama-swap id, and `engine`; `llamabored_model_info` carries the
+  descriptive strings; token, time and request counters since llama-watch
+  started; latency summaries), and health series (`_snapshot_up`,
+  `_snapshot_stale`, `_snapshot_age_seconds`, `_snapshot_seq`,
+  `_exporter_build_info`, `_exporter_rejected_connections_total`,
+  `_collector_suspected_loads_total`). A stale snapshot drops the value
+  series. Labels carry only model ids, display names and allowlisted
+  tuning tokens. The full list is in the README.
 - **No persistence.** History and the dial live in memory and refill after a
   restart. The snapshot lives on tmpfs.
 

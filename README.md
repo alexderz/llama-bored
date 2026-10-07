@@ -52,7 +52,8 @@ shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
 line under the model name with the short name (`llama.cpp`, `sglang`,
 `vllm`, `strata`, `openai`) and drops the quant first when space is short.
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
-`openai`) as the `backend` label on `llamabored_model_loaded`.
+`openai`) as the `engine` label on every per-model series (see
+**llama-metrics** under Features).
 
 **Speeds.** RECENT's PROMPT and GEN tok/s come from llama-swap, which has
 them only for llama.cpp. For a vLLM request they are measured by the
@@ -64,9 +65,10 @@ first over decode time (speculative decoding included). If several
 requests finished in that window, the row shows their average; if none
 did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
 per-request prefill or decode time, so its rows keep `--`. The same window
-speeds are on the exporter as `llamabored_model_prefill_tokens_per_second`
-and `llamabored_model_decode_tokens_per_second`, and at the end of the
-model's backend line on tty11 when it fits. Strata reports no histograms
+speeds are at the end of the model's backend line on tty11 when it fits;
+the exporter carries the counters they come from instead
+(`llamabored_model_prefill_seconds_total` and friends, see
+**llama-metrics** under Features). Strata reports no histograms
 but its lifetime `totals` (#54): prefill = Δ(prompt − reused tokens) ÷
 Δ`prompt_ms`, decode = Δoutput tokens ÷ Δ`decode_ms` (every output token,
 as Strata times them), over the same windows; a total going down is a
@@ -195,32 +197,99 @@ falls back to utilisation.
 **llama-metrics** (Prometheus)
 
 - `GET /metrics` on `:19477` for a CIDR allowlist. Numbers and model names
-  only; never prompt or output text. Everything the dashboards show is
-  exported (a test fails if a snapshot field is not):
+  only; never prompt or output text. Every snapshot field is exported (a
+  test fails if one is not).
+- It is the one scrape target: never scrape the engines through
+  llama-swap's `/upstream/<id>/…`, which can load a model (#70).
+- Since 0.5 (#71) every engine's numbers that mean the same thing are one
+  series, told apart by labels: `model` (the llama-swap model id, exact;
+  the join key), `engine` (`llamacpp`, `vllm`, `sglang`, `strata` or
+  `openai`), and `slot`, `state`, `status` and `reason` where they apply.
+- Names carry their unit, ratios are 0 to 1, only counters end in
+  `_total`, and descriptive strings live on `llamabored_model_info` only.
+  Counters count since llama-watch started: an engine restart or a model
+  unloading and coming back carries on from the total, and only a
+  llama-watch restart resets them (which `rate()` handles). A series an
+  engine cannot report is absent, not zero; a model that is not loaded has
+  no series at all, while the host series stay.
+
+Per model (labels `model`, `engine`):
+
+| Series | Type | Filled by |
+|---|---|---|
+| `llamabored_model_info{display_name, quant, kv_type, version}` | gauge, 1 | every engine (`version`: Strata; empty when unknown) |
+| `llamabored_model_state{state}` | gauge | every engine (`ready`, `starting`, `stopping`, `other`) |
+| `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context` |
+| `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata |
+| `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1 |
+| `llamabored_model_kv_cache_usage_ratio` | gauge | vLLM, SGLang; llama.cpp builds that still report it |
+| `llamabored_model_prompt_tokens_total` | counter | every engine (llama.cpp and OpenAI-compatible from llama-swap's activity rows) |
+| `llamabored_model_prompt_cached_tokens_total` | counter | llama.cpp (`cache_tokens`), vLLM, SGLang, Strata (`reused`) |
+| `llamabored_model_generation_tokens_total` | counter | every engine (llama.cpp `tokens_predicted_total`; OpenAI-compatible from activity rows) |
+| `llamabored_model_prefill_seconds_total`, `…_decode_seconds_total` | counter | llama.cpp (`prompt_seconds_total`, `tokens_predicted_seconds_total`), vLLM (per-request time sums), Strata (`prompt_ms`, `decode_ms`) |
+| `llamabored_model_requests_total{status}` | counter | every engine, from llama-swap's activity rows (`ok` is 2xx, else `error`) |
+| `llamabored_model_time_to_first_token_seconds` | summary (`_sum`, `_count`) | vLLM, SGLang |
+| `llamabored_model_inter_token_latency_seconds` | summary | vLLM, SGLang |
+| `llamabored_model_request_duration_seconds` | summary | vLLM, SGLang (e2e histograms); others from activity row durations |
+| `llamabored_model_spec_draft_tokens_total`, `…_spec_accepted_tokens_total` | counter | vLLM, Strata, llama.cpp (activity draft fields) |
+| `llamabored_model_spec_drafts_total` | counter | vLLM (the others count no draft rounds) |
+| `llamabored_model_preemptions_total`, `llamabored_model_sleeping` | counter, gauge | vLLM |
+| `llamabored_model_kv_block_size_tokens`, `llamabored_model_prefix_caching` | gauge | vLLM `cache_config_info` |
+| `llamabored_model_expert_cache_hit_ratio`, `…_pcie_share_ratio` | gauge | Strata: the newest finished request's `hit_rate`, `pcie_share` |
+| `llamabored_slot_context_used_tokens` | gauge | llama.cpp; labels `model`, `engine`, `slot` |
+| `llamabored_slot_context_resets_total{reason}` | counter | llama.cpp; labels `model`, `engine`, `slot`; best-guess reason (compacted, new, evicted, unknown) |
+
+The latencies are `summary` families with no quantiles: one `# TYPE …
+summary` and a `_sum` and `_count` sample per model, both counters to
+`rate()`. Not reported, so absent: TTFT and ITL for llama.cpp, Strata and
+OpenAI-compatible servers; prefill and decode seconds for SGLang and
+OpenAI-compatible servers; speculative counters for SGLang (it reports
+only gauges) and OpenAI-compatible servers.
+
+Host and exporter:
 
 | Series | Labels | Meaning |
 |---|---|---|
-| `llamabored_activity_pct`, `_load_pct`, `_cpu_pct`, `_cpu_topk_pct`, `_gpu_pct`, `_mem_pct` | | Host load, % |
+| `llamabored_activity_ratio` | | Activity, 0 to 1.25 (1 is nominal sustained load) |
+| `llamabored_load_ratio`, `_cpu_utilization_ratio`, `_cpu_topk_utilization_ratio`, `_gpu_utilization_ratio` | | Host load, 0 to 1 |
 | `llamabored_coolant_celsius`, `_cpu_celsius`, `_gpu_celsius` | | Temperatures |
 | `llamabored_gpu_power_watts`, `_gpu_power_limit_watts`, `_cpu_power_watts` | | Power draw and GPU limit |
 | `llamabored_gpu_memory_used_bytes`, `_total_bytes`; `llamabored_memory_used_bytes`, `_total_bytes` | | VRAM and system memory |
-| `llamabored_tokens_decoded_total`, `llamabored_tokens_prompt_total` | | Counters since the watcher started; use `rate()` for tok/s |
 | `llamabored_ai_state` | `state` | down / idle / loaded |
-| `llamabored_model_loaded`, `_model_ctx_size_tokens`, `_model_state` | `name`, `full_name`, ... | Loaded models, context size, lifecycle (ready / starting / stopping) |
-| `llamabored_slots_busy`, `llamabored_slots_total` | `name`, `full_name` | llama.cpp slots |
-| `llamabored_slot_ctx_used_tokens` | `name`, `full_name`, `slot` | Context a llama.cpp slot holds |
-| `llamabored_slot_ctx_resets_total` | `name`, `full_name`, `slot`, `reason` | Context drops by best-guess reason (compacted, new, evicted, unknown) |
-| `llamabored_model_prompt_tokens_total`, `_model_prompt_cached_tokens_total` | `name`, `full_name` | Prompt tokens and the cached part; hit ratio = `rate(cached) / rate(total)` |
-| `llamabored_model_requests_running`, `_requests_queued`, `_kv_cache_usage_ratio`, `_cache_hit_ratio` | `name`, `full_name` | SGLang / vLLM request and cache gauges |
-| `llamabored_model_spec_acceptance_ratio`, `_spec_accepted_length`; `_spec_drafts_total`, `_spec_draft_tokens_total`, `_spec_accepted_tokens_total` | `name`, `full_name` | Speculative decoding (vLLM, SGLang; Strata fills acceptance and the draft/accepted token totals, but counts no draft rounds, so no accepted length or drafts total) |
-| `llamabored_model_prefill_tokens_per_second`, `_decode_tokens_per_second` | `name`, `full_name` | Engine-measured prefill and decode tok/s over the last window (vLLM, Strata) |
-| `llamabored_model_expert_cache_hit_ratio`, `_pcie_share_ratio` | `name`, `full_name` | Strata: expert cache hit rate and PCIe share of the newest finished request, 0 to 1 |
-| `llamabored_model_ttft_seconds`, `_itl_seconds`, `_e2e_latency_seconds` | `name`, `full_name` | Mean time to first token, inter-token and request latency over the last window |
-| `llamabored_model_preemptions_total`, `_sleeping`, `_kv_block_size_tokens`, `_prefix_caching` | `name`, `full_name` | vLLM preemptions, engine sleep, cache config |
 | `llamabored_fan_rpm`, `llamabored_fan_pwm_ratio` | `channel`, `label` | FANS panel, when `[fans]` is on (read only) |
 | `llamabored_source_up`, `llamabored_source_latency_seconds` | `source` | Health of each watcher source (llama-swap, running, slots, metrics, activity, gpu, hwmon, proc) |
+| `llamabored_collector_suspected_loads_total` | `model` | Suspected model loads after an upstream read (#70); absent while there are none |
 | `llamabored_snapshot_up`, `_snapshot_stale`, `_snapshot_age_seconds`, `_snapshot_seq` | | Snapshot freshness |
 | `llamabored_exporter_build_info`, `_exporter_rejected_connections_total` | | Exporter version and refusals |
+
+Examples:
+
+```promql
+# Decode tok/s while generating, per model
+rate(llamabored_model_generation_tokens_total[5m])
+  / rate(llamabored_model_decode_seconds_total[5m])
+
+# Prompt cache hit ratio
+rate(llamabored_model_prompt_cached_tokens_total[5m])
+  / rate(llamabored_model_prompt_tokens_total[5m])
+
+# Speculative acceptance
+rate(llamabored_model_spec_accepted_tokens_total[5m])
+  / rate(llamabored_model_spec_draft_tokens_total[5m])
+
+# Mean time to first token, seconds
+rate(llamabored_model_time_to_first_token_seconds_sum[5m])
+  / rate(llamabored_model_time_to_first_token_seconds_count[5m])
+```
+
+Prefill tok/s is `rate(prompt_tokens_total - prompt_cached_tokens_total)`
+over `rate(prefill_seconds_total)` (every engine times only the tokens it
+computed). Add a display name with `* on (model, engine)
+group_left(display_name) llamabored_model_info`.
+
+**Dashboards need a migration for 0.5**: every per-model series changed
+its labels (`model` and `engine` instead of `name` and `full_name`) and
+many changed names. [CHANGELOG.md](CHANGELOG.md) has the old-to-new table.
 
 **Backends behind llama-swap.** llama-bored tells each model's server apart
 by its launch command (or `[llama.backends]` in `watch.toml`):
