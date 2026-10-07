@@ -121,6 +121,7 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
         },
         fans: Vec::new(),
         sources: None,
+        suspected_loads: Vec::new(),
     }
 }
 

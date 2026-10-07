@@ -79,6 +79,7 @@ fn valid() -> WireSnapshot {
         },
         fans: Vec::new(),
         sources: None,
+        suspected_loads: Vec::new(),
     }
 }
 
@@ -772,7 +773,61 @@ fn full() -> WireSnapshot {
         hwmon: up(0.0),
         proc: up(0.0),
     });
+    snap.suspected_loads = (0..wire::MAX_SUSPECTED_LOADS)
+        .map(|n| wire::SuspectedLoadWire {
+            model: format!("{n}{}", "x".repeat(wire::MAX_FULL_NAME_CHARS - 1)),
+            count: u64::MAX,
+        })
+        .collect();
     snap
+}
+
+#[test]
+fn suspected_loads_are_additive_and_bounded() {
+    // #70: an older watcher sends none; nothing writes the key when empty.
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#70 snapshot");
+    assert!(old.suspected_loads.is_empty());
+    let text = String::from_utf8(to_json(&valid()).expect("encode")).expect("utf8");
+    assert!(!text.contains("suspected"), "{text}");
+    let json = insert_after(
+        &base_json(),
+        "{",
+        r#""suspected_loads":[{"model":"qwen3.6-35b-a3b","count":3}],"#,
+    );
+    let snap = parse_validated(&json).expect("one row");
+    assert_eq!(snap.suspected_loads[0].count, 3);
+
+    let gauge_cases: [Mutate; 3] = [
+        |s| s.suspected_loads[0].count = 0,
+        |s| s.suspected_loads[1].model = s.suspected_loads[0].model.clone(),
+        |s| {
+            s.suspected_loads.push(wire::SuspectedLoadWire {
+                model: "one-more".to_owned(),
+                count: 1,
+            })
+        },
+    ];
+    for (i, bad) in gauge_cases.into_iter().enumerate() {
+        let mut snap = full();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+    let detail_cases: [Mutate; 3] = [
+        |s| s.suspected_loads[0].model = String::new(),
+        |s| s.suspected_loads[0].model = "a\nb".to_owned(),
+        |s| s.suspected_loads[0].model = "x".repeat(wire::MAX_FULL_NAME_CHARS + 1),
+    ];
+    for (i, bad) in detail_cases.into_iter().enumerate() {
+        let mut snap = full();
+        bad(&mut snap);
+        assert_eq!(validate(&snap), Err(WireError::Detail), "case {i}");
+    }
+    let json = insert_after(
+        &base_json(),
+        "{",
+        r#""suspected_loads":[{"model":"m","count":-1}],"#,
+    );
+    assert_eq!(parse_validated(&json), Err(WireError::Parse));
 }
 
 #[test]

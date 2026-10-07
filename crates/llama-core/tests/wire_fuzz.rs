@@ -69,6 +69,7 @@ fn sample() -> WireSnapshot {
         },
         fans: Vec::new(),
         sources: None,
+        suspected_loads: Vec::new(),
     }
 }
 

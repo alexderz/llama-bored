@@ -238,7 +238,8 @@ starts it, or a wrapper script), llama-watch reads that model's `/metrics`
 once while it is loaded and recognises the server by its metric names
 (`vllm:`, `sglang:`, `llamacpp:`), or Strata by the shape of its JSON (an
 object whose `engine` and `live` members are objects). It only ever reads models llama-swap
-reports as `ready`, so it never makes llama-swap load one.
+reports as `ready`, so it never makes llama-swap load one (see
+**Never swaps models** below).
 `[llama.backends]` overrides the detection. Once the server is known either
 way, its flags are read from the arguments after the image of a
 `podman run` / `docker run` command (the whole command when no image is
@@ -252,6 +253,48 @@ server in its own container, so pass it there with `-e`. Without it IN and
 OUT show the last finished exchange from llama-swap's request captures and
 the log says so once per model; SLOTS, ctx and resets still come from
 `/slots`, and a server restarted with the variable gets live text again.
+
+**Never swaps models (#70).** llama-swap starts, or swaps in, any model
+an `/upstream/<model>/…` request names that is not loaded, so llama-watch
+makes sure its own polling never does:
+
+- **Fresh gate.** Every upstream read (`/metrics`, `/slots`, the one-time
+  engine probe) is sent right after a `/running` read of its own, and only
+  for a model that read lists as `ready`. A model that was ready a moment
+  ago but is not in that read is skipped, not retried.
+- **No reads during a swap.** If that `/running` lists any model as
+  `starting`, `stopping` or in any other state, no upstream request is
+  made for the rest of that round.
+- **Self-check.** `/running` is read again just after each upstream read.
+  A model `starting` there, or an upstream read slower than 2 s, is a
+  suspected load: a warning names the model and path
+  (`<id>: suspected model load after GET /upstream/<id>/metrics (…)`), that
+  model gets no upstream reads for 5 minutes, and
+  `llamabored_collector_suspected_loads_total{model}` counts it.
+- A `409`, or any other non-2xx answer, from an upstream read means "not
+  available now": that model's engine series are dropped as on unload,
+  it is not read again that round, and llama-swap's `source_up` stays 1.
+  A 409 is logged once (`<id>: llama-swap says not loaded; skipping until
+  ready`). Redirects are never followed.
+
+When a model is not running, its series are simply absent: llama-metrics
+renders only what the snapshot holds, so the exposition stays valid and
+`llamabored_ai_state` is still there.
+
+llama-swap still decides between our `/running` read and our upstream
+read, so a short window remains (one request apart, normally well under
+a millisecond) in which another client's request can start a swap. As optional extra protection, list the
+poller's paths in llama-swap's `upstream.ignorePaths` (v256 and later):
+llama-swap then answers such a request for a model that is not loaded
+with `409` and never loads it. Listing `ignorePaths` replaces llama-swap's
+default pattern, so keep that one too:
+
+```yaml
+upstream:
+  ignorePaths:
+    - '.*\.(js|json|css|png|gif|jpg|jpeg|ico|txt)$'
+    - '^/(metrics|slots|props|health)$'
+```
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
 controller are optional; missing sources show "—".

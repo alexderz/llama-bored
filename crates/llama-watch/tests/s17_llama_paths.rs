@@ -5,7 +5,10 @@
 //! endpoint fails this scan until it is added here on purpose. #31's
 //! backend detection reuses `/upstream/<model>/metrics`: no new path.
 //! `tests/s31_ready_gate.rs` pins at runtime that no upstream path is
-//! requested for a model `/running` does not list as `ready`.
+//! requested for a model `/running` does not list as `ready`, in the
+//! `/running` read just before it (#70). The scan below pins that every
+//! upstream GET goes through that one fresh gate, `upstream_read`, and that
+//! the agent follows no redirect.
 
 use std::path::PathBuf;
 
@@ -81,7 +84,8 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
         ],
         "a new llama-swap path needs S17 updated on purpose"
     );
-    let mut leaves: Vec<String> = call_literals(&poller, "upstream")
+    // #70: the leaves are named only at the fresh gate's call sites.
+    let mut leaves: Vec<String> = call_literals(&poller, "upstream_read")
         .into_iter()
         .flatten()
         .collect();
@@ -150,21 +154,28 @@ fn the_scanner_finds_literals_in_calls() {
     );
 }
 
+/// The body of `fn name` in `code`, up to the next method.
+fn body(code: &str, name: &str) -> String {
+    code.split(&format!("fn {name}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{name}"))
+        .split("\n    fn ")
+        .next()
+        .expect("body")
+        .to_owned()
+}
+
+/// Byte offset of `needle` in `text`, which must hold it.
+fn at(text: &str, needle: &str, what: &str) -> usize {
+    text.find(needle)
+        .unwrap_or_else(|| panic!("{what}: no {needle:?}"))
+}
+
 #[test]
 fn upstream_reads_come_from_the_ready_list_only() {
     let poller = source("src/poller.rs");
-    let body = |name: &str| -> String {
-        poller
-            .split(&format!("fn {name}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{name}"))
-            .split("\n    fn ")
-            .next()
-            .expect("body")
-            .to_owned()
-    };
     // Only `ready` entries of a good `/running` read join the list.
-    let running = body("poll_running");
+    let running = body(&poller, "poll_running");
     assert!(running.contains(r#"if info.state != "ready" {"#));
     assert!(running.contains("self.ready.clear();"));
     let fill = running.find("self.ready.push(").expect("push");
@@ -172,20 +183,76 @@ fn upstream_reads_come_from_the_ready_list_only() {
         .find("if self.running_up {")
         .expect("running_up gate");
     assert!(gate < fill);
-    // #31: the probe walks that list before its one GET, at the server cap.
-    let probe = body("probe_backends");
-    let from_ready = probe
-        .find("self\n            .ready")
-        .expect("probe reads self.ready");
-    let get = probe.find("get_exact(").expect("GET");
-    assert!(from_ready < get);
-    assert!(probe.contains("SERVER_METRICS_CAP"));
-    assert!(probe.contains("upstream(&self.limits.url, &id, \"metrics\")"));
-    // Metrics and slots GETs, likewise, start from `self.ready`.
-    for name in ["poll_metrics", "poll_slots"] {
-        let text = body(name);
-        let from_ready = text.find(".ready").unwrap_or(usize::MAX);
-        let get = text.find("get_").expect("GET");
-        assert!(from_ready < get, "{name}");
+    // #70: any model not `ready` is a swap in progress.
+    assert!(running.contains(r#".any(|info| info.state != "ready")"#));
+}
+
+/// #70: one function makes every `/upstream/<id>/…` GET, and it reads
+/// `/running` itself just before, checks the swap and the `ready` list,
+/// and reads `/running` again just after for the self-check.
+#[test]
+fn every_upstream_get_goes_through_the_fresh_gate() {
+    let poller = source("src/poller.rs");
+    // The URL builder is called once, in the gate.
+    assert_eq!(
+        poller.matches("upstream(&").count(),
+        1,
+        "one upstream URL site"
+    );
+    assert_eq!(
+        poller.matches("\"upstream/").count(),
+        1,
+        "one upstream path"
+    );
+    let gate = body(&poller, "upstream_read");
+    let blocked = at(&gate, "if self.round_blocked", "gate");
+    let backed = at(&gate, "self.backed_off(id)", "gate");
+    let fresh = at(&gate, "self.poll_running();", "gate");
+    let swap = at(&gate, "if self.swapping {", "gate");
+    let ready = at(
+        &gate,
+        "self.ready.iter().find(|model| model.id == id)",
+        "gate",
+    );
+    let url = at(&gate, "upstream(&self.limits.url, &model.id, leaf)", "gate");
+    let get = at(&gate, "get_limited(&self.agent, &url", "gate");
+    assert!(
+        blocked < fresh && backed < fresh,
+        "skips come before the read"
+    );
+    assert!(fresh < swap && swap < ready && ready < url && url < get);
+    // Nothing but the `/running` read sits between the gate's check and
+    // the GET: no other request.
+    assert_eq!(gate[fresh..get].matches("get_").count(), 0);
+    assert_eq!(gate[fresh..get].matches("self.poll_").count(), 1);
+    // The check read, then the self-check, after the GET.
+    let check = gate[get..].find("self.poll_running();").expect("check") + get;
+    let suspect = at(&gate, "self.suspect_load(", "gate");
+    assert!(check < suspect);
+    assert!(gate.contains("SUSPECT_SLOW"));
+    // Every upstream reader goes through the gate and makes no GET itself.
+    for name in ["probe_backends", "poll_metrics", "poll_slots"] {
+        let text = body(&poller, name);
+        assert!(text.contains("self.upstream_read("), "{name}");
+        assert!(!text.contains("get_"), "{name} GETs itself");
+        assert!(!text.contains("upstream(&"), "{name} builds a URL");
     }
+    let suspect = body(&poller, "suspect_load");
+    assert!(suspect.contains("SUSPECT_BACKOFF"));
+    assert!(suspect.contains("Priority::Warning"));
+}
+
+/// #70: an upstream GET follows no redirect, so llama-swap cannot send it
+/// on to another model's path.
+#[test]
+fn the_llama_swap_agent_follows_no_redirect() {
+    let agent = body(&source("src/sources/llamaswap.rs"), "new_agent");
+    assert!(agent.contains(".max_redirects(0)"), "{agent}");
+    let poller = source("src/poller.rs");
+    assert!(poller.contains("let agent = llamaswap::new_agent();"));
+    assert_eq!(
+        poller.matches("Agent::").count(),
+        0,
+        "one agent, from new_agent"
+    );
 }

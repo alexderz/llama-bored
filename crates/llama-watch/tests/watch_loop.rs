@@ -1327,6 +1327,7 @@ fn empty_detail() -> LlamaDetail {
         capture: None,
         setup: Vec::new(),
         engine_live: Vec::new(),
+        suspected_loads: Vec::new(),
     }
 }
 

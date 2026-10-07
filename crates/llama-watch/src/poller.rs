@@ -10,9 +10,10 @@
 //!
 //! The taps run in series on this thread. With eight ready models the worst
 //! case is one `/running` timeout, eight `/metrics` timeouts, eight `/slots`
-//! timeouts, one activity timeout and one capture timeout. At the default
-//! timeouts that is 0.25 + 8×0.2 + 8×0.5 + 0.25 + 1 = 7.1 s when every call
-//! hangs. The consumer calls [`SampleRx::take`], which does not wait, so that
+//! timeouts, two `/running` timeouts around each of those sixteen (the
+//! fresh gate, #70), one activity timeout and one capture timeout. At the
+//! default timeouts that is 0.25 + 8×0.2 + 8×0.5 + 32×0.25 + 0.25 + 1 =
+//! 15.1 s when every call hangs. The consumer calls [`SampleRx::take`], which does not wait, so that
 //! hang cannot stall the main loop.
 //!
 //! IN and OUT for a model without `/slots` come from llama-swap's request
@@ -55,10 +56,28 @@
 //! one after it pass the server to the launch command parser, which reads
 //! a container's flags after its image (#67).
 //!
-//! Every `/upstream/<id>/…` GET, the probe included, is for a model the last
-//! good `/running` read listed as `ready`: an upstream request for any other
-//! model would make llama-swap load it. A `/running` failure clears the
-//! ready list, so nothing upstream is read until llama-swap answers again.
+//! llama-swap loads (or swaps in) a model on any `/upstream/<id>/…` request
+//! for a model that is not loaded, so polling must never make one (#31,
+//! #70). Every upstream GET, the probe and `/slots` included, goes through
+//! [`State::upstream_read`], the fresh gate: it reads `/running` itself,
+//! as the request just before that one GET, and sends it only if that
+//! read lists the model as `ready` and lists no model in any other state
+//! (a model starting or stopping is a swap in progress, and the rest of
+//! the round makes no upstream request at all). A read the gate drops is
+//! not retried. A `/running` failure clears the ready list, so nothing
+//! upstream is read until llama-swap answers again.
+//!
+//! The gate then reads `/running` again at once and checks itself: a
+//! model `starting` there, or a GET slower than 2 s, is a suspected load.
+//! It is logged as a warning with the model id and path, counted per
+//! model on the snapshot (`suspected_loads`), and that model gets no
+//! upstream reads for 5 minutes.
+//!
+//! A 409 (what llama-swap answers when the path is in its optional
+//! `upstream.ignorePaths` and the model is not loaded), or any other
+//! non-2xx answer, means "not available now": the model's engine numbers
+//! are dropped (as on unload) and it gets no more reads that round. A 409
+//! is logged once per change and is not a source failure.
 //!
 //! RECENT's PROMPT and GEN for a vLLM request come from the engine (#35,
 //! [`crate::speeds`]): llama-swap gives `-1` for them, so each new row of a
@@ -116,6 +135,13 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 const MODEL_PLACEHOLDER: &str = "model";
 /// Backend gauges older than this (or two metrics periods) are not shown.
 const FRESH_GAUGES: Duration = Duration::from_secs(1);
+/// An upstream read slower than this is a suspected model load (#70): a
+/// loaded server answers `/metrics` and `/slots` in milliseconds.
+const SUSPECT_SLOW: Duration = Duration::from_secs(2);
+/// No upstream reads for a model this long after a suspected load (#70).
+const SUSPECT_BACKOFF: Duration = Duration::from_secs(300);
+/// Most model ids whose suspected loads are counted (#70).
+const MAX_SUSPECTS: usize = 8;
 
 /// How long the last attempt at each tap took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,6 +182,9 @@ pub struct LlamaDetail {
     /// What each ready model's engine reports it is doing now, from a
     /// fresh `/metrics` read (Strata's `live`, #54).
     pub engine_live: Vec<ModelEngineLive>,
+    /// Suspected model loads this run (#70): `(llama-swap id, sanitised,
+    /// count)`, at most [`MAX_SUSPECTS`] ids. Empty when there were none.
+    pub suspected_loads: Vec<(String, u64)>,
 }
 
 /// One ready model's [`EngineLive`] (#54).
@@ -501,6 +530,36 @@ struct State<L> {
     textless_logged: HashSet<String>,
     capture_failed: bool,
     capture_oversize: bool,
+    /// Models that answered an upstream read with a non-2xx this round
+    /// (#70): no more upstream reads for them until the next round.
+    round_skip: HashSet<String>,
+    /// Ready models whose last upstream read got llama-swap's 409 "not
+    /// loaded" (#70), so it is logged once until a read succeeds or the
+    /// model leaves `ready`.
+    not_loaded: HashSet<String>,
+    /// The last good `/running` read listed a model in a state other than
+    /// `ready`: llama-swap is loading or unloading one (#70).
+    swapping: bool,
+    /// A gate read this round saw a swap: no more upstream reads until the
+    /// next round (#70).
+    round_blocked: bool,
+    /// Models with no upstream reads until the given time, after a
+    /// suspected load (#70).
+    backoff: HashMap<String, Instant>,
+    /// Suspected loads per model id this run (#70), at most
+    /// [`MAX_SUSPECTS`] ids.
+    suspected: Vec<(String, u64)>,
+}
+
+/// What [`State::upstream_read`] did.
+enum Gate {
+    /// No GET: the fresh `/running` read does not list the model as
+    /// `ready`, or it already had a non-2xx this round.
+    Skipped,
+    /// llama-swap answered 409: the model is not loaded. Already handled.
+    NotLoaded,
+    /// The GET was made. The model is as the fresh `/running` read gave it.
+    Read(ReadyModel, Result<Limited, TapError>),
 }
 
 fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: Receiver<()>) {
@@ -551,6 +610,12 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         textless_logged: HashSet::new(),
         capture_failed: false,
         capture_oversize: false,
+        round_skip: HashSet::new(),
+        not_loaded: HashSet::new(),
+        swapping: false,
+        round_blocked: false,
+        backoff: HashMap::new(),
+        suspected: Vec::new(),
     };
     let mut next_running = Instant::now();
     let mut next_metrics = Instant::now();
@@ -562,6 +627,10 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         }
         let now = Instant::now();
         let mut worked = false;
+        // One round of upstream reads per pass: a model that answered one
+        // with a non-2xx is not read again until the next pass (#70).
+        state.round_skip.clear();
+        state.round_blocked = false;
         if now >= next_running || state.running_due {
             state.poll_running();
             next_running = Instant::now() + state.limits.running_interval;
@@ -631,6 +700,9 @@ impl<L: Sink> State<L> {
         self.note_reach(down);
         self.ai = ai;
         self.running_up = down.is_none();
+        // Any model starting, stopping or in another state: a swap is in
+        // progress, and no upstream read is made until it is over (#70).
+        self.swapping = self.running_up && reading.models.iter().any(|info| info.state != "ready");
         if !self.running_up {
             self.recent.note_down();
         }
@@ -745,6 +817,7 @@ impl<L: Sink> State<L> {
         }
         self.fallback.retain(|id| ready.contains(id.as_str()));
         self.slots_textless.retain(|id| ready.contains(id.as_str()));
+        self.not_loaded.retain(|id| ready.contains(id.as_str()));
         self.gauges.retain(|id, _| ready.contains(id.as_str()));
         self.engine_facts
             .retain(|id, _| ready.contains(id.as_str()));
@@ -800,8 +873,9 @@ impl<L: Sink> State<L> {
     }
 
     /// One `/metrics` GET for each ready model that still needs a probe
-    /// this load (#31). Only models in `self.ready`, the last good
-    /// `/running` read's `ready` list, are probed.
+    /// this load (#31), through the fresh gate (#70). A model the gate
+    /// skips, or that llama-swap says is not loaded, keeps its probe for a
+    /// later round.
     fn probe_backends(&mut self) {
         let todo: Vec<String> = self
             .ready
@@ -810,15 +884,15 @@ impl<L: Sink> State<L> {
             .map(|model| model.id.clone())
             .collect();
         for id in todo {
-            let url = upstream(&self.limits.url, &id, "metrics");
-            let read = get_exact(
-                &self.agent,
-                &url,
-                self.limits.metrics_timeout,
-                SERVER_METRICS_CAP,
-            )
-            .map_err(TapError::label)
-            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
+            let read = match self.upstream_read(&id, "metrics", self.limits.metrics_timeout, |_| {
+                SERVER_METRICS_CAP
+            }) {
+                Gate::Read(model, read) if model.probe && !self.detected.contains_key(&id) => read,
+                Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => continue,
+            };
+            let read = exact(read)
+                .map_err(TapError::label)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
             let (kind, note) = match read.as_deref().map(detect_backend) {
                 Ok(Some(kind)) => (kind, format!("/metrics says {}", kind.as_str())),
                 Ok(None) => (
@@ -877,17 +951,21 @@ impl<L: Sink> State<L> {
         }
         let started = Instant::now();
         let mut failure: Option<&'static str> = None;
-        for model in &ready {
-            let url = upstream(&self.limits.url, &model.id, "metrics");
-            let read = get_exact(
-                &self.agent,
-                &url,
+        for listed in &ready {
+            let (model, read) = match self.upstream_read(
+                &listed.id,
+                "metrics",
                 self.limits.metrics_timeout,
-                metrics_cap(model.backend),
-            )
-            .map_err(TapError::label)
-            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
-            .map(|text| parse_metrics_full(model.backend, &text));
+                metrics_cap,
+            ) {
+                Gate::Read(model, read) if model.backend.has_metrics() => (model, read),
+                Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => continue,
+            };
+            let model = &model;
+            let read = exact(read)
+                .map_err(TapError::label)
+                .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
+                .map(|text| parse_metrics_full(model.backend, &text));
             let now = Instant::now();
             let mut live = None;
             let read = read.map(|(sample, facts)| {
@@ -951,6 +1029,134 @@ impl<L: Sink> State<L> {
         self.latencies.metrics = Some(started.elapsed());
     }
 
+    /// The fresh gate (#70), and the one place an `/upstream/<id>/<leaf>`
+    /// GET is made. llama-swap loads any model an upstream request names
+    /// that is not loaded, so:
+    ///
+    /// 1. It reads `/running` itself, as the request just before the GET.
+    /// 2. If that read lists any model in a state other than `ready`, a
+    ///    swap is in progress: no upstream read for the rest of the round.
+    /// 3. It GETs only if that read lists `id` as `ready`, `id` had no
+    ///    non-2xx answer this round, and `id` is not backed off.
+    /// 4. It reads `/running` again at once. A model `starting` there
+    ///    began loading during our GET (step 2 means none was before), and
+    ///    a GET slower than [`SUSPECT_SLOW`] may have waited for one: either
+    ///    is a suspected load. It is logged, counted, and `id` gets no
+    ///    upstream reads for [`SUSPECT_BACKOFF`].
+    ///
+    /// A dropped read is not retried; the next round asks again. `cap` is
+    /// given the model's server as the read in step 1 has it.
+    ///
+    /// A 409 (llama-swap's `upstream.ignorePaths` answer for a model that
+    /// is not loaded) or any other non-2xx answer: the model is not
+    /// available now. Its engine numbers go, as on unload, and it gets no
+    /// more reads this round. A 409 is logged once until a read succeeds or
+    /// the model leaves `ready`, and is no failure of any tap.
+    fn upstream_read(
+        &mut self,
+        id: &str,
+        leaf: &'static str,
+        timeout: Duration,
+        cap: impl FnOnce(Backend) -> usize,
+    ) -> Gate {
+        if self.round_blocked || self.round_skip.contains(id) || self.backed_off(id) {
+            return Gate::Skipped;
+        }
+        self.poll_running();
+        if self.swapping {
+            self.round_blocked = true;
+            return Gate::Skipped;
+        }
+        let Some(model) = self.ready.iter().find(|model| model.id == id).cloned() else {
+            return Gate::Skipped;
+        };
+        let url = upstream(&self.limits.url, &model.id, leaf);
+        let started = Instant::now();
+        let read = get_limited(&self.agent, &url, timeout, cap(model.backend));
+        let took = started.elapsed();
+        if let Err(TapError::NotLoaded) = &read {
+            // llama-swap refused without starting anything.
+            self.not_available(id);
+            if self.not_loaded.insert(id.to_owned()) {
+                log::emit(
+                    &mut self.log,
+                    Priority::Info,
+                    &format!("{id}: llama-swap says not loaded; skipping until ready"),
+                );
+            }
+            return Gate::NotLoaded;
+        }
+        self.poll_running();
+        let why = if self.running_up && self.swapping_to_start() {
+            Some("a model is starting after it".to_owned())
+        } else if took > SUSPECT_SLOW {
+            Some(format!("it took {:.1} s", took.as_secs_f64()))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.suspect_load(id, leaf, &why);
+        }
+        match &read {
+            Err(TapError::Status | TapError::Unauthorized) => self.not_available(id),
+            Ok(_) => {
+                self.not_loaded.remove(id);
+            }
+            Err(_) => {}
+        }
+        Gate::Read(model, read)
+    }
+
+    /// The last `/running` read lists a model as `starting`.
+    fn swapping_to_start(&self) -> bool {
+        self.models.iter().any(|model| model.state == "starting")
+    }
+
+    /// `id` is backed off after a suspected load. An expired entry goes.
+    fn backed_off(&mut self, id: &str) -> bool {
+        let now = Instant::now();
+        self.backoff.retain(|_, until| *until > now);
+        self.backoff.contains_key(id)
+    }
+
+    /// Our upstream read of `id` may have made llama-swap load a model
+    /// (#70): warn, count it, and leave `id` alone for [`SUSPECT_BACKOFF`].
+    fn suspect_load(&mut self, id: &str, leaf: &str, why: &str) {
+        self.backoff
+            .insert(id.to_owned(), Instant::now() + SUSPECT_BACKOFF);
+        self.round_skip.insert(id.to_owned());
+        if let Some((_, count)) = self.suspected.iter_mut().find(|(model, _)| model == id) {
+            *count = count.saturating_add(1);
+        } else if self.suspected.len() < MAX_SUSPECTS {
+            self.suspected.push((id.to_owned(), 1));
+        }
+        log::emit(
+            &mut self.log,
+            Priority::Warning,
+            &format!(
+                "{id}: suspected model load after GET /upstream/{id}/{leaf} ({why}); no upstream reads for it for {} s",
+                SUSPECT_BACKOFF.as_secs()
+            ),
+        );
+    }
+
+    /// `id` answered an upstream read with a non-2xx (#70): forget its
+    /// engine numbers and slots, as on unload, and skip it for the rest of
+    /// this round. Its counters stay: the process may well be the same.
+    fn not_available(&mut self, id: &str) {
+        self.round_skip.insert(id.to_owned());
+        self.gauges.remove(id);
+        self.engine_facts.remove(id);
+        self.forget_engine(id);
+        let keep: Vec<&str> = self
+            .ready
+            .iter()
+            .map(|model| model.id.as_str())
+            .filter(|model| *model != id)
+            .collect();
+        self.slots.retain_models(&keep);
+    }
+
     /// A non-llama.cpp model with no decode counter: count it from activity
     /// rows. Logged once per model per run; never a `metrics` failure.
     fn use_activity(&mut self, model: &ReadyModel, reason: &str) {
@@ -990,14 +1196,15 @@ impl<L: Sink> State<L> {
         self.slots.begin_round();
         let mut failure: Option<&'static str> = None;
         let mut oversize = false;
-        for model in &busy {
-            let url = upstream(&self.limits.url, &model.id, "slots");
-            match get_limited(
-                &self.agent,
-                &url,
-                self.limits.slots_timeout,
-                self.limits.slots_cap,
-            ) {
+        let cap = self.limits.slots_cap;
+        for listed in &busy {
+            let (model, read) =
+                match self.upstream_read(&listed.id, "slots", self.limits.slots_timeout, |_| cap) {
+                    Gate::Read(model, read) if model.backend.has_slots() => (model, read),
+                    Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => continue,
+                };
+            let model = &model;
+            match read {
                 Ok(Limited::Exact(bytes)) => {
                     if self.slots.apply(
                         &model.id,
@@ -1315,6 +1522,16 @@ impl<L: Sink> State<L> {
             capture: self.capture.as_ref().map(|(_, view)| view.clone()),
             setup: self.setup_with_engine(),
             engine_live: self.engine_live(now),
+            suspected_loads: self
+                .suspected
+                .iter()
+                .map(|(id, count)| {
+                    (
+                        sanitize(id, llama_core::detail::MAX_FULL_NAME_CHARS),
+                        *count,
+                    )
+                })
+                .collect(),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());
@@ -1450,6 +1667,9 @@ enum Limited {
 enum TapError {
     Timeout,
     Refused,
+    /// 409 on an upstream read: llama-swap says the model is not loaded
+    /// (its `upstream.ignorePaths` answer, #70).
+    NotLoaded,
     Status,
     /// 401 or 403: the server wants an API key llama-bored does not keep.
     Unauthorized,
@@ -1462,6 +1682,7 @@ impl TapError {
         match self {
             Self::Timeout => "timeout",
             Self::Refused => "connection refused",
+            Self::NotLoaded => "not loaded",
             Self::Status => "http status",
             Self::Unauthorized => "unauthorized, API key set",
             Self::Oversize => "oversized body",
@@ -1510,7 +1731,12 @@ fn get_exact(
     timeout: Duration,
     cap: usize,
 ) -> Result<Vec<u8>, TapError> {
-    match get_limited(agent, url, timeout, cap)? {
+    exact(get_limited(agent, url, timeout, cap))
+}
+
+/// An oversized body is an error.
+fn exact(read: Result<Limited, TapError>) -> Result<Vec<u8>, TapError> {
+    match read? {
         Limited::Exact(bytes) => Ok(bytes),
         Limited::Oversize => Err(TapError::Oversize),
     }
@@ -1532,6 +1758,9 @@ fn get_limited(
     let status = response.status().as_u16();
     if status == 401 || status == 403 {
         return Err(TapError::Unauthorized);
+    }
+    if status == 409 {
+        return Err(TapError::NotLoaded);
     }
     if status != 200 {
         return Err(TapError::Status);

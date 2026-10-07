@@ -77,6 +77,7 @@ fn publish(path: &std::path::Path, t_mono_ns: u64) {
         },
         fans: Vec::new(),
         sources: None,
+        suspected_loads: Vec::new(),
     };
     let bytes = wire::to_json(&snapshot).expect("json");
     std::fs::write(path, bytes).expect("write");

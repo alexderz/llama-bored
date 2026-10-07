@@ -319,6 +319,7 @@ fn metrics_extras_reach_the_wire() {
             }),
             ..Default::default()
         }),
+        suspected_loads: vec![("qwen3.6-35b-a3b".to_owned(), 2)],
     };
     publisher
         .publish_with(&snap, &llama, &extras)
@@ -333,6 +334,14 @@ fn metrics_extras_reach_the_wire() {
     assert_eq!(wire.host.mem_used_bytes, Some(64 << 30));
     assert_eq!(wire.host.mem_total_bytes, Some(128 << 30));
     assert_eq!(wire.tokens.prompt_total, Some(4_000));
+    // #70: suspected loads by llama-swap id.
+    assert_eq!(
+        wire.suspected_loads,
+        vec![wire::SuspectedLoadWire {
+            model: "qwen3.6-35b-a3b".to_owned(),
+            count: 2
+        }]
+    );
     let flash = &wire.ai.models[0];
     assert_eq!(
         (flash.running, flash.queued, flash.kv_fill, flash.cache_hit),
@@ -429,6 +438,12 @@ fn out_of_range_extras_are_left_out_not_fatal() {
             }),
             ..Default::default()
         }),
+        // #70: a zero, a repeat, an empty id and more than eight ids.
+        suspected_loads: [("zero", 0), ("a", 1), ("a", 5), ("\n", 1)]
+            .into_iter()
+            .map(|(id, count)| (id.to_owned(), count))
+            .chain((0..12).map(|n| (format!("m{n}"), 1)))
+            .collect(),
         ..Extras::default()
     };
     let snap = snapshot(
@@ -467,6 +482,13 @@ fn out_of_range_extras_are_left_out_not_fatal() {
             latency_s: None
         })
     );
+    let suspects: Vec<(&str, u64)> = wire
+        .suspected_loads
+        .iter()
+        .map(|row| (row.model.as_str(), row.count))
+        .collect();
+    assert_eq!(suspects.len(), wire::MAX_SUSPECTED_LOADS, "{suspects:?}");
+    assert_eq!(&suspects[..2], &[("a", 1), ("m0", 1)]);
     assert!(lines.lines().is_empty(), "{:?}", lines.lines());
 }
 

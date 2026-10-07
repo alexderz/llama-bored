@@ -79,6 +79,8 @@ pub struct Extras {
     pub fans: Vec<(u32, String, Option<u32>, Option<u8>)>,
     /// The tty health line, as wire sources. `None` while starting.
     pub sources: Option<Sources>,
+    /// Suspected model loads per llama-swap id, sanitised (#70).
+    pub suspected_loads: Vec<(String, u64)>,
 }
 
 /// One llama.cpp slot's context numbers for the wire (#10).
@@ -265,6 +267,7 @@ pub fn build(
         },
         fans: fans_of(&extras.fans),
         sources: extras.sources.map(sources_of),
+        suspected_loads: suspected_of(&extras.suspected_loads),
     }
 }
 
@@ -301,6 +304,26 @@ fn fans_of(fans: &[(u32, String, Option<u32>, Option<u8>)]) -> Vec<FanWire> {
             label,
             rpm: rpm.filter(|r| *r <= wire::MAX_FAN_RPM),
             pwm: pwm.map(|p| f32::from(p) / 255.0),
+        });
+    }
+    out
+}
+
+/// The first [`wire::MAX_SUSPECTED_LOADS`] valid, distinct rows (#70).
+fn suspected_of(rows: &[(String, u64)]) -> Vec<wire::SuspectedLoadWire> {
+    let mut out: Vec<wire::SuspectedLoadWire> = Vec::new();
+    for (model, count) in rows {
+        let model = sanitize(model, wire::MAX_FULL_NAME_CHARS);
+        if model.is_empty()
+            || *count == 0
+            || out.len() >= wire::MAX_SUSPECTED_LOADS
+            || out.iter().any(|row| row.model == model)
+        {
+            continue;
+        }
+        out.push(wire::SuspectedLoadWire {
+            model,
+            count: *count,
         });
     }
     out

@@ -137,5 +137,8 @@
     "gpu": { "up": true },
     "hwmon": { "up": false },
     "proc": { "up": true }
-  }
+  },
+  "suspected_loads": [
+    { "model": "qwen3.6-35b-a3b", "count": 2 }
+  ]
 }
