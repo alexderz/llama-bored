@@ -127,12 +127,24 @@ or more gets a yellow `!` after its bar. Without a context size the bar is
 scaled to the largest such row shown and marked `~`. With `chart_glyphs =
 "halves"` the heights fall back to `▄` and `█` and the colours carry the
 rest. Engines that report no cached count show all input as new.
+IN is always the whole prompt and CACHED its reused part (#82):
+llama-swap's `input_tokens` leaves the cached tokens out for llama.cpp
+and Strata (it takes their `timings`) and counts them for vLLM, SGLang
+and any OpenAI `usage`, so llama-watch reads it per engine, in one place,
+for IN, CACHED, the bar, the per-model prompt counters, the in-flight
+handover and the reset matching. A row of a model this run never saw
+loaded reads as the OpenAI form unless its cached count is above its
+input, which only the other form can give.
 
 ```text
  RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ████████
+>       18:47:20              Qwen 35B  69,632+   61,440     0  ...  36.4s ▅███████▁█▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp
    4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▁███████████▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
->       18:47:20              Qwen 35B  120,000        0     0  ...  36.4s ▁██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp c
 ```
+
+The first row is a llama.cpp request in prefill (#78): `/slots` gives
+what the slot holds so far, 61,440 reused and 8,192 computed, a lower
+bound of the prompt, so IN has a `+` and the bar no target.
 
 **In-flight rows.** Where the engine reports a request while it runs, it
 is RECENT's top row until llama-swap's finished row replaces it (never
@@ -193,6 +205,16 @@ screens lose no RECENT row to it):
   each busy slot's prompt plus generated tokens.
 
 `≈` is in the bundled fonts and in eurlatgr.
+
+**SLOTS progress.** A llama.cpp slot's count is the prompt tokens it
+computed beyond the cache against the whole prompt once it decodes
+(`11,000/91,000`, the bar full: cached and computed make the prompt). In
+prefill `/slots` gives no prompt length, so the count is against what the
+slot holds so far, a lower bound (`8,192/69,632+`), and the bar stays
+empty (#82). A new task whose reused prefix (`n_prompt_tokens_cache`) is
+far below what the slot held is a context drop by the usual rule (over
+30 % and 2,000 tokens), counted and marked on the sparkline, even when its
+prompt grew past the old context before the first poll that saw it.
 
 **SETUP.** Under the meters (one per row since #52), tty11 shows the
 settings of the model generating now, or else the one RECENT saw last:

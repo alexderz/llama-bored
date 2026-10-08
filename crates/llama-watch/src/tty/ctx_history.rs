@@ -102,6 +102,8 @@ pub struct CtxHistory {
     live: CtxPoint,
     /// The last value recorded, so an idle slot keeps its cached context.
     held: Option<u64>,
+    /// The task id of the last reading with one (#82).
+    task: Option<i64>,
 }
 
 impl CtxHistory {
@@ -127,6 +129,7 @@ impl CtxHistory {
             }),
             live: CtxPoint::default(),
             held: None,
+            task: None,
         }
     }
 
@@ -164,13 +167,41 @@ impl CtxHistory {
     /// before (llama-server reports an idle slot as 0) keeps the held value:
     /// its context is still cached until the next task says otherwise.
     pub fn sample(&mut self, used: Option<u64>, busy: bool) -> bool {
+        self.sample_cached(used, busy, None)
+    }
+
+    /// [`Self::sample`] for a slot running `task` with `cached` prompt
+    /// tokens reused (#82). A task id this history has not seen yet is a
+    /// new request; if it reused much less than the slot held, the context
+    /// dropped even when the new prompt already grew past the old one
+    /// before this reading (a short prefill between two polls).
+    pub fn sample_task(
+        &mut self,
+        used: Option<u64>,
+        busy: bool,
+        task: i64,
+        cached: Option<u64>,
+    ) -> bool {
+        let fresh = task >= 0 && self.task.is_some_and(|seen| seen != task);
+        if task >= 0 {
+            self.task = Some(task);
+        }
+        self.sample_cached(used, busy, cached.filter(|_| fresh))
+    }
+
+    fn sample_cached(
+        &mut self,
+        used: Option<u64>,
+        busy: bool,
+        new_task_cached: Option<u64>,
+    ) -> bool {
         let prev = self.held;
         let value = match (used, prev) {
             (Some(v), Some(p)) if !busy && v < p => Some(p),
             (Some(v), _) => Some(v),
             (None, p) => p,
         };
-        let reset = busy && matches!((used, prev), (Some(v), Some(p)) if is_drop(p, v));
+        let reset = dropped(prev, used, busy, new_task_cached);
         self.live.merge(CtxPoint {
             ms: 0,
             max: value,
@@ -278,6 +309,24 @@ impl CtxHistory {
             self.push(k + 1, full);
         }
     }
+}
+
+/// The rule both the sparkline and the drop counts use (#10, #82): only a
+/// busy slot drops, when its reading fell by [`is_drop`] from `prev`, or
+/// when a new task's reused prefix (`new_task_cached`, given only for a
+/// task id not seen before) is that far below it.
+#[must_use]
+pub fn dropped(
+    prev: Option<u64>,
+    used: Option<u64>,
+    busy: bool,
+    new_task_cached: Option<u64>,
+) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    busy && (used.is_some_and(|v| is_drop(prev, v))
+        || new_task_cached.is_some_and(|c| is_drop(prev, c)))
 }
 
 /// More than [`DROP_PCT`] percent and more than [`DROP_MIN_TOKENS`] down.
@@ -433,7 +482,12 @@ impl CtxBook {
             kept.last_seen = now;
             kept.swaps = self.swaps;
             let history = &mut kept.history;
-            history.sample(used_ctx(slot), slot.is_processing);
+            history.sample_task(
+                used_ctx(slot),
+                slot.is_processing,
+                slot.id_task,
+                slot.prompt_cached,
+            );
             if self.counted.len() < MAX_SLOTS || self.counted.contains_key(&key) {
                 let before = self.counted.insert(key.clone(), slot.resets);
                 for reason in ResetReason::ALL {
@@ -561,6 +615,43 @@ mod tests {
             input: Vec::new(),
             output: Vec::new(),
         }
+    }
+
+    /// #82: a new task that reused little of what the slot held is a
+    /// drop even when its prompt already grew past the old context before
+    /// the first poll that saw it. The same task, or one that reused the
+    /// held context, is not.
+    #[test]
+    fn a_new_task_reusing_little_marks_a_drop() {
+        let mut history = CtxHistory::new(6);
+        assert!(!history.sample_task(Some(80_000), true, 1, Some(0)));
+        // Task 2 finished a 100k prefill with nothing reused, unseen.
+        assert!(history.sample_task(Some(100_010), true, 2, Some(0)));
+        assert!(
+            !history.sample_task(Some(100_020), true, 2, Some(0)),
+            "same task"
+        );
+        // A continuation reuses the held context.
+        assert!(!history.sample_task(Some(120_000), true, 3, Some(100_020)));
+        // An idle reading never drops; a lone new task without a cached
+        // count falls back to the readings.
+        assert!(!history.sample_task(Some(0), false, 4, Some(0)));
+        assert!(!history.sample_task(Some(130_000), true, 5, None));
+        assert_eq!(history.held, Some(130_000));
+        let mut book = CtxBook::new(6);
+        let a = vec!["A".to_owned()];
+        let t0 = Instant::now();
+        let mut first = slot("A", 0, true, 80_000, 0);
+        first.prompt_cached = Some(0);
+        book.record(t0, &a, &[first]);
+        let mut next = slot("A", 0, true, 100_000, 10);
+        (next.id_task, next.prompt_cached) = (2, Some(0));
+        book.record(t0 + Duration::from_secs(1), &a, &[next]);
+        assert_eq!(
+            resets(&book.points("A", 0)),
+            1,
+            "the sparkline marks it too"
+        );
     }
 
     fn maxes(points: &[CtxPoint]) -> Vec<Option<u64>> {

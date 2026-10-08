@@ -1531,11 +1531,17 @@ fn layout_slots(slots: &[SlotView], history: &CtxBook) -> Vec<Slot> {
         .iter()
         .filter_map(|slot| {
             let id = u32::try_from(slot.id).ok()?;
+            // #82: the exact prompt once decoding; in prefill what the
+            // slot holds so far, a lower bound (`n_prompt_tokens` also
+            // holds the output, #78).
+            let exact = slot.prompt_total();
             Some(Slot {
                 id,
                 generating: slot.is_processing,
                 done: slot.n_prompt_tokens_processed,
-                total: slot.n_prompt_tokens,
+                cached: slot.prompt_cached.unwrap_or(0),
+                total: exact.unwrap_or(slot.n_prompt_tokens),
+                open: exact.is_none() && slot.is_processing,
                 decoded: slot.n_decoded,
                 ctx_prompt: slot.ctx_prompt,
                 n_ctx: slot.n_ctx,
@@ -1640,26 +1646,30 @@ fn layout_requests(
         }
     });
     let flying = !recent.flights.is_empty();
-    let finished = rows.iter().enumerate().map(|(index, row)| Activity {
-        n_ctx: recent.ctx_sizes.get(&row.model).copied(),
-        inflight: None,
-        live: !flying && index == 0 && state == WatchState::Generating,
-        id: u32::try_from(row.id).unwrap_or(0),
-        time: local_request_time(&row.time, zone),
-        source: row.source.clone(),
-        model: row.model.clone(),
-        input_tok: row.input_tokens.unwrap_or(0),
-        cached_tok: row.cached_tokens.unwrap_or(0),
-        output_tok: row.output_tokens.unwrap_or(0),
-        prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
-        gen_tps: row.gen_tps.or(row.engine_gen_tps),
-        prompt_measured: row.prompt_tps.is_none() && row.engine_prompt_tps.is_some(),
-        gen_measured: row.gen_tps.is_none() && row.engine_gen_tps.is_some(),
-        dur: match row.duration_ms {
-            Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
-            None => "--".to_owned(),
-        },
-        err: row.status.is_some_and(|code| !(200..300).contains(&code)),
+    let finished = rows.iter().enumerate().map(|(index, row)| {
+        // #82: the whole prompt and its cached part, per engine.
+        let prompt = row.prompt().unwrap_or_default();
+        Activity {
+            n_ctx: recent.ctx_sizes.get(&row.model).copied(),
+            inflight: None,
+            live: !flying && index == 0 && state == WatchState::Generating,
+            id: u32::try_from(row.id).unwrap_or(0),
+            time: local_request_time(&row.time, zone),
+            source: row.source.clone(),
+            model: row.model.clone(),
+            input_tok: prompt.whole,
+            cached_tok: prompt.cached,
+            output_tok: row.output_tokens.unwrap_or(0),
+            prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
+            gen_tps: row.gen_tps.or(row.engine_gen_tps),
+            prompt_measured: row.prompt_tps.is_none() && row.engine_prompt_tps.is_some(),
+            gen_measured: row.gen_tps.is_none() && row.engine_gen_tps.is_some(),
+            dur: match row.duration_ms {
+                Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
+                None => "--".to_owned(),
+            },
+            err: row.status.is_some_and(|code| !(200..300).contains(&code)),
+        }
     });
     flights.chain(finished).collect()
 }
@@ -2072,6 +2082,32 @@ mod tests {
         assert!(layout_requests(&rows, WatchState::Generating, Zone::utc(), &none)[0].live);
     }
 
+    /// #82: IN is the whole prompt and the bar's cached run its reused
+    /// part, whatever the engine's `input_tokens` meant.
+    #[test]
+    fn recent_in_and_the_bar_read_input_tokens_per_engine() {
+        let page = br#"{"data":[
+            {"id":3,"timestamp":"2026-10-03T10:00:03Z","model":"strata","tokens":{"input_tokens":21,"cache_tokens":102231}},
+            {"id":2,"timestamp":"2026-10-03T10:00:02Z","model":"vllm","tokens":{"input_tokens":9000,"cache_tokens":8192}},
+            {"id":1,"timestamp":"2026-10-03T10:00:01Z","model":"lcpp","tokens":{"input_tokens":500,"cache_tokens":100}}
+        ]}"#;
+        let mut rows = crate::activity::parse_activity(page).expect("page");
+        rows[0].engine = Some(Backend::Strata);
+        rows[1].engine = Some(Backend::Vllm);
+        rows[2].engine = Some(Backend::LlamaCpp);
+        let recent = RecentCtx {
+            flights: &[],
+            ctx_sizes: &BTreeMap::new(),
+            ids: &[],
+        };
+        let shown = layout_requests(&rows, WatchState::Ready, Zone::utc(), &recent);
+        let ins: Vec<(u64, u64)> = shown
+            .iter()
+            .map(|req| (req.input_tok, req.cached_tok))
+            .collect();
+        assert_eq!(ins, vec![(102_252, 102_231), (9_000, 8_192), (600, 100)]);
+    }
+
     #[test]
     fn recent_rows_use_engine_speeds_only_where_llama_swap_had_none() {
         let page = br#"{"data":[
@@ -2174,6 +2210,79 @@ mod tests {
         assert_eq!(slots[0].ctx_prompt, Some(91_000));
         assert_eq!(slots[0].n_ctx, Some(262_144));
         assert_eq!(slots[0].decoded, 816);
+    }
+
+    /// #82: SLOTS counts the processed tokens against the exact prompt once
+    /// the slot decodes, and against what it holds so far, a lower bound,
+    /// in prefill; b11429 bodies.
+    #[test]
+    fn layout_slots_counts_against_the_exact_prompt_or_a_lower_bound() {
+        let fixture = |name: &str| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/llama")
+                .join(name);
+            std::fs::read(path).expect("fixture")
+        };
+        let mut book = crate::slots::SlotBook::without_text();
+        assert!(book.apply("m", "m", &fixture("slots-b11429-prefill.json"), 0, 0));
+        let prefill = layout_slots(&book.slots(), &CtxBook::new(6));
+        // 61,440 cached + 8,192 processed so far; the prompt is longer.
+        assert_eq!(
+            (prefill[0].done, prefill[0].total, prefill[0].open),
+            (8_192, 69_632, true)
+        );
+        let mut book = crate::slots::SlotBook::without_text();
+        assert!(book.apply("m", "m", &fixture("slots-b11429-decode.json"), 0, 0));
+        let view = book.slots();
+        let decode = layout_slots(&view, &CtxBook::new(6));
+        let slot = &view[0];
+        assert!(slot.n_decoded > 0);
+        let exact = slot.prompt_total().expect("decoding: exact");
+        assert_eq!((decode[0].total, decode[0].open), (exact, false));
+        assert!(
+            exact < slot.n_prompt_tokens,
+            "the held count includes output"
+        );
+        assert_eq!(decode[0].done, slot.n_prompt_tokens_processed);
+        assert_eq!(decode[0].cached, slot.prompt_cached.unwrap_or(0));
+
+        let render = |slots: Vec<SlotView>| -> Vec<String> {
+            let sample = backend_sample(vec![served("m", "ready", None)]);
+            let mut tick = TickState::new(2, 6);
+            tick.heard = true;
+            tick.detail.slots = slots;
+            let ctx = frame_ctx(None, true);
+            let model = tty_model(
+                &sample,
+                &mut tick,
+                Instant::now(),
+                UNIX_EPOCH,
+                Zone::utc(),
+                &ctx,
+            );
+            let grid = layout::layout(&model, 240, 67);
+            (0..grid.rows())
+                .map(|row| {
+                    (0..grid.cols())
+                        .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                        .collect()
+                })
+                .collect()
+        };
+        let mut book = crate::slots::SlotBook::without_text();
+        assert!(book.apply("m", "m", &fixture("slots-b11429-prefill.json"), 0, 0));
+        let text = render(book.slots());
+        assert!(
+            text.iter().any(|row| row.contains("8,192/69,632+")),
+            "lower bound"
+        );
+        let pair = layout::comma_pair(decode[0].done, exact);
+        let text = render(view);
+        assert!(
+            text.iter()
+                .any(|row| row.contains(&pair) && !row.contains(&format!("{pair}+"))),
+            "exact: {pair}"
+        );
     }
 
     fn slot(id: i64, id_task: i64, busy: bool, input: &str, output: &str) -> SlotView {
@@ -2810,6 +2919,7 @@ mod tests {
             draft_tokens: None,
             draft_accepted: None,
             captured: false,
+            engine: None,
         };
         detail.activity = vec![row.clone()];
         assert_eq!(

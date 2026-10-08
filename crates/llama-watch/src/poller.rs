@@ -144,6 +144,8 @@ const SUSPECT_SLOW: Duration = Duration::from_secs(2);
 const SUSPECT_BACKOFF: Duration = Duration::from_secs(300);
 /// Most model ids whose suspected loads are counted (#70).
 const MAX_SUSPECTS: usize = 8;
+/// Most models whose server RECENT remembers for its rows (#82).
+const MAX_ROW_ENGINES: usize = 64;
 
 /// How long the last attempt at each tap took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -562,6 +564,11 @@ struct State<L> {
     /// Suspected loads per model id this run (#70), at most
     /// [`MAX_SUSPECTS`] ids.
     suspected: Vec<(String, u64)>,
+    /// The server of each model this run saw ready, by
+    /// [`activity::model_key`], at most [`MAX_ROW_ENGINES`] (#82): an
+    /// activity row's `input_tokens` is read by its engine, also after the
+    /// model unloads.
+    row_engines: HashMap<String, Backend>,
 }
 
 /// What [`State::upstream_read`] did.
@@ -631,6 +638,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         round_blocked: false,
         backoff: HashMap::new(),
         suspected: Vec::new(),
+        row_engines: HashMap::new(),
     };
     let mut next_running = Instant::now();
     let mut next_metrics = Instant::now();
@@ -786,6 +794,7 @@ impl<L: Sink> State<L> {
             }
         }
         let ready: HashSet<String> = self.ready.iter().map(|model| model.id.clone()).collect();
+        self.note_row_engines();
         if self.running_up {
             // A model that left `ready` in a good read was unloaded (or is
             // loading again), and one whose server changed is a new
@@ -849,6 +858,21 @@ impl<L: Sink> State<L> {
             self.slots.retain_models(&ids);
         }
         self.latencies.running = Some(started.elapsed());
+    }
+
+    /// Remember each ready model's server for its activity rows (#82). A
+    /// model still waiting for its `/metrics` probe is not known yet.
+    fn note_row_engines(&mut self) {
+        for model in &self.ready {
+            if model.probe && !self.detected.contains_key(&model.id) {
+                continue;
+            }
+            let key = activity::model_key(&model.id);
+            if self.row_engines.len() >= MAX_ROW_ENGINES && !self.row_engines.contains_key(&key) {
+                continue;
+            }
+            self.row_engines.insert(key, model.backend);
+        }
     }
 
     /// Drop `id`'s engine windows and attributed-speed reads (#31, #35).
@@ -1308,7 +1332,10 @@ impl<L: Sink> State<L> {
             ACTIVITY_CAP,
         ) {
             Ok(bytes) => match activity::parse_activity_rows(&bytes, activity::MAX_PAGE_ROWS) {
-                Some(rows) => {
+                Some(mut rows) => {
+                    for row in &mut rows {
+                        row.engine = self.row_engines.get(&row.model).copied();
+                    }
                     let merged = self.recent.merge(rows);
                     if merged.restarted {
                         log::emit(
@@ -1379,15 +1406,25 @@ impl<L: Sink> State<L> {
         for model in &self.ready {
             let key = activity::model_key(&model.id);
             for row in rows.iter().filter(|row| row.model == key) {
-                self.prompt_cache
-                    .add_row(&model.id, row.input_tokens, row.cached_tokens);
+                self.prompt_cache.add_row(
+                    &model.id,
+                    row.prompt_for(Some(model.backend)),
+                    row.cached_tokens.is_some(),
+                );
                 self.series
                     .add_row(&model.id, row, model.backend.has_slots());
             }
         }
         let window = self.limits.activity_interval + self.limits.activity_timeout;
-        let fallback: Vec<String> = self.fallback.iter().cloned().collect();
-        for id in &fallback {
+        let fallback: Vec<(String, Option<Backend>)> = self
+            .fallback
+            .iter()
+            .map(|id| {
+                let backend = self.ready.iter().find(|m| m.id == *id).map(|m| m.backend);
+                (id.clone(), backend)
+            })
+            .collect();
+        for (id, backend) in &fallback {
             let key = activity::model_key(id);
             let new_rows = || rows.iter().filter(|row| row.model == key);
             let tokens = new_rows()
@@ -1396,7 +1433,8 @@ impl<L: Sink> State<L> {
             self.counter.add(id, tokens, now, window);
             self.series.add_generation(id, tokens);
             let prompt = new_rows()
-                .filter_map(|row| row.input_tokens)
+                .filter_map(|row| row.prompt_for(*backend))
+                .map(|prompt| prompt.whole)
                 .fold(0u64, u64::saturating_add);
             self.prompt_box.add(id, prompt, now, window);
         }

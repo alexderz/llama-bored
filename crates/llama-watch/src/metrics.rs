@@ -1557,11 +1557,11 @@ pub const PROMPT_CACHE_MODELS: usize = 64;
 /// - SGLang and vLLM `/metrics` with both a prompt and a cached counter
 ///   ([`Self::observe_metrics`]): each read adds its delta, and a counter
 ///   that went down (the server restarted) adds its new value.
-/// - Otherwise llama-swap activity rows, once each ([`Self::add_row`]). A
-///   row with a known `cache_tokens` came from llama.cpp timings, where
-///   `input_tokens` counts only the tokens processed, so the prompt is
-///   `input + cache`. A row without it (OpenAI `usage`) counts `input` as the
-///   whole prompt and adds nothing cached.
+/// - Otherwise llama-swap activity rows, once each ([`Self::add_row`]),
+///   read per engine by [`crate::activity::prompt_split`] (#82): llama.cpp
+///   and Strata's `input_tokens` leave the cache out, vLLM, SGLang and
+///   OpenAI `usage` count it. A row with no `cache_tokens` adds nothing
+///   cached.
 ///
 /// A model keeps its counters for the whole run, across unloads, so a
 /// counter only goes back to zero when the watcher restarts. At most
@@ -1624,22 +1624,28 @@ impl PromptCache {
         }
     }
 
-    /// One new activity row of `model`. Ignored while `/metrics` counts it.
-    pub fn add_row(&mut self, model: &str, input: Option<u64>, cache: Option<u64>) {
+    /// One new activity row of `model`: its prompt as
+    /// [`crate::activity::ActivityRow::prompt_for`] reads it (#82), and
+    /// whether llama-swap gave a cached count at all. Ignored while
+    /// `/metrics` counts the model.
+    pub fn add_row(
+        &mut self,
+        model: &str,
+        prompt: Option<crate::activity::PromptSplit>,
+        cache_known: bool,
+    ) {
         let Some(totals) = self.entry(model) else {
             return;
         };
-        let Some(input) = input else {
+        let Some(prompt) = prompt else {
             return;
         };
         if totals.from_metrics {
             return;
         }
-        totals.prompt = totals
-            .prompt
-            .saturating_add(input.saturating_add(cache.unwrap_or(0)));
-        if let Some(cache) = cache {
-            totals.cached = Some(totals.cached.unwrap_or(0).saturating_add(cache));
+        totals.prompt = totals.prompt.saturating_add(prompt.whole);
+        if cache_known {
+            totals.cached = Some(totals.cached.unwrap_or(0).saturating_add(prompt.cached));
         }
     }
 
@@ -3074,31 +3080,46 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
         );
     }
 
+    /// One activity row through the #82 helper, as the poller adds it.
+    fn add(
+        cache: &mut PromptCache,
+        model: &str,
+        input: Option<u64>,
+        cached: Option<u64>,
+        engine: Backend,
+    ) {
+        let prompt = crate::activity::prompt_split(input, cached, Some(engine));
+        cache.add_row(model, prompt, cached.is_some());
+    }
+
     #[test]
     fn prompt_cache_counts_rows_once_and_prefers_metrics_counters() {
         let mut cache = PromptCache::default();
         assert_eq!(cache.get("llama"), None);
         // llama.cpp timings: input is what was processed, cache the reuse.
-        cache.add_row("llama", Some(69), Some(553));
-        cache.add_row("llama", Some(1_000), Some(0));
+        add(&mut cache, "llama", Some(69), Some(553), Backend::LlamaCpp);
+        add(&mut cache, "llama", Some(1_000), Some(0), Backend::LlamaCpp);
         assert_eq!(cache.get("llama"), Some((1_622, Some(553))));
         // An OpenAI usage row: the prompt only, nothing known cached.
-        cache.add_row("tabby", Some(300), None);
-        cache.add_row("tabby", None, Some(5));
+        add(&mut cache, "tabby", Some(300), None, Backend::OpenAi);
+        add(&mut cache, "tabby", None, Some(5), Backend::OpenAi);
         assert_eq!(cache.get("tabby"), Some((300, None)));
+        // #82: a vLLM row's input already counts its cached tokens.
+        add(&mut cache, "vllm", Some(9_000), Some(8_192), Backend::Vllm);
+        assert_eq!(cache.get("vllm"), Some((9_000, Some(8_192))));
 
         // SGLang: the first read is the baseline, then deltas, then a
         // server restart adds its new value. Rows are ignored meanwhile.
         cache.observe_metrics("flash", Some(10_000), Some(9_000));
         assert_eq!(cache.get("flash"), Some((0, Some(0))));
-        cache.add_row("flash", Some(123), None);
+        add(&mut cache, "flash", Some(123), None, Backend::SgLang);
         cache.observe_metrics("flash", Some(10_500), Some(9_400));
         assert_eq!(cache.get("flash"), Some((500, Some(400))));
         cache.observe_metrics("flash", Some(50), Some(10));
         assert_eq!(cache.get("flash"), Some((550, Some(410))));
         // Metrics without the cached counter: rows count again, from here.
         cache.observe_metrics("flash", Some(60), None);
-        cache.add_row("flash", Some(7), None);
+        add(&mut cache, "flash", Some(7), None, Backend::SgLang);
         assert_eq!(cache.get("flash"), Some((557, Some(410))));
         // Counters never go down within a run.
         cache.observe_metrics("flash", Some(100), Some(90));
@@ -3113,10 +3134,10 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
         let mut cache = PromptCache::default();
         cache.observe_metrics("m", Some(1_000), Some(100));
         cache.observe_metrics("m", Some(1_500), Some(300));
-        cache.add_row("m", Some(50), Some(5));
+        add(&mut cache, "m", Some(50), Some(5), Backend::LlamaCpp);
         assert_eq!(cache.get("m"), Some((500, Some(200))), "rows ignored");
         cache.forget("m");
-        cache.add_row("m", Some(50), Some(5));
+        add(&mut cache, "m", Some(50), Some(5), Backend::LlamaCpp);
         assert_eq!(cache.get("m"), Some((555, Some(205))), "rows count again");
         // A later metrics read is a new baseline, not a restart delta.
         cache.observe_metrics("m", Some(40), Some(4));
@@ -3154,7 +3175,13 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
         cache.observe_metrics("m", Some(10), Some(50));
         assert_eq!(cache.get("m"), Some((10, Some(10))));
         for i in 0..PROMPT_CACHE_MODELS + 5 {
-            cache.add_row(&format!("x{i}"), Some(1), Some(0));
+            add(
+                &mut cache,
+                &format!("x{i}"),
+                Some(1),
+                Some(0),
+                Backend::LlamaCpp,
+            );
         }
         assert_eq!(cache.models.len(), PROMPT_CACHE_MODELS);
         assert_eq!(cache.get(&format!("x{}", PROMPT_CACHE_MODELS + 1)), None);

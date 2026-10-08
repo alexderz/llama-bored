@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use llama_core::backend::Backend;
 use llama_core::rate::{counter_delta, delta_per_s};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -12,7 +13,7 @@ use crate::activity::{ActivityRow, model_key};
 use crate::config::PromptView;
 use crate::resets::{DISPLACED_MODELS, Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
 use crate::tty::chat_template::clean;
-use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, is_drop};
+use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, dropped};
 use crate::tty::grid::Cell;
 use crate::tty::sanitize::sanitize;
 
@@ -145,6 +146,8 @@ struct Tracked {
 #[derive(Debug, Default)]
 struct CtxTrack {
     held: Option<u64>,
+    /// The task id of the last reading with one (#82).
+    task: Option<i64>,
     resets: ResetCounts,
     last: Option<ResetReason>,
     /// A drop waiting for its evidence (#9).
@@ -178,18 +181,29 @@ impl CtxTrack {
     /// The [`crate::tty::ctx_history::CtxHistory::sample`] rule: only a busy
     /// slot can drop, and an idle slot that reads lower keeps its value.
     /// Returns the context held before a drop.
-    fn sample(&mut self, used: Option<u64>, busy: bool) -> Option<u64> {
+    ///
+    /// A task id not seen before is a new request: its reused prefix
+    /// `cached` far below what the slot held is a drop too (#82), so a
+    /// prefill that ends between two polls is not missed.
+    fn sample(
+        &mut self,
+        used: Option<u64>,
+        busy: bool,
+        task: i64,
+        cached: Option<u64>,
+    ) -> Option<u64> {
         let prev = self.held;
-        let dropped = match (used, prev) {
-            (Some(v), Some(p)) if busy && is_drop(p, v) => Some(p),
-            _ => None,
-        };
+        let fresh = task >= 0 && self.task.is_some_and(|seen| seen != task);
+        if task >= 0 {
+            self.task = Some(task);
+        }
+        let left = prev.filter(|_| dropped(prev, used, busy, cached.filter(|_| fresh)));
         self.held = match (used, prev) {
             (Some(v), Some(p)) if !busy && v < p => Some(p),
             (Some(v), _) => Some(v),
             (None, p) => p,
         };
-        dropped
+        left
     }
 
     /// Decide the pending drop with `cached` as its evidence. A prompt
@@ -238,13 +252,15 @@ fn prune_displaced(displaced: &mut HashMap<String, Displaced>, now: Instant) {
     displaced.retain(|_, lost| !lost.is_empty());
 }
 
-/// True when an activity row's prompt (`input + cache`, llama.cpp timings)
-/// is `prompt`, give or take 0.5 % (at least 8 tokens).
+/// True when an activity row's whole prompt is `prompt`, give or take
+/// 0.5 % (at least 8 tokens). The row is a llama.cpp model's, read by the
+/// one helper (#82); it needs a cached count, the drop's evidence.
 fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
-    let (Some(input), Some(cache)) = (row.input_tokens, row.cached_tokens) else {
+    if row.cached_tokens.is_none() {
         return false;
-    };
-    input.saturating_add(cache).abs_diff(prompt) <= (prompt / 200).max(8)
+    }
+    row.prompt_for(Some(Backend::LlamaCpp))
+        .is_some_and(|split| split.whole.abs_diff(prompt) <= (prompt / 200).max(8))
 }
 
 /// Slot numbers and tails across polls.
@@ -348,7 +364,12 @@ impl SlotBook {
             pending.prompt = total;
             pending.exact = true;
         }
-        let Some(left) = track.sample(used, slot.is_processing) else {
+        let Some(left) = track.sample(
+            used,
+            slot.is_processing,
+            slot.id_task,
+            slot.n_prompt_tokens_cache,
+        ) else {
             return;
         };
         // A drop still waiting when the next one comes is decided now.
@@ -1186,6 +1207,38 @@ mod tests {
         }
     }
 
+    /// #82: the drop blind spot. Task 2 reused nothing of the 80k the
+    /// slot held and finished its 100k prefill before the first poll that
+    /// saw it, so the slot reads higher than before: its reused prefix
+    /// still tells the drop, once, by the sparkline's rule.
+    #[test]
+    fn a_new_task_reusing_little_is_a_drop_though_it_grew() {
+        let body = |id_task: i64, prompt: u64, cached: u64, decoded: u64| {
+            serde_json::to_vec(&serde_json::json!([{
+                "id": 0,
+                "id_task": id_task,
+                "is_processing": true,
+                "n_ctx": 262_144,
+                "n_prompt_tokens": prompt + decoded.saturating_sub(1),
+                "n_prompt_tokens_cache": cached,
+                "n_prompt_tokens_processed": prompt - cached,
+                "next_token": [{"n_decoded": decoded}],
+            }]))
+            .expect("json")
+        };
+        for mut book in [SlotBook::default(), SlotBook::without_text()] {
+            assert!(book.apply("m", "M", &body(1, 80_000, 0, 1), 64, 64));
+            assert!(book.apply("m", "M", &body(2, 100_000, 0, 10), 64, 64));
+            assert!(book.apply("m", "M", &body(2, 100_000, 0, 20), 64, 64));
+            settle(&mut book);
+            assert_eq!(ctx_of(&book, 0), (Some(100_019), 1));
+            // A continuation that reused the held context is no drop.
+            assert!(book.apply("m", "M", &body(3, 120_000, 100_019, 5), 64, 64));
+            settle(&mut book);
+            assert_eq!(ctx_of(&book, 0), (Some(120_004), 1));
+        }
+    }
+
     #[test]
     fn slot_ctx_counts_survive_clear_and_unload_but_the_context_does_not() {
         let mut book = SlotBook::default();
@@ -1232,6 +1285,7 @@ mod tests {
             draft_tokens: None,
             draft_accepted: None,
             captured: false,
+            engine: None,
         }
     }
 

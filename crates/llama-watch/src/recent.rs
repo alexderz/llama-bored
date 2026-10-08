@@ -239,6 +239,7 @@ mod tests {
             draft_tokens: None,
             draft_accepted: None,
             captured: false,
+            engine: None,
         }
     }
 

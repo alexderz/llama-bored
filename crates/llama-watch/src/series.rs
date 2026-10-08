@@ -429,6 +429,7 @@ mod tests {
             draft_tokens: drafts.map(|(tokens, _)| tokens),
             draft_accepted: drafts.map(|(_, accepted)| accepted),
             captured: false,
+            engine: None,
         }
     }
 
