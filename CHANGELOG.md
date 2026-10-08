@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+- The snapshot size cap is 32 KiB, up from 16 KiB (#84), so per-model KV, counters, temperatures and fans fit with room to spare. Every reader takes the cap from llama-core; after upgrading, restart every unit so no older reader meets a larger snapshot.
+
 - RECENT's context-bar colours run red (smallest step) through green to blue (largest) instead of violet to orange, and the header key follows (#83).
 
 Ships as 0.5.0: the exporter's series change incompatibly (#71).
