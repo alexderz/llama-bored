@@ -44,6 +44,9 @@ buffer.</sub>
 
 `llama-core` is the shared library: the snapshot schema and its validator, the
 name sanitiser, logging.
+Every reader refuses a snapshot over 32 KiB, the cap llama-core sets (16 KiB
+before #84); after an upgrade, restart every unit so no older reader meets a
+larger snapshot.
 
 **Engine.** tty11's header always names the inference engine serving the
 shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
@@ -408,7 +411,7 @@ Per model (labels `model`, `engine`):
 | `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context` |
 | `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata |
 | `llamabored_model_inflight_requests` | gauge | every engine, from llama-swap's `/api/events` while a vLLM or SGLang model is loaded (#80); one aggregate per model, never a series per request |
-| `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1 |
+| `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1, or its `batch_slots` in parallel mode (#81) |
 | `llamabored_model_kv_cache_usage_ratio` | gauge | KV in use / capacity (#79), else the engine's own ratio: every engine but OpenAI-compatible |
 | `llamabored_model_kv_used_tokens`, `…_kv_capacity_tokens` | gauge | KV across all sessions (#79): llama.cpp (`/slots`), vLLM (ratio × `kv_cache_size_tokens`, block-rounded), SGLang, Strata |
 | `llamabored_model_kv_cached_tokens` | gauge | SGLang's reusable radix cache, not part of used (#79) |
