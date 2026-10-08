@@ -3358,11 +3358,13 @@ fn a_non_2xx_upstream_answer_skips_the_model_for_the_round() {
         .filter(|(_, at)| *at >= failed_at)
         .collect();
     // A `/slots` read never follows a failed `/metrics` read of the same
-    // round (they would be milliseconds apart).
+    // round: within a round they are a few milliseconds apart (two `/running`
+    // reads between them). Separate rounds can land under 100 ms apart on a
+    // loaded host, so the bound is 30 ms.
     for pair in after.windows(2) {
         if pair[0].0 == "/upstream/l/metrics" && pair[1].0 == "/upstream/l/slots" {
             assert!(
-                pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(100),
+                pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(30),
                 "{after:?}"
             );
         }
