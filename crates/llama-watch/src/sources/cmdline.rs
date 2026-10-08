@@ -35,6 +35,23 @@ pub struct Launch {
     /// `--max-running-requests` (SGLang) or `--max-num-seqs` (vLLM); 1 for
     /// Strata, which serves one request at a time.
     pub max_running: Option<u16>,
+    /// llama.cpp's KV layout (#79). `None` for other servers, and for a
+    /// command whose flags are not read as llama.cpp's.
+    pub kv: Option<KvLayout>,
+}
+
+/// How a llama-server lays out its KV cache (#79), from its flags; later
+/// flags win, as in llama.cpp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvLayout {
+    /// Every slot shares one pool: `--kv-unified` / `-kvu`, or, with
+    /// neither that nor `--no-kv-unified` / `-no-kvu`, an automatic slot
+    /// count (no `-np` / `--parallel`, or `-1`), which llama-server
+    /// b11429 and later turn into a unified cache.
+    pub unified: bool,
+    /// `--kv-unified-per-slot N`: each slot's `n_ctx` is capped at `N`,
+    /// so one slot's `n_ctx` no longer shows the whole pool.
+    pub per_slot_cap: bool,
 }
 
 /// Detect the server, then read its flags.
@@ -65,6 +82,7 @@ pub fn parse_launch_as(cmd: &str, known: Option<Backend>) -> Launch {
         backend: named,
         detail,
         max_running,
+        kv: (reader == Backend::LlamaCpp).then(|| kv_layout(&args[start..])),
     }
 }
 
@@ -290,6 +308,39 @@ fn server_flags(backend: Backend, args: &[&str]) -> (Option<ModelDetail>, Option
     (Some(detail), max_running)
 }
 
+/// llama-server's KV layout from its flags (#79): see [`KvLayout`].
+#[must_use]
+pub fn kv_layout(args: &[&str]) -> KvLayout {
+    let mut unified: Option<bool> = None;
+    let mut parallel: Option<i64> = None;
+    let mut per_slot_cap = false;
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (arg, None),
+        };
+        match flag {
+            "-kvu" | "--kv-unified" => unified = Some(true),
+            "-no-kvu" | "--no-kv-unified" => unified = Some(false),
+            "-np" | "--parallel" => {
+                parallel = inline.or_else(|| args.next()).and_then(|v| v.parse().ok());
+            }
+            "--kv-unified-per-slot" => {
+                per_slot_cap = inline
+                    .or_else(|| args.next())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .is_some_and(|n| n > 0);
+            }
+            _ => {}
+        }
+    }
+    KvLayout {
+        unified: unified.unwrap_or_else(|| parallel.is_none_or(|n| n < 0)),
+        per_slot_cap,
+    }
+}
+
 /// Parse the flags this display cares about. Later flags win, as in llama.cpp.
 #[must_use]
 pub fn parse(cmd: &str) -> ModelDetail {
@@ -478,6 +529,49 @@ mod tests {
     use super::*;
 
     const BONSAI: &str = "/models/prism/llama-server --host 127.0.0.1 --port 5800 -fa on --metrics\n-ctk q8_0 -ctv q8_0\n-m /models/llm/bonsai2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf\n-ngl 999 -c 262144\n";
+
+    /// #79: the llama.cpp KV layout; later flags win.
+    #[test]
+    fn llamacpp_kv_layout() {
+        let layout = |cmd: &str| parse_launch(cmd).kv;
+        let shared = Some(KvLayout {
+            unified: true,
+            per_slot_cap: false,
+        });
+        let own = Some(KvLayout {
+            unified: false,
+            per_slot_cap: false,
+        });
+        assert_eq!(
+            layout("llama-server -m m.gguf -c 65536"),
+            shared,
+            "auto slots"
+        );
+        assert_eq!(layout("llama-server -np -1"), shared);
+        assert_eq!(layout("llama-server -np 4"), own);
+        assert_eq!(layout("llama-server --parallel=2"), own);
+        assert_eq!(layout("llama-server -np 4 -kvu"), shared);
+        assert_eq!(
+            layout("llama-server --kv-unified -np 4 --no-kv-unified"),
+            own
+        );
+        assert_eq!(layout("llama-server -no-kvu"), own);
+        assert_eq!(
+            layout("llama-server -np 4 -kvu --kv-unified-per-slot 32768"),
+            Some(KvLayout {
+                unified: true,
+                per_slot_cap: true,
+            })
+        );
+        // Not llama.cpp, or flags a wrapper holds before the entry point.
+        assert_eq!(layout("vllm serve m --max-num-seqs 4"), None);
+        assert_eq!(layout("python3 -m sglang.launch_server --dp 2"), None);
+        assert_eq!(layout("env -np 4 llama-server -m m.gguf"), shared);
+        assert_eq!(
+            parse_launch_as("podman run img -np 2", Some(Backend::LlamaCpp)).kv,
+            own
+        );
+    }
 
     #[test]
     fn real_bonsai_command() {

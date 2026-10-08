@@ -903,6 +903,7 @@ fn backend_and_its_gauges_reach_the_wire() {
         kv_permille: Some(370),
         hit_permille: Some(800),
         engine: Default::default(),
+        kv: None,
     };
     let models = vec![
         model("flash", Some(gauges)),
@@ -1210,4 +1211,85 @@ fn hardware_rows_are_trimmed_from_the_end_to_fit_the_cap() {
         .filter(|l| l.contains("dropped"))
         .collect();
     assert_eq!(lines.len(), 1, "logged once: {:?}", log.lines());
+}
+
+/// #79: each model's KV reaches the wire as compact numbers, sets
+/// `kv_fill` to used / capacity, and is clamped into the wire's ranges.
+#[test]
+fn kv_reaches_the_wire_and_sets_the_fill() {
+    use llama_core::backend::{Backend, BackendInfo, KvUsage};
+
+    let dir = scratch("kv");
+    let mut publisher = Publisher::open(&dir, Capture::default()).expect("open");
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_millis(1);
+    let model =
+        |name: &str, kind: Backend, kv_permille: Option<u16>, kv: Option<KvUsage>| ModelInfo {
+            name: name.to_owned(),
+            state: "ready".to_owned(),
+            full_name: None,
+            detail: None,
+            backend: Some(BackendInfo {
+                kind,
+                kv_permille,
+                kv,
+                ..BackendInfo::default()
+            }),
+        };
+    let shared = KvUsage {
+        used: Some(50_000),
+        capacity: Some(131_072),
+        sessions: Some(2),
+        unified: Some(true),
+        unified_assumed: true,
+        ..KvUsage::default()
+    };
+    let vllm = KvUsage {
+        used: Some(77_319),
+        capacity: Some(187_440),
+        sessions: Some(1),
+        approx: true,
+        ..KvUsage::default()
+    };
+    let wild = KvUsage {
+        used: Some(u64::MAX),
+        capacity: Some(10),
+        cached: Some(11),
+        sessions: Some(u16::MAX),
+        ..KvUsage::default()
+    };
+    let models = vec![
+        model("qwen", Backend::LlamaCpp, None, Some(shared)),
+        model("v", Backend::Vllm, Some(412), Some(vllm)),
+        model("wild", Backend::SgLang, Some(999), Some(wild)),
+        model("ratio", Backend::SgLang, Some(270), None),
+    ];
+    let snap = snapshot(wall, Some(1.0), AiState::Loaded, models.clone());
+    let llama = view(AiState::Loaded, models, None);
+    publisher.publish(&snap, &llama).expect("publish");
+    let bytes = std::fs::read(dir.join("snapshot.json")).expect("read");
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    assert!(
+        text.contains(r#""kv":{"u":50000,"t":131072,"s":2,"h":true}"#),
+        "the assumption stays on the tty: {text}"
+    );
+    assert!(
+        text.contains(r#""kv":{"u":77319,"t":187440,"s":1,"a":true}"#),
+        "{text}"
+    );
+    let parsed = wire::parse_validated(&bytes).expect("parse");
+    let m = &parsed.ai.models;
+    assert_eq!(m[0].kv_fill, Some(50_000.0 / 131_072.0));
+    assert_eq!(m[1].kv_fill, Some((77_319.0f64 / 187_440.0) as f32));
+    let clamped = m[2].kv.expect("wild kv");
+    assert_eq!(
+        (
+            clamped.used,
+            clamped.capacity,
+            clamped.cached,
+            clamped.sessions
+        ),
+        (Some(10), Some(10), Some(10), Some(wire::MAX_REQS))
+    );
+    assert_eq!(m[2].kv_fill, Some(1.0));
+    assert_eq!((m[3].kv, m[3].kv_fill), (None, Some(0.27)));
 }

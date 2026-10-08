@@ -1,0 +1,3 @@
+[{"id":0,"id_task":31,"n_ctx":65536,"speculative":false,"is_processing":true,"n_prompt_tokens":41000,"n_prompt_tokens_processed":2200,"n_prompt_tokens_cache":38800,"next_token":[{"has_next_token":true,"n_decoded":120}]},
+ {"id":1,"id_task":27,"n_ctx":65536,"speculative":false,"is_processing":false,"n_prompt_tokens":9000,"n_prompt_tokens_processed":9000,"n_prompt_tokens_cache":0,"next_token":[{"has_next_token":false,"n_decoded":800}]},
+ {"id":2,"n_ctx":65536,"speculative":false,"is_processing":false}]

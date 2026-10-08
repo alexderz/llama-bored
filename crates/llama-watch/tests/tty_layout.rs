@@ -1578,7 +1578,7 @@ fn row_with(grid: &llama_watch::tty::grid::Grid, needle: &str) -> u16 {
 fn is_console_char(ch: char) -> bool {
     matches!(
         ch,
-        ' '..='~' | '█' | '▌' | '▐' | '░' | '▒' | '▓' | '▀' | '▄' | '·' | '…'
+        ' '..='~' | '█' | '▌' | '▐' | '░' | '▒' | '▓' | '▀' | '▄' | '·' | '…' | '≈'
     )
 }
 
@@ -3364,7 +3364,11 @@ fn sglang_model() -> TtyModel {
     ));
     model.slots_line = "--".to_string();
     model.slots = Vec::new();
-    model.backend_lines = vec!["sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %".to_string()];
+    // #79: the KV item from SGLang's token gauges.
+    model.backend_lines = vec![
+        "sglang  running 1/4 · queued 0 · KV 75k/204k tok 37 % · +31k cached · hit 50 %"
+            .to_string(),
+    ];
     model.text_note = "text needs llama.cpp /slots".to_string();
     model.in_title = "  IN".to_string();
     model.out_title = "  OUT".to_string();
@@ -3436,7 +3440,8 @@ fn vllm_model() -> TtyModel {
         Some(&info),
     ));
     model.backend_lines = vec![
-        "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
+        // #79: in use is vLLM's ratio × capacity: approximate.
+        "vllm  running 1 · queued 0 · KV \u{2248}77k/187k tok 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
             .to_string(),
     ];
     let measured = [
@@ -3478,7 +3483,8 @@ fn dump_vllm_goldens() {
     }
 }
 
-/// #33: a Strata model: one request at a time, no KV gauge.
+/// #33: a Strata model: one request at a time. #79: its KV is its batch
+/// slots' tokens.
 fn strata_model() -> TtyModel {
     let mut model = sglang_model();
     model.model_name = "bonsai-27b".to_string();
@@ -3497,7 +3503,8 @@ fn strata_model() -> TtyModel {
         Some(&detail),
         None,
     ));
-    model.backend_lines = vec!["strata  running 1/1 · queued 0".to_string()];
+    model.backend_lines =
+        vec!["strata  running 1/1 · queued 0 · KV 6k/524k tok 1 % · 2 sessions".to_string()];
     for req in &mut model.requests {
         req.model = "bonsai-27b".to_string();
     }
@@ -3524,6 +3531,14 @@ fn openai_model() -> TtyModel {
     model
 }
 
+/// #79: a llama.cpp model's KV line, under its slot rows: every slot's
+/// held tokens in the one pool they share.
+fn llamacpp_kv_model() -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    model.backend_lines = vec!["llamacpp  KV 91k/262k tok shared 35 % · 1 session".to_string()];
+    model
+}
+
 /// A golden file and the frame it holds.
 type EngineGolden = (&'static str, fn() -> TtyModel);
 
@@ -3531,6 +3546,37 @@ const ENGINE_GOLDENS: [EngineGolden; 2] = [
     ("strata-240.json", strata_model),
     ("openai-240.json", openai_model),
 ];
+
+const KV_GOLDENS: [(&str, u16, u16); 2] = [
+    ("kv-llamacpp-240.json", 240, 67),
+    ("kv-llamacpp-160x49.json", 160, 49),
+];
+
+#[test]
+fn llamacpp_kv_goldens_match_character_and_colour() {
+    for (name, _, _) in KV_GOLDENS {
+        let fix = load(name);
+        assert_frame(name, &fix, &llamacpp_kv_model());
+    }
+    // The line sits right under the slot rows, `≈`-free and whole.
+    let grid = draw(&llamacpp_kv_model(), 160, 49);
+    let slots = row_with(&grid, "SLOTS");
+    assert!(
+        row_string(&grid, slots + 2).ends_with("llamacpp  KV 91k/262k tok shared 35 % · 1 session"),
+        "{}",
+        row_string(&grid, slots + 2)
+    );
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #79 llama.cpp KV goldens"]
+fn dump_llamacpp_kv_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in KV_GOLDENS {
+        let grid = draw(&llamacpp_kv_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write kv golden");
+    }
+}
 
 #[test]
 fn engine_goldens_match_character_and_colour() {
@@ -3589,7 +3635,7 @@ fn sglang_frame_names_the_backend_and_its_gauges() {
         let slots = row_with(&grid, "SLOTS");
         let line = row_string(&grid, slots + 1);
         assert!(
-            line.contains("sglang  running 1/4 · queued 0 · KV 37 % · hit 50 %"),
+            line.contains("sglang  running 1/4 · queued 0 · KV 75k/204k tok 37 %"),
             "{cols}: {line}"
         );
         let in_row = (0..grid.rows())

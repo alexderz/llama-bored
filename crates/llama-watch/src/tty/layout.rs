@@ -184,7 +184,8 @@ pub struct TtyModel {
     pub prompt_ceiling: f64,
     pub slots: Vec<Slot>,
     /// One SLOTS line per ready model without `/slots` (T72), such as
-    /// `sglang  running 1 · queued 0 · KV 37 %`. Drawn under the slot rows.
+    /// `sglang  running 1 · queued 0 · KV 75k/204k tok 37 %`, then one per
+    /// llama.cpp model with KV numbers (#79). Drawn under the slot rows.
     pub backend_lines: Vec<String>,
     /// Drawn in IN and OUT while they are empty. Empty draws nothing.
     pub text_note: String,
@@ -538,8 +539,9 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
     col_u16(end.saturating_add(3))
 }
 
-/// Grey detail text. Printable ASCII, the `·` separator and `…` are drawn,
-/// any other scalar is `?`. Returns the cells used.
+/// Grey detail text. Printable ASCII, the `·` separator, `…` and `≈` (an
+/// approximate KV count, #79) are drawn, any other scalar is `?`. Returns
+/// the cells used.
 fn paint_detail(grid: &mut Grid, col: usize, row: usize, text: &str, cap: usize) -> usize {
     paint_detail_fg(grid, col, row, text, cap, C16::BrightBlack)
 }
@@ -555,7 +557,9 @@ fn paint_detail_fg(
 ) -> usize {
     let mut drawn = 0;
     for ch in text.chars().take(cap) {
-        let ch = if matches!(ch, '\u{00B7}' | '\u{2026}') || ('\u{20}'..='\u{7e}').contains(&ch) {
+        let ch = if matches!(ch, '\u{00B7}' | '\u{2026}' | '\u{2248}')
+            || ('\u{20}'..='\u{7e}').contains(&ch)
+        {
             ch
         } else {
             '?'
@@ -1710,7 +1714,8 @@ fn ctx_fill_frac(used: u64, n_ctx: u64) -> Option<f64> {
 }
 
 /// Thousands as `91k`. Smaller counts stay decimal. Truncates, so 91_816 is `91k`.
-fn compact_k(n: u64) -> String {
+#[must_use]
+pub fn compact_k(n: u64) -> String {
     if n < 1000 {
         n.to_string()
     } else {

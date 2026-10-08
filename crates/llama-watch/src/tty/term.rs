@@ -24,7 +24,9 @@ const MAX_ROWS: u16 = 512;
 /// The first ten are present in eurlatgr (parsed
 /// `/usr/lib/kbd/consolefonts/eurlatgr.psfu.gz`, 2026-09-25) and are all that
 /// `chart_glyphs = "halves"` draws. `…` (U+2026) is glyph 491 in that font; the
-/// RECENT table uses it to mark a name or address cut to the column.
+/// RECENT table uses it to mark a name or address cut to the column. `≈`
+/// (U+2248, glyph 484 there; appended to llama-hack's extras) marks an
+/// approximate KV count on a SLOTS engine line (#79).
 ///
 /// The last six are the lower eighths U+2581–2583 and U+2585–2587 (`▄` is
 /// above). eurlatgr lacks them; they are verified present in
@@ -33,7 +35,7 @@ const MAX_ROWS: u16 = 512;
 /// single-spaced meter bars (`▇`; `▄` in halves mode). `▔` (U+2594) is in that font too but
 /// is not drawn, so it is not here.
 pub const GLYPHS: &[char] = &[
-    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '▁', '▂', '▃', '▅', '▆', '▇',
+    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
 /// Columns and rows reported for the terminal.

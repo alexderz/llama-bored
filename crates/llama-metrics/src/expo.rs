@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use llama_core::detail::{self, KV_DEFAULT, ModelDetail};
 use llama_core::wire::{
-    self, AiWire, EngineWire, FanRowWire, FanWire, ModelState, ModelWire, SlotCtxWire,
+    self, AiWire, EngineWire, FanRowWire, FanWire, KvWire, ModelState, ModelWire, SlotCtxWire,
     SumCountWire, TempWire, WireSnapshot,
 };
 
@@ -283,9 +283,13 @@ fn counters(model: &ModelWire) -> Option<&wire::CountersWire> {
     model.counters.as_ref()
 }
 
+fn kv(model: &ModelWire) -> Option<&KvWire> {
+    model.kv.as_ref()
+}
+
 /// Per-model families with one sample per model, in export order: the
 /// first ten, then the requests and the latency summaries, then the rest.
-const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 19] = [
+const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 24] = [
     (
         "llamabored_model_context_size_tokens",
         "gauge",
@@ -319,8 +323,15 @@ const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 19] = [
     (
         "llamabored_model_kv_cache_usage_ratio",
         "gauge",
-        "KV cache fill, 0 to 1.",
-        |m| m.kv_fill.filter(|v| v.is_finite()).map(num),
+        "KV cache fill across all sessions, 0 to 1: used / capacity tokens, else the engine's own ratio.",
+        |m| {
+            kv(m)
+                .and_then(KvWire::ratio)
+                .map(|ratio| ratio as f32)
+                .or(m.kv_fill)
+                .filter(|v| v.is_finite())
+                .map(num)
+        },
     ),
     (
         "llamabored_model_prompt_tokens_total",
@@ -432,6 +443,37 @@ const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 19] = [
                 .filter(|v| v.is_finite())
                 .map(num)
         },
+    ),
+    // #79: the KV cache across all sessions.
+    (
+        "llamabored_model_kv_used_tokens",
+        "gauge",
+        "KV cache tokens held for live sessions, idle llama.cpp and Strata slots included (vLLM: its usage ratio times the capacity, block-rounded).",
+        |m| kv(m).and_then(|kv| kv.used).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_kv_capacity_tokens",
+        "gauge",
+        "KV cache capacity, tokens (llama.cpp with a unified cache: the one pool every slot shares).",
+        |m| kv(m).and_then(|kv| kv.capacity).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_kv_cached_tokens",
+        "gauge",
+        "KV cache tokens kept only as reusable prefix cache, not held by a session (SGLang).",
+        |m| kv(m).and_then(|kv| kv.cached).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_kv_sessions",
+        "gauge",
+        "Sessions holding KV cache: slots with tokens (llama.cpp, Strata), else running requests.",
+        |m| kv(m).and_then(|kv| kv.sessions).map(|n| n.to_string()),
+    ),
+    (
+        "llamabored_model_kv_unified",
+        "gauge",
+        "llama.cpp: 1 when every slot shares one KV pool, 0 when each slot has its own.",
+        |m| kv(m).and_then(|kv| kv.unified).map(flag),
     ),
 ];
 

@@ -13,6 +13,12 @@
 //! ([`CACHE_KEYS`]), each value capped at [`MAX_LABEL_VALUE`] bytes.
 //! [`detect_backend`] tells a server the launch command did not name by
 //! its metric prefix.
+//!
+//! #79 reads each engine's KV cache in tokens ([`KvTokens`]): SGLang's
+//! `kv_used_tokens`, `kv_evictable_tokens` and `max_total_num_tokens`
+//! gauges (they lag the scheduler by up to 40 decode steps), vLLM's
+//! `cache_config_info` capacity times its usage ratio, and Strata's batch
+//! slots. llama.cpp's comes from `/slots` ([`crate::kv`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -34,6 +40,11 @@ struct Names {
     queued: &'static [&'static str],
     /// KV fill 0..=1, newest name first; the first name that appears wins.
     kv: &'static [&'static str],
+    /// KV tokens held by running requests, held as reusable cache, and the
+    /// pool's size (#79). SGLang only; summed across label sets.
+    kv_used: &'static [&'static str],
+    kv_cached: &'static [&'static str],
+    kv_capacity: &'static [&'static str],
     /// Cache hit ratio 0..=1.
     hit: &'static [&'static str],
     /// Prefix cache hit and query counters, for a ratio.
@@ -85,8 +96,12 @@ const LLAMACPP: Names = Names {
     // #71: requests waiting for a slot. Read for llama-metrics only; the
     // tty keeps its slot view.
     queued: &["llamacpp:requests_deferred"],
-    // Older llama-server builds only; newer ones dropped it.
+    // Older llama-server builds only; b11429 and later dropped it, and the
+    // KV tokens come from `/slots` (#79).
     kv: &["llamacpp:kv_cache_usage_ratio"],
+    kv_used: NONE,
+    kv_cached: NONE,
+    kv_capacity: NONE,
     hit: &[],
     prefix_hits: &[],
     prefix_queries: &[],
@@ -117,7 +132,13 @@ const SGLANG: Names = Names {
     running: &["sglang:num_running_reqs"],
     prompt: &["sglang:prompt_tokens_total"],
     queued: &["sglang:num_queue_reqs"],
-    kv: &["sglang:token_usage"],
+    // #79: not `token_usage`, which is the fullest of the full-attention,
+    // sliding-window and Mamba pools. The KV fill is used / capacity from
+    // the token gauges; this ratio is the fallback.
+    kv: &["sglang:full_token_usage"],
+    kv_used: &["sglang:kv_used_tokens"],
+    kv_cached: &["sglang:kv_evictable_tokens"],
+    kv_capacity: &["sglang:max_total_num_tokens"],
     hit: &["sglang:cache_hit_rate"],
     prefix_hits: &[],
     prefix_queries: &[],
@@ -150,6 +171,10 @@ const VLLM: Names = Names {
     prompt: &["vllm:prompt_tokens_total"],
     queued: &["vllm:num_requests_waiting"],
     kv: &["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
+    // The capacity is a `cache_config_info` label (#79).
+    kv_used: NONE,
+    kv_cached: NONE,
+    kv_capacity: NONE,
     hit: &[],
     prefix_hits: &["vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"],
     prefix_queries: &[
@@ -187,7 +212,16 @@ const VLLM: Names = Names {
 };
 
 /// `cache_config_info` label keys read; every other label is skipped.
-pub const CACHE_KEYS: [&str; 3] = ["cache_dtype", "block_size", "enable_prefix_caching"];
+/// #79 adds the KV capacity in tokens and in blocks, and how many
+/// full-length requests fit.
+pub const CACHE_KEYS: [&str; 6] = [
+    "cache_dtype",
+    "block_size",
+    "enable_prefix_caching",
+    "kv_cache_size_tokens",
+    "num_gpu_blocks",
+    "kv_cache_max_concurrency",
+];
 /// Longest label value kept, bytes. A longer value is dropped.
 pub const MAX_LABEL_VALUE: usize = 64;
 /// Most labels scanned on one series line.
@@ -257,8 +291,11 @@ pub struct MetricsSample {
     pub prompt_total: Option<u64>,
     /// Requests waiting. SGLang and vLLM only.
     pub queued: Option<f64>,
-    /// KV cache fill, 0..=1.
+    /// KV cache fill, 0..=1: used / capacity where [`Self::kv`] has both
+    /// (#79), else the engine's own ratio.
     pub kv_fill: Option<f64>,
+    /// KV cache tokens across every session, and the capacity (#79).
+    pub kv: KvTokens,
     /// Prefix cache hit ratio, 0..=1.
     pub cache_hit: Option<f64>,
     /// Cached prompt-token counter (`sglang:cached_tokens_total`,
@@ -297,6 +334,35 @@ pub struct MetricsSample {
     pub predicted_seconds: Option<f64>,
 }
 
+/// A model's KV cache in tokens, from its `/metrics` (#79). llama.cpp's
+/// comes from `/slots` instead ([`crate::kv`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvTokens {
+    /// Tokens held for live sessions: SGLang's `kv_used_tokens`, vLLM's
+    /// usage ratio × capacity, Strata's slots.
+    pub used: Option<u64>,
+    /// The pool's size: SGLang's `max_total_num_tokens`, vLLM's
+    /// `kv_cache_size_tokens` (else `num_gpu_blocks` × `block_size`),
+    /// Strata's `context` × `batch_slots`.
+    pub capacity: Option<u64>,
+    /// Tokens held only as reusable cache: SGLang's `kv_evictable_tokens`.
+    pub cached: Option<u64>,
+    /// Strata's slots that hold tokens. Other engines leave it `None`:
+    /// their sessions are the running requests.
+    pub sessions: Option<u64>,
+    /// [`Self::used`] is a block-rounded ratio times the capacity (vLLM).
+    pub approx: bool,
+}
+
+impl KvTokens {
+    /// `used / capacity`, when both are known and the capacity is not 0.
+    #[must_use]
+    pub fn ratio(&self) -> Option<f64> {
+        let (used, capacity) = (self.used?, self.capacity?);
+        (capacity > 0).then(|| used.min(capacity) as f64 / capacity as f64)
+    }
+}
+
 /// llama.cpp parse, the pre-T72 behaviour. See [`parse_metrics_for`].
 #[must_use]
 pub fn parse_metrics(body: &str) -> MetricsSample {
@@ -330,6 +396,10 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut prompt = Acc::default();
     let mut queued = Acc::default();
     let mut kv: [Option<f64>; 2] = [None, None];
+    let mut kv_used = Acc::default();
+    let mut kv_cached = Acc::default();
+    let mut kv_capacity = Acc::default();
+    let mut vllm_capacity: Option<u64> = None;
     let mut hit = None;
     let mut hits = Acc::default();
     let mut queries = Acc::default();
@@ -365,6 +435,12 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             prompt_seconds.add(value, names.sum);
         } else if names.predicted_seconds.contains(&name) {
             predicted_seconds.add(value, names.sum);
+        } else if names.kv_used.contains(&name) {
+            kv_used.add(value, names.sum);
+        } else if names.kv_cached.contains(&name) {
+            kv_cached.add(value, names.sum);
+        } else if names.kv_capacity.contains(&name) {
+            kv_capacity.add(value, names.sum);
         } else if let Some(index) = names.kv.iter().position(|kv_name| *kv_name == name) {
             if let Some(slot) = kv.get_mut(index) {
                 *slot = max_ratio(*slot, value);
@@ -388,6 +464,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         } else if names.cache_info.contains(&name) {
             if facts.is_none() {
                 facts = Some(cache_facts(line));
+                vllm_capacity = cache_capacity(line);
             }
         } else if let Some(index) = [
             names.spec_drafts,
@@ -454,12 +531,33 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         decode: phase(&hists[5], &hists[6]),
     }
     .reported();
+    let engine_fill = kv[0].or(kv[1]);
+    let kv = match vllm_capacity {
+        // vLLM (#79): its ratio counts blocks, so the tokens are rounded.
+        Some(capacity) => KvTokens {
+            used: engine_fill.and_then(|fill| finite_u64((fill * capacity as f64).round())),
+            capacity: Some(capacity),
+            approx: true,
+            ..KvTokens::default()
+        },
+        None => KvTokens {
+            used: kv_used.0.and_then(finite_u64),
+            capacity: kv_capacity.0.and_then(finite_u64).filter(|n| *n > 0),
+            cached: kv_cached.0.and_then(finite_u64),
+            ..KvTokens::default()
+        },
+    };
     let sample = MetricsSample {
         n_decode_total: decode.0.and_then(finite_u64),
         requests_processing: running.0,
         prompt_total: prompt.0.and_then(finite_u64),
         queued: queued.0,
-        kv_fill: kv[0].or(kv[1]),
+        kv_fill: if kv.approx {
+            engine_fill
+        } else {
+            kv.ratio().or(engine_fill)
+        },
+        kv,
         cache_hit: hit.or(prefix),
         cached_total: cached.iter().find_map(|acc| acc.0).and_then(finite_u64),
         spec,
@@ -516,9 +614,12 @@ impl HistAcc {
     }
 }
 
-/// The three known keys of a `cache_config_info` line ([`CACHE_KEYS`]).
+/// The known keys of a `cache_config_info` line ([`CACHE_KEYS`]).
 /// `cache_dtype` must be a detail token; `block_size` a whole number in
-/// 1..=[`MAX_KV_BLOCK`]; `enable_prefix_caching` `True` or `False`.
+/// 1..=[`MAX_KV_BLOCK`]; `enable_prefix_caching` `True` or `False`. The
+/// KV capacity in tokens and blocks, and the max concurrency rounded to
+/// two decimals, become SETUP's `engine:kv_tokens`, `engine:kv_blocks`
+/// and `engine:kv_max_concurrency` (#79) when they are plain numbers.
 fn cache_facts(line: &str) -> EngineFacts {
     let labels = labels_of(line);
     let get = |key: &str| {
@@ -527,7 +628,22 @@ fn cache_facts(line: &str) -> EngineFacts {
             .find(|(name, _)| *name == key)
             .map(|(_, value)| value.as_str())
     };
+    let mut values = EngineValues::new();
+    for (key, label) in [("kv_tokens", CACHE_KEYS[3]), ("kv_blocks", CACHE_KEYS[4])] {
+        if let Some(text) = get(label).filter(|text| is_plain_number(text)) {
+            values.insert(key, text.to_owned());
+        }
+    }
+    if let Some(text) = get(CACHE_KEYS[5])
+        .and_then(|text| text.parse::<f64>().ok())
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n < 1e12)
+        .map(|n| format!("{n:.2}"))
+        .filter(|text| is_plain_number(text))
+    {
+        values.insert("kv_max_concurrency", text);
+    }
     EngineFacts {
+        values,
         ctx: None,
         kv: get(CACHE_KEYS[0])
             .map(str::to_ascii_lowercase)
@@ -542,6 +658,22 @@ fn cache_facts(line: &str) -> EngineFacts {
         },
         ..EngineFacts::default()
     }
+}
+
+/// vLLM's KV capacity in tokens from a `cache_config_info` line (#79):
+/// `kv_cache_size_tokens` (right for hybrid models, whose blocks are not
+/// all attention), else `num_gpu_blocks` × `block_size`. `None` when
+/// neither gives a positive whole number.
+fn cache_capacity(line: &str) -> Option<u64> {
+    let labels = labels_of(line);
+    let get = |key: &str| {
+        labels
+            .iter()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    };
+    get(CACHE_KEYS[3]).or_else(|| get(CACHE_KEYS[4])?.checked_mul(get(CACHE_KEYS[1])?))
 }
 
 /// The value of label `key` on a series line, under [`labels_of`]'s rules.
@@ -630,7 +762,7 @@ pub const MAX_ENGINE_VALUE: usize = 16;
 /// Every key the engine parsers fill (Strata's, #54). `[setup]`'s
 /// `engine:<key>` must name one of these; nothing else of the JSON is
 /// reachable.
-pub const ENGINE_KEYS: [&str; 30] = [
+pub const ENGINE_KEYS: [&str; 33] = [
     // `engine` object: the server's own settings.
     "engine",
     "version",
@@ -667,6 +799,11 @@ pub const ENGINE_KEYS: [&str; 30] = [
     "last_drafts_accepted",
     // `live.max_tokens` of the request in flight.
     "max_tokens",
+    // vLLM's `cache_config_info` (#79): the KV capacity in tokens and in
+    // blocks, and how many full-length requests fit (two decimals).
+    "kv_tokens",
+    "kv_blocks",
+    "kv_max_concurrency",
 ];
 
 /// Longest `live.phase` kept, characters (#54).
@@ -769,6 +906,9 @@ struct StrataEngine {
     conversation_cache_mib: Option<String>,
     #[serde(deserialize_with = "num_text")]
     conversation_cache_slots: Option<String>,
+    /// Batch slots the engine runs (#79); absent means one.
+    #[serde(deserialize_with = "number")]
+    batch_slots: Option<f64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -796,6 +936,55 @@ struct StrataLive {
     tok_s_mean: Option<f64>,
     #[serde(deserialize_with = "number")]
     prefill_tok_s_mean: Option<f64>,
+    /// Each batch slot's tokens (#79). Issue #81 reads the rest.
+    #[serde(deserialize_with = "strata_slots")]
+    slots: Option<Vec<StrataSlot>>,
+}
+
+/// One entry of Strata's `live.slots[]` (#79): only its tokens. An idle
+/// slot reports the `held_tokens` it keeps for a next turn; a busy one
+/// its request's `prompt_tokens` and `generated`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StrataSlot {
+    #[serde(deserialize_with = "word")]
+    state: Option<String>,
+    #[serde(deserialize_with = "number")]
+    held_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    prompt_tokens: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    generated: Option<f64>,
+}
+
+impl StrataSlot {
+    /// The tokens this slot holds in KV.
+    fn tokens(&self) -> f64 {
+        match self.state.as_deref() {
+            Some("idle") | None => self.held_tokens.unwrap_or(0.0),
+            Some(_) => self.prompt_tokens.unwrap_or(0.0) + self.generated.unwrap_or(0.0),
+        }
+    }
+}
+
+/// Most `live.slots[]` entries read (#79): the wire's slot cap.
+const MAX_STRATA_SLOTS: usize = llama_core::wire::MAX_SLOTS as usize;
+
+/// `live.slots`: the first [`MAX_STRATA_SLOTS`] objects of an array; an
+/// entry that is not an object is skipped. Anything but an array is `None`.
+fn strata_slots<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<StrataSlot>>, D::Error> {
+    let serde_json::Value::Array(items) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        items
+            .into_iter()
+            .take(MAX_STRATA_SLOTS)
+            .filter_map(|item| serde_json::from_value::<StrataSlot>(item).ok())
+            .collect(),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -986,8 +1175,14 @@ fn unit(value: Option<f64>) -> Option<f64> {
 ///   [`speeds::window`] like vLLM's histograms, `totals.requests` the count.
 /// - the newest finished request's expert cache `hit_rate` and
 ///   `pcie_share` (#54), as gauges.
-/// - no KV fill (Strata has none) and no hit ratio: `totals` holds only
-///   lifetime sums, not the recent-window rate other backends report.
+/// - KV (#79): capacity is `engine.context` × `engine.batch_slots` (one
+///   slot when absent); in use is the sum over `live.slots[]` of each
+///   idle slot's `held_tokens` and each busy slot's `prompt_tokens` +
+///   `generated`, and the sessions are the slots holding any. Without
+///   `live.slots`, the request in flight's `prompt_tokens` + `generated`.
+///   The fill is in use over capacity.
+/// - no hit ratio: `totals` holds only lifetime sums, not the
+///   recent-window rate other backends report.
 ///
 /// The facts carry `engine` (ctx, KV, and the [`ENGINE_KEYS`] values for
 /// SETUP) and `live` ([`EngineLive`]). `history` and `hardware` are never
@@ -1044,6 +1239,7 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
     }
     .reported();
     let newest = doc.requests.as_ref();
+    let kv = strata_kv(&doc, busy);
     let sample = MetricsSample {
         n_decode_total: totals
             .output_tokens
@@ -1051,7 +1247,8 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         requests_processing: busy.map(|busy| if busy { 1.0 } else { 0.0 }),
         prompt_total: totals.prompt_tokens.and_then(finite_u64),
         queued: doc.live.queued,
-        kv_fill: None,
+        kv_fill: kv.ratio(),
+        kv,
         cache_hit: None,
         cached_total: totals.reused.and_then(finite_u64),
         spec,
@@ -1080,6 +1277,49 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         ..EngineFacts::default()
     };
     (sample, facts)
+}
+
+/// Strata's KV cache (#79); see [`parse_strata`].
+fn strata_kv(doc: &StrataDoc, busy: Option<bool>) -> KvTokens {
+    let context = doc
+        .engine
+        .context
+        .as_deref()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|ctx| *ctx > 0);
+    let batch = doc
+        .engine
+        .batch_slots
+        .and_then(finite_u64)
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let (used, sessions) = match &doc.live.slots {
+        Some(slots) => {
+            let held: Vec<f64> = slots.iter().map(StrataSlot::tokens).collect();
+            (
+                finite_u64(held.iter().sum()),
+                Some(held.iter().filter(|tokens| **tokens > 0.0).count() as u64),
+            )
+        }
+        None => match busy {
+            Some(true) => {
+                let tokens =
+                    doc.live.prompt_tokens.unwrap_or(0.0) + doc.live.generated.unwrap_or(0.0);
+                (finite_u64(tokens), Some(u64::from(tokens > 0.0)))
+            }
+            _ => (None, None),
+        },
+    };
+    let capacity = context.and_then(|ctx| ctx.checked_mul(batch));
+    KvTokens {
+        used: match (used, capacity) {
+            (Some(used), Some(capacity)) => Some(used.min(capacity)),
+            (used, _) => used,
+        },
+        capacity,
+        sessions,
+        ..KvTokens::default()
+    }
 }
 
 /// The [`ENGINE_KEYS`] values of one Strata document.
@@ -1721,8 +1961,8 @@ mod tests {
         doc.to_string()
     }
 
-    /// #71: llama-server's request-end counters, its deferred requests and
-    /// (older builds) its KV fill, by their exact names.
+    /// #71: llama-server's request-end counters and its deferred requests,
+    /// by their exact names. #79: b11429's metric set has no KV gauge.
     #[test]
     fn llamacpp_request_counters_and_gauges() {
         let body = include_str!("../../../fixtures/llama/llamacpp-metrics.txt");
@@ -1734,7 +1974,14 @@ mod tests {
         assert_eq!(sample.predicted_seconds, Some(40.96));
         assert_eq!(sample.requests_processing, Some(1.0));
         assert_eq!(sample.queued, Some(2.0));
-        assert_eq!(sample.kv_fill, Some(0.25));
+        assert_eq!(sample.kv_fill, None, "b11429 dropped kv_cache_usage_ratio");
+        assert_eq!(sample.kv, KvTokens::default(), "llama.cpp's KV is /slots");
+        // An older build's ratio still reads.
+        let older = format!("{body}llamacpp:kv_cache_usage_ratio 0.25\n");
+        assert_eq!(
+            parse_metrics_for(Backend::LlamaCpp, &older).kv_fill,
+            Some(0.25)
+        );
         // Other engines never read llama.cpp's names.
         let vllm = parse_metrics_for(Backend::Vllm, body);
         assert_eq!(vllm.predicted_total, None);
@@ -1758,7 +2005,16 @@ mod tests {
                 requests_processing: Some(1.0),
                 prompt_total: Some(12_000),
                 queued: Some(2.0),
-                kv_fill: None,
+                // #79: slot 0 generating (1,800 + 40), slot 1 idle holding
+                // 5,120, over 262,144 × 2 batch slots.
+                kv_fill: Some(6960.0 / 524_288.0),
+                kv: KvTokens {
+                    used: Some(6960),
+                    capacity: Some(524_288),
+                    cached: None,
+                    sessions: Some(2),
+                    approx: false,
+                },
                 cache_hit: None,
                 cached_total: Some(9000),
                 // #54: drafted and accepted tokens, no rounds.
@@ -2202,6 +2458,80 @@ llamacpp:requests_processing{lane=\"a b\"} 2
         );
     }
 
+    /// #79: SGLang's KV token gauges, summed over data-parallel ranks; the
+    /// fill is used / capacity, not `token_usage` (the Mamba pool here).
+    #[test]
+    fn sglang_kv_tokens_replace_token_usage() {
+        let body = include_str!("../../../fixtures/llama/sglang-metrics.txt");
+        let sample = parse_metrics_for(Backend::SgLang, body);
+        assert_eq!(
+            sample.kv,
+            KvTokens {
+                used: Some(54_272),
+                capacity: Some(204_800),
+                cached: Some(31_200),
+                sessions: None,
+                approx: false,
+            }
+        );
+        assert_eq!(sample.kv_fill, Some(54_272.0 / 204_800.0));
+        assert_eq!(sample.requests_processing, Some(2.0));
+        // Without the token gauges, the full-attention ratio is the fill.
+        let older: String = body
+            .lines()
+            .filter(|line| !line.contains("_tokens{"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let sample = parse_metrics_for(Backend::SgLang, &older);
+        assert_eq!(sample.kv, KvTokens::default());
+        assert_eq!(
+            sample.kv_fill,
+            Some(0.27),
+            "the larger rank's full_token_usage"
+        );
+    }
+
+    /// #79: vLLM without `kv_cache_size_tokens` falls back to its blocks.
+    #[test]
+    fn vllm_kv_capacity_falls_back_to_blocks() {
+        let body = VLLM_SAMPLE.replace("kv_cache_size_tokens=\"187440\",", "");
+        let sample = parse_metrics_for(Backend::Vllm, &body);
+        assert_eq!(sample.kv.capacity, Some(9372 * 16));
+        assert_eq!(sample.kv.used, Some(61_855), "0.4125 × 149,952, rounded");
+        assert!(sample.kv.approx);
+        let none = body.replace("num_gpu_blocks=\"9372\",", "");
+        assert_eq!(
+            parse_metrics_for(Backend::Vllm, &none).kv,
+            KvTokens::default()
+        );
+    }
+
+    /// #79: Strata's KV without `batch_slots` is one slot; without
+    /// `live.slots`, the request in flight.
+    #[test]
+    fn strata_kv_defaults_to_one_slot_and_the_live_request() {
+        let mut doc: serde_json::Value = serde_json::from_str(STRATA).expect("fixture");
+        doc["engine"]
+            .as_object_mut()
+            .expect("engine")
+            .remove("batch_slots");
+        doc["live"].as_object_mut().expect("live").remove("slots");
+        let (sample, _) = parse_strata(&doc.to_string());
+        assert_eq!(
+            sample.kv,
+            KvTokens {
+                used: Some(1840),
+                capacity: Some(262_144),
+                cached: None,
+                sessions: Some(1),
+                approx: false,
+            }
+        );
+        let idle = strata_live(r#"{"state": "idle", "queued": 0}"#);
+        let (sample, _) = parse_strata(&idle);
+        assert_eq!((sample.kv.used, sample.kv.capacity), (None, Some(524_288)));
+    }
+
     #[test]
     fn sglang_names_sum_over_labels() {
         let body = "\
@@ -2225,7 +2555,7 @@ sglang:num_queue_reqs{model_name=\"x\"} -3
         assert_eq!(sample.prompt_total, Some(5000));
         assert_eq!(sample.requests_processing, Some(1.0));
         assert_eq!(sample.queued, Some(2.0));
-        assert_eq!(sample.kv_fill, Some(0.37));
+        assert_eq!(sample.kv_fill, None, "#79: token_usage is not the KV fill");
         assert_eq!(sample.cache_hit, Some(0.8));
         assert_eq!(sample.cached_total, None);
         let cached = format!(
@@ -2287,6 +2617,18 @@ vllm:prefix_cache_queries_total{model_name=\"m\"} 120.0
         assert_eq!(sample.requests_processing, Some(1.0));
         assert_eq!(sample.queued, Some(2.0), "not the by-reason split");
         assert_eq!(sample.kv_fill, Some(0.4125));
+        // #79: kv_cache_size_tokens, not 9,372 blocks × 16; in use is the
+        // ratio times it, rounded, and marked approximate.
+        assert_eq!(
+            sample.kv,
+            KvTokens {
+                used: Some(77_319),
+                capacity: Some(187_440),
+                cached: None,
+                sessions: None,
+                approx: true,
+            }
+        );
         assert_eq!(sample.cache_hit, Some(0.75));
         assert_eq!(
             sample.cached_total,
@@ -2332,6 +2674,14 @@ vllm:prefix_cache_queries_total{model_name=\"m\"} 120.0
                 kv: Some("fp8_e4m3".to_owned()),
                 kv_block: Some(16),
                 prefix_cache: Some(true),
+                values: [
+                    ("kv_tokens", "187440"),
+                    ("kv_blocks", "9372"),
+                    ("kv_max_concurrency", "1.43"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key, value.to_owned()))
+                .collect(),
                 ..EngineFacts::default()
             })
         );

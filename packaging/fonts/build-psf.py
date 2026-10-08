@@ -58,6 +58,8 @@ SLOTS = 512
 EXTRA = (
     [chr(c) for c in range(0x2580, 0x25A0)]
     + list("─│┌┐└┘├┤┬┴┼═║•…–—‘’“”�")
+    # #79: tty11 marks an approximate KV count with it.
+    + list("≈")
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))

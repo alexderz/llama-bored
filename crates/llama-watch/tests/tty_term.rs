@@ -21,9 +21,10 @@ fn paint(term: &mut Term<Vec<u8>>, grid: &Grid, now: Instant) -> Vec<u8> {
 
 /// Parsed `/usr/lib/kbd/consolefonts/eurlatgr.psfu.gz` on 2026-09-25:
 /// U+2581–2587 and U+2594 are missing. The font has `█ ▀ ▄ ▌ ▐ ░ ▒ ▓`,
-/// `·` (U+00B7) and `…` (U+2026, glyph 491). `chart_glyphs = "halves"`
-/// draws with only these, for when llama-hack-12x24 failed to load.
-const EURLATGR: &[char] = &['█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…'];
+/// `·` (U+00B7), `…` (U+2026, glyph 491) and `≈` (U+2248, glyph 484, #79).
+/// `chart_glyphs = "halves"` draws with only these, for when
+/// llama-hack-12x24 failed to load.
+const EURLATGR: &[char] = &['█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈'];
 
 /// Lower eighths U+2581–2587 other than `▄`. Verified present in
 /// llama-hack-12x24 by `tests/tty_font.rs`; absent from eurlatgr.

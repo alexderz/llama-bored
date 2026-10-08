@@ -100,7 +100,8 @@ impl Backend {
         Ok(word.map(|word| Self::from_word(&word).unwrap_or(Self::OpenAi)))
     }
 
-    /// Whether the server reports a KV cache fill. Strata has none.
+    /// Whether the server reports a KV cache fill ratio of its own. Strata
+    /// has none; its KV comes as tokens (#79).
     #[must_use]
     pub fn has_kv_gauge(self) -> bool {
         self != Self::Strata
@@ -138,6 +139,58 @@ pub struct BackendInfo {
     /// Engine numbers beyond the gauges: speculative decoding, preemptions,
     /// sleep and latency means (#31). vLLM, and SGLang where its names allow.
     pub engine: EngineStats,
+    /// KV cache in use across every session, and its capacity (#79).
+    /// `None` when the engine gave neither.
+    pub kv: Option<KvUsage>,
+}
+
+/// A model's KV cache across all its sessions (#79), in tokens. Every
+/// number is `None` when the engine does not report it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KvUsage {
+    /// Tokens the KV cache holds for live sessions: llama.cpp's and
+    /// Strata's slots (idle ones keep their context), SGLang's
+    /// `kv_used_tokens`, vLLM's usage ratio times its capacity.
+    pub used: Option<u64>,
+    /// Tokens the KV cache can hold.
+    pub capacity: Option<u64>,
+    /// Tokens held only as reusable cache, not by a live session (SGLang's
+    /// radix cache, `kv_evictable_tokens`). Not part of [`Self::used`].
+    pub cached: Option<u64>,
+    /// Sessions holding KV: slots with tokens (llama.cpp, Strata), else
+    /// running requests (SGLang, vLLM).
+    pub sessions: Option<u16>,
+    /// llama.cpp only: `true` when every slot shares one KV pool
+    /// (`--kv-unified`, the default with an automatic slot count).
+    pub unified: Option<bool>,
+    /// [`Self::unified`] was not in the launch command: it is assumed
+    /// because every slot reports the same `n_ctx`. Not on the wire.
+    pub unified_assumed: bool,
+    /// [`Self::used`] is derived from a block-rounded ratio (vLLM).
+    pub approx: bool,
+}
+
+impl KvUsage {
+    /// `used / capacity` as 0..=1000, when both are known and the
+    /// capacity is not zero.
+    #[must_use]
+    pub fn permille(&self) -> Option<u16> {
+        let (used, capacity) = (self.used?, self.capacity?);
+        (capacity > 0).then(|| {
+            let used = u128::from(used.min(capacity));
+            ((used * 1000 + u128::from(capacity) / 2) / u128::from(capacity)) as u16
+        })
+    }
+
+    /// True when no field is known.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.used.is_none()
+            && self.capacity.is_none()
+            && self.cached.is_none()
+            && self.sessions.is_none()
+            && self.unified.is_none()
+    }
 }
 
 /// Longest mean accepted length per speculative step kept.
