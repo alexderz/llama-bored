@@ -1873,22 +1873,22 @@ fn paint_legend(grid: &mut Grid, row: u16, cols: u16, base: &str, measured: bool
     }
 }
 
-/// #75: the order of the remainder cell's colours, by palette slot. Under
-/// the llama palette it runs around the hue wheel: violet, indigo, blue,
-/// sky, green, light green, light yellow, orange. It skips the warning
-/// yellow and reds and the output magenta; blue and sky are also the
-/// cached and new colours, told apart by the cell's place (the first of a
-/// run). The same slots in every mode (tty11, llama-view 16 / 256 /
-/// truecolor, llama-cast), so the order reads the same everywhere.
+/// #75, #83: the order of the remainder cell's colours, by palette slot,
+/// smallest step first. Under the llama palette it runs red to green to
+/// blue: red, orange, amber, yellow, light green, green, sky, blue. Red and
+/// yellow also mark `gen` and the context warning, but those are text
+/// (`gen`, `!`), never a bar cell. The same slots in every mode (tty11,
+/// llama-view 16 / 256 / truecolor, llama-cast), so the order reads the
+/// same everywhere.
 pub const RAINBOW: [C16; 8] = [
-    C16::Magenta,
-    C16::BrightBlue,
-    C16::Blue,
-    C16::BrightCyan,
-    C16::Green,
-    C16::BrightGreen,
-    C16::BrightYellow,
+    C16::Red,
     C16::Cyan,
+    C16::Yellow,
+    C16::BrightYellow,
+    C16::BrightGreen,
+    C16::Green,
+    C16::BrightCyan,
+    C16::Blue,
 ];
 
 /// RECENT's rainbow key (#77): [`RAINBOW`] as full blocks, one cell per

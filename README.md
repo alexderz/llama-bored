@@ -112,8 +112,9 @@ tokens, linearly. Each run starts with its remainder cell: its height is
 the fraction of a cell in eighths (`▁`..`▇`, at least `▁` for any tokens at
 all), and its colour the fraction of an eighth, in this fixed order of
 eight palette slots, the same on tty11, in llama-view (16, 256 and
-truecolor) and on llama-cast: violet, indigo, blue, sky, green, light
-green, light yellow, orange (slots 5, 12, 4, 14, 2, 10, 11, 6). At 30
+truecolor) and on llama-cast: red, orange, amber, yellow, light green,
+green, sky, blue (slots 1, 6, 3, 11, 10, 2, 14, 4): red is the smallest step,
+blue the largest. At 30
 cells and a 262,144-token context one colour step is about 136 tokens.
 The RECENT header row carries the order as a key (#77): the eight
 colours as full blocks, left-aligned directly over the bar's first cells,
