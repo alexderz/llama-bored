@@ -4779,6 +4779,76 @@ fn legend_row(grid: &llama_watch::tty::grid::Grid) -> u16 {
         .expect("legend")
 }
 
+/// The header row's rainbow key (#77): its first column and its cells.
+fn key_of(grid: &llama_watch::tty::grid::Grid, header: u16) -> (u16, Vec<(char, C16)>) {
+    let start = (0..grid.cols())
+        .find(|col| {
+            let cell = grid.get(*col, header).unwrap();
+            cell.ch == '\u{2588}' && cell.fg == RAINBOW[0]
+        })
+        .expect("rainbow key in the RECENT header");
+    let cells = (start..grid.cols())
+        .map(|col| grid.get(col, header).unwrap())
+        .take_while(|cell| cell.ch == '\u{2588}')
+        .map(|cell| (cell.ch, cell.fg))
+        .collect();
+    (start, cells)
+}
+
+#[test]
+fn rainbow_key_sits_over_the_first_bar_cells_in_rainbow_order() {
+    let mut req = recent_model().requests[0].clone();
+    (req.input_tok, req.cached_tok, req.output_tok) = (60_000, 40_000, 3_000);
+    req.n_ctx = Some(262_144);
+    for (glyphs, cols) in [
+        (ChartGlyphs::Eighths, 240),
+        (ChartGlyphs::Halves, 240),
+        (ChartGlyphs::Eighths, 160),
+        (ChartGlyphs::Eighths, 480),
+    ] {
+        let grid = draw(&bar_model(vec![req.clone()], glyphs), cols, 67);
+        let header = row_with(&grid, "RECENT");
+        let (start, key) = key_of(&grid, header);
+        // Full blocks in RAINBOW order, halves mode too.
+        let want: Vec<(char, C16)> = RAINBOW.iter().map(|fg| ('\u{2588}', *fg)).collect();
+        assert_eq!(key, want, "{glyphs:?} {cols}");
+        // Left-aligned over the bar: bar cell 0 is under key cell 0.
+        let bar = bar_of(&grid, header + 1);
+        let row = row_string(&grid, header + 1);
+        let bar_start = row
+            .chars()
+            .position(is_bar_char)
+            .and_then(|c| u16::try_from(c).ok())
+            .unwrap();
+        assert_eq!(start, bar_start, "{glyphs:?} {cols}: {row}");
+        assert!(bar.len() >= RAINBOW.len(), "{bar:?}");
+        // The header words keep their places left of the key.
+        let words = row_string(&grid, header);
+        assert!(words.contains("DUR"), "{words}");
+        assert!(col_of(&grid, header, "DUR") < start, "{words}");
+    }
+}
+
+#[test]
+fn rainbow_key_is_whole_at_the_smallest_screen() {
+    // Below MIN_COLS the frame is the "too small" line, and from it the bar
+    // is at least BAR_FLOOR = RAINBOW.len() wide, so the whole key fits.
+    // The clip for a narrower bar is a unit test in layout.rs.
+    let mut req = recent_model().requests[0].clone();
+    req.n_ctx = Some(262_144);
+    let model = bar_model(vec![req], ChartGlyphs::Eighths);
+    let min = llama_watch::tty::layout::MIN_COLS;
+    for cols in min..min + 4 {
+        let grid = draw(&model, cols, 49);
+        let (start, key) = key_of(&grid, row_with(&grid, "RECENT"));
+        assert_eq!(key.len(), RAINBOW.len(), "{cols}");
+        assert!(
+            start + u16::try_from(RAINBOW.len()).unwrap() < cols - 1,
+            "{cols}"
+        );
+    }
+}
+
 #[test]
 fn legend_keeps_its_items_in_order_and_fits_160_columns() {
     let mut model = recent_model();
@@ -4789,13 +4859,10 @@ fn legend_keeps_its_items_in_order_and_fits_160_columns() {
         legend.contains("\u{2588}cached \u{2588}new \u{2588}out"),
         "{legend}"
     );
-    assert!(legend.contains("per 1/8"), "{legend}");
-    let at = legend_row(&grid);
-    let strip = col_of(&grid, at, "per 1/8") - 9;
-    let colours: Vec<C16> = (0..8u16)
-        .map(|i| grid.get(strip + i, at).unwrap().fg)
-        .collect();
-    assert_eq!(colours, RAINBOW);
+    assert!(
+        !legend.contains("per 1/8"),
+        "the header key replaces the strip (#77): {legend}"
+    );
     // 160 columns with every note: items drop, nothing passes the edge.
     model.requests[0].gen_measured = true;
     model.requests[0].n_ctx = None;
@@ -4803,10 +4870,6 @@ fn legend_keeps_its_items_in_order_and_fits_160_columns() {
     let legend = row_string(&grid, legend_row(&grid));
     assert!(legend.trim_end().chars().count() <= 158, "{legend}");
     assert!(legend.contains("cached"), "the colour key stays: {legend}");
-    assert!(
-        !legend.contains("per 1/8"),
-        "the rainbow goes first: {legend}"
-    );
 }
 
 fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activity {

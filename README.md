@@ -115,6 +115,11 @@ eight palette slots, the same on tty11, in llama-view (16, 256 and
 truecolor) and on llama-cast: violet, indigo, blue, sky, green, light
 green, light yellow, orange (slots 5, 12, 4, 14, 2, 10, 11, 6). At 30
 cells and a 262,144-token context one colour step is about 136 tokens.
+The RECENT header row carries the order as a key (#77): the eight
+colours as full blocks, left-aligned directly over the bar's first cells,
+so a remainder cell's colour reads as the start, middle or end of its
+eighth by matching it to the key; a bar narrower than eight cells shows
+what fits. The legend keeps `█cached █new █out`.
 The colours are a function of the counts only: a finished row never
 changes. Empty cells are a dim baseline. A request at 90 % of the context
 or more gets a yellow `!` after its bar. Without a context size the bar is
@@ -123,6 +128,7 @@ scaled to the largest such row shown and marked `~`. With `chart_glyphs =
 rest. Engines that report no cached count show all input as new.
 
 ```text
+ RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ████████
    4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▁███████████▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 >       18:47:20              Qwen 35B  120,000        0     0  ...  36.4s ▁██████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp c
 ```

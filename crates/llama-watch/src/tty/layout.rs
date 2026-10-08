@@ -1821,21 +1821,12 @@ const LEGEND_MEASURED: &str = " · ~ = engine-measured";
 const LEGEND_KEY: &str = " · █cached █new █out";
 /// #75: a bar without a context size is scaled to the largest row.
 const LEGEND_RELATIVE: &str = " · ~bar = vs largest row";
-/// #75: the rainbow strip, painted over the `▁`s.
-const LEGEND_RAINBOW: &str = " · ▁▁▁▁▁▁▁▁ per 1/8";
 
 /// The RECENT legend: the column words, then what fits of the measured
-/// note, the bar's colour key, the relative note and the rainbow order,
-/// dropped in reverse order of that list when the row is short.
-fn paint_legend(
-    grid: &mut Grid,
-    row: u16,
-    cols: u16,
-    base: &str,
-    measured: bool,
-    relative: bool,
-    glyphs: ChartGlyphs,
-) {
+/// note, the bar's colour key and the relative note, dropped in reverse
+/// order of that list when the row is short. The rainbow order is the key
+/// in the header row (#77).
+fn paint_legend(grid: &mut Grid, row: u16, cols: u16, base: &str, measured: bool, relative: bool) {
     let room = usize::from(cols.saturating_sub(3));
     let mut items: Vec<&str> = Vec::new();
     if measured {
@@ -1845,12 +1836,11 @@ fn paint_legend(
     if relative {
         items.push(LEGEND_RELATIVE);
     }
-    items.push(LEGEND_RAINBOW);
     let len = |items: &[&str]| {
         base.chars().count() + items.iter().map(|i| i.chars().count()).sum::<usize>()
     };
     while !items.is_empty() && len(&items) > room {
-        let drop = [LEGEND_RAINBOW, LEGEND_RELATIVE, LEGEND_MEASURED, LEGEND_KEY]
+        let drop = [LEGEND_RELATIVE, LEGEND_MEASURED, LEGEND_KEY]
             .iter()
             .find_map(|d| items.iter().position(|i| i == d));
         match drop {
@@ -1864,7 +1854,6 @@ fn paint_legend(
     paint_fixed(grid, col, row, base, C16::BrightBlack);
     col += u16_from(base.chars().count());
     for item in items {
-        let mut rainbow = 0usize;
         let mut key = 0usize;
         for ch in item.chars() {
             match ch {
@@ -1872,18 +1861,6 @@ fn paint_legend(
                     let fg = [C16::Blue, C16::BrightCyan, C16::BrightMagenta][key.min(2)];
                     paint(grid, col, row, '█', fg, C16::Black);
                     key += 1;
-                }
-                '▁' => {
-                    let glyph = track_glyph(glyphs);
-                    paint(
-                        grid,
-                        col,
-                        row,
-                        glyph,
-                        RAINBOW[rainbow % RAINBOW.len()],
-                        C16::Black,
-                    );
-                    rainbow += 1;
                 }
                 _ => paint_fixed(grid, col, row, &ch.to_string(), C16::BrightBlack),
             }
@@ -1909,6 +1886,24 @@ pub const RAINBOW: [C16; 8] = [
     C16::BrightYellow,
     C16::Cyan,
 ];
+
+/// RECENT's rainbow key (#77): [`RAINBOW`] as full blocks, one cell per
+/// colour, from the bar's first cell, so key cell `i` sits over bar cell
+/// `i` and a remainder cell's colour reads as the start, middle or end of
+/// its eighth. Full blocks in halves mode too. A bar narrower than the
+/// key, or one that runs off the screen, shows what fits.
+fn paint_rainbow_key(grid: &mut Grid, bar: Span, row: u16) {
+    for (i, fg) in RAINBOW.iter().take(usize::from(bar.w)).enumerate() {
+        paint(
+            grid,
+            bar.x.saturating_add(u16_from(i)),
+            row,
+            '\u{2588}',
+            *fg,
+            C16::Black,
+        );
+    }
+}
 
 /// Which part of a RECENT context bar a cell draws (#75).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2504,6 +2499,7 @@ fn u16_from(n: usize) -> u16 {
 fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots: u16) {
     let plan = request_plan(g.cols);
     paint_request_headers(grid, header, &plan);
+    paint_rainbow_key(grid, plan.bar, header);
     let legend = if plan.wide {
         LEGEND_WIDE
     } else {
@@ -2527,7 +2523,6 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         legend,
         measured && !starting,
         relative && !starting,
-        model.chart_glyphs,
     );
     if model.state == WatchState::Starting {
         paint_str(
@@ -4033,6 +4028,31 @@ mod tests {
         assert!(reds.windows(2).all(|w| w[0] <= w[1]), "{reds:?}");
     }
     use super::*;
+
+    #[test]
+    fn rainbow_key_clips_to_a_bar_narrower_than_the_key() {
+        let mut grid = Grid::new(40, 4);
+        paint_rainbow_key(&mut grid, Span { x: 10, w: 5 }, 1);
+        let row: Vec<(char, C16)> = (0..40)
+            .map(|col| {
+                let cell = grid.get(col, 1).unwrap();
+                (cell.ch, cell.fg)
+            })
+            .collect();
+        let want: Vec<(char, C16)> = RAINBOW[..5].iter().map(|fg| ('\u{2588}', *fg)).collect();
+        assert_eq!(&row[10..15], want.as_slice());
+        assert!(row[15..].iter().all(|(ch, _)| *ch == ' '), "{row:?}");
+        assert!(row[..10].iter().all(|(ch, _)| *ch == ' '), "{row:?}");
+        // A bar running off the screen: what fits before the last column.
+        let mut grid = Grid::new(16, 4);
+        paint_rainbow_key(&mut grid, Span { x: 12, w: 30 }, 1);
+        let drawn: Vec<C16> = (0..16)
+            .map(|col| grid.get(col, 1).unwrap())
+            .filter(|cell| cell.ch == '\u{2588}')
+            .map(|cell| cell.fg)
+            .collect();
+        assert_eq!(drawn, RAINBOW[..3]);
+    }
 
     #[test]
     fn request_time_formats_to_the_second() {
