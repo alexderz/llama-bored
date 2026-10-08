@@ -371,3 +371,136 @@ fn b11429_cache_restore_is_mostly_cached_with_no_target() {
         (119_472, true, 1_200)
     );
 }
+
+/// A Strata `/metrics` document in parallel mode (#81), parsed as the
+/// poller parses it: `live` as given, two batch slots.
+fn strata_parallel(live: serde_json::Value) -> ModelEngineLive {
+    let doc = serde_json::json!({
+        "engine": {"context": 262_144, "batch_slots": 2},
+        "live": live,
+    });
+    let (_, facts) = llama_watch::metrics::parse_strata(&doc.to_string());
+    ModelEngineLive {
+        model: "strata".to_owned(),
+        live: facts.live.expect("live"),
+    }
+}
+
+/// #81: each busy batch slot is its own row. The newest request (the one
+/// reading slot whose prompt is `live.prompt_tokens`) gets the top-level
+/// `prompt_read` / `prompt_total` and a target; DUR runs from the slot's
+/// own `elapsed_s`; no cached part while it runs.
+#[test]
+fn strata_parallel_slots_are_one_flight_each() {
+    let mut feed = Feed::new();
+    let live = |read: u64, gen0: u64| {
+        strata_parallel(serde_json::json!({
+            "state": "reading", "parallel": 2, "running": 2, "waiting": 0,
+            "outside_slots": 0, "prompt_tokens": 5_965, "prompt_read": read,
+            "prompt_total": 5_965, "generated": 0, "prefill_tok_s_mean": 900.0,
+            "slots": [
+                {"slot": 0, "state": "decoding", "prompt_tokens": 7_853,
+                 "generated": gen0, "elapsed_s": 1.7, "tok_s": 34.4},
+                {"slot": 1, "state": "reading", "prompt_tokens": 5_965,
+                 "generated": 0, "elapsed_s": 0.4, "tok_s": null},
+            ],
+        }))
+    };
+    let got = feed.poll_with(0, &[], &[live(1_024, 51)], &[]);
+    assert_eq!(got.len(), 2);
+    let (reading, decoding) = (&got[0], &got[1]);
+    assert_eq!(
+        (
+            reading.prompt,
+            reading.cached,
+            reading.processed,
+            reading.decoded
+        ),
+        (5_965, 0, 1_024, 0),
+        "newest first: slot 1"
+    );
+    assert!(reading.prompt_known && reading.progress && !reading.decoding);
+    assert_eq!(reading.prompt_tps, Some(900.0));
+    assert_eq!(
+        (decoding.prompt, decoding.processed, decoding.decoded),
+        (7_853, 7_853, 51)
+    );
+    assert!(decoding.decoding && !decoding.progress);
+    assert_eq!(decoding.gen_tps, Some(34.4));
+    assert_eq!(decoding.engine, Some(llama_core::backend::Backend::Strata));
+    // DUR from the engine's clock: 1.7 s before it was first seen.
+    let dur = decoding
+        .polled
+        .saturating_duration_since(decoding.started_mono);
+    assert_eq!(dur, Duration::from_millis(1_700));
+
+    // The next poll: the same two requests, moved on.
+    let got = feed.poll_with(500, &[], &[live(4_096, 60)], &[]);
+    assert_eq!(got.len(), 2);
+    assert_eq!((got[0].processed, got[1].decoded), (4_096, 60));
+
+    // A reading slot that is not the newest shows its prompt, no target.
+    let other = strata_parallel(serde_json::json!({
+        "state": "reading", "parallel": 2, "running": 2,
+        "prompt_tokens": 900, "prompt_read": 100, "prompt_total": 900,
+        "slots": [
+            {"slot": 0, "state": "reading", "prompt_tokens": 7_000, "generated": 0, "elapsed_s": 2.0},
+            {"slot": 1, "state": "reading", "prompt_tokens": 900, "generated": 0, "elapsed_s": 0.1},
+        ],
+    }));
+    let mut fresh = Feed::new();
+    let got = fresh.poll_with(0, &[], &[other], &[]);
+    let old = got.iter().find(|f| f.prompt == 7_000).expect("slot 0");
+    assert!(!old.progress && !old.decoding && old.prompt_known);
+    let new = got.iter().find(|f| f.prompt == 900).expect("slot 1");
+    assert_eq!((new.processed, new.progress), (100, true));
+}
+
+/// #81: a slot that runs a new request is a new row; each finished row
+/// (llama-swap's Strata input leaves the cache out, #82) replaces exactly
+/// one flight, never two, and none is shown twice.
+#[test]
+fn strata_slots_hand_over_one_row_each() {
+    let two = |gen0: u64, gen1: u64| {
+        strata_parallel(serde_json::json!({
+            "state": "generating", "parallel": 2, "running": 2,
+            "slots": [
+                {"slot": 0, "state": "decoding", "prompt_tokens": 63, "generated": gen0, "elapsed_s": 3.0},
+                {"slot": 1, "state": "decoding", "prompt_tokens": 63, "generated": gen1, "elapsed_s": 2.0},
+            ],
+        }))
+    };
+    let mut feed = Feed::new();
+    let history = [row(1, "strata", 10)];
+    assert_eq!(feed.poll_with(0, &[], &[two(5, 4)], &history).len(), 2);
+    // One of the two 63-token requests finished: one row, one flight gone.
+    let done = [row_cached(2, "strata", 3, 60), row(1, "strata", 10)];
+    let got = feed.poll_with(500, &[], &[two(9, 8)], &done);
+    assert_eq!(got.len(), 1, "one row replaces one flight: {got:?}");
+    // Slot 0 now runs a new request: a new row, started 0.2 s ago.
+    let next = strata_parallel(serde_json::json!({
+        "state": "generating", "parallel": 2, "running": 2,
+        "slots": [
+            {"slot": 0, "state": "reading", "prompt_tokens": 2_000, "generated": 0, "elapsed_s": 0.2},
+            {"slot": 1, "state": "decoding", "prompt_tokens": 63, "generated": 12, "elapsed_s": 2.5},
+        ],
+    }));
+    let got = feed.poll_with(1_000, &[], &[next], &done);
+    let prompts: Vec<u64> = got.iter().map(|f| f.prompt).collect();
+    assert!(prompts.contains(&2_000), "{prompts:?}");
+    // Both finish: two rows, every flight replaced, nothing doubled.
+    let idle = strata_parallel(serde_json::json!({
+        "state": "idle", "parallel": 2, "running": 0,
+        "slots": [
+            {"slot": 0, "state": "idle", "held_tokens": 2_040},
+            {"slot": 1, "state": "idle", "held_tokens": 80},
+        ],
+    }));
+    let all = [
+        row_cached(4, "strata", 40, 1_960),
+        row_cached(3, "strata", 1, 62),
+        row_cached(2, "strata", 3, 60),
+        row(1, "strata", 10),
+    ];
+    assert!(feed.poll_with(1_500, &[], &[idle], &all).is_empty());
+}

@@ -745,7 +745,8 @@ impl<L: Sink> State<L> {
                     kind: self.backend_of(info),
                     max_running: info.max_running.or_else(|| {
                         // Strata serves one request at a time, whichever
-                        // way it was told (#54).
+                        // way it was told (#54), unless its `live` reports
+                        // batch slots (#81, set with the gauges).
                         (self.backend_of(info) == Backend::Strata).then_some(1)
                     }),
                     ..BackendInfo::default()
@@ -1704,6 +1705,15 @@ impl<L: Sink> State<L> {
             info.kv_permille = gauges.kv_permille;
             info.hit_permille = gauges.hit_permille;
             info.engine = gauges.engine;
+            // #81: Strata in parallel mode runs one request per batch slot.
+            if let Some(parallel) = gauges
+                .live
+                .as_ref()
+                .and_then(|live| live.parallel)
+                .filter(|n| *n >= 2)
+            {
+                info.max_running = backend::reqs(f64::from(parallel));
+            }
             info.kv = crate::kv::from_metrics(gauges.kv, gauges.running);
         }
         models

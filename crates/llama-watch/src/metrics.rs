@@ -854,6 +854,116 @@ pub struct EngineLive {
     pub tok_s_mean: Option<f64>,
     /// Prefill tok/s of the request.
     pub prefill_tok_s_mean: Option<f64>,
+    /// Batch slots in parallel mode (`live.parallel`, Strata's
+    /// `engine.batch_slots` ≥ 2, #81); `None` in serial mode.
+    pub parallel: Option<u32>,
+    /// Requests running now (`live.running`), parallel mode only.
+    pub running: Option<u32>,
+    /// Requests waiting for a slot (`live.waiting`), parallel mode only.
+    pub waiting: Option<u32>,
+    /// Running requests outside every slot (`live.outside_slots`).
+    pub outside_slots: Option<u32>,
+    /// `live.slots[]` (#81), from the one parse that also gives the KV
+    /// numbers (#79): read them with [`Self::slots`] and
+    /// [`Self::held_tokens`]. In parallel mode the top-level request fields
+    /// above are the newest request's only. Built only by the parser.
+    pub slots: Vec<LiveSlot>,
+}
+
+/// One of Strata's batch slots (#81), from `live.slots[]`: idle with the
+/// tokens it keeps for a next turn, or busy with a request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveSlot {
+    /// The slot index.
+    pub slot: u32,
+    /// `idle`, `reading`, `decoding`, or another short token.
+    pub state: String,
+    /// An idle slot's `held_tokens`.
+    pub held_tokens: Option<u64>,
+    /// A busy slot's request: its whole prompt.
+    pub prompt_tokens: Option<u64>,
+    /// Tokens it generated so far.
+    pub generated: Option<u64>,
+    /// Seconds since the request started.
+    pub elapsed_s: Option<f64>,
+    /// Its decode tok/s, once it has a first token.
+    pub tok_s: Option<f64>,
+}
+
+impl LiveSlot {
+    /// Running a request (any state but `idle`).
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.state != "idle"
+    }
+
+    /// Past its prompt: the request has a first token.
+    #[must_use]
+    pub fn decoding(&self) -> bool {
+        self.busy() && (self.state == "decoding" || self.generated.is_some_and(|n| n > 0))
+    }
+
+    /// Tokens the slot holds in its KV now: an idle slot's `held_tokens`,
+    /// a busy one's prompt plus what it generated.
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        if self.busy() {
+            self.prompt_tokens
+                .unwrap_or(0)
+                .saturating_add(self.generated.unwrap_or(0))
+        } else {
+            self.held_tokens.unwrap_or(0)
+        }
+    }
+}
+
+impl EngineLive {
+    /// Strata's batch slots in parallel mode (#81); empty in serial mode.
+    #[must_use]
+    pub fn slots(&self) -> &[LiveSlot] {
+        &self.slots
+    }
+
+    /// Tokens held across every batch slot (#81, for the KV in use of
+    /// #79): `None` in serial mode.
+    #[must_use]
+    pub fn held_tokens(&self) -> Option<u64> {
+        (!self.slots.is_empty()).then(|| {
+            self.slots
+                .iter()
+                .map(LiveSlot::held)
+                .fold(0, u64::saturating_add)
+        })
+    }
+
+    /// The slot reading the newest request, whose progress the top-level
+    /// `prompt_read` / `prompt_total` are (#81): the one busy slot still
+    /// in prefill whose prompt is `live.prompt_tokens`. `None` when there
+    /// is no progress to give, or two slots could be it.
+    #[must_use]
+    pub fn newest_slot(&self) -> Option<u32> {
+        self.prompt_total?;
+        let mut reading = self.slots.iter().filter(|slot| {
+            slot.busy()
+                && !slot.decoding()
+                && slot.prompt_tokens.is_some()
+                && slot.prompt_tokens == self.prompt_tokens
+        });
+        let first = reading.next()?;
+        reading.next().is_none().then_some(first.slot)
+    }
+
+    /// Tokens the busy slots generated so far; `None` in serial mode.
+    #[must_use]
+    pub fn slots_generated(&self) -> Option<u64> {
+        (!self.slots.is_empty()).then(|| {
+            self.slots
+                .iter()
+                .filter(|slot| slot.busy())
+                .filter_map(|slot| slot.generated)
+                .fold(0, u64::saturating_add)
+        })
+    }
 }
 
 /// The parts of Strata's `GET /metrics` JSON this reads. Everything else
@@ -936,17 +1046,28 @@ struct StrataLive {
     tok_s_mean: Option<f64>,
     #[serde(deserialize_with = "number")]
     prefill_tok_s_mean: Option<f64>,
-    /// Each batch slot's tokens (#79). Issue #81 reads the rest.
+    #[serde(deserialize_with = "number")]
+    parallel: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    running: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    waiting: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    outside_slots: Option<f64>,
+    /// Each batch slot (#79, #81): the one parse of `live.slots[]`. The KV
+    /// numbers read its tokens; [`EngineLive::slots`] hands out the rest.
     #[serde(deserialize_with = "strata_slots")]
     slots: Option<Vec<StrataSlot>>,
 }
 
-/// One entry of Strata's `live.slots[]` (#79): only its tokens. An idle
-/// slot reports the `held_tokens` it keeps for a next turn; a busy one
-/// its request's `prompt_tokens` and `generated`.
+/// One entry of Strata's `live.slots[]` (#79, #81). An idle slot reports
+/// the `held_tokens` it keeps for a next turn; a busy one its request's
+/// `prompt_tokens`, `generated`, `elapsed_s` and `tok_s`.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct StrataSlot {
+    #[serde(deserialize_with = "number")]
+    slot: Option<f64>,
     #[serde(deserialize_with = "word")]
     state: Option<String>,
     #[serde(deserialize_with = "number")]
@@ -955,6 +1076,10 @@ struct StrataSlot {
     prompt_tokens: Option<f64>,
     #[serde(deserialize_with = "number")]
     generated: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    elapsed_s: Option<f64>,
+    #[serde(deserialize_with = "number")]
+    tok_s: Option<f64>,
 }
 
 impl StrataSlot {
@@ -1197,9 +1322,17 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         Some("idle") => Some(false),
         _ => None,
     };
-    let live = match busy {
-        Some(true) => doc.live.generated.unwrap_or(0.0),
+    let parsed_live = strata_live(&doc.live);
+    // #81: in parallel mode every busy slot's tokens are in flight, and
+    // `live.running` counts the requests; the top level is the newest one.
+    let live = match (parsed_live.slots_generated(), busy) {
+        (Some(slots), _) => slots as f64,
+        (None, Some(true)) => doc.live.generated.unwrap_or(0.0),
         _ => 0.0,
+    };
+    let processing = match (parsed_live.running, busy) {
+        (Some(running), _) if parsed_live.parallel.is_some() => Some(f64::from(running)),
+        (_, busy) => busy.map(|busy| if busy { 1.0 } else { 0.0 }),
     };
     let totals = &doc.totals;
     let spec = match (totals.drafts_offered, totals.drafts_accepted) {
@@ -1244,7 +1377,7 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         n_decode_total: totals
             .output_tokens
             .and_then(|done| finite_u64(done + live)),
-        requests_processing: busy.map(|busy| if busy { 1.0 } else { 0.0 }),
+        requests_processing: processing,
         prompt_total: totals.prompt_tokens.and_then(finite_u64),
         queued: doc.live.queued,
         kv_fill: kv.ratio(),
@@ -1273,7 +1406,7 @@ pub fn parse_strata(body: &str) -> (MetricsSample, EngineFacts) {
         ctx,
         kv: kv.clone(),
         values: strata_values(&doc, kv),
-        live: Some(strata_live(&doc.live)).filter(|live| *live != EngineLive::default()),
+        live: Some(parsed_live).filter(|live| *live != EngineLive::default()),
         ..EngineFacts::default()
     };
     (sample, facts)
@@ -1438,7 +1571,35 @@ fn strata_live(live: &StrataLive) -> EngineLive {
         tok_s: rate(live.tok_s),
         tok_s_mean: rate(live.tok_s_mean),
         prefill_tok_s_mean: rate(live.prefill_tok_s_mean),
+        parallel: small(live.parallel),
+        running: small(live.running),
+        waiting: small(live.waiting),
+        outside_slots: small(live.outside_slots),
+        slots: live
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| {
+                Some(LiveSlot {
+                    slot: small(slot.slot)?,
+                    state: slot.state.clone().filter(|state| is_token(state))?,
+                    held_tokens: count(slot.held_tokens),
+                    prompt_tokens: count(slot.prompt_tokens),
+                    generated: count(slot.generated),
+                    elapsed_s: slot.elapsed_s,
+                    tok_s: rate(slot.tok_s),
+                })
+            })
+            .collect(),
     }
+}
+
+/// A whole number that fits a `u32` (slot counts and indices).
+fn small(value: Option<f64>) -> Option<u32> {
+    value
+        .filter(|n| n.fract() == 0.0)
+        .and_then(finite_u64)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// One series value: the sum over label sets, or the last one.
@@ -2092,6 +2253,27 @@ mod tests {
                     tok_s: Some(31.5),
                     tok_s_mean: Some(30.1),
                     prefill_tok_s_mean: Some(612.4),
+                    // #81: parallel mode, read from the one slots parse.
+                    parallel: Some(2),
+                    running: Some(1),
+                    slots: vec![
+                        LiveSlot {
+                            slot: 0,
+                            state: "generating".to_owned(),
+                            prompt_tokens: Some(1800),
+                            generated: Some(40),
+                            elapsed_s: Some(3.2),
+                            tok_s: Some(31.5),
+                            ..LiveSlot::default()
+                        },
+                        LiveSlot {
+                            slot: 1,
+                            state: "idle".to_owned(),
+                            held_tokens: Some(5120),
+                            ..LiveSlot::default()
+                        },
+                    ],
+                    ..EngineLive::default()
                 }),
                 ..EngineFacts::default()
             }

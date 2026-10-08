@@ -1794,6 +1794,15 @@ fn strata_metrics(output: u64, prompt: u64, reused: u64, state: &str, generated:
     } else {
         serde_json::json!(generated)
     };
+    // #81: in parallel mode the busy slot carries the request too, and
+    // `running` counts it.
+    doc["live"]["running"] = serde_json::json!(u8::from(state != "idle"));
+    doc["live"]["slots"][0] = if state == "idle" {
+        serde_json::json!({"slot": 0, "state": "idle", "held_tokens": 1840})
+    } else {
+        serde_json::json!({"slot": 0, "state": "decoding", "prompt_tokens": 1800,
+            "generated": generated, "elapsed_s": 3.2, "tok_s": 31.5})
+    };
     serde_json::to_vec(&doc).expect("json")
 }
 
@@ -1818,13 +1827,15 @@ fn strata_reads_its_json_metrics_and_never_slots() {
     assert_eq!(info.kind, llama_core::backend::Backend::Strata);
     assert_eq!(info.running, Some(1));
     assert_eq!(info.queued, Some(2));
-    assert_eq!(info.max_running, Some(1));
-    // #79: two batch slots holding 1,840 and 5,120 tokens of 2 × 262,144.
+    // #81: `live.parallel` 2, one request per batch slot.
+    assert_eq!(info.max_running, Some(2));
+    // #79: two batch slots holding 1,820 (1,800 + 20 generated so far)
+    // and 5,120 tokens of 2 × 262,144.
     assert_eq!(info.kv_permille, Some(13));
     let kv = info.kv.expect("#79 kv");
     assert_eq!(
         (kv.used, kv.capacity, kv.sessions),
-        (Some(6960), Some(524_288), Some(2))
+        (Some(6940), Some(524_288), Some(2))
     );
     assert_eq!(info.hit_permille, None);
     // ctx and KV come from `engine`, which the launch command lacks.
@@ -2027,7 +2038,7 @@ fn a_container_strata_is_found_by_the_shape_of_its_metrics() {
     });
     let info = view.models[0].backend.expect("backend");
     assert_eq!(info.kind, llama_core::backend::Backend::Strata);
-    assert_eq!(info.max_running, Some(1), "Strata serves one at a time");
+    assert_eq!(info.max_running, Some(2), "#81: one per batch slot");
     assert_eq!(info.running, Some(1));
     assert_eq!(info.queued, Some(2));
     // The first read: everything since Strata started.
