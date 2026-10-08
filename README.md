@@ -140,7 +140,10 @@ rows), Strata from its `live` report. IN is the whole prompt, CACHED the
 reused part, OUT the tokens so far, DUR the time since it was first seen;
 PROMPT and GEN are the live rates, marked `~`. During prefill the new run
 fills, poll by poll, toward the rest of the prompt drawn as a sky-blue low
-line, and the row is marked `pp`, with the SLOTS reset letter (`c`, `n`,
+line. llama.cpp's `/slots` does not give the prompt's length, so its
+prefill row shows only what the slot holds so far, IN with a `+`
+(`69,632+`) and no low line; it turns exact when decoding starts. The
+prefill row is marked `pp`, with the SLOTS reset letter (`c`, `n`,
 `e`) when a context reset just made it start from zero; then `gen` while
 it decodes. The row holds the latest poll's numbers, nothing in between.
 vLLM, SGLang and OpenAI-compatible servers report no per-request

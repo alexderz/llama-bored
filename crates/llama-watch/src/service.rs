@@ -1567,6 +1567,7 @@ fn layout_requests(
             inflight: Some(InFlight {
                 decoding: flight.decoding,
                 processed: flight.processed,
+                open: !flight.prompt_known,
                 reset: flight.reset,
             }),
         }
@@ -1597,7 +1598,8 @@ fn layout_requests(
 }
 
 fn prompt_last(slots: &[SlotView]) -> Option<u64> {
-    pick_slot(slots).map(|slot| slot.n_prompt_tokens)
+    // #78: the whole prompt once known, else what the slot holds.
+    pick_slot(slots).map(|slot| slot.prompt_total().unwrap_or(slot.n_prompt_tokens))
 }
 
 fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<HealthSeg> {
@@ -1946,7 +1948,8 @@ mod tests {
     fn inflight_rows_lead_recent_with_their_model_key_and_context() {
         let mut busy = slot(0, 41, true, "", "");
         busy.model = "Qwen 35B".to_owned();
-        (busy.n_prompt_tokens, busy.n_prompt_tokens_processed) = (50_000, 20_000);
+        // #78: in prefill the slot holds cached + processed so far.
+        (busy.n_prompt_tokens, busy.n_prompt_tokens_processed) = (20_000, 20_000);
         busy.prompt_cached = Some(0);
         busy.n_ctx = None;
         let ids = vec![("Qwen 35B".to_owned(), "qwen3.6-35b-a3b".to_owned())];
@@ -1979,12 +1982,13 @@ mod tests {
         assert_eq!(live.model, "qwen3.6-35b-a3b");
         assert_eq!(
             (live.input_tok, live.cached_tok, live.output_tok),
-            (50_000, 0, 0)
+            (20_000, 0, 0)
         );
         assert_eq!(live.n_ctx, Some(262_144));
         assert_eq!(
-            live.inflight.map(|f| (f.decoding, f.processed)),
-            Some((false, 20_000))
+            live.inflight.map(|f| (f.decoding, f.processed, f.open)),
+            Some((false, 20_000, true)),
+            "the whole prompt is not known in prefill"
         );
         assert_eq!(
             (live.prompt_tps, live.prompt_measured),
