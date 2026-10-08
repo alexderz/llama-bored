@@ -18,6 +18,15 @@
 //!   `prompt_total` (or `prompt_tokens`), `prompt_read` and `generated`.
 //!   Strata reports no cached count for the live request, so all its input
 //!   is new until it finishes.
+//! - **Strata in parallel mode** (`live.slots[]`, #81): one row per busy
+//!   slot, from its `prompt_tokens` (the whole prompt), `generated`,
+//!   `elapsed_s` (the row starts that long before it was first seen) and
+//!   `tok_s`. A slot whose prompt changes, or whose clock or output goes
+//!   back, runs a new request. `live.prompt_read` / `prompt_total` are the
+//!   newest request's only: the one reading slot whose prompt is
+//!   `live.prompt_tokens` gets them, and with them the target track
+//!   ([`Flight::progress`]); any other slot in prefill shows its prompt
+//!   with no target.
 //! - vLLM, SGLang and OpenAI-compatible servers report no per-request
 //!   progress: no in-flight row; RECENT keeps marking its newest finished
 //!   row `gen` while the model generates.
@@ -34,7 +43,7 @@
 //! a request is never shown twice, and the gap between the slot going idle
 //! and llama-swap's row is covered.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use llama_core::backend::Backend;
@@ -48,6 +57,17 @@ use crate::slots::SlotView;
 pub const HANDOVER: Duration = Duration::from_secs(3);
 /// Most flights tracked at once.
 pub const MAX_FLIGHTS: usize = 16;
+
+/// One Strata slot's request as last seen (#81), to tell a new one.
+#[derive(Clone, Copy, Debug, Default)]
+struct SlotMark {
+    prompt: u64,
+    generated: u64,
+    elapsed: f64,
+    epoch: u32,
+    /// Seen idle since: its next request is a new one.
+    idle: bool,
+}
 
 /// One request still running (or just finished, waiting for its row).
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +89,10 @@ pub struct Flight {
     pub cached: u64,
     /// Prompt tokens computed so far beyond the cache.
     pub processed: u64,
+    /// [`Self::processed`] is the engine's own count against the whole
+    /// prompt, so the rest of the prompt can be drawn as the target. False
+    /// for a Strata slot that is not the newest request (#81).
+    pub progress: bool,
     /// Tokens generated so far.
     pub decoded: u64,
     /// Decoding; else still in prefill.
@@ -94,8 +118,22 @@ pub struct Flight {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FlightId {
-    Slot { model: String, slot: i64, task: i64 },
-    Engine { model: String, prompt: u64 },
+    Slot {
+        model: String,
+        slot: i64,
+        task: i64,
+    },
+    Engine {
+        model: String,
+        prompt: u64,
+    },
+    /// A Strata batch slot's request (#81); `epoch` counts the requests
+    /// the slot ran.
+    EngineSlot {
+        model: String,
+        slot: u32,
+        epoch: u32,
+    },
 }
 
 /// What one poll says.
@@ -121,7 +159,17 @@ pub struct Tracker {
     flights: Vec<Flight>,
     /// Each slot's reset total at the previous poll.
     slot_resets: HashMap<(String, i64), u64>,
+    /// Each Strata slot's request as last seen (#81).
+    strata_slots: HashMap<(String, u32), SlotMark>,
+    /// Flights their finished row replaced, newest last, at most
+    /// [`MAX_REPLACED`]: never shown again (#81).
+    replaced: VecDeque<FlightId>,
 }
+
+/// Most replaced flights remembered.
+const MAX_REPLACED: usize = 64;
+/// Most Strata slots remembered across models.
+const MAX_STRATA_MARKS: usize = 256;
 
 impl Tracker {
     /// Take a new poll's numbers.
@@ -144,10 +192,13 @@ impl Tracker {
             let total = slot.prompt_total();
             let prompt = total.unwrap_or(slot.n_prompt_tokens);
             let cached = slot.prompt_cached.unwrap_or(0).min(prompt);
-            let flight = self.flight(&id, &slot.model, mono, wall, head_seq, before);
+            let Some(flight) = self.flight(&id, &slot.model, mono, wall, head_seq, before) else {
+                continue;
+            };
             flight.polled = mono;
             flight.prompt = prompt;
             flight.prompt_known = total.is_some();
+            flight.progress = total.is_some();
             flight.cached = cached;
             flight.processed = prompt - cached;
             flight.decoded = slot.n_decoded;
@@ -168,6 +219,10 @@ impl Tracker {
         }
         for engine in poll.engine_live {
             let live = &engine.live;
+            if !live.slots().is_empty() {
+                self.poll_strata_slots(engine, mono, wall, head_seq, &mut seen);
+                continue;
+            }
             let state = live.state.as_deref().unwrap_or("");
             if state != "reading" && state != "generating" {
                 continue;
@@ -178,11 +233,14 @@ impl Tracker {
                 model: engine.model.clone(),
                 prompt,
             };
-            let flight = self.flight(&id, &engine.model, mono, wall, head_seq, 0);
+            let Some(flight) = self.flight(&id, &engine.model, mono, wall, head_seq, 0) else {
+                continue;
+            };
             let decoding = state == "generating";
             flight.polled = mono;
             flight.prompt = prompt;
             flight.prompt_known = total.is_some();
+            flight.progress = total.is_some();
             flight.cached = 0;
             flight.processed = if decoding {
                 prompt
@@ -202,24 +260,150 @@ impl Tracker {
                 flight.ended = Some(mono);
             }
         }
-        // Handover: the finished row replaces its flight.
-        self.flights.retain(|flight| {
+        self.hand_over(poll);
+        self.retire(mono);
+    }
+
+    /// Handover: the finished row replaces its flight. Oldest flight
+    /// first, each row replaces at most one flight by its prompt, so two
+    /// requests running together are never both taken by one row (#81).
+    fn hand_over(&mut self, poll: &Poll<'_>) {
+        let mut taken: Vec<u64> = Vec::new();
+        let mut order: Vec<usize> = (0..self.flights.len()).collect();
+        order.sort_by_key(|at| self.flights[*at].started_mono);
+        let mut gone = vec![false; self.flights.len()];
+        for at in order {
+            let flight = &self.flights[at];
             let key = model_key(poll.ids, &flight.model);
             let later = || {
-                poll.activity
-                    .iter()
-                    .filter(|row| row.seq > flight.head_seq && row.model == key)
+                poll.activity.iter().filter(|row| {
+                    row.seq > flight.head_seq && row.model == key && !taken.contains(&row.seq)
+                })
             };
             // The row's whole prompt, read per engine (#82); a prompt
             // still only a lower bound matches no row (#78).
-            let finished = flight.prompt_known
-                && later().any(|row| {
-                    row.prompt_for(flight.engine).map(|split| split.whole) == Some(flight.prompt)
-                });
-            let replaced = finished || (flight.ended.is_some() && later().next().is_some());
-            !replaced
+            let finished = flight
+                .prompt_known
+                .then(|| {
+                    later().find(|row| {
+                        row.prompt_for(flight.engine).map(|split| split.whole)
+                            == Some(flight.prompt)
+                    })
+                })
+                .flatten()
+                .map(|row| row.seq);
+            if let Some(seq) = finished {
+                taken.push(seq);
+                gone[at] = true;
+            } else if flight.ended.is_some() && later().next().is_some() {
+                gone[at] = true;
+            }
+        }
+        // Only ids unique to one request: a serial Strata request is known
+        // by its prompt length, which the next request may share.
+        for (flight, _) in self
+            .flights
+            .iter()
+            .zip(&gone)
+            .filter(|(flight, gone)| **gone && !matches!(flight.id, FlightId::Engine { .. }))
+        {
+            if self.replaced.len() >= MAX_REPLACED {
+                self.replaced.pop_front();
+            }
+            self.replaced.push_back(flight.id.clone());
+        }
+        let mut at = 0;
+        self.flights.retain(|_| {
+            at += 1;
+            !gone[at - 1]
         });
-        self.retire(mono);
+    }
+
+    /// One row per busy Strata batch slot (#81).
+    fn poll_strata_slots(
+        &mut self,
+        engine: &ModelEngineLive,
+        mono: Instant,
+        wall: SystemTime,
+        head_seq: u64,
+        seen: &mut Vec<FlightId>,
+    ) {
+        let live = &engine.live;
+        let newest = live.newest_slot();
+        if self.strata_slots.len() >= MAX_STRATA_MARKS {
+            self.strata_slots.clear();
+        }
+        for slot in live.slots().iter().filter(|slot| !slot.busy()) {
+            if let Some(mark) = self
+                .strata_slots
+                .get_mut(&(engine.model.clone(), slot.slot))
+            {
+                mark.idle = true;
+            }
+        }
+        for slot in live.slots().iter().filter(|slot| slot.busy()) {
+            let prompt = slot.prompt_tokens.unwrap_or(0);
+            let generated = slot.generated.unwrap_or(0);
+            let elapsed = slot
+                .elapsed_s
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .unwrap_or(0.0);
+            let mark = self
+                .strata_slots
+                .entry((engine.model.clone(), slot.slot))
+                .or_insert(SlotMark {
+                    prompt,
+                    generated,
+                    elapsed,
+                    epoch: 0,
+                    idle: false,
+                });
+            if mark.idle
+                || mark.prompt != prompt
+                || generated < mark.generated
+                || elapsed + 0.05 < mark.elapsed
+            {
+                mark.epoch = mark.epoch.wrapping_add(1);
+            }
+            (mark.prompt, mark.generated, mark.elapsed, mark.idle) =
+                (prompt, generated, elapsed, false);
+            let id = FlightId::EngineSlot {
+                model: engine.model.clone(),
+                slot: slot.slot,
+                epoch: mark.epoch,
+            };
+            // The engine's own clock: the request started this long ago.
+            let ago = Duration::try_from_secs_f64(elapsed.min(86_400.0)).unwrap_or_default();
+            let started = mono.checked_sub(ago).unwrap_or(mono);
+            let started_wall = wall.checked_sub(ago).unwrap_or(wall);
+            let Some(flight) = self.flight(&id, &engine.model, started, started_wall, head_seq, 0)
+            else {
+                continue;
+            };
+            let decoding = slot.decoding();
+            let progress = !decoding && newest == Some(slot.slot);
+            flight.polled = mono;
+            flight.prompt = prompt;
+            flight.prompt_known = slot.prompt_tokens.is_some();
+            flight.progress = progress;
+            flight.cached = 0;
+            flight.processed = if progress {
+                live.prompt_read.unwrap_or(0).min(prompt)
+            } else {
+                prompt
+            };
+            flight.decoded = generated;
+            flight.decoding = decoding;
+            flight.prompt_tps = if progress {
+                live.prefill_tok_s_mean
+            } else {
+                None
+            };
+            flight.gen_tps = slot.tok_s;
+            flight.engine = Some(Backend::Strata);
+            flight.ended = None;
+            seen.push(id);
+        }
     }
 
     /// Drop flights that ended more than [`HANDOVER`] ago without a row.
@@ -247,9 +431,14 @@ impl Tracker {
         wall: SystemTime,
         head_seq: u64,
         start_resets: u64,
-    ) -> &mut Flight {
+    ) -> Option<&mut Flight> {
         if let Some(at) = self.flights.iter().position(|f| f.id == *id) {
-            return &mut self.flights[at];
+            return Some(&mut self.flights[at]);
+        }
+        // Its finished row already replaced it: an engine that still
+        // reports it for a poll after does not bring it back.
+        if self.replaced.contains(id) {
+            return None;
         }
         if self.flights.len() >= MAX_FLIGHTS
             && let Some(oldest) = self
@@ -270,6 +459,7 @@ impl Tracker {
             prompt_known: false,
             cached: 0,
             processed: 0,
+            progress: false,
             decoded: 0,
             decoding: false,
             reset: None,
@@ -283,7 +473,7 @@ impl Tracker {
             start_resets,
         });
         let last = self.flights.len() - 1;
-        &mut self.flights[last]
+        Some(&mut self.flights[last])
     }
 }
 

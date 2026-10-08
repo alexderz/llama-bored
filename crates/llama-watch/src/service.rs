@@ -574,9 +574,9 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         .iter()
         .map(|model| model.name.clone())
         .collect();
-    state
-        .ctx_history
-        .record(mono, &running, &state.detail.slots);
+    let mut held = state.detail.slots.clone();
+    held.extend(strata_views(&state.detail.engine_live));
+    state.ctx_history.record(mono, &running, &held);
     note_stopping(&mut state.stopping_since, &sample.snapshot.models, mono);
     let zone = input.clock.zone(mono);
     let model = tty_model(&sample, state, mono, wall, zone, ctx);
@@ -992,7 +992,15 @@ fn tty_model(
         prompt_last: prompt_last(&tick.detail.slots),
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
-        slots: layout_slots(&tick.detail.slots, &tick.ctx_history),
+        slots: {
+            let mut slots = layout_slots(&tick.detail.slots, &tick.ctx_history);
+            slots.extend(strata_slot_rows(
+                &tick.detail.engine_live,
+                &tick.llama.models,
+                &tick.ctx_history,
+            ));
+            slots
+        },
         backend_lines: engine_lines(sample, &tick.detail.engine_live, watch),
         text_note: if ctx.show_text && no_slots && tick.detail.slots.is_empty() && capture.is_none()
         {
@@ -1526,6 +1534,91 @@ fn swap_line(state: WatchState) -> String {
     }
 }
 
+/// Strata's batch slots (#81) as numbers-only slot views for the SLOTS
+/// sparklines: each slot's held tokens, busy or idle. No text, no task id.
+fn strata_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
+    live.iter()
+        .flat_map(|entry| {
+            entry.live.slots().iter().map(|slot| {
+                let held = slot.held();
+                let decoded = if slot.busy() {
+                    slot.generated.unwrap_or(0)
+                } else {
+                    0
+                };
+                SlotView {
+                    model: entry.model.clone(),
+                    id: i64::from(slot.slot),
+                    id_task: -1,
+                    is_processing: slot.busy(),
+                    n_prompt_tokens: held,
+                    n_prompt_tokens_processed: 0,
+                    n_decoded: decoded,
+                    n_ctx: None,
+                    ctx_prompt: Some(held - decoded.min(held)),
+                    prompt_cached: None,
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    ctx_used: Some(held),
+                    resets: Default::default(),
+                    last_reset: None,
+                }
+            })
+        })
+        .collect()
+}
+
+/// One SLOTS row per Strata batch slot (#81): an idle slot's held tokens
+/// on its ctx meter; a busy one's prompt against itself once decoding,
+/// the newest request's `prompt_read` while it reads, and `--` for any
+/// other slot still reading (Strata gives no progress for it).
+fn strata_slot_rows(
+    live: &[ModelEngineLive],
+    models: &[ModelInfo],
+    history: &CtxBook,
+) -> Vec<Slot> {
+    let mut rows = Vec::new();
+    for entry in live {
+        let n_ctx = models
+            .iter()
+            .find(|model| model.name == entry.model)
+            .and_then(|model| model.detail.as_ref())
+            .and_then(|detail| detail.ctx)
+            .map(u64::from);
+        let newest = entry.live.newest_slot();
+        for slot in entry.live.slots() {
+            let held = slot.held();
+            let prompt = slot.prompt_tokens.unwrap_or(0);
+            let busy = slot.busy();
+            let decoding = slot.decoding();
+            let (done, done_known) = if !busy {
+                (0, true)
+            } else if decoding {
+                (prompt, true)
+            } else if newest == Some(slot.slot) {
+                (entry.live.prompt_read.unwrap_or(0).min(prompt), true)
+            } else {
+                (0, false)
+            };
+            let decoded = if busy { slot.generated.unwrap_or(0) } else { 0 };
+            rows.push(Slot {
+                id: slot.slot,
+                generating: busy,
+                done,
+                cached: 0,
+                total: if busy { prompt } else { 0 },
+                open: false,
+                done_known,
+                decoded,
+                ctx_prompt: Some(held - decoded.min(held)),
+                n_ctx,
+                ctx_history: history.points(&entry.model, i64::from(slot.slot)),
+            });
+        }
+    }
+    rows
+}
+
 fn layout_slots(slots: &[SlotView], history: &CtxBook) -> Vec<Slot> {
     slots
         .iter()
@@ -1542,6 +1635,7 @@ fn layout_slots(slots: &[SlotView], history: &CtxBook) -> Vec<Slot> {
                 cached: slot.prompt_cached.unwrap_or(0),
                 total: exact.unwrap_or(slot.n_prompt_tokens),
                 open: exact.is_none() && slot.is_processing,
+                done_known: true,
                 decoded: slot.n_decoded,
                 ctx_prompt: slot.ctx_prompt,
                 n_ctx: slot.n_ctx,
@@ -1641,6 +1735,7 @@ fn layout_requests(
                 decoding: flight.decoding,
                 processed: flight.processed,
                 open: !flight.prompt_known,
+                target: flight.progress,
                 reset: flight.reset,
             }),
         }
@@ -3430,6 +3525,114 @@ mod tests {
     /// #54: Strata's engine numbers, then a second line with its live
     /// phase and progress: the prompt read while reading, the tokens and
     /// tok/s while generating, nothing while idle.
+    /// The rows of one frame as text.
+    fn frame_rows(grid: &crate::tty::grid::Grid) -> Vec<String> {
+        (0..grid.rows())
+            .map(|row| {
+                (0..grid.cols())
+                    .map(|col| grid.get(col, row).map_or(' ', |cell| cell.ch))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// #81: Strata in parallel mode, one slot decoding and one reading the
+    /// newest request: two in-flight RECENT rows, and one SLOTS line per
+    /// slot with what it holds.
+    #[test]
+    fn strata_parallel_slots_lead_recent_and_fill_slots() {
+        let detail = llama_core::detail::ModelDetail {
+            ctx: Some(262_144),
+            ..llama_core::detail::ModelDetail::default()
+        };
+        let mut flash = served(
+            "flash",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::Strata,
+                max_running: Some(2),
+                running: Some(2),
+                queued: Some(0),
+                ..BackendInfo::default()
+            }),
+        );
+        flash.detail = Some(detail);
+        let sample = backend_sample(vec![flash.clone()]);
+        let doc = serde_json::json!({
+            "engine": {"context": 262_144, "batch_slots": 2},
+            "live": {
+                "state": "reading", "parallel": 2, "running": 2, "waiting": 0,
+                "prompt_tokens": 5_965, "prompt_read": 1_024, "prompt_total": 5_965,
+                "prefill_tok_s_mean": 900.0,
+                "slots": [
+                    {"slot": 0, "state": "decoding", "prompt_tokens": 7_853,
+                     "generated": 51, "elapsed_s": 1.7, "tok_s": 34.4},
+                    {"slot": 1, "state": "reading", "prompt_tokens": 5_965,
+                     "generated": 0, "elapsed_s": 0.4},
+                ],
+            },
+        });
+        let (_, facts) = crate::metrics::parse_strata(&doc.to_string());
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.llama.ai = AiState::Loaded;
+        tick.llama.models = vec![flash];
+        tick.detail.engine_live = vec![ModelEngineLive {
+            model: "flash".to_owned(),
+            live: facts.live.expect("live"),
+        }];
+        tick.detail.setup = vec![crate::poller::ModelSetup {
+            key: "flash".to_owned(),
+            ..crate::poller::ModelSetup::default()
+        }];
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_791_417_180);
+        note_poll(&mut tick, mono, wall);
+        let ctx = frame_ctx(None, true);
+        let model = tty_model(&sample, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert_eq!(model.slots.len(), 2);
+        assert_eq!(
+            (
+                model.slots[0].done,
+                model.slots[0].total,
+                model.slots[0].decoded
+            ),
+            (7_853, 7_853, 51)
+        );
+        assert_eq!(
+            (
+                model.slots[1].done,
+                model.slots[1].total,
+                model.slots[1].ctx_prompt
+            ),
+            (1_024, 5_965, Some(5_965))
+        );
+        let flying: Vec<_> = model
+            .requests
+            .iter()
+            .filter(|r| r.inflight.is_some())
+            .collect();
+        assert_eq!(flying.len(), 2);
+        assert_eq!(
+            (flying[0].input_tok, flying[0].inflight.map(|f| f.target)),
+            (5_965, Some(true))
+        );
+        assert_eq!((flying[1].output_tok, flying[1].dur.as_str()), (51, "1.7s"));
+        let rows = frame_rows(&layout::layout(&model, 192, 60));
+        let at = rows
+            .iter()
+            .position(|r| r.contains("SLOTS"))
+            .expect("SLOTS");
+        let recent = rows
+            .iter()
+            .position(|r| r.contains("RECENT"))
+            .expect("RECENT");
+        assert!(rows[at + 1].contains("s0 gen") && rows[at + 1].contains("7,853/7,853"));
+        assert!(rows[at + 2].contains("s1 gen") && rows[at + 2].contains("1,024/5,965"));
+        assert!(rows[recent + 1].starts_with('>') && rows[recent + 1].trim_end().ends_with("pp"));
+        assert!(rows[recent + 2].starts_with('>') && rows[recent + 2].trim_end().ends_with("gen"));
+    }
+
     #[test]
     fn strata_live_line_shows_phase_and_progress() {
         use llama_core::backend::EngineStats;

@@ -64,6 +64,9 @@ pub struct Slot {
     /// [`Self::total`] is a lower bound: drawn `8,192/69,632+`, and the bar
     /// has no fill, since no honest fraction exists (#78, #82).
     pub open: bool,
+    /// [`Self::done`] is known. False for a Strata slot reading a prompt
+    /// that is not the newest request (#81): drawn `--/1,800`, no fill.
+    pub done_known: bool,
     pub decoded: u64,
     /// Prompt tokens counted toward context. `None` when `/slots` omitted both
     /// `n_prompt_tokens` and the cached-prompt count.
@@ -114,6 +117,10 @@ pub struct InFlight {
     /// The whole prompt is not known yet (#78): `input_tok` is a lower
     /// bound, drawn `12,345+`, and the bar has no target track.
     pub open: bool,
+    /// `processed` is the engine's count against the whole prompt, so the
+    /// rest of it is drawn as the target track in prefill. False with
+    /// `open`, and for a Strata slot that is not the newest request (#81).
+    pub target: bool,
     /// A context reset just before this request, which started it from
     /// zero: its letter shows after `pp`, as in SLOTS.
     pub reset: Option<ResetReason>,
@@ -1406,7 +1413,7 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         paint_str(grid, g.right + 3, row, state, state_fg, C16::Black);
         // #82: the prompt in the KV against the whole prompt; nothing
         // while the whole prompt is not known.
-        let frac = (slot.total > 0 && !slot.open)
+        let frac = (slot.total > 0 && !slot.open && slot.done_known)
             .then(|| (slot.cached.saturating_add(slot.done) as f64 / slot.total as f64).min(1.0));
         let fill = if slot.generating {
             C16::White
@@ -1428,7 +1435,11 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
             ("idle".to_string(), "--".to_string(), C16::BrightBlack)
         } else {
-            let pair = comma_pair(slot.done, slot.total);
+            let pair = if slot.done_known {
+                comma_pair(slot.done, slot.total)
+            } else {
+                format!("--/{}", commas(slot.total))
+            };
             (
                 if slot.open { format!("{pair}+") } else { pair },
                 format!("{} tok", commas(slot.decoded)),
@@ -2025,7 +2036,7 @@ fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
     let cached = req.cached_tok.min(req.input_tok);
     let new = req.input_tok - cached;
     let (done, pending) = match req.inflight {
-        Some(flight) if !flight.decoding && !flight.open => {
+        Some(flight) if !flight.decoding && !flight.open && flight.target => {
             let done = flight.processed.min(new);
             (done, new - done)
         }
@@ -4153,6 +4164,7 @@ mod tests {
             done: 0,
             cached: 0,
             open: false,
+            done_known: true,
             total: 0,
             decoded,
             ctx_prompt: prompt,

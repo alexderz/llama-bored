@@ -163,6 +163,33 @@ vLLM, SGLang and OpenAI-compatible servers report no per-request
 progress: their newest finished row is marked `gen` while the model
 generates, as before.
 
+**Strata in parallel mode** (`batch_slots` of 2 or more, #81): each busy
+batch slot is its own in-flight row, from `live.slots[]`: IN its prompt
+(exact from the start), OUT what it generated, GEN its `tok_s`, DUR its
+own `elapsed_s`, and no cached part until llama-swap's row says. Strata
+gives prompt progress (`prompt_read` / `prompt_total`) for the newest
+request only, so that slot's prefill row fills toward a target and any
+other slot still reading shows its prompt without one. A slot whose
+prompt changes, or whose clock or output goes back, runs a new request.
+Each finished row replaces exactly one flight, oldest first, and a
+replaced flight never comes back for a late poll. SLOTS gets one line per
+slot: an idle slot's held tokens on its ctx meter, a busy one's prompt
+(`7,853/7,853` once decoding, the newest request's `1,024/5,965` while it
+reads, `--/5,965` for another reading slot) and what it generated; the
+model's request cap is the slot count.
+
+```text
+  SLOTS  prompt processed                         decoded
+  s0 gen ▐█████████████████         7,853/7,853   51 tok                ctx ▐░░░░░░░░░░░ 7k/262k
+  s1 gen ▐██░░░░░░░░░░░░░░░         1,024/5,965   0 tok                 ctx ▐░░░░░░░░░░░ 5k/262k
+  strata  running 2/2 · queued 0
+          reading · prompt 1,024/5,965 (17 %)
+
+  RECENT TIME      MODEL       IN   CACHED   OUT  PROMPT     GEN    DUR
+>        23:52:59  flash    5,965        0     0    ~900      --   0.4s ▄________________________ pp
+>        23:52:58  flash    7,853        0    51      --   ~34.4   1.7s █▄_______________________ gen
+```
+
 **KV cache.** Each loaded model's KV cache across all its sessions, and
 its capacity, is one item on its SLOTS engine line (#79): the line a
 vLLM, SGLang or Strata model already has, and for a llama.cpp model a
