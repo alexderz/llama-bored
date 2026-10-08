@@ -90,7 +90,8 @@ pub struct Activity {
     /// the bar to the largest row shown and marks it `~`.
     pub n_ctx: Option<u64>,
     /// A request still running (#75), from live per-request numbers.
-    /// `input_tok` is then its whole prompt, `output_tok` the tokens so far.
+    /// `input_tok` is then its whole prompt (or, while `open`, the prompt
+    /// tokens held so far), `output_tok` the tokens so far.
     pub inflight: Option<InFlight>,
 }
 
@@ -101,6 +102,9 @@ pub struct InFlight {
     pub decoding: bool,
     /// Prompt tokens computed so far, beyond the cached part.
     pub processed: u64,
+    /// The whole prompt is not known yet (#78): `input_tok` is a lower
+    /// bound, drawn `12,345+`, and the bar has no target track.
+    pub open: bool,
     /// A context reset just before this request, which started it from
     /// zero: its letter shows after `pp`, as in SLOTS.
     pub reset: Option<ResetReason>,
@@ -2003,7 +2007,7 @@ fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
     let cached = req.cached_tok.min(req.input_tok);
     let new = req.input_tok - cached;
     let (done, pending) = match req.inflight {
-        Some(flight) if !flight.decoding => {
+        Some(flight) if !flight.decoding && !flight.open => {
             let done = flight.processed.min(new);
             (done, new - done)
         }
@@ -2576,14 +2580,13 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         paint_span_left(grid, plan.time, row, &time, plain, C16::Black);
         paint_ellipsis(grid, plan.source, row, &format_source(&req.source), plain);
         paint_ellipsis(grid, plan.model, row, &req.model, plain);
-        paint_span_right(
-            grid,
-            plan.prompt_tok,
-            row,
-            &commas(req.input_tok),
-            hot,
-            C16::Black,
-        );
+        let open = req.inflight.is_some_and(|flight| flight.open);
+        let input = if open {
+            format!("{}+", commas(req.input_tok))
+        } else {
+            commas(req.input_tok)
+        };
+        paint_span_right(grid, plan.prompt_tok, row, &input, hot, C16::Black);
         paint_span_right(
             grid,
             plan.cached,

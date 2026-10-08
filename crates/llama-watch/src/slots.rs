@@ -27,16 +27,22 @@ pub struct SlotView {
     pub id_task: i64,
     /// Server's processing flag.
     pub is_processing: bool,
-    /// Prompt tokens for this task.
+    /// `n_prompt_tokens`: on current llama-server (b11429+) the tokens the
+    /// slot holds in its KV, not the whole prompt (#78). In prefill it is
+    /// cached + processed so far; while decoding it is the prompt plus
+    /// `n_decoded − 1` (the newest sampled token is not in the KV yet).
+    /// See [`whole_prompt`].
     pub n_prompt_tokens: u64,
-    /// Prompt tokens processed so far.
+    /// Prompt tokens computed so far beyond the cache.
     pub n_prompt_tokens_processed: u64,
     /// `next_token[0].n_decoded`, or 0 when the array is empty.
     pub n_decoded: u64,
     /// `n_ctx` when that key is present. `Some(0)` is a real zero.
     pub n_ctx: Option<u64>,
-    /// Prompt tokens that occupy context: `n_prompt_tokens` when that key is
-    /// present, otherwise `n_prompt_tokens_cache`. `None` when both are absent.
+    /// Context tokens that are not output: `n_prompt_tokens − n_decoded`
+    /// when that key is present (#78), so `ctx_prompt + n_decoded` is the
+    /// context the slot holds; otherwise `n_prompt_tokens_cache`. `None`
+    /// when both are absent.
     pub ctx_prompt: Option<u64>,
     /// `n_prompt_tokens_cache`: prompt tokens this task reused from the
     /// cache, when the server sends it (#75).
@@ -46,7 +52,7 @@ pub struct SlotView {
     /// Sanitised generated tail from this poll, or the previous tail when
     /// text was skipped.
     pub output: Vec<Cell>,
-    /// Context the slot holds (#10): prompt plus decoded, and an idle slot
+    /// Context the slot holds (#10): `n_prompt_tokens`, and an idle slot
     /// keeps its last value (its KV cache stays). `None` until `/slots`
     /// gave a prompt count.
     pub ctx_used: Option<u64>,
@@ -70,6 +76,51 @@ pub fn pick_slot(slots: &[SlotView]) -> Option<&SlotView> {
     slots
         .iter()
         .max_by_key(|slot| (slot.is_processing, slot.id_task))
+}
+
+impl SlotView {
+    /// The task's whole prompt, once it is known (#78): see [`whole_prompt`].
+    #[must_use]
+    pub fn prompt_total(&self) -> Option<u64> {
+        whole_prompt(
+            (self.n_prompt_tokens > 0).then_some(self.n_prompt_tokens),
+            self.prompt_cached,
+            self.n_prompt_tokens_processed,
+            self.n_decoded,
+        )
+    }
+}
+
+/// A task's whole prompt from `/slots` numbers (#78), or `None` while it
+/// is not known.
+///
+/// llama-server (b11429, `server-context.cpp` `to_json`) sends no prompt
+/// length: `n_prompt_tokens` is `prompt.tokens.size()`, the tokens the slot
+/// holds. `params` has none either, and `n_remain` is `n_predict − n_gen`.
+/// So:
+///
+/// - **Prefill** (`n_decoded == 0`): unknown. The slot holds cached +
+///   processed so far, a lower bound.
+/// - **Decode**: prefill is complete, so `n_prompt_tokens_cache +
+///   n_prompt_tokens_processed` is the prompt exactly. Without the cache
+///   count it is `n_prompt_tokens − n_decoded + 1`: the slot holds every
+///   sampled token but the newest, which goes into the KV on the next step.
+#[must_use]
+pub fn whole_prompt(
+    n_prompt_tokens: Option<u64>,
+    cached: Option<u64>,
+    processed: u64,
+    decoded: u64,
+) -> Option<u64> {
+    if decoded == 0 {
+        return None;
+    }
+    match cached {
+        Some(cached) => Some(cached.saturating_add(processed)),
+        None => n_prompt_tokens
+            .filter(|held| *held > 0)
+            .map(|held| held.saturating_add(1).saturating_sub(decoded)),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -105,8 +156,13 @@ struct CtxTrack {
 struct Pending {
     /// Context the slot held before the drop: the conversation that left.
     left: u64,
-    /// The new task's prompt tokens.
+    /// The new task, whose prompt `prompt` is.
+    task: i64,
+    /// The new task's prompt tokens: the whole prompt when `exact`, else
+    /// what the slot held so far in prefill, a lower bound (#78).
     prompt: u64,
+    /// `prompt` is the whole prompt: the task was seen decoding.
+    exact: bool,
     /// `/slots` `n_prompt_tokens_cache` at the drop, when the server sent it.
     slots_cached: Option<u64>,
     /// Newest activity row number ([`ActivityRow::seq`]) when the drop was
@@ -136,11 +192,14 @@ impl CtxTrack {
         dropped
     }
 
-    /// Decide the pending drop with `cached` as its evidence.
+    /// Decide the pending drop with `cached` as its evidence. A prompt
+    /// still only known as a lower bound decides nothing but unknown: its
+    /// cached share would read too high (#78).
     fn decide(&mut self, cached: Option<u64>, displaced: &mut Displaced, now: Instant) {
         let Some(pending) = self.pending.take() else {
             return;
         };
+        let cached = cached.filter(|_| pending.exact);
         let reason = classify(pending.prompt, cached, displaced, now);
         self.resets.add(reason);
         self.last = Some(reason);
@@ -274,7 +333,21 @@ impl SlotBook {
         let used = slot
             .ctx_prompt
             .map(|prompt| prompt.saturating_add(slot.n_decoded));
+        let total = whole_prompt(
+            slot.held,
+            slot.n_prompt_tokens_cache,
+            slot.n_prompt_tokens_processed,
+            slot.n_decoded,
+        );
         let track = self.ctx.entry(key).or_default();
+        // The drop's task left prefill: its whole prompt is known now (#78).
+        if let (Some(pending), Some(total)) = (&mut track.pending, total)
+            && pending.task == slot.id_task
+            && !pending.exact
+        {
+            pending.prompt = total;
+            pending.exact = true;
+        }
         let Some(left) = track.sample(used, slot.is_processing) else {
             return;
         };
@@ -285,14 +358,18 @@ impl SlotBook {
             let displaced = displaced_of(&mut self.displaced, model_id, now);
             track.decide(cached, displaced, now);
         }
-        let prompt = if slot.n_prompt_tokens > 0 {
-            slot.n_prompt_tokens
-        } else {
-            slot.ctx_prompt.unwrap_or(0)
-        };
+        let prompt = total.unwrap_or_else(|| {
+            if slot.n_prompt_tokens > 0 {
+                slot.n_prompt_tokens
+            } else {
+                slot.ctx_prompt.unwrap_or(0)
+            }
+        });
         track.pending = Some(Pending {
             left,
+            task: slot.id_task,
             prompt,
+            exact: total.is_some(),
             slots_cached: slot.n_prompt_tokens_cache,
             after: self.activity_newest,
             since: None,
@@ -317,7 +394,9 @@ impl SlotBook {
     }
 
     /// Feed one activity read (#9): a waiting drop takes the newer row of
-    /// its model whose prompt matches its own, and one that waited
+    /// its model whose prompt matches its own, once that prompt is whole
+    /// (#78; the row comes when the request ends, after its decode), and
+    /// one that waited
     /// [`PENDING_TTL`] is decided on what `/slots` said, or as unknown.
     /// A failed read passes no rows and still ages the waits.
     ///
@@ -339,6 +418,7 @@ impl SlotBook {
                 row.model == key
                     && pending.after.is_none_or(|after| row.seq > after)
                     && !taken.contains(index)
+                    && pending.exact
                     && row_matches(row, pending.prompt)
             });
             let cached = match found {
@@ -563,6 +643,8 @@ struct LightSlot {
     id_task: i64,
     is_processing: bool,
     n_prompt_tokens: u64,
+    /// `n_prompt_tokens` when the key is present.
+    held: Option<u64>,
     n_prompt_tokens_processed: u64,
     n_decoded: u64,
     n_ctx: Option<u64>,
@@ -589,22 +671,17 @@ fn parse_numbers(body: &[u8]) -> Option<Vec<LightSlot>> {
     Some(
         slots
             .into_iter()
-            .map(|slot| LightSlot {
-                id: slot.id,
-                id_task: slot.id_task,
-                is_processing: slot.is_processing,
-                n_prompt_tokens: slot.n_prompt_tokens.unwrap_or(0),
-                n_prompt_tokens_processed: slot.n_prompt_tokens_processed,
-                n_decoded: slot
-                    .next_token
-                    .first()
-                    .map(|token| token.n_decoded)
-                    .unwrap_or(0),
-                n_ctx: slot.n_ctx,
-                ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
-                n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
-                generated: String::new(),
-                has_text: false,
+            .map(|slot| {
+                LightSlot::numbers(
+                    slot.id,
+                    slot.id_task,
+                    slot.is_processing,
+                    slot.n_prompt_tokens,
+                    slot.n_prompt_tokens_cache,
+                    slot.n_prompt_tokens_processed,
+                    &slot.next_token,
+                    slot.n_ctx,
+                )
             })
             .collect(),
     )
@@ -626,21 +703,50 @@ impl From<SlotJsonLight> for LightSlot {
     fn from(slot: SlotJsonLight) -> Self {
         let has_text = slot.prompt.is_some() || slot.generated.is_some();
         Self {
-            id: slot.id,
-            id_task: slot.id_task,
-            is_processing: slot.is_processing,
-            n_prompt_tokens: slot.n_prompt_tokens.unwrap_or(0),
-            n_prompt_tokens_processed: slot.n_prompt_tokens_processed,
-            n_decoded: slot
-                .next_token
-                .first()
-                .map(|token| token.n_decoded)
-                .unwrap_or(0),
-            n_ctx: slot.n_ctx,
-            ctx_prompt: slot.n_prompt_tokens.or(slot.n_prompt_tokens_cache),
-            n_prompt_tokens_cache: slot.n_prompt_tokens_cache,
             generated: slot.generated.unwrap_or_default(),
             has_text,
+            ..Self::numbers(
+                slot.id,
+                slot.id_task,
+                slot.is_processing,
+                slot.n_prompt_tokens,
+                slot.n_prompt_tokens_cache,
+                slot.n_prompt_tokens_processed,
+                &slot.next_token,
+                slot.n_ctx,
+            )
+        }
+    }
+}
+
+impl LightSlot {
+    /// The numbers of one slot, no text.
+    #[allow(clippy::too_many_arguments)]
+    fn numbers(
+        id: i64,
+        id_task: i64,
+        is_processing: bool,
+        held: Option<u64>,
+        cached: Option<u64>,
+        processed: u64,
+        next_token: &[NextTokenJson],
+        n_ctx: Option<u64>,
+    ) -> Self {
+        let n_decoded = next_token.first().map_or(0, |token| token.n_decoded);
+        Self {
+            id,
+            id_task,
+            is_processing,
+            n_prompt_tokens: held.unwrap_or(0),
+            held,
+            n_prompt_tokens_processed: processed,
+            n_decoded,
+            n_ctx,
+            // The slot holds `n_prompt_tokens`, output included (#78).
+            ctx_prompt: held.map(|held| held.saturating_sub(n_decoded)).or(cached),
+            n_prompt_tokens_cache: cached,
+            generated: String::new(),
+            has_text: false,
         }
     }
 }
@@ -877,9 +983,9 @@ mod tests {
             "id_task": 7,
             "is_processing": true,
             "n_ctx": 262_144,
-            "n_prompt_tokens": 91_000,
+            "n_prompt_tokens": 91_815,
             "n_prompt_tokens_cache": 80_000,
-            "n_prompt_tokens_processed": 91_000,
+            "n_prompt_tokens_processed": 11_000,
             "next_token": [{"n_decoded": 816}],
             "prompt": "p",
             "generated": "g",
@@ -888,7 +994,10 @@ mod tests {
         assert!(book.apply("m", "Model", &bytes, 32, 32));
         let slots = book.slots();
         assert_eq!(slots[0].n_ctx, Some(262_144));
-        assert_eq!(slots[0].ctx_prompt, Some(91_000));
+        // #78: the slot holds 91,815 tokens, 816 of them output.
+        assert_eq!(slots[0].ctx_prompt, Some(90_999));
+        assert_eq!(slots[0].ctx_used, Some(91_815));
+        assert_eq!(slots[0].prompt_total(), Some(91_000));
         assert_eq!(slots[0].n_decoded, 816);
     }
 
@@ -987,7 +1096,7 @@ mod tests {
         assert!(ctx.apply("m", "Model", &bytes, 256, 256));
         let slots = ctx.slots();
         assert_eq!(slots[0].n_ctx, Some(262_144));
-        assert_eq!(slots[0].ctx_prompt, Some(91_000));
+        assert_eq!(slots[0].ctx_prompt, Some(91_000 - 816));
         assert_eq!(slots[0].n_decoded, 816);
     }
 
@@ -1016,13 +1125,17 @@ mod tests {
         assert_eq!(input, "-- user --\n[2Jhi31m?");
     }
 
+    /// A slot whose task has a `prompt`-token prompt, all computed, and
+    /// `decoded` out. As b11429 (#78), `n_prompt_tokens` is what the slot
+    /// holds: the prompt and every sampled token but the newest. `decoded`
+    /// 0 reads as a prefill, whose whole prompt is not known yet.
     fn ctx_body(id: i64, id_task: i64, busy: bool, prompt: u64, decoded: u64) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!([{
             "id": id,
             "id_task": id_task,
             "is_processing": busy,
             "n_ctx": 262_144,
-            "n_prompt_tokens": prompt,
+            "n_prompt_tokens": prompt + decoded.saturating_sub(1),
             "n_prompt_tokens_processed": prompt,
             "next_token": [{"n_decoded": decoded}],
             "prompt": "INVENTED-PROMPT",
@@ -1052,11 +1165,12 @@ mod tests {
     #[test]
     fn slot_ctx_holds_idle_context_and_counts_drops() {
         for mut book in [SlotBook::default(), SlotBook::without_text()] {
+            // #78: the slot holds 80,499 (the newest token is not in yet).
             assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 500), 64, 64));
-            assert_eq!(ctx_of(&book, 0), (Some(80_500), 0));
+            assert_eq!(ctx_of(&book, 0), (Some(80_499), 0));
             // Idle reads 0: the cache is held, no drop.
             assert!(book.apply("m", "M", &ctx_body(0, 1, false, 0, 0), 64, 64));
-            assert_eq!(ctx_of(&book, 0), (Some(80_500), 0));
+            assert_eq!(ctx_of(&book, 0), (Some(80_499), 0));
             // A small prune is not a drop; a compaction is.
             assert!(book.apply("m", "M", &ctx_body(0, 2, true, 70_000, 0), 64, 64));
             assert_eq!(ctx_of(&book, 0), (Some(70_000), 0));
@@ -1149,7 +1263,7 @@ mod tests {
         // Agent A grows to 80k in slot 0, then compacts to 20k: 14k of the
         // new prompt was cached.
         assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 1), 64, 64));
         assert_eq!(reasons(&book, 0), (ResetCounts::default(), None));
         // Rows that are not this request: older, another model, another size.
         let noise = [
@@ -1168,7 +1282,7 @@ mod tests {
         // Agent B takes slot 0 from A (20k): a new conversation, nothing
         // cached. A's 20k is remembered as lost.
         assert!(book.apply("m", "M", &ctx_body(0, 3, true, 22_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 3_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 3_000, 1), 64, 64));
         book.note_activity(&[row(14, "m", 2_990, Some(10))], t0);
         assert_eq!(
             reasons(&book, 0),
@@ -1178,7 +1292,7 @@ mod tests {
         // Slot 1 holds C at 60k; A comes back there at 23k with ~0 cached:
         // its cache was lost, the whole prompt is processed again.
         assert!(book.apply("m", "M", &ctx_body(1, 5, true, 60_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(1, 6, true, 23_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(1, 6, true, 23_000, 1), 64, 64));
         book.note_activity(&[row(15, "m", 22_800, Some(200))], t0);
         assert_eq!(
             reasons(&book, 1),
@@ -1201,7 +1315,7 @@ mod tests {
         };
         book.note_activity(&[numbered(40, 7, 5, 0)], t0);
         assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 20_000, 1), 64, 64));
         // An old-generation row with a matching prompt but an older number.
         book.note_activity(&[numbered(41, 6, 6_000, 14_000)], t0);
         assert_eq!(reasons(&book, 0).0.total(), 0);
@@ -1222,7 +1336,7 @@ mod tests {
         book.note_activity(&[row(1, "m", 5, Some(0))], t0);
         // B takes slot 0 from A's 80k conversation: a new one.
         assert!(book.apply("m", "M", &ctx_body(0, 1, true, 80_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 3_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 2, true, 3_000, 1), 64, 64));
         book.note_activity(&[row(2, "m", 2_990, Some(10))], t0);
         assert_eq!(reasons(&book, 0).1, Some(ResetReason::New));
         assert_eq!(book.displaced["m"].len(), 1);
@@ -1232,7 +1346,7 @@ mod tests {
         assert_eq!(book.displaced["m"].len(), 1, "kept for its own TTL");
         // m is back; slot 0 drops from 120k to A's 79k, nothing cached.
         assert!(book.apply("m", "M", &ctx_body(0, 3, true, 120_000, 0), 64, 64));
-        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 79_000, 0), 64, 64));
+        assert!(book.apply("m", "M", &ctx_body(0, 4, true, 79_000, 1), 64, 64));
         book.note_activity(&[row(3, "m", 79_000, Some(0))], t0);
         assert_eq!(
             reasons(&book, 0),
@@ -1265,11 +1379,12 @@ mod tests {
         let mut book = SlotBook::default();
         let t0 = Instant::now();
         let with_cache = |id_task: i64, prompt: u64, cache: Option<u64>| {
+            // Decoding its first token: the prompt is whole (#78).
             let mut slot = serde_json::json!({
                 "id": 0, "id_task": id_task, "is_processing": true,
                 "n_ctx": 262_144, "n_prompt_tokens": prompt,
-                "n_prompt_tokens_processed": prompt,
-                "next_token": [{"n_decoded": 0}],
+                "n_prompt_tokens_processed": prompt - cache.unwrap_or(0),
+                "next_token": [{"n_decoded": 1}],
                 "prompt": "INVENTED", "generated": "INVENTED",
             });
             if let Some(cache) = cache {
@@ -1314,7 +1429,8 @@ mod tests {
         });
         if let Some(id_task) = id_task {
             slot["id_task"] = id_task.into();
-            slot["n_prompt_tokens"] = prompt.into();
+            // #78: the slot holds the prompt and all output but the newest.
+            slot["n_prompt_tokens"] = (prompt + decoded.saturating_sub(1)).into();
             slot["n_prompt_tokens_processed"] = prompt.saturating_sub(cache).into();
             slot["n_prompt_tokens_cache"] = cache.into();
             slot["params"] = serde_json::json!({"n_predict": -1, "temperature": 1.0});
@@ -1351,14 +1467,15 @@ mod tests {
         assert_eq!(book.has_text("m"), Some(false));
         let slot = &book.slots()[0];
         assert_eq!(slot.n_ctx, Some(262_144));
-        assert_eq!(slot.n_prompt_tokens, 80_000);
+        assert_eq!(slot.n_prompt_tokens, 80_499);
         assert_eq!(slot.n_prompt_tokens_processed, 20_000);
         assert_eq!(slot.n_decoded, 500);
-        assert_eq!(slot.ctx_used, Some(80_500));
+        assert_eq!(slot.ctx_used, Some(80_499));
+        assert_eq!(slot.prompt_total(), Some(80_000));
         assert!(slot.input.is_empty() && slot.output.is_empty());
 
         // A drop is still counted and decided on `n_prompt_tokens_cache`.
-        let dropped = bodies(&[bare_slot(Some(6), true, 30_000, 25_000, 0)]);
+        let dropped = bodies(&[bare_slot(Some(6), true, 30_000, 25_000, 1)]);
         assert!(book.apply("m", "M", &dropped, 64, 64));
         settle(&mut book);
         assert_eq!(
@@ -1390,6 +1507,74 @@ mod tests {
         let mut quiet = SlotBook::without_text();
         assert!(quiet.apply("q", "Q", &busy, 64, 64));
         assert_eq!(quiet.has_text("q"), None);
+    }
+
+    /// One b11429 slot (#78) of task `id_task`: `cache` reused,
+    /// `processed` computed so far, `decoded` out. It holds all of those
+    /// but the newest sampled token.
+    fn phase_slot(id_task: i64, cache: u64, processed: u64, decoded: u64) -> Vec<u8> {
+        bodies(&[serde_json::json!({
+            "id": 0, "n_ctx": 262_144, "speculative": false, "is_processing": true,
+            "id_task": id_task,
+            "n_prompt_tokens": cache + processed + decoded.saturating_sub(1),
+            "n_prompt_tokens_processed": processed,
+            "n_prompt_tokens_cache": cache,
+            "params": {"n_predict": -1, "n_keep": 0},
+            "next_token": [{
+                "has_next_token": true, "has_new_line": false,
+                "n_remain": -1, "n_decoded": decoded,
+            }],
+        })])
+    }
+
+    /// #78: a drop first seen mid-prefill knows only what the slot holds
+    /// so far. A new conversation with a cached 2k system prompt would read
+    /// as compacted (2k of 3k held); it waits for the decode, whose whole
+    /// prompt (30k) makes it new, and for the row of that size.
+    #[test]
+    fn a_drop_seen_in_prefill_waits_for_the_whole_prompt() {
+        let mut book = SlotBook::without_text();
+        let t0 = Instant::now();
+        book.note_activity(&[row(1, "m", 5, Some(0))], t0);
+        assert!(book.apply("m", "M", &phase_slot(1, 0, 80_000, 900), 64, 64));
+        // Task 2 starts: the KV is cut to its 2k cached prefix.
+        assert!(book.apply("m", "M", &phase_slot(2, 2_000, 1_000, 0), 64, 64));
+        assert_eq!(book.slots()[0].ctx_used, Some(3_000));
+        // A row the size of the held count is not this request's.
+        book.note_activity(&[row(2, "m", 1_000, Some(2_000))], t0);
+        assert_eq!(
+            reasons(&book, 0).0.total(),
+            0,
+            "a lower bound matches no row"
+        );
+        // Decoding: the prompt is 30k, so the row of 28k + 2k is its own.
+        assert!(book.apply("m", "M", &phase_slot(2, 2_000, 28_000, 40), 64, 64));
+        assert_eq!(book.slots()[0].ctx_used, Some(30_039));
+        book.note_activity(&[row(3, "m", 28_000, Some(2_000))], t0);
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(0, 1, 0, 0), Some(ResetReason::New))
+        );
+        // The held 80,899 is remembered as the conversation that left.
+        assert_eq!(book.displaced["m"].len(), 1);
+    }
+
+    /// #78: a drop whose task was never seen decoding has no whole prompt;
+    /// its cached share would be a guess, so it is unknown.
+    #[test]
+    fn a_drop_never_seen_decoding_is_unknown() {
+        let mut book = SlotBook::without_text();
+        assert!(book.apply("m", "M", &phase_slot(1, 0, 80_000, 900), 64, 64));
+        assert!(book.apply("m", "M", &phase_slot(2, 2_000, 6_000, 0), 64, 64));
+        // The next task takes the slot before task 2 was seen decoding.
+        assert!(book.apply("m", "M", &phase_slot(3, 100, 400, 0), 64, 64));
+        assert_eq!(
+            reasons(&book, 0),
+            (counts(0, 0, 0, 1), Some(ResetReason::Unknown))
+        );
+        // Timing out in prefill is unknown too, whatever /slots cached.
+        settle(&mut book);
+        assert_eq!(reasons(&book, 0).0.unknown, 2);
     }
 
     #[test]

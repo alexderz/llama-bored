@@ -832,7 +832,8 @@ fn text_off_keeps_slot_numbers_and_no_prompt_or_output_text() {
     let slot = &detail.slots[0];
     assert!(slot.is_processing);
     assert_eq!(slot.n_ctx, Some(32_768));
-    assert_eq!(slot.ctx_prompt, Some(9_000));
+    // #78: `n_prompt_tokens` holds the output too.
+    assert_eq!(slot.ctx_prompt, Some(9_000 - 42));
     assert!(slot.input.is_empty(), "{:?}", slot.input);
     assert!(slot.output.is_empty(), "{:?}", slot.output);
     let kept = format!("{detail:?}{:?}", log.lines());
@@ -2182,6 +2183,8 @@ fn prompt_cache_counters_come_from_activity_rows_and_sglang_metrics() {
 
 // ---- #9: reset reasons through the poller -----------------------------------
 
+/// A slot decoding its first token after a `prompt`-token prefill: the
+/// whole prompt is known (#78).
 fn ctx_slot(id_task: i64, prompt: u64) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!([{
         "id": 0,
@@ -2190,7 +2193,7 @@ fn ctx_slot(id_task: i64, prompt: u64) -> Vec<u8> {
         "n_ctx": 262_144,
         "n_prompt_tokens": prompt,
         "n_prompt_tokens_processed": prompt,
-        "next_token": [{"n_decoded": 0}],
+        "next_token": [{"n_decoded": 1}],
         "prompt": "INVENTED-SECRET-PROMPT",
         "generated": "INVENTED-SECRET-OUTPUT"
     }]))
@@ -2469,7 +2472,7 @@ fn a_llamacpp_model_never_fetches_captures() {
 fn textless_slots(id_task: i64) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!([{
         "id": 0, "n_ctx": 262_144, "speculative": false, "is_processing": true,
-        "id_task": id_task, "n_prompt_tokens": 40, "n_prompt_tokens_processed": 30,
+        "id_task": id_task, "n_prompt_tokens": 46, "n_prompt_tokens_processed": 30,
         "n_prompt_tokens_cache": 10, "params": {"n_predict": -1},
         "next_token": [{"has_next_token": true, "has_new_line": false, "n_remain": -1, "n_decoded": 7}]
     }]))
@@ -2512,7 +2515,7 @@ fn a_llamacpp_model_without_slot_text_uses_captures_until_text_appears() {
     let slot = detail.slots.first().expect("slot");
     assert_eq!(
         (slot.n_ctx, slot.ctx_used, slot.n_decoded),
-        (Some(262_144), Some(47), 7)
+        (Some(262_144), Some(46), 7)
     );
     // Several more `/slots` reads: logged once, fetched once.
     thread::sleep(Duration::from_millis(1_200));

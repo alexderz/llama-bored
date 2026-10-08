@@ -4,9 +4,16 @@
 //! top until llama-swap's finished row for it arrives:
 //!
 //! - **llama.cpp `/slots`**: one row per busy slot (`is_processing`), from
-//!   `n_prompt_tokens` (the whole prompt), `n_prompt_tokens_cache`
-//!   (reused), `n_prompt_tokens_processed` (computed so far beyond the
-//!   cache) and `next_token[0].n_decoded`. A new `id_task` is a new request.
+//!   `n_prompt_tokens_cache` (reused), `n_prompt_tokens_processed`
+//!   (computed so far beyond the cache), `n_prompt_tokens` and
+//!   `next_token[0].n_decoded`. A new `id_task` is a new request.
+//!   `n_prompt_tokens` is the tokens the slot holds, not the whole prompt
+//!   (#78), and `/slots` sends no prompt length, so:
+//!   - in **prefill** the row shows what the slot holds (cached +
+//!     processed so far) with no target: [`Flight::prompt_known`] is false
+//!     and IN reads as a lower bound;
+//!   - once it **decodes**, the prefill is done and the prompt is exact
+//!     ([`crate::slots::whole_prompt`]); the output is `n_decoded`.
 //! - **Strata `live`**: while `state` is `reading` or `generating`, from
 //!   `prompt_total` (or `prompt_tokens`), `prompt_read` and `generated`.
 //!   Strata reports no cached count for the live request, so all its input
@@ -21,8 +28,8 @@
 //!
 //! **Handover.** The poller numbers every activity row it keeps (`seq`).
 //! A flight remembers the newest number when it started; a later row for
-//! the same model with the same prompt count is its finished row and
-//! replaces it at once. A flight whose slot went idle also goes when any
+//! the same model with the same whole prompt (`input + cache`) is its
+//! finished row and replaces it at once. A flight whose slot went idle also goes when any
 //! later row of its model arrives, and after [`HANDOVER`] in any case. So
 //! a request is never shown twice, and the gap between the slot going idle
 //! and llama-swap's row is covered.
@@ -51,8 +58,11 @@ pub struct Flight {
     pub started_wall: SystemTime,
     /// The poll the numbers come from.
     pub polled: Instant,
-    /// Whole prompt, tokens.
+    /// Whole prompt, tokens, when [`Self::prompt_known`]; else the prompt
+    /// tokens held so far (cached + processed), a lower bound (#78).
     pub prompt: u64,
+    /// `prompt` is the whole prompt. False for a llama.cpp slot in prefill.
+    pub prompt_known: bool,
     /// Prompt tokens reused from the cache (0 when unknown).
     pub cached: u64,
     /// Prompt tokens computed so far beyond the cache.
@@ -125,16 +135,18 @@ impl Tracker {
                 .get(&key)
                 .copied()
                 .unwrap_or_else(|| slot.resets.total());
-            let cached = slot.prompt_cached.unwrap_or(0).min(slot.n_prompt_tokens);
-            let room = slot.n_prompt_tokens - cached;
-            let processed = slot.n_prompt_tokens_processed.min(room);
+            // #78: the whole prompt once decoding, else what is held.
+            let total = slot.prompt_total();
+            let prompt = total.unwrap_or(slot.n_prompt_tokens);
+            let cached = slot.prompt_cached.unwrap_or(0).min(prompt);
             let flight = self.flight(&id, &slot.model, mono, wall, head_seq, before);
             flight.polled = mono;
-            flight.prompt = slot.n_prompt_tokens;
+            flight.prompt = prompt;
+            flight.prompt_known = total.is_some();
             flight.cached = cached;
-            flight.processed = processed;
+            flight.processed = prompt - cached;
             flight.decoded = slot.n_decoded;
-            flight.decoding = slot.n_decoded > 0 || (room > 0 && processed >= room);
+            flight.decoding = slot.n_decoded > 0;
             flight.reset = (cached == 0 && slot.resets.total() > flight.start_resets)
                 .then_some(slot.last_reset)
                 .flatten();
@@ -154,7 +166,8 @@ impl Tracker {
             if state != "reading" && state != "generating" {
                 continue;
             }
-            let prompt = live.prompt_total.or(live.prompt_tokens).unwrap_or(0);
+            let total = live.prompt_total.or(live.prompt_tokens);
+            let prompt = total.unwrap_or(0);
             let id = FlightId::Engine {
                 model: engine.model.clone(),
                 prompt,
@@ -163,6 +176,7 @@ impl Tracker {
             let decoding = state == "generating";
             flight.polled = mono;
             flight.prompt = prompt;
+            flight.prompt_known = total.is_some();
             flight.cached = 0;
             flight.processed = if decoding {
                 prompt
@@ -189,7 +203,14 @@ impl Tracker {
                     .iter()
                     .filter(|row| row.seq > flight.head_seq && row.model == key)
             };
-            let finished = later().any(|row| row.input_tokens == Some(flight.prompt));
+            // llama.cpp's row splits the prompt into input + cache; a
+            // prompt still only a lower bound matches no row (#78).
+            let finished = flight.prompt_known
+                && later().any(|row| {
+                    let input = row.input_tokens;
+                    let whole = input.map(|n| n.saturating_add(row.cached_tokens.unwrap_or(0)));
+                    whole == Some(flight.prompt) || input == Some(flight.prompt)
+                });
             let replaced = finished || (flight.ended.is_some() && later().next().is_some());
             !replaced
         });
@@ -241,6 +262,7 @@ impl Tracker {
             started_wall: wall,
             polled: mono,
             prompt: 0,
+            prompt_known: false,
             cached: 0,
             processed: 0,
             decoded: 0,

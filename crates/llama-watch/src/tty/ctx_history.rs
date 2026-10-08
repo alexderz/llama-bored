@@ -287,7 +287,8 @@ pub fn is_drop(prev: u64, cur: u64) -> bool {
     fall > DROP_MIN_TOKENS && u128::from(fall) * 100 > u128::from(prev) * u128::from(DROP_PCT)
 }
 
-/// Used context of one slot: prompt tokens in context plus decoded.
+/// Used context of one slot: prompt tokens in context plus decoded, which
+/// is `n_prompt_tokens`, what the slot holds (#78).
 #[must_use]
 pub fn used_ctx(slot: &SlotView) -> Option<u64> {
     slot.ctx_prompt

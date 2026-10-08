@@ -11,9 +11,12 @@
 //!
 //! - the drop itself, from `/slots` (the sparkline rule: a busy slot's
 //!   context falls by more than 30 % and 2k tokens);
-//! - the new task's prompt size `P` (`n_prompt_tokens`) and how much of it
-//!   was reused from the cache `C`. `C` comes from the finished request's
-//!   llama-swap activity row (`cache_tokens`; llama.cpp's timings make
+//! - the new task's whole prompt `P` and how much of it was reused from
+//!   the cache `C`. `/slots` gives `P` only once the task decodes
+//!   ([`crate::slots::whole_prompt`]; its `n_prompt_tokens` is what the
+//!   slot holds, #78), so a drop seen in prefill waits for that; one whose
+//!   task is never seen decoding is [`ResetReason::Unknown`]. `C` comes
+//!   from the finished request's llama-swap activity row (`cache_tokens`; llama.cpp's timings make
 //!   `input_tokens + cache_tokens` the whole prompt, so the row whose sum is
 //!   `P` is this task's), or, when no row matches in time, from `/slots`
 //!   `n_prompt_tokens_cache` if the server sends it.

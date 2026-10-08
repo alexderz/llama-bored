@@ -4889,6 +4889,7 @@ fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activ
     req.inflight = Some(InFlight {
         decoding: decoded > 0,
         processed,
+        open: false,
         reset,
     });
     req
@@ -4976,4 +4977,33 @@ fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
         .filter(|r| row_string(&grid, *r).starts_with('>'))
         .count();
     assert_eq!(flying, 4);
+}
+
+/// #78: a llama.cpp prefill whose whole prompt `/slots` does not give:
+/// IN is the held count with a `+`, the bar has no pending target.
+#[test]
+fn an_open_prefill_reads_as_a_lower_bound_with_no_target() {
+    let mut model = inflight_model();
+    let mut open = flight_row(48_000, 0, None);
+    (open.input_tok, open.cached_tok) = (78_000, 30_000);
+    if let Some(flight) = open.inflight.as_mut() {
+        flight.open = true;
+    }
+    model.requests[0] = open;
+    let grid = draw(&model, 192, 60);
+    let header = row_with(&grid, "RECENT");
+    let prefill = row_string(&grid, header + 1);
+    assert!(prefill.contains("78,000+"), "{prefill}");
+    assert!(prefill.trim_end().ends_with("pp"), "{prefill}");
+    let bar = bar_of(&grid, header + 1);
+    let pending = bar
+        .iter()
+        .filter(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightCyan)
+        .count();
+    let done = bar
+        .iter()
+        .filter(|(ch, fg)| *ch == '█' && *fg == C16::BrightCyan)
+        .count();
+    assert_eq!(pending, 0, "no target track: {bar:?}");
+    assert!(done > 0, "{bar:?}");
 }
