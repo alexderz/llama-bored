@@ -53,8 +53,17 @@ pub struct HealthSeg {
 pub struct Slot {
     pub id: u32,
     pub generating: bool,
+    /// Prompt tokens computed beyond the cache.
     pub done: u64,
+    /// Prompt tokens reused from the cache; with [`Self::done`], the part
+    /// of the prompt the bar fills.
+    pub cached: u64,
+    /// The prompt (#82): exact once the slot decodes; while it is still in
+    /// prefill ([`Self::open`]) what it holds so far, a lower bound.
     pub total: u64,
+    /// [`Self::total`] is a lower bound: drawn `8,192/69,632+`, and the bar
+    /// has no fill, since no honest fraction exists (#78, #82).
+    pub open: bool,
     pub decoded: u64,
     /// Prompt tokens counted toward context. `None` when `/slots` omitted both
     /// `n_prompt_tokens` and the cached-prompt count.
@@ -1395,7 +1404,10 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
             ("idle", C16::BrightBlack)
         };
         paint_str(grid, g.right + 3, row, state, state_fg, C16::Black);
-        let frac = (slot.total > 0).then_some(slot.done as f64 / slot.total as f64);
+        // #82: the prompt in the KV against the whole prompt; nothing
+        // while the whole prompt is not known.
+        let frac = (slot.total > 0 && !slot.open)
+            .then(|| (slot.cached.saturating_add(slot.done) as f64 / slot.total as f64).min(1.0));
         let fill = if slot.generating {
             C16::White
         } else {
@@ -1416,8 +1428,9 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
             ("idle".to_string(), "--".to_string(), C16::BrightBlack)
         } else {
+            let pair = comma_pair(slot.done, slot.total);
             (
-                comma_pair(slot.done, slot.total),
+                if slot.open { format!("{pair}+") } else { pair },
                 format!("{} tok", commas(slot.decoded)),
                 C16::BrightWhite,
             )
@@ -4138,6 +4151,8 @@ mod tests {
             id: 0,
             generating: true,
             done: 0,
+            cached: 0,
+            open: false,
             total: 0,
             decoded,
             ctx_prompt: prompt,

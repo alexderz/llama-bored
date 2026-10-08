@@ -37,6 +37,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
+use llama_core::backend::Backend;
+
 use crate::activity::ActivityRow;
 use crate::poller::ModelEngineLive;
 use crate::resets::ResetReason;
@@ -78,6 +80,9 @@ pub struct Flight {
     pub gen_tps: Option<f64>,
     /// The slot's context size, when it reports one.
     pub n_ctx: Option<u64>,
+    /// The engine running it, which says how its finished row counts the
+    /// prompt (#82).
+    pub engine: Option<Backend>,
     id: FlightId,
     /// Newest activity `seq` when the flight started.
     head_seq: u64,
@@ -153,6 +158,7 @@ impl Tracker {
             flight.prompt_tps = poll.prompt_tps;
             flight.gen_tps = poll.gen_tps;
             flight.n_ctx = slot.n_ctx.filter(|n| *n > 0);
+            flight.engine = Some(Backend::LlamaCpp);
             flight.ended = None;
             seen.push(id);
         }
@@ -187,6 +193,7 @@ impl Tracker {
             flight.decoding = decoding;
             flight.prompt_tps = live.prefill_tok_s_mean;
             flight.gen_tps = live.tok_s.or(live.tok_s_mean);
+            flight.engine = Some(Backend::Strata);
             flight.ended = None;
             seen.push(id);
         }
@@ -203,13 +210,11 @@ impl Tracker {
                     .iter()
                     .filter(|row| row.seq > flight.head_seq && row.model == key)
             };
-            // llama.cpp's row splits the prompt into input + cache; a
-            // prompt still only a lower bound matches no row (#78).
+            // The row's whole prompt, read per engine (#82); a prompt
+            // still only a lower bound matches no row (#78).
             let finished = flight.prompt_known
                 && later().any(|row| {
-                    let input = row.input_tokens;
-                    let whole = input.map(|n| n.saturating_add(row.cached_tokens.unwrap_or(0)));
-                    whole == Some(flight.prompt) || input == Some(flight.prompt)
+                    row.prompt_for(flight.engine).map(|split| split.whole) == Some(flight.prompt)
                 });
             let replaced = finished || (flight.ended.is_some() && later().next().is_some());
             !replaced
@@ -271,6 +276,7 @@ impl Tracker {
             prompt_tps: None,
             gen_tps: None,
             n_ctx: None,
+            engine: None,
             id: id.clone(),
             head_seq,
             ended: None,

@@ -1,5 +1,6 @@
 //! `/api/metrics/activity`: llama-swap's newest requests. Unknown fields are dropped.
 
+use llama_core::backend::Backend;
 use llama_core::names::sanitize;
 use serde::Deserialize;
 
@@ -49,6 +50,90 @@ pub struct ActivityRow {
     pub draft_accepted: Option<u64>,
     /// llama-swap kept this request's bodies (`has_capture`, #5).
     pub captured: bool,
+    /// The engine that served it, when the poller knew it (#82): it says
+    /// what [`Self::input_tokens`] counts. Never parsed.
+    pub engine: Option<Backend>,
+}
+
+/// A request's prompt (#82): the whole prompt and the part of it reused
+/// from the cache, whatever the engine's llama-swap `input_tokens` meant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PromptSplit {
+    /// Every prompt token, cached ones included.
+    pub whole: u64,
+    /// Of [`Self::whole`], the tokens reused from the cache.
+    pub cached: u64,
+}
+
+impl PromptSplit {
+    /// Prompt tokens computed for this request: `whole − cached`.
+    #[must_use]
+    pub fn new_tokens(self) -> u64 {
+        self.whole - self.cached
+    }
+}
+
+/// llama-swap's `input_tokens` leaves the cached tokens out for this
+/// engine (#82). llama-swap takes it from llama-server's `timings.prompt_n`
+/// when the reply has `timings` (llama.cpp, and Strata, which sends them),
+/// and from OpenAI `usage.prompt_tokens`, which counts them, otherwise
+/// (vLLM, SGLang, any OpenAI-compatible server).
+#[must_use]
+pub fn input_excludes_cache(engine: Backend) -> bool {
+    matches!(engine, Backend::LlamaCpp | Backend::Strata)
+}
+
+/// The one place llama-swap's `input_tokens` and `cache_tokens` become a
+/// prompt (#82): RECENT's IN and CACHED, the context bar, the prompt
+/// counters fed from activity rows, the in-flight handover and the reset
+/// matching all read it.
+///
+/// With the engine unknown (a row of a model this run never saw loaded),
+/// a cached count above the input can only mean the excluding form; any
+/// other row reads as the OpenAI form, input = whole prompt. `None` when
+/// llama-swap gave no input count.
+#[must_use]
+pub fn prompt_split(
+    input: Option<u64>,
+    cached: Option<u64>,
+    engine: Option<Backend>,
+) -> Option<PromptSplit> {
+    let input = input?;
+    let cached = cached.unwrap_or(0);
+    let excludes = match engine {
+        Some(engine) => input_excludes_cache(engine),
+        None => cached > input,
+    };
+    Some(if excludes {
+        PromptSplit {
+            whole: input.saturating_add(cached),
+            cached,
+        }
+    } else {
+        PromptSplit {
+            whole: input,
+            cached: cached.min(input),
+        }
+    })
+}
+
+impl ActivityRow {
+    /// This row's prompt by its own engine ([`prompt_split`]).
+    #[must_use]
+    pub fn prompt(&self) -> Option<PromptSplit> {
+        self.prompt_for(None)
+    }
+
+    /// [`Self::prompt`], reading the row as `engine`'s when the poller did
+    /// not stamp one.
+    #[must_use]
+    pub fn prompt_for(&self, engine: Option<Backend>) -> Option<PromptSplit> {
+        prompt_split(
+            self.input_tokens,
+            self.cached_tokens,
+            self.engine.or(engine),
+        )
+    }
 }
 
 /// Rows [`parse_activity`] keeps.
@@ -97,6 +182,7 @@ impl From<ActivityJson> for ActivityRow {
             draft_tokens: nonneg_u64(tokens.draft_tokens),
             draft_accepted: nonneg_u64(tokens.draft_acc_tokens),
             captured: row.has_capture,
+            engine: None,
             status: row.resp_status_code.and_then(|code| {
                 if (0.0..65536.0).contains(&code) && code.fract() == 0.0 {
                     Some(code as u16)
@@ -263,6 +349,66 @@ mod tests {
         assert!(!format!("{rows:?}").contains("SECRET_ACTIVITY_TEXT"));
 
         assert!(parse_activity(b"not-json").is_none());
+        assert_eq!(rows[0].engine, None, "the poller stamps the engine");
         assert_eq!(parse_activity(br#"{"data":[]}"#).unwrap().len(), 0);
+    }
+
+    /// #82: one helper reads `input_tokens` per engine. llama.cpp and
+    /// Strata (llama-server `timings`) leave the cache out; vLLM, SGLang
+    /// and OpenAI `usage` count it.
+    #[test]
+    fn prompt_split_reads_input_tokens_per_engine() {
+        let split = |input, cached, engine| prompt_split(Some(input), cached, engine);
+        // Seen live on Strata: 21 new, 102,231 reused.
+        for engine in [Backend::LlamaCpp, Backend::Strata] {
+            assert_eq!(
+                split(21, Some(102_231), Some(engine)),
+                Some(PromptSplit {
+                    whole: 102_252,
+                    cached: 102_231
+                })
+            );
+            assert_eq!(
+                split(500, Some(100), Some(engine)).map(PromptSplit::new_tokens),
+                Some(500)
+            );
+        }
+        for engine in [Backend::Vllm, Backend::SgLang, Backend::OpenAi] {
+            let got = split(9_000, Some(8_192), Some(engine)).expect("split");
+            assert_eq!(
+                (got.whole, got.cached, got.new_tokens()),
+                (9_000, 8_192, 808)
+            );
+            // A cached count past the prompt is clamped, never negative.
+            let odd = split(10, Some(50), Some(engine)).expect("split");
+            assert_eq!((odd.whole, odd.cached), (10, 10));
+        }
+        // No cached count: everything is new.
+        assert_eq!(
+            split(64, None, Some(Backend::LlamaCpp)),
+            Some(PromptSplit {
+                whole: 64,
+                cached: 0
+            })
+        );
+        // Engine unknown: only a cached count above the input proves the
+        // excluding form.
+        assert_eq!(split(69, Some(553), None).map(|p| p.whole), Some(622));
+        assert_eq!(split(900, Some(300), None).map(|p| p.whole), Some(900));
+        assert_eq!(prompt_split(None, Some(5), Some(Backend::Vllm)), None);
+
+        // A row stamped by the poller wins over the caller's guess.
+        let page = br#"{"data":[{"id":1,"timestamp":"t","model":"m","tokens":{"input_tokens":69,"cache_tokens":553}}]}"#;
+        let mut row = parse_activity(page).expect("page").remove(0);
+        assert_eq!(
+            row.prompt_for(Some(Backend::Vllm)).map(|p| p.whole),
+            Some(69)
+        );
+        row.engine = Some(Backend::LlamaCpp);
+        assert_eq!(
+            row.prompt_for(Some(Backend::Vllm)).map(|p| p.whole),
+            Some(622)
+        );
+        assert_eq!(row.prompt().map(|p| p.cached), Some(553));
     }
 }
