@@ -1,5 +1,6 @@
 pub mod chips;
 pub mod cmdline;
+pub mod events;
 pub mod fans;
 pub mod gpu;
 pub mod hwmon;

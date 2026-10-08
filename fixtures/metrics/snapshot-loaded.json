@@ -127,6 +127,7 @@
         "queued": 0,
         "kv_fill": 0.5,
         "max_running": 8,
+        "inflight": 2,
         "prompt_tokens": 500000,
         "prompt_cached_tokens": 375000,
         "detail": {

@@ -124,6 +124,19 @@ pub struct InFlight {
     /// A context reset just before this request, which started it from
     /// zero: its letter shows after `pp`, as in SLOTS.
     pub reset: Option<ResetReason>,
+    /// The numbers are a share of several requests' totals, or a lower
+    /// bound (#80): IN, CACHED and OUT are drawn `≈12,345`.
+    pub approx: bool,
+    /// IN and CACHED are not known (#80): drawn `--`.
+    pub no_prompt: bool,
+    /// OUT is not known (#80): drawn `--`.
+    pub no_output: bool,
+    /// The KV the request holds (#80, SGLang): the bar is this one run.
+    pub held: Option<u64>,
+    /// No engine numbers at all (#80): the bar's place says `streaming`
+    /// and llama-swap's response bytes so far, or stays empty before the
+    /// first byte.
+    pub bytes: Option<u64>,
 }
 
 /// One item on a SETUP row (#52): `kv q8_0`, drawn after `sep`.
@@ -2033,6 +2046,26 @@ pub fn ctx_cells(parts: &[(CtxPart, u64)], scale: u64, width: usize) -> Vec<CtxC
 /// A row's bar segments: cached, new (computed so far, in flight), the
 /// prompt still to compute (in flight), output.
 fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
+    // #80: what an SGLang request holds is one run; a request with no
+    // engine numbers draws nothing.
+    if let Some(flight) = req.inflight {
+        if let Some(held) = flight.held {
+            return [
+                (CtxPart::Cached, 0),
+                (CtxPart::New, held),
+                (CtxPart::Pending, 0),
+                (CtxPart::Out, 0),
+            ];
+        }
+        if flight.bytes.is_some() {
+            return [
+                (CtxPart::Cached, 0),
+                (CtxPart::New, 0),
+                (CtxPart::Pending, 0),
+                (CtxPart::Out, 0),
+            ];
+        }
+    }
     let cached = req.cached_tok.min(req.input_tok);
     let new = req.input_tok - cached;
     let (done, pending) = match req.inflight {
@@ -2610,28 +2643,28 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         paint_ellipsis(grid, plan.source, row, &format_source(&req.source), plain);
         paint_ellipsis(grid, plan.model, row, &req.model, plain);
         let open = req.inflight.is_some_and(|flight| flight.open);
-        let input = if open {
+        let flight = req.inflight.unwrap_or_default();
+        // #80: `--` for what the engine does not say, `≈` for a share.
+        let input = if flight.no_prompt {
+            "--".to_owned()
+        } else if open {
             format!("{}+", commas(req.input_tok))
         } else {
             commas(req.input_tok)
         };
-        paint_span_right(grid, plan.prompt_tok, row, &input, hot, C16::Black);
-        paint_span_right(
-            grid,
-            plan.cached,
-            row,
-            &commas(req.cached_tok),
-            plain,
-            C16::Black,
-        );
-        paint_span_right(
-            grid,
-            plan.output,
-            row,
-            &commas(req.output_tok),
-            hot,
-            C16::Black,
-        );
+        let known = |unknown: bool, n: u64| {
+            if unknown {
+                ("--".to_owned(), false)
+            } else {
+                (commas(n), flight.approx)
+            }
+        };
+        let approx_in = flight.approx && !flight.no_prompt;
+        paint_span_approx(grid, plan.prompt_tok, row, &input, approx_in, hot);
+        let (cached, approx) = known(flight.no_prompt, req.cached_tok);
+        paint_span_approx(grid, plan.cached, row, &cached, approx, plain);
+        let (output, approx) = known(flight.no_output, req.output_tok);
+        paint_span_approx(grid, plan.output, row, &output, approx, hot);
         paint_span_right(
             grid,
             plan.prompt_tps,
@@ -2649,15 +2682,23 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             C16::Black,
         );
         paint_span_right(grid, plan.dur, row, &req.dur, plain, C16::Black);
-        draw_ctx_bar(
-            grid,
-            req,
-            plan.bar,
-            row,
-            relative_scale,
-            dim,
-            model.chart_glyphs,
-        );
+        if let Some(bytes) = flight.bytes.filter(|_| req.inflight.is_some()) {
+            // #80: no engine numbers; llama-swap's bytes are the progress.
+            if bytes > 0 {
+                let text = format!("streaming {}", byte_text(bytes));
+                paint_span_left(grid, plan.bar, row, &text, C16::BrightBlack, C16::Black);
+            }
+        } else {
+            draw_ctx_bar(
+                grid,
+                req,
+                plan.bar,
+                row,
+                relative_scale,
+                dim,
+                model.chart_glyphs,
+            );
+        }
         if req.err {
             paint_span_left(grid, plan.status, row, " ERR ", C16::Black, C16::Yellow);
         } else if let Some(flight) = req.inflight.filter(|_| !dim) {
@@ -2670,6 +2711,35 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         } else if req.live && !dim {
             paint_span_left(grid, plan.status, row, "gen", C16::BrightRed, C16::Black);
         }
+    }
+}
+
+/// [`paint_span_right`], with `≈` before the text when `approx` (#80).
+/// Painted as a cell: the sanitiser would turn `≈` into `?`.
+fn paint_span_approx(grid: &mut Grid, span: Span, row: u16, text: &str, approx: bool, fg: C16) {
+    paint_span_right(grid, span, row, text, fg, C16::Black);
+    let len = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+    if approx && len < span.w {
+        paint(
+            grid,
+            span.x + span.w - len - 1,
+            row,
+            '\u{2248}',
+            fg,
+            C16::Black,
+        );
+    }
+}
+
+/// llama-swap's response bytes as `812 B`, `12.3 kB`, `4.6 MB` (#80).
+#[must_use]
+pub fn byte_text(bytes: u64) -> String {
+    if bytes < 1_000 {
+        format!("{bytes} B")
+    } else if bytes < 1_000_000 {
+        format!("{:.1} kB", bytes as f64 / 1e3)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1e6)
     }
 }
 

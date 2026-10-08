@@ -27,9 +27,17 @@
 //!   `live.prompt_tokens` gets them, and with them the target track
 //!   ([`Flight::progress`]); any other slot in prefill shows its prompt
 //!   with no target.
-//! - vLLM, SGLang and OpenAI-compatible servers report no per-request
-//!   progress: no in-flight row; RECENT keeps marking its newest finished
-//!   row `gen` while the model generates.
+//! - **vLLM and SGLang** (#80): llama-swap's `/api/events` lists each
+//!   request in flight ([`crate::poller::LiveRequest`]); it is `pp` until
+//!   llama-swap has streamed a byte of its answer and `gen` after, DUR runs
+//!   from its start by llama-swap's `elapsed_ms`, and its tokens are what
+//!   the engine's totals give ([`crate::live`]): vLLM's prompt (once its
+//!   prefill completed), cached part and output; SGLang's held KV and
+//!   decode rate; approximate when shared among several requests. Before
+//!   any read credited it the row shows llama-swap's byte count only.
+//! - OpenAI-compatible servers report no per-request progress: no
+//!   in-flight row; RECENT keeps marking its newest finished row `gen`
+//!   while the model generates.
 //!
 //! A row holds the numbers of the latest poll only: no extrapolation and
 //! nothing tied to the frame clock, so it changes exactly when a poll does
@@ -37,11 +45,14 @@
 //!
 //! **Handover.** The poller numbers every activity row it keeps (`seq`).
 //! A flight remembers the newest number when it started; a later row for
-//! the same model with the same whole prompt (`input + cache`) is its
-//! finished row and replaces it at once. A flight whose slot went idle also goes when any
-//! later row of its model arrives, and after [`HANDOVER`] in any case. So
-//! a request is never shown twice, and the gap between the slot going idle
-//! and llama-swap's row is covered.
+//! the same model with the same whole prompt (read per engine, #82) is its
+//! finished row and replaces it at once. A flight whose request ended
+//! (its slot idle, or llama-swap's `remove`) also goes when a later row of
+//! its model arrives that no other flight took (llama-swap's in-flight id
+//! is not its activity id, so a vLLM or SGLang request is matched by model
+//! and order), and after [`HANDOVER`] in any case. Oldest flight first,
+//! each row replaces one flight. So a request is never shown twice, and the
+//! gap between the request ending and llama-swap's row is covered.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -49,7 +60,7 @@ use std::time::{Duration, Instant, SystemTime};
 use llama_core::backend::Backend;
 
 use crate::activity::ActivityRow;
-use crate::poller::ModelEngineLive;
+use crate::poller::{LiveRequest, ModelEngineLive};
 use crate::resets::ResetReason;
 use crate::slots::SlotView;
 
@@ -107,6 +118,19 @@ pub struct Flight {
     /// The engine running it, which says how its finished row counts the
     /// prompt (#82).
     pub engine: Option<Backend>,
+    /// Its numbers are a share of several requests' totals, or a lower
+    /// bound (#80): drawn `≈`.
+    pub approx: bool,
+    /// The prompt is not known (#80: vLLM before its prefill completed,
+    /// SGLang): IN and CACHED are `--`.
+    pub prompt_unknown: bool,
+    /// The output is not known (#80: SGLang): OUT is `--`.
+    pub output_unknown: bool,
+    /// The KV it holds (#80, SGLang): the bar's one run.
+    pub held: Option<u64>,
+    /// No engine numbers at all (#80): llama-swap's response bytes so far,
+    /// the row's only sign of progress.
+    pub bytes: Option<u64>,
     id: FlightId,
     /// Newest activity `seq` when the flight started.
     head_seq: u64,
@@ -134,6 +158,11 @@ enum FlightId {
         slot: u32,
         epoch: u32,
     },
+    /// A request in llama-swap's in-flight list (#80), by its id there.
+    Request {
+        model: String,
+        id: String,
+    },
 }
 
 /// What one poll says.
@@ -143,6 +172,8 @@ pub struct Poll<'a> {
     pub slots: &'a [SlotView],
     /// Engines' own live reports (Strata).
     pub engine_live: &'a [ModelEngineLive],
+    /// vLLM and SGLang requests in flight (#80).
+    pub requests: &'a [LiveRequest],
     /// RECENT's rows, newest first.
     pub activity: &'a [ActivityRow],
     /// `(display name, llama-swap key)` of each loaded model.
@@ -255,6 +286,9 @@ impl Tracker {
             flight.ended = None;
             seen.push(id);
         }
+        for req in poll.requests {
+            self.poll_request(req, mono, head_seq, &mut seen);
+        }
         for flight in &mut self.flights {
             if !seen.contains(&flight.id) && flight.ended.is_none() {
                 flight.ended = Some(mono);
@@ -272,31 +306,42 @@ impl Tracker {
         let mut order: Vec<usize> = (0..self.flights.len()).collect();
         order.sort_by_key(|at| self.flights[*at].started_mono);
         let mut gone = vec![false; self.flights.len()];
-        for at in order {
-            let flight = &self.flights[at];
-            let key = model_key(poll.ids, &flight.model);
-            let later = || {
-                poll.activity.iter().filter(|row| {
-                    row.seq > flight.head_seq && row.model == key && !taken.contains(&row.seq)
-                })
-            };
-            // The row's whole prompt, read per engine (#82); a prompt
-            // still only a lower bound matches no row (#78).
-            let finished = flight
-                .prompt_known
-                .then(|| {
-                    later().find(|row| {
-                        row.prompt_for(flight.engine).map(|split| split.whole)
-                            == Some(flight.prompt)
+        // Two passes, oldest flight first: rows matching a flight's exact
+        // prompt first, then the oldest row left for each ended flight.
+        for exact in [true, false] {
+            for &at in &order {
+                if gone[at] {
+                    continue;
+                }
+                let flight = &self.flights[at];
+                let key = model_key(poll.ids, &flight.model);
+                let later = || {
+                    poll.activity.iter().filter(|row| {
+                        row.seq > flight.head_seq && row.model == key && !taken.contains(&row.seq)
                     })
-                })
-                .flatten()
-                .map(|row| row.seq);
-            if let Some(seq) = finished {
-                taken.push(seq);
-                gone[at] = true;
-            } else if flight.ended.is_some() && later().next().is_some() {
-                gone[at] = true;
+                };
+                let seq = if exact {
+                    // The row's whole prompt, read per engine (#82); a
+                    // prompt still only a lower bound matches no row (#78).
+                    flight
+                        .prompt_known
+                        .then(|| {
+                            later().find(|row| {
+                                row.prompt_for(flight.engine).map(|split| split.whole)
+                                    == Some(flight.prompt)
+                            })
+                        })
+                        .flatten()
+                        .map(|row| row.seq)
+                } else if flight.ended.is_some() {
+                    later().map(|row| row.seq).min()
+                } else {
+                    None
+                };
+                if let Some(seq) = seq {
+                    taken.push(seq);
+                    gone[at] = true;
+                }
             }
         }
         // Only ids unique to one request: a serial Strata request is known
@@ -317,6 +362,64 @@ impl Tracker {
             at += 1;
             !gone[at - 1]
         });
+    }
+
+    /// One vLLM or SGLang request from llama-swap's in-flight list (#80).
+    fn poll_request(
+        &mut self,
+        req: &LiveRequest,
+        mono: Instant,
+        head_seq: u64,
+        seen: &mut Vec<FlightId>,
+    ) {
+        let id = FlightId::Request {
+            model: req.model.clone(),
+            id: req.id.clone(),
+        };
+        let Some(flight) = self.flight(&id, &req.model, req.started, req.started_wall, head_seq, 0)
+        else {
+            return;
+        };
+        flight.polled = mono;
+        flight.engine = Some(req.engine);
+        // Nothing streamed yet: still in prefill.
+        flight.decoding = req.resp_bytes > 0;
+        flight.progress = false;
+        flight.prompt_tps = None;
+        flight.n_ctx = None;
+        match req.tokens {
+            Some(tokens) => {
+                let prompt = tokens.prompt.unwrap_or(0);
+                let cached = tokens.cached.unwrap_or(0).min(prompt);
+                flight.prompt = prompt;
+                // Only an exact prompt matches a finished row by count.
+                flight.prompt_known = tokens.prompt.is_some() && !tokens.approx;
+                flight.cached = cached;
+                flight.processed = prompt - cached;
+                flight.decoded = tokens.output.unwrap_or(0);
+                flight.gen_tps = tokens.gen_tps;
+                flight.approx = tokens.approx;
+                flight.prompt_unknown = tokens.prompt.is_none();
+                flight.output_unknown = tokens.output.is_none();
+                flight.held = tokens.held;
+                flight.bytes = None;
+            }
+            None => {
+                flight.prompt = 0;
+                flight.prompt_known = false;
+                flight.cached = 0;
+                flight.processed = 0;
+                flight.decoded = 0;
+                flight.gen_tps = None;
+                flight.approx = false;
+                flight.prompt_unknown = true;
+                flight.output_unknown = true;
+                flight.held = None;
+                flight.bytes = Some(req.resp_bytes);
+            }
+        }
+        flight.ended = None;
+        seen.push(id);
     }
 
     /// One row per busy Strata batch slot (#81).
@@ -467,6 +570,11 @@ impl Tracker {
             gen_tps: None,
             n_ctx: None,
             engine: None,
+            approx: false,
+            prompt_unknown: false,
+            output_unknown: false,
+            held: None,
+            bytes: None,
             id: id.clone(),
             head_seq,
             ended: None,

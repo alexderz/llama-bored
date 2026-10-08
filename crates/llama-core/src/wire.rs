@@ -153,7 +153,7 @@ pub enum WireError {
     /// A model name is empty, too long, or not canonical.
     #[error("snapshot model name is not canonical")]
     Name,
-    /// A model's `running`, `queued` or `max_running` is above
+    /// A model's `running`, `queued`, `max_running` or `inflight` is above
     /// [`MAX_REQS`], its `kv_fill` is non-finite or outside 0..=1, its
     /// engine numbers are out of range ([`EngineWire::is_valid`]), its
     /// cached prompt tokens exceed its prompt tokens, a counter is above
@@ -368,6 +368,11 @@ pub struct ModelWire {
     /// is 1), at most [`MAX_REQS`] (#71).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_running: Option<u16>,
+    /// Requests llama-swap has in flight for the model, from its
+    /// `/api/events` while llama-watch reads that stream (#80: while a
+    /// vLLM or SGLang model is loaded), at most [`MAX_REQS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inflight: Option<u16>,
     /// Prompt tokens of the model's finished requests since the watcher
     /// started, cached ones included (#10). A counter: it restarts with the
     /// watcher. Omitted when not measured.
@@ -891,6 +896,7 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
         if model.running.is_some_and(|n| n > MAX_REQS)
             || model.queued.is_some_and(|n| n > MAX_REQS)
             || model.max_running.is_some_and(|n| n > MAX_REQS)
+            || model.inflight.is_some_and(|n| n > MAX_REQS)
             || not_ratio(model.kv_fill)
             || model.slots_total.is_some_and(|n| n > MAX_SLOTS)
             || model

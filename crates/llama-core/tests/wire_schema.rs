@@ -48,6 +48,7 @@ fn valid() -> WireSnapshot {
                     full_name: None,
                     detail: None,
                     max_running: None,
+                    inflight: None,
                     id: None,
                     version: None,
                     counters: None,
@@ -68,6 +69,7 @@ fn valid() -> WireSnapshot {
                     full_name: None,
                     detail: None,
                     max_running: None,
+                    inflight: None,
                     id: None,
                     version: None,
                     counters: None,
@@ -138,6 +140,7 @@ fn sanitize_wire_names_pass_validate() {
             full_name: None,
             detail: None,
             max_running: None,
+            inflight: None,
             id: None,
             version: None,
             counters: None,
@@ -464,6 +467,7 @@ fn model_count_and_loaded_state() {
             full_name: None,
             detail: None,
             max_running: None,
+            inflight: None,
             id: None,
             version: None,
             counters: None,
@@ -487,6 +491,7 @@ fn model_count_and_loaded_state() {
         full_name: None,
         detail: None,
         max_running: None,
+        inflight: None,
         id: None,
         version: None,
         counters: None,
@@ -519,6 +524,7 @@ fn name_length_and_canonical_form() {
         full_name: None,
         detail: None,
         max_running: None,
+        inflight: None,
         id: None,
         version: None,
         counters: None,
@@ -902,6 +908,7 @@ fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
         kv_fill: Some(0.123_456_7),
         slots_total: Some(wire::MAX_SLOTS),
         max_running: Some(wire::MAX_REQS),
+        inflight: Some(wire::MAX_REQS),
         id: Some("i".repeat(wire::MAX_FULL_NAME_CHARS)),
         version: Some("v".repeat(16)),
         prompt_tokens: None,
@@ -949,9 +956,11 @@ fn metrics_fields_are_bounded() {
         assert_eq!(validate(&snap), Err(WireError::OutOfRange { field }));
     }
 
-    let gauge_cases: [Mutate; 2] = [
+    let gauge_cases: [Mutate; 3] = [
         |s| s.ai.models[0].slots_total = Some(wire::MAX_SLOTS + 1),
         |s| s.ai.models[1].max_running = Some(wire::MAX_REQS + 1),
+        // #80
+        |s| s.ai.models[1].inflight = Some(wire::MAX_REQS + 1),
     ];
     for (i, bad) in gauge_cases.into_iter().enumerate() {
         let mut snap = full();
@@ -1158,6 +1167,7 @@ fn worst_case() -> WireSnapshot {
         slots_total: Some(wire::MAX_SLOTS),
         // #71: the id, version and request cap at their widest.
         max_running: Some(wire::MAX_REQS),
+        inflight: Some(wire::MAX_REQS),
         id: Some("i".repeat(wire::MAX_FULL_NAME_CHARS)),
         version: Some("v".repeat(16)),
         // The watcher writes no counter above MAX_COUNTER (#71).

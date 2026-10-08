@@ -4971,6 +4971,7 @@ fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activ
         open: false,
         target: true,
         reset,
+        ..InFlight::default()
     });
     req
 }

@@ -108,6 +108,7 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
                 full_name: None,
                 detail: None,
                 max_running: None,
+                inflight: None,
                 id: None,
                 version: None,
                 counters: None,

@@ -505,6 +505,7 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                             }),
                         slots_total: slot_total,
                         max_running: gauges.and_then(|info| info.max_running).map(cap_reqs),
+                        inflight: series.and_then(|series| series.inflight).map(cap_reqs),
                         prompt_tokens,
                         prompt_cached_tokens,
                         slot_ctx,
