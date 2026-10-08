@@ -151,6 +151,49 @@ vLLM, SGLang and OpenAI-compatible servers report no per-request
 progress: their newest finished row is marked `gen` while the model
 generates, as before.
 
+**KV cache.** Each loaded model's KV cache across all its sessions, and
+its capacity, is one item on its SLOTS engine line (#79): the line a
+vLLM, SGLang or Strata model already has, and for a llama.cpp model a
+`llamacpp` line under its slot rows (which sits beside SETUP, so short
+screens lose no RECENT row to it):
+
+```text
+  SLOTS  prompt processed                 decoded
+  s0 gen ▐█████████       91,204/91,204   612 tok      ctx ▐███░░░░░░░░ 91k/262k
+  llamacpp  KV 91k/262k tok shared 35 % · 1 session
+  sglang  running 1/4 · queued 0 · KV 75k/204k tok 37 % · +31k cached · hit 50 %
+  vllm  running 1 · queued 0 · KV ≈77k/187k tok 41 % · hit 75 % · …
+  strata  running 1/1 · queued 0 · KV 6k/524k tok 1 % · 2 sessions
+```
+
+- **llama.cpp**: in use is the sum of every slot's held tokens (`/slots`
+  `n_prompt_tokens`; an idle slot keeps its context until llama-server
+  clears it). With a unified cache (`--kv-unified`, or no `-np`: an
+  automatic slot count turns it on) every slot reports the whole pool as
+  its `n_ctx`, so the capacity is one slot's `n_ctx` and the line says
+  `shared`; with `-np N` and no `--kv-unified` each slot has its own part
+  and the capacity is their sum (`--kv-unified-per-slot` caps each slot:
+  the sum, at most `-c`). When the launch command cannot be read, the
+  cache is assumed unified if every slot reports the same `n_ctx`, shown
+  `shared?`. Sessions are the slots holding tokens. Current llama-server
+  (b11429 on) no longer exports `kv_cache_usage_ratio`.
+- **vLLM**: capacity is `cache_config_info`'s `kv_cache_size_tokens` (else
+  `num_gpu_blocks` × `block_size`); in use is `kv_cache_usage_perc` ×
+  capacity, block-rounded, so it is marked `≈`. vLLM counts prefix-cached
+  blocks no request holds as free, so there is no cached figure.
+  `engine:kv_tokens`, `engine:kv_blocks` and `engine:kv_max_concurrency`
+  are there for `[setup]` rules.
+- **SGLang**: `kv_used_tokens` in use, `kv_evictable_tokens` (the radix
+  cache) as `+N cached`, `max_total_num_tokens` as capacity. These gauges
+  lag the scheduler by up to 40 decode steps. `token_usage` is no longer
+  read: it is the fullest of the attention, sliding-window and Mamba
+  pools; without the token gauges the fill is `full_token_usage`.
+- **Strata**: capacity is `context` × `batch_slots` (1 when absent); in
+  use is the sum over `live.slots` of each idle slot's `held_tokens` and
+  each busy slot's prompt plus generated tokens.
+
+`≈` is in the bundled fonts and in eurlatgr.
+
 **SETUP.** Under the meters (one per row since #52), tty11 shows the
 settings of the model generating now, or else the one RECENT saw last:
 
@@ -273,7 +316,11 @@ Per model (labels `model`, `engine`):
 | `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context` |
 | `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata |
 | `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1 |
-| `llamabored_model_kv_cache_usage_ratio` | gauge | vLLM, SGLang; llama.cpp builds that still report it |
+| `llamabored_model_kv_cache_usage_ratio` | gauge | KV in use / capacity (#79), else the engine's own ratio: every engine but OpenAI-compatible |
+| `llamabored_model_kv_used_tokens`, `…_kv_capacity_tokens` | gauge | KV across all sessions (#79): llama.cpp (`/slots`), vLLM (ratio × `kv_cache_size_tokens`, block-rounded), SGLang, Strata |
+| `llamabored_model_kv_cached_tokens` | gauge | SGLang's reusable radix cache, not part of used (#79) |
+| `llamabored_model_kv_sessions` | gauge | slots holding tokens (llama.cpp, Strata), else running requests (#79) |
+| `llamabored_model_kv_unified` | gauge | llama.cpp: 1 when every slot shares one pool (#79) |
 | `llamabored_model_prompt_tokens_total` | counter | every engine (llama.cpp and OpenAI-compatible from llama-swap's activity rows) |
 | `llamabored_model_prompt_cached_tokens_total` | counter | llama.cpp (`cache_tokens`), vLLM, SGLang, Strata (`reused`) |
 | `llamabored_model_generation_tokens_total` | counter | every engine (llama.cpp `tokens_predicted_total`; OpenAI-compatible from activity rows) |
@@ -328,6 +375,9 @@ rate(llamabored_model_prompt_cached_tokens_total[5m])
 # Speculative acceptance
 rate(llamabored_model_spec_accepted_tokens_total[5m])
   / rate(llamabored_model_spec_draft_tokens_total[5m])
+
+# KV cache headroom, tokens (#79)
+llamabored_model_kv_capacity_tokens - llamabored_model_kv_used_tokens
 
 # Mean time to first token, seconds
 rate(llamabored_model_time_to_first_token_seconds_sum[5m])
