@@ -54,8 +54,9 @@ pub use crate::detail::{MAX_FULL_NAME_CHARS, ModelDetail};
 
 /// Wire schema version this crate reads and writes.
 pub const SCHEMA: u8 = 1;
-/// Largest snapshot accepted before parsing.
-pub const MAX_BYTES: usize = 16 * 1024;
+/// Largest snapshot accepted before parsing. 32 KiB since #84 (16 KiB
+/// before): every reader takes it from here, so they move together.
+pub const MAX_BYTES: usize = 32 * 1024;
 /// Top of `host.activity_pct`. 100 is nominal sustained load; the watcher
 /// pins spikes at this value. Every other percent tops out at 100.
 pub const ACTIVITY_MAX_PCT: f32 = 125.0;

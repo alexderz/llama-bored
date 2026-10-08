@@ -158,7 +158,7 @@ fn sanitize_wire_names_pass_validate() {
 #[test]
 fn constants_match_the_v1_contract() {
     assert_eq!(wire::SCHEMA, 1);
-    assert_eq!(wire::MAX_BYTES, 16 * 1024);
+    assert_eq!(wire::MAX_BYTES, 32 * 1024);
     assert_eq!(wire::MAX_MODELS, 8);
     assert_eq!(wire::MAX_NAME_CHARS, 13);
     assert_eq!(wire::CANONICAL_NAME_CHARS, 12);
@@ -1205,14 +1205,14 @@ fn worst_case() -> WireSnapshot {
     snap
 }
 
-/// #79's KV object, eight times at its widest, took 640 of the 859 bytes
-/// this case had left (15,525 to 16,165): it keeps a 128-byte margin.
+/// The worst case was 16,165 bytes after #79; #84 raised the cap to 32 KiB
+/// so later fields have room. Keep at least a quarter of the cap free.
 #[test]
 fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
     let snap = worst_case();
     let bytes = to_json(&snap).expect("encode");
     assert!(
-        bytes.len() < wire::MAX_BYTES - 128,
+        bytes.len() < wire::MAX_BYTES * 3 / 4,
         "worst case is {} bytes",
         bytes.len()
     );
@@ -1502,7 +1502,7 @@ fn temps_and_fan_rows_are_bounded() {
 /// temperature rows, then fan rows (llama-watch `publish::fit`, tested
 /// there), so the cap holds.
 #[test]
-fn hardware_rows_fit_a_realistic_snapshot_and_pass_only_the_worst_case() {
+fn hardware_rows_fit_even_the_worst_case_snapshot() {
     let widest_temps: Vec<wire::TempWire> = (0..wire::MAX_TEMPS)
         .map(|n| {
             let chip = format!("{n:0>width$}", width = wire::MAX_TEMP_CHIP_CHARS);
@@ -1533,12 +1533,15 @@ fn hardware_rows_fit_a_realistic_snapshot_and_pass_only_the_worst_case() {
     worst.temps = widest_temps;
     worst.fan_rows = widest_fans;
     let bytes = to_json(&worst).expect("encode");
+    // Since #84 (32 KiB) even this fits; the watcher's trimming
+    // (`publish::fit`) stays as a backstop.
     assert!(
-        bytes.len() > wire::MAX_BYTES,
-        "worst case {} + rows {} now fits; the trimming note can go",
+        bytes.len() < wire::MAX_BYTES,
+        "worst case {} + rows {} passes the cap",
         base,
         bytes.len() - base
     );
+    assert!(parse_validated(&bytes).is_ok());
 }
 
 /// #79: the KV object is additive (an older watcher sends none, and an
