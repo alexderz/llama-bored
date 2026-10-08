@@ -1329,6 +1329,7 @@ fn empty_detail() -> LlamaDetail {
         engine_live: Vec::new(),
         suspected_loads: Vec::new(),
         series: Vec::new(),
+        requests: Vec::new(),
     }
 }
 

@@ -254,6 +254,9 @@ llamabored_model_kv_sessions{model="qwen3.8-27b-vllm",engine="vllm"} 1
 # HELP llamabored_model_kv_unified llama.cpp: 1 when every slot shares one KV pool, 0 when each slot has its own.
 # TYPE llamabored_model_kv_unified gauge
 llamabored_model_kv_unified{model="qwen3-coder-30b",engine="llamacpp"} 1
+# HELP llamabored_model_inflight_requests Requests llama-swap has in flight for the model, from its event stream while a vLLM or SGLang model is loaded.
+# TYPE llamabored_model_inflight_requests gauge
+llamabored_model_inflight_requests{model="qwen3.8-27b-vllm",engine="vllm"} 2
 # HELP llamabored_slot_context_used_tokens Context tokens a llama.cpp slot holds (prompt plus generated; an idle slot keeps its last value).
 # TYPE llamabored_slot_context_used_tokens gauge
 llamabored_slot_context_used_tokens{model="qwen3-coder-30b",engine="llamacpp",slot="0"} 0

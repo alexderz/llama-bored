@@ -955,6 +955,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 engine_live: Vec::new(),
                 suspected_loads: Vec::new(),
                 series: Vec::new(),
+                requests: Vec::new(),
             },
         ));
     }
@@ -2297,12 +2298,19 @@ fn allowed_path(path: &str) -> bool {
         .strip_prefix("/upstream/")
         .and_then(|rest| rest.split_once('/'))
         .is_some_and(|(model, leaf)| {
-            !model.is_empty() && !model.contains("..") && matches!(leaf, "metrics" | "slots")
+            !model.is_empty()
+                && !model.contains("..")
+                && matches!(leaf, "metrics" | "slots" | "v1/loads?include=core")
         });
     let capture = path
         .strip_prefix("/api/captures/")
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-    path == "/running" || path == "/api/metrics/activity" || upstream || capture
+    // #80: llama-swap's event stream, while a vLLM or SGLang model is ready.
+    path == "/running"
+        || path == "/api/metrics/activity"
+        || path == "/api/events"
+        || upstream
+        || capture
 }
 
 fn capture_row(id: i64, model: &str, has_capture: bool) -> serde_json::Value {
@@ -3244,6 +3252,14 @@ fn engine_numbers(view: &LlamaView) -> bool {
 /// Every upstream request comes right after a `/running` read and is
 /// followed by one: the fresh gate and its self-check (#70).
 fn assert_gated(hits: &[String]) {
+    // #80: `/api/events` is another thread's connection, not an upstream
+    // read; it may land anywhere in the order.
+    let hits: Vec<String> = hits
+        .iter()
+        .filter(|path| *path != "/api/events")
+        .cloned()
+        .collect();
+    let hits = hits.as_slice();
     for (i, path) in hits.iter().enumerate() {
         if path.contains("/upstream/") {
             assert_eq!(

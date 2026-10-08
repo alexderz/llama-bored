@@ -289,7 +289,7 @@ fn kv(model: &ModelWire) -> Option<&KvWire> {
 
 /// Per-model families with one sample per model, in export order: the
 /// first ten, then the requests and the latency summaries, then the rest.
-const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 24] = [
+const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 25] = [
     (
         "llamabored_model_context_size_tokens",
         "gauge",
@@ -474,6 +474,12 @@ const MODEL_FAMILIES: [(&str, &str, &str, ModelValue); 24] = [
         "gauge",
         "llama.cpp: 1 when every slot shares one KV pool, 0 when each slot has its own.",
         |m| kv(m).and_then(|kv| kv.unified).map(flag),
+    ),
+    (
+        "llamabored_model_inflight_requests",
+        "gauge",
+        "Requests llama-swap has in flight for the model, from its event stream while a vLLM or SGLang model is loaded.",
+        |m| m.inflight.map(|n| n.to_string()),
     ),
 ];
 

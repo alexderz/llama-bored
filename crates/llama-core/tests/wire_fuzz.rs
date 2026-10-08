@@ -56,6 +56,7 @@ fn sample() -> WireSnapshot {
                     prefix_cache: None,
                 }),
                 max_running: None,
+                inflight: None,
                 id: None,
                 version: None,
                 counters: None,

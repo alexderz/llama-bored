@@ -159,9 +159,52 @@ prefill row shows only what the slot holds so far, IN with a `+`
 prefill row is marked `pp`, with the SLOTS reset letter (`c`, `n`,
 `e`) when a context reset just made it start from zero; then `gen` while
 it decodes. The row holds the latest poll's numbers, nothing in between.
-vLLM, SGLang and OpenAI-compatible servers report no per-request
-progress: their newest finished row is marked `gen` while the model
-generates, as before.
+OpenAI-compatible servers report no per-request progress: their newest
+finished row is marked `gen` while the model generates, as before.
+
+**vLLM and SGLang in flight** (#80). While a vLLM or SGLang model is
+loaded, llama-watch keeps one connection to llama-swap's `GET
+/api/events` (Server-Sent Events, on a thread of its own so it never
+holds the poller; lines and frames capped at 256 KiB, the ~100 KB log
+history v256 sends on connect read through and dropped; reconnect after
+1 s, doubling to 30 s; one fresh session every 2 minutes). Its `inflight`
+frames list every request llama-swap is serving; each vLLM or SGLang one
+is an in-flight row: `pp` until llama-swap has streamed a byte of the
+answer, then `gen`; DUR from the start llama-swap gives (`elapsed_ms`).
+Tokens come only from reads that happen anyway, through the fresh gate,
+so a row changes when a read does and never in between:
+
+- **vLLM**: each `/metrics` read shares the deltas of
+  `generation_tokens_total`, `prompt_tokens_total` and
+  `prompt_tokens_cached` since the read before among the requests in
+  flight in that window (or `num_requests_running`, if more). One request
+  gets exactly its own; several get an even split, drawn `≈`. vLLM counts
+  a prompt (cached part included) when its prefill completes, so IN and
+  CACHED are `--` until then; OUT counts from the first read. A window in
+  which no request is listed stays open up to 5 s, so a request the stream
+  lists a moment late still gets its first tokens; one first credited
+  after it had already run a window is a lower bound, drawn `≈`.
+- **SGLang**: its `/metrics` gauges lag up to 40 decode steps, so for a
+  model with a request in flight each metrics round also reads
+  `/v1/loads?include=core` (computed on demand; its per-DP-rank entries
+  summed): `num_used_tokens` is the bar (the KV the request holds) and
+  `gen_throughput` GEN, shared evenly and drawn `≈` when several run. IN,
+  CACHED and OUT are `--`: SGLang reports none per request.
+- Before any read has credited it, a row shows DUR and llama-swap's byte
+  count in the bar's place (`streaming 4.1 kB`), no bar.
+
+llama-swap's in-flight id is not its activity id, so the finished row
+takes over by model and order: an exact vLLM prompt matches its own row,
+any other ended request the oldest later row of its model no other flight
+took; never both, never twice.
+
+```text
+  RECENT TIME      MODEL           IN   CACHED    OUT  PROMPT     GEN    DUR
+>        23:52:59  bonsai-sg       --       --     --      --      --   0.4s streaming 4.1 kB            gen
+>        23:52:58  bonsai-sg       --       --     --      --   ~41.5   1.2s ▄███████████████_______ gen
+>        23:52:57  qwen-vllm       --       --    ≈12      --      --   2.3s ▄______________________ pp
+>        23:52:51  qwen-vllm    9,000    8,192     64      --      --   8.8s ▄██▄▄__________________ gen
+```
 
 **Strata in parallel mode** (`batch_slots` of 2 or more, #81): each busy
 batch slot is its own in-flight row, from `live.slots[]`: IN its prompt
@@ -364,6 +407,7 @@ Per model (labels `model`, `engine`):
 | `llamabored_model_state{state}` | gauge | every engine (`ready`, `starting`, `stopping`, `other`) |
 | `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context` |
 | `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata |
+| `llamabored_model_inflight_requests` | gauge | every engine, from llama-swap's `/api/events` while a vLLM or SGLang model is loaded (#80); one aggregate per model, never a series per request |
 | `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1 |
 | `llamabored_model_kv_cache_usage_ratio` | gauge | KV in use / capacity (#79), else the engine's own ratio: every engine but OpenAI-compatible |
 | `llamabored_model_kv_used_tokens`, `…_kv_capacity_tokens` | gauge | KV across all sessions (#79): llama.cpp (`/slots`), vLLM (ratio × `kv_cache_size_tokens`, block-rounded), SGLang, Strata |
@@ -479,7 +523,8 @@ an `/upstream/<model>/…` request names that is not loaded, so llama-watch
 makes sure its own polling never does:
 
 - **Fresh gate.** Every upstream read (`/metrics`, `/slots`, the one-time
-  engine probe) is sent right after a `/running` read of its own, and only
+  engine probe, SGLang's `/v1/loads?include=core` for an in-flight row)
+  is sent right after a `/running` read of its own, and only
   for a model that read lists as `ready`. A model that was ready a moment
   ago but is not in that read is skipped, not retried.
 - **No reads during a swap.** If that `/running` lists any model as
@@ -495,7 +540,12 @@ makes sure its own polling never does:
   available now": that model's engine series are dropped as on unload,
   it is not read again that round, and llama-swap's `source_up` stays 1.
   A 409 is logged once (`<id>: llama-swap says not loaded; skipping until
-  ready`). Redirects are never followed.
+  ready`). Redirects are never followed. (A non-2xx to `/v1/loads` only
+  says that SGLang lacks it: it is not asked again for that load, and the
+  model's gauges stay.)
+- llama-swap's own `/api/events` stream (#80), read while a vLLM or
+  SGLang model is loaded, names no model path and cannot load one, like
+  `/running`.
 
 When a model is not running, its series are simply absent: llama-metrics
 renders only what the snapshot holds, so the exposition stays valid and

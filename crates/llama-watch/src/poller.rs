@@ -13,7 +13,9 @@
 //! timeouts, two `/running` timeouts around each of those sixteen (the
 //! fresh gate, #70), one activity timeout and one capture timeout. At the
 //! default timeouts that is 0.25 + 8×0.2 + 8×0.5 + 32×0.25 + 0.25 + 1 =
-//! 15.1 s when every call hangs. The consumer calls [`SampleRx::take`], which does not wait, so that
+//! 15.1 s when every call hangs (an SGLang model with a request in flight
+//! adds one `/v1/loads` read and its two gate reads to that, #80; the
+//! `/api/events` stream has its own thread and adds nothing). The consumer calls [`SampleRx::take`], which does not wait, so that
 //! hang cannot stall the main loop.
 //!
 //! IN and OUT for a model without `/slots` come from llama-swap's request
@@ -94,6 +96,16 @@
 //! row number, and a capture is only fetched for a row of the page just
 //! read.
 //!
+//! **In flight on vLLM and SGLang (#80).** While a vLLM or SGLang model is
+//! ready, llama-swap's `GET /api/events` stream runs on a thread of its own
+//! ([`crate::sources::events`]): its `inflight` frames list the requests
+//! llama-swap is serving, for any engine. Each vLLM `/metrics` read shares
+//! its counter deltas among them ([`crate::live`]); for an SGLang model
+//! with a request in flight the round adds one gated
+//! `GET /upstream/<id>/v1/loads?include=core`, at the metrics cadence. Each
+//! such request is a [`LiveRequest`] for RECENT, and each listed model's
+//! in-flight count rides [`ModelSeries::inflight`] while the stream is up.
+//!
 //! The thread never touches the console or the snapshot file.
 
 use std::collections::{HashMap, HashSet};
@@ -101,7 +113,7 @@ use std::io::Read;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use llama_core::backend::{self, Backend, BackendInfo, EngineStats};
 use llama_core::log::{self, Priority, Sink};
@@ -112,6 +124,7 @@ use llama_core::wire::CANONICAL_NAME_CHARS;
 use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
+use crate::live::{LOADS_CAP, LiveBook, LiveTokens, parse_loads};
 use crate::metrics::{
     DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, KvTokens,
     MetricsSample, PromptCache, detect_backend, parse_metrics_full,
@@ -121,6 +134,7 @@ use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::KvLayout;
+use crate::sources::events::{Events, EventsView};
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
 use crate::tty::grid::Cell;
@@ -146,6 +160,12 @@ const SUSPECT_BACKOFF: Duration = Duration::from_secs(300);
 const MAX_SUSPECTS: usize = 8;
 /// Most models whose server RECENT remembers for its rows (#82).
 const MAX_ROW_ENGINES: usize = 64;
+/// SGLang's live load report (#80), read only while a request is in
+/// flight: the leaf [`State::poll_loads`] names at its gate call (S17
+/// reads it there). A non-2xx answer to it says nothing of the model.
+const LOADS_LEAF: &str = "v1/loads?include=core";
+/// The shortest connect and head timeout for `/api/events` (#80).
+const EVENTS_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long the last attempt at each tap took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,6 +212,29 @@ pub struct LlamaDetail {
     /// Each listed model's cumulative numbers for llama-metrics (#71), in
     /// the order of the view's models.
     pub series: Vec<ModelSeries>,
+    /// vLLM and SGLang requests llama-swap has in flight (#80), oldest
+    /// first, with what the engine's totals say of each.
+    pub requests: Vec<LiveRequest>,
+}
+
+/// One vLLM or SGLang request in flight (#80), from llama-swap's
+/// `/api/events` and the engine's totals.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveRequest {
+    /// Display name of its model, as [`SlotView::model`] has it.
+    pub model: String,
+    /// llama-swap's in-flight id (not the activity id).
+    pub id: String,
+    /// Its engine.
+    pub engine: Backend,
+    /// When it started, by llama-swap's `elapsed_ms`.
+    pub started: Instant,
+    /// The same on the wall clock.
+    pub started_wall: SystemTime,
+    /// Response bytes written: 0 while it is still in prefill.
+    pub resp_bytes: u64,
+    /// Its tokens, once a read credited it.
+    pub tokens: Option<LiveTokens>,
 }
 
 /// One ready model's [`EngineLive`] (#54).
@@ -569,6 +612,17 @@ struct State<L> {
     /// activity row's `input_tokens` is read by its engine, also after the
     /// model unloads.
     row_engines: HashMap<String, Backend>,
+    /// llama-swap's `/api/events` stream while a vLLM or SGLang model is
+    /// ready (#80), and what it said at the start of this round.
+    events: Option<Events>,
+    events_view: EventsView,
+    events_failed: bool,
+    /// vLLM and SGLang requests' token shares (#80).
+    live: LiveBook,
+    /// Ready SGLang models whose `/v1/loads` answered non-2xx this load:
+    /// not asked again until they reload (#80).
+    loads_missing: HashSet<String>,
+    loads_failed: bool,
 }
 
 /// What [`State::upstream_read`] did.
@@ -639,6 +693,12 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         backoff: HashMap::new(),
         suspected: Vec::new(),
         row_engines: HashMap::new(),
+        events: None,
+        events_view: EventsView::default(),
+        events_failed: false,
+        live: LiveBook::default(),
+        loads_missing: HashSet::new(),
+        loads_failed: false,
     };
     let mut next_running = Instant::now();
     let mut next_metrics = Instant::now();
@@ -656,6 +716,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         state.round_blocked = false;
         if now >= next_running || state.running_due {
             state.poll_running();
+            state.sync_events();
             next_running = Instant::now() + state.limits.running_interval;
             worked = true;
         }
@@ -887,6 +948,8 @@ impl<L: Sink> State<L> {
     /// its prompt counters come from activity rows until `/metrics` gives
     /// both again (#46).
     fn forget_process(&mut self, id: &str) {
+        self.live.forget(id);
+        self.loads_missing.remove(id);
         self.counter.forget(id);
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
@@ -981,6 +1044,11 @@ impl<L: Sink> State<L> {
     }
 
     fn poll_metrics(&mut self) {
+        // The requests in flight as of now, for this round's token shares
+        // (#80): a request listed late would only get a lower bound.
+        if let Some(events) = &self.events {
+            self.events_view = events.view();
+        }
         self.probe_backends();
         let ready: Vec<ReadyModel> = self
             .ready
@@ -1021,6 +1089,11 @@ impl<L: Sink> State<L> {
             if let Ok(sample) = &read {
                 self.series
                     .observe_metrics(&model.id, model.backend, sample, now);
+                if model.backend == Backend::Vllm {
+                    let key = activity::model_key(&model.id);
+                    self.live
+                        .observe_vllm(&model.id, &key, now, sample, &self.events_view);
+                }
             }
             let decoded = match &read {
                 Ok(sample) => sample.n_decode_total,
@@ -1073,7 +1146,119 @@ impl<L: Sink> State<L> {
             }
         }
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
+        self.poll_loads();
         self.latencies.metrics = Some(started.elapsed());
+    }
+
+    /// Start llama-swap's `/api/events` stream while a vLLM or SGLang model
+    /// is ready (or llama-swap is away and it ran), stop it otherwise, and
+    /// take what it says for this round (#80).
+    fn sync_events(&mut self) {
+        let wanted = self
+            .ready
+            .iter()
+            .any(|model| matches!(model.backend, Backend::Vllm | Backend::SgLang))
+            || (!self.running_up && self.events.is_some());
+        if !wanted {
+            self.events = None;
+        } else if self.events.is_none() {
+            match Events::spawn(
+                &self.limits.url,
+                self.limits.running_timeout.max(EVENTS_TIMEOUT),
+            ) {
+                Ok(events) => self.events = Some(events),
+                Err(err) => log::emit(
+                    &mut self.log,
+                    Priority::Warning,
+                    &format!("events: cannot start its thread: {err}"),
+                ),
+            }
+        }
+        self.events_view = self.events.as_ref().map(Events::view).unwrap_or_default();
+        let failure = self.events_view.failure;
+        note_flag(&mut self.log, &mut self.events_failed, failure, "events");
+        self.live.prune(&self.events_view);
+    }
+
+    /// One gated `/v1/loads` read for each ready SGLang model with a
+    /// request in flight (#80), at the metrics cadence.
+    fn poll_loads(&mut self) {
+        let todo: Vec<String> = self
+            .ready
+            .iter()
+            .filter(|model| model.backend == Backend::SgLang)
+            .filter(|model| !self.loads_missing.contains(&model.id))
+            .filter(|model| {
+                let key = activity::model_key(&model.id);
+                self.events_view.requests.iter().any(|req| req.model == key)
+            })
+            .map(|model| model.id.clone())
+            .collect();
+        let mut failure: Option<&'static str> = None;
+        for id in todo {
+            let (model, read) = match self.upstream_read(
+                &id,
+                "v1/loads?include=core",
+                self.limits.metrics_timeout,
+                |_| LOADS_CAP,
+            ) {
+                Gate::Read(model, read) if model.backend == Backend::SgLang => (model, read),
+                Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => continue,
+            };
+            let loads = match exact(read) {
+                Ok(bytes) => parse_loads(&bytes),
+                Err(TapError::Status) => {
+                    self.loads_missing.insert(model.id.clone());
+                    log::emit(
+                        &mut self.log,
+                        Priority::Info,
+                        &format!(
+                            "{}: no /v1/loads from sglang; its in-flight rows show no tokens",
+                            model.id
+                        ),
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    failure = failure.or(Some(err.label()));
+                    continue;
+                }
+            };
+            match loads {
+                Some(loads) => {
+                    let key = activity::model_key(&model.id);
+                    self.live
+                        .observe_loads(&key, Instant::now(), &loads, &self.events_view);
+                }
+                None => {
+                    failure = failure.or(Some("malformed"));
+                }
+            }
+        }
+        note_flag(&mut self.log, &mut self.loads_failed, failure, "loads");
+    }
+
+    /// The vLLM and SGLang requests in flight now (#80), oldest first.
+    fn live_requests(&self, view: &EventsView) -> Vec<LiveRequest> {
+        let mut out = Vec::new();
+        for req in &view.requests {
+            let Some(model) = self.ready.iter().find(|model| {
+                matches!(model.backend, Backend::Vllm | Backend::SgLang)
+                    && activity::model_key(&model.id) == req.model
+            }) else {
+                continue;
+            };
+            out.push(LiveRequest {
+                model: model.name.clone(),
+                id: req.id.clone(),
+                engine: model.backend,
+                started: req.started,
+                started_wall: req.started_wall,
+                resp_bytes: req.resp_bytes,
+                tokens: self.live.tokens(&req.model, &req.id),
+            });
+        }
+        out
     }
 
     /// The fresh gate (#70), and the one place an `/upstream/<id>/<leaf>`
@@ -1145,6 +1330,9 @@ impl<L: Sink> State<L> {
             self.suspect_load(id, leaf, &why);
         }
         match &read {
+            // An SGLang without `/v1/loads` answers 404: that says nothing
+            // of the model, whose gauges stay (#80).
+            Err(TapError::Status) if leaf == LOADS_LEAF => {}
             Err(TapError::Status | TapError::Unauthorized) => self.not_available(id),
             Ok(_) => {
                 self.not_loaded.remove(id);
@@ -1526,6 +1714,8 @@ impl<L: Sink> State<L> {
 
     fn publish(&mut self) -> Result<(), ()> {
         let now = Instant::now();
+        // One fresh look at the event stream for the whole sample (#80).
+        let events = self.events.as_ref().map(Events::view).unwrap_or_default();
         let ready_ids: Vec<&str> = self.ready.iter().map(|model| model.id.as_str()).collect();
         let decoded = if self.unmetered {
             None
@@ -1597,7 +1787,8 @@ impl<L: Sink> State<L> {
                     )
                 })
                 .collect(),
-            series: self.model_series(now),
+            series: self.model_series(now, &events),
+            requests: self.live_requests(&events),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());
@@ -1619,7 +1810,7 @@ impl<L: Sink> State<L> {
 
     /// Each listed model's cumulative numbers (#71), in the order of
     /// [`Self::models`], with the version its engine reports.
-    fn model_series(&self, now: Instant) -> Vec<ModelSeries> {
+    fn model_series(&self, now: Instant, events: &EventsView) -> Vec<ModelSeries> {
         let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
         self.models
             .iter()
@@ -1630,6 +1821,16 @@ impl<L: Sink> State<L> {
                     .engine_facts
                     .get(id)
                     .and_then(|facts| facts.values.get("version").cloned()),
+                // #80: llama-swap's own count, while its stream is up.
+                inflight: events.connected.then(|| {
+                    let key = activity::model_key(id);
+                    let n = events
+                        .requests
+                        .iter()
+                        .filter(|req| req.model == key)
+                        .count();
+                    u16::try_from(n).unwrap_or(u16::MAX)
+                }),
                 ..self.series.get(id, now, fresh)
             })
             .collect()

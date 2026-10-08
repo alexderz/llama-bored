@@ -2,10 +2,12 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+use llama_core::backend::Backend;
 use llama_watch::activity::{ActivityRow, parse_activity};
 use llama_watch::inflight::{Flight, HANDOVER, Poll, Tracker};
+use llama_watch::live::LiveTokens;
 use llama_watch::metrics::EngineLive;
-use llama_watch::poller::ModelEngineLive;
+use llama_watch::poller::{LiveRequest, ModelEngineLive};
 use llama_watch::resets::{ResetCounts, ResetReason};
 use llama_watch::slots::{SlotBook, SlotView};
 
@@ -102,10 +104,32 @@ impl Feed {
         let poll = Poll {
             slots,
             engine_live: engine,
+            requests: &[],
             activity,
             ids: &self.ids,
             prompt_tps: Some(2_400.0),
             gen_tps: Some(54.2),
+        };
+        let mono = self.t0 + Duration::from_millis(at_ms);
+        self.tracker.poll(&poll, mono, SystemTime::UNIX_EPOCH);
+        self.flights()
+    }
+
+    /// One poll with vLLM or SGLang requests in flight (#80).
+    fn poll_requests(
+        &mut self,
+        at_ms: u64,
+        requests: &[LiveRequest],
+        activity: &[ActivityRow],
+    ) -> Vec<Flight> {
+        let poll = Poll {
+            slots: &[],
+            engine_live: &[],
+            requests,
+            activity,
+            ids: &self.ids,
+            prompt_tps: None,
+            gen_tps: None,
         };
         let mono = self.t0 + Duration::from_millis(at_ms);
         self.tracker.poll(&poll, mono, SystemTime::UNIX_EPOCH);
@@ -503,4 +527,105 @@ fn strata_slots_hand_over_one_row_each() {
         row(1, "strata", 10),
     ];
     assert!(feed.poll_with(1_500, &[], &[idle], &all).is_empty());
+}
+
+/// A vLLM request llama-swap lists (#80), `bytes` streamed so far.
+fn vllm(
+    feed: &Feed,
+    id: &str,
+    started_ms: u64,
+    bytes: u64,
+    tokens: Option<LiveTokens>,
+) -> LiveRequest {
+    LiveRequest {
+        model: "qwen-vllm".to_owned(),
+        id: id.to_owned(),
+        engine: Backend::Vllm,
+        started: feed.t0 + Duration::from_millis(started_ms),
+        started_wall: SystemTime::UNIX_EPOCH,
+        resp_bytes: bytes,
+        tokens,
+    }
+}
+
+/// #80: a vLLM request is `pp` until a byte streams, `gen` after; its DUR
+/// runs from llama-swap's start; before any metrics read credits it, it
+/// has only llama-swap's byte count.
+#[test]
+fn a_vllm_request_is_a_flight_from_the_event_stream() {
+    let mut feed = Feed::new();
+    let got = feed.poll_requests(500, &[vllm(&feed, "30", 0, 0, None)], &[]);
+    assert_eq!(got.len(), 1);
+    let f = &got[0];
+    assert!(!f.decoding, "nothing streamed: prefill");
+    assert!(f.prompt_unknown && f.output_unknown && !f.prompt_known);
+    assert_eq!(f.bytes, Some(0));
+    assert_eq!(f.engine, Some(Backend::Vllm));
+    assert_eq!(
+        f.polled.saturating_duration_since(f.started_mono),
+        Duration::from_millis(500)
+    );
+    let tokens = LiveTokens {
+        prompt: Some(9_000),
+        cached: Some(8_192),
+        output: Some(64),
+        ..LiveTokens::default()
+    };
+    let got = feed.poll_requests(1_000, &[vllm(&feed, "30", 0, 4_096, Some(tokens))], &[]);
+    let f = &got[0];
+    assert!(f.decoding, "bytes streamed: decoding");
+    assert_eq!(
+        (f.prompt, f.cached, f.processed, f.decoded),
+        (9_000, 8_192, 808, 64)
+    );
+    assert!(f.prompt_known && !f.approx && f.bytes.is_none());
+    // A shared count is drawn ≈ and never matches a row by its prompt.
+    let shared = LiveTokens {
+        approx: true,
+        ..tokens
+    };
+    let got = feed.poll_requests(1_500, &[vllm(&feed, "30", 0, 8_000, Some(shared))], &[]);
+    assert!(got[0].approx && !got[0].prompt_known);
+}
+
+/// #80: llama-swap's in-flight id is not its activity id, so an ended
+/// request takes the oldest later row of its model that no other flight
+/// took; two requests that end together take two rows, never one twice,
+/// and an exact vLLM prompt takes its own row first.
+#[test]
+fn vllm_flights_hand_over_one_row_each() {
+    let mut feed = Feed::new();
+    let exact = LiveTokens {
+        prompt: Some(9_000),
+        cached: Some(8_192),
+        output: Some(10),
+        ..LiveTokens::default()
+    };
+    let history = [row(5, "qwen-vllm", 100)];
+    let both = [
+        vllm(&feed, "30", 0, 10, None),
+        vllm(&feed, "31", 100, 10, Some(exact)),
+    ];
+    assert_eq!(feed.poll_requests(200, &both, &history).len(), 2);
+    // Both end; one row arrives, with 31's whole prompt (vLLM's input
+    // counts the cache, #82).
+    let one = [
+        row_cached(6, "qwen-vllm", 9_000, 8_192),
+        row(5, "qwen-vllm", 100),
+    ];
+    let got = feed.poll_requests(400, &[], &one);
+    assert_eq!(got.len(), 1, "31 took its own row: {got:?}");
+    assert!(got[0].bytes.is_some(), "30 waits for its row");
+    // 30's row comes: nothing is left, and nothing comes back.
+    let two = [
+        row(7, "qwen-vllm", 300),
+        row_cached(6, "qwen-vllm", 9_000, 8_192),
+        row(5, "qwen-vllm", 100),
+    ];
+    assert!(feed.poll_requests(600, &[], &two).is_empty());
+    // A late frame still listing 30 does not bring it back.
+    assert!(
+        feed.poll_requests(700, &[vllm(&feed, "30", 0, 10, None)], &two)
+            .is_empty()
+    );
 }

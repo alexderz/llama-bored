@@ -6,6 +6,7 @@ pub mod collector;
 pub mod config;
 pub mod inflight;
 pub mod kv;
+pub mod live;
 mod load;
 pub mod localtime;
 pub mod metrics;

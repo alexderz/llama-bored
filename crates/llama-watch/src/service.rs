@@ -37,7 +37,7 @@ use crate::tty::layout::{
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
 use crate::tty::writer::FrameWriter;
-use llama_core::backend::{self, KvUsage};
+use llama_core::backend::{self, Backend, KvUsage};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
 use llama_core::wire::{SourceWire, Sources};
@@ -492,6 +492,7 @@ impl TickState {
                 engine_live: Vec::new(),
                 suspected_loads: Vec::new(),
                 series: Vec::new(),
+                requests: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -1691,6 +1692,7 @@ fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
     let poll = crate::inflight::Poll {
         slots: &state.detail.slots,
         engine_live: &state.detail.engine_live,
+        requests: &state.detail.requests,
         activity: &state.detail.activity,
         ids: &ids,
         prompt_tps: state.detail.prompt_tps,
@@ -1734,8 +1736,17 @@ fn layout_requests(
             inflight: Some(InFlight {
                 decoding: flight.decoding,
                 processed: flight.processed,
-                open: !flight.prompt_known,
+                // #80: a vLLM or SGLang IN is exact or unknown, never a
+                // lower bound.
+                open: !flight.prompt_known
+                    && !flight.prompt_unknown
+                    && !matches!(flight.engine, Some(Backend::Vllm | Backend::SgLang)),
                 target: flight.progress,
+                approx: flight.approx,
+                no_prompt: flight.prompt_unknown,
+                no_output: flight.output_unknown,
+                held: flight.held,
+                bytes: flight.bytes,
                 reset: flight.reset,
             }),
         }
@@ -2133,6 +2144,7 @@ mod tests {
             &crate::inflight::Poll {
                 slots: &[busy],
                 engine_live: &[],
+                requests: &[],
                 activity: &rows,
                 ids: &ids,
                 prompt_tps: Some(2_000.0),
@@ -2754,6 +2766,7 @@ mod tests {
                     engine_live: Vec::new(),
                     suspected_loads: Vec::new(),
                     series: Vec::new(),
+                    requests: Vec::new(),
                 },
             ))
         }
@@ -2903,6 +2916,7 @@ mod tests {
                     engine_live: Vec::new(),
                     suspected_loads: Vec::new(),
                     series: Vec::new(),
+                    requests: Vec::new(),
                 },
             ))
         }
@@ -3631,6 +3645,134 @@ mod tests {
         assert!(rows[at + 2].contains("s1 gen") && rows[at + 2].contains("1,024/5,965"));
         assert!(rows[recent + 1].starts_with('>') && rows[recent + 1].trim_end().ends_with("pp"));
         assert!(rows[recent + 2].starts_with('>') && rows[recent + 2].trim_end().ends_with("gen"));
+    }
+
+    /// #80: vLLM and SGLang requests from llama-swap's event stream lead
+    /// RECENT: exact numbers, a shared count marked `≈`, SGLang's held KV
+    /// as the bar with `--` columns, and a request with no engine numbers
+    /// yet showing llama-swap's bytes.
+    #[test]
+    fn vllm_and_sglang_requests_lead_recent() {
+        use crate::live::LiveTokens;
+        use crate::poller::LiveRequest;
+        let detail = |ctx: u32| llama_core::detail::ModelDetail {
+            ctx: Some(ctx),
+            ..llama_core::detail::ModelDetail::default()
+        };
+        let backend = |kind| BackendInfo {
+            kind,
+            running: Some(1),
+            queued: Some(0),
+            ..BackendInfo::default()
+        };
+        let mut vllm = served("qwen-vllm", "ready", Some(backend(Backend::Vllm)));
+        vllm.detail = Some(detail(131_072));
+        let mut sg = served("bonsai-sg", "ready", Some(backend(Backend::SgLang)));
+        sg.detail = Some(detail(65_536));
+        let sample = backend_sample(vec![vllm.clone(), sg.clone()]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.llama.ai = AiState::Loaded;
+        tick.llama.models = vec![vllm, sg];
+        tick.detail.setup = ["qwen-vllm", "bonsai-sg"]
+            .iter()
+            .map(|key| crate::poller::ModelSetup {
+                key: (*key).to_owned(),
+                ..crate::poller::ModelSetup::default()
+            })
+            .collect();
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_791_417_180);
+        let ago = |ms: u64| mono - Duration::from_millis(ms);
+        let req = |model: &str, id: &str, engine, ms: u64, bytes, tokens| LiveRequest {
+            model: model.to_owned(),
+            id: id.to_owned(),
+            engine,
+            started: ago(ms),
+            started_wall: wall - Duration::from_millis(ms),
+            resp_bytes: bytes,
+            tokens,
+        };
+        tick.detail.requests = vec![
+            req(
+                "qwen-vllm",
+                "30",
+                Backend::Vllm,
+                8_751,
+                4_096,
+                Some(LiveTokens {
+                    prompt: Some(9_000),
+                    cached: Some(8_192),
+                    output: Some(64),
+                    ..LiveTokens::default()
+                }),
+            ),
+            req(
+                "qwen-vllm",
+                "31",
+                Backend::Vllm,
+                2_300,
+                0,
+                Some(LiveTokens {
+                    output: Some(12),
+                    approx: true,
+                    ..LiveTokens::default()
+                }),
+            ),
+            req(
+                "bonsai-sg",
+                "32",
+                Backend::SgLang,
+                1_200,
+                2_048,
+                Some(LiveTokens {
+                    held: Some(30_000),
+                    gen_tps: Some(41.5),
+                    ..LiveTokens::default()
+                }),
+            ),
+            req("bonsai-sg", "33", Backend::SgLang, 400, 4_120, None),
+        ];
+        note_poll(&mut tick, mono, wall);
+        let ctx = frame_ctx(None, true);
+        let model = tty_model(&sample, &mut tick, mono, wall, Zone::utc(), &ctx);
+        let flying: Vec<_> = model
+            .requests
+            .iter()
+            .filter(|r| r.inflight.is_some())
+            .collect();
+        assert_eq!(flying.len(), 4);
+        let rows = frame_rows(&layout::layout(&model, 192, 60));
+        let recent = rows
+            .iter()
+            .position(|r| r.contains("RECENT"))
+            .expect("RECENT");
+        let shown: Vec<&String> = rows[recent + 1..recent + 5].iter().collect();
+        // Newest first.
+        let streaming = shown[0];
+        assert!(streaming.contains("bonsai-sg") && streaming.contains("streaming 4.1 kB"));
+        assert!(streaming.trim_end().ends_with("gen"), "{streaming}");
+        let held = shown[1];
+        assert!(held.contains("~41.5") && held.contains("1.2s"), "{held}");
+        assert_eq!(
+            held.matches("--").count(),
+            4,
+            "IN, CACHED, OUT and PROMPT: {held}"
+        );
+        let shared = shown[2];
+        assert!(
+            shared.contains("\u{2248}12") && shared.trim_end().ends_with("pp"),
+            "{shared}"
+        );
+        let exact = shown[3];
+        for text in ["9,000", "8,192", "64", "8.8s"] {
+            assert!(exact.contains(text), "{text}: {exact}");
+        }
+        assert!(
+            !exact.contains('\u{2248}') && exact.trim_end().ends_with("gen"),
+            "{exact}"
+        );
+        assert!(shown.iter().all(|row| row.starts_with('>')));
     }
 
     #[test]

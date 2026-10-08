@@ -9,6 +9,12 @@
 //! `/running` read just before it (#70). The scan below pins that every
 //! upstream GET goes through that one fresh gate, `upstream_read`, and that
 //! the agent follows no redirect.
+//!
+//! #80 adds two on purpose. `GET /api/events`, llama-swap's own SSE stream
+//! (like `/running`, it names no model path and cannot load one), read on
+//! its own thread by `src/sources/events.rs` with an agent from
+//! `new_agent`. And the upstream leaf `v1/loads?include=core` (SGLang's
+//! live load report), through the same fresh gate.
 
 use std::path::PathBuf;
 
@@ -91,7 +97,33 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
         .collect();
     leaves.sort();
     leaves.dedup();
-    assert_eq!(leaves, vec!["metrics".to_owned(), "slots".to_owned()]);
+    assert_eq!(
+        leaves,
+        vec![
+            "metrics".to_owned(),
+            "slots".to_owned(),
+            "v1/loads?include=core".to_owned()
+        ]
+    );
+    // The gate's own name for that leaf is the same text (#80).
+    assert!(poller.contains(r#"const LOADS_LEAF: &str = "v1/loads?include=core";"#));
+
+    // #80: the event stream is one fixed path, one GET site, on an agent
+    // from `new_agent`.
+    let events = source("src/sources/events.rs");
+    assert!(events.contains(r#"format!("{}/api/events", url.trim_end_matches('/'))"#));
+    assert_eq!(events.matches("/api/").count(), 1, "one llama-swap path");
+    assert_eq!(
+        events.matches(".get(endpoint)").count(),
+        1,
+        "events GET sites"
+    );
+    assert!(events.contains("super::llamaswap::new_agent()"));
+    assert_eq!(
+        events.matches("Agent::").count(),
+        0,
+        "one agent, from new_agent"
+    );
 
     let running = source("src/sources/llamaswap.rs");
     assert!(running.contains(r#"format!("{}/running""#));
@@ -102,6 +134,7 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
     for rel in [
         "src/poller.rs",
         "src/sources/llamaswap.rs",
+        "src/sources/events.rs",
         "src/service.rs",
     ] {
         let code = source(rel);
@@ -231,7 +264,7 @@ fn every_upstream_get_goes_through_the_fresh_gate() {
     assert!(check < suspect);
     assert!(gate.contains("SUSPECT_SLOW"));
     // Every upstream reader goes through the gate and makes no GET itself.
-    for name in ["probe_backends", "poll_metrics", "poll_slots"] {
+    for name in ["probe_backends", "poll_metrics", "poll_slots", "poll_loads"] {
         let text = body(&poller, name);
         assert!(text.contains("self.upstream_read("), "{name}");
         assert!(!text.contains("get_"), "{name} GETs itself");

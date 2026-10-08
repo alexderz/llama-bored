@@ -88,6 +88,9 @@ pub struct ModelSeries {
     pub spec_draft_tokens: Option<u64>,
     /// Of those, accepted.
     pub spec_accepted_tokens: Option<u64>,
+    /// Requests llama-swap has in flight for the model (#80), from its
+    /// `/api/events` while that stream runs. The poller fills it.
+    pub inflight: Option<u16>,
 }
 
 /// One source counter folded into a total since the watcher started.
@@ -366,6 +369,7 @@ impl SeriesBook {
             e2e: track.e2e.total,
             spec_draft_tokens: track.spec.map(|(tokens, _)| tokens),
             spec_accepted_tokens: track.spec.map(|(_, accepted)| accepted),
+            inflight: None,
         }
     }
 }
