@@ -1,6 +1,6 @@
 # HELP llamabored_exporter_build_info llama-metrics build; always 1.
 # TYPE llamabored_exporter_build_info gauge
-llamabored_exporter_build_info{version="0.4.1",wire_schema="1"} 1
+llamabored_exporter_build_info{version="0.5.0",wire_schema="1"} 1
 # HELP llamabored_exporter_rejected_connections_total Connections closed before a request was read, by reason.
 # TYPE llamabored_exporter_rejected_connections_total counter
 llamabored_exporter_rejected_connections_total{reason="busy"} 1

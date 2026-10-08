@@ -6,7 +6,9 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
-Ships as 0.5.0: the exporter's series change incompatibly (#71).
+## 0.5.0 — 2026-10-07
+
+The exporter's series change incompatibly (#71): update dashboards with the mapping below.
 
 ### Upgrading
 
