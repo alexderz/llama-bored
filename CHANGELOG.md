@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+- RECENT's context-bar colours run red (smallest step) through green to blue (largest) instead of violet to orange, and the header key follows (#83).
+
 Ships as 0.5.0: the exporter's series change incompatibly (#71).
 
 ### Upgrading
