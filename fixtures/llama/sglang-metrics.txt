@@ -1,0 +1,50 @@
+# Invented values in the shape of SGLang's /metrics (#79): the KV token
+# gauges, the ratios, and two data-parallel ranks whose tokens sum.
+# HELP sglang:num_running_reqs The number of running requests.
+# TYPE sglang:num_running_reqs gauge
+sglang:num_running_reqs{model_name="flash",dp_rank="0"} 1.0
+sglang:num_running_reqs{model_name="flash",dp_rank="1"} 1.0
+# HELP sglang:num_queue_reqs The number of requests in the waiting queue.
+# TYPE sglang:num_queue_reqs gauge
+sglang:num_queue_reqs{model_name="flash",dp_rank="0"} 0.0
+sglang:num_queue_reqs{model_name="flash",dp_rank="1"} 0.0
+# HELP sglang:token_usage The token usage.
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="flash",dp_rank="0"} 0.91
+sglang:token_usage{model_name="flash",dp_rank="1"} 0.88
+# HELP sglang:full_token_usage The token usage for full attention layers.
+# TYPE sglang:full_token_usage gauge
+sglang:full_token_usage{model_name="flash",dp_rank="0"} 0.27
+sglang:full_token_usage{model_name="flash",dp_rank="1"} 0.26
+# HELP sglang:mamba_usage The token usage for Mamba layers.
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage{model_name="flash",dp_rank="0"} 0.91
+sglang:mamba_usage{model_name="flash",dp_rank="1"} 0.88
+# HELP sglang:num_used_tokens The number of used tokens.
+# TYPE sglang:num_used_tokens gauge
+sglang:num_used_tokens{model_name="flash",dp_rank="0"} 27648.0
+sglang:num_used_tokens{model_name="flash",dp_rank="1"} 26624.0
+# HELP sglang:kv_available_tokens Number of free token slots in the KV cache pool.
+# TYPE sglang:kv_available_tokens gauge
+sglang:kv_available_tokens{model_name="flash",dp_rank="0"} 58752.0
+sglang:kv_available_tokens{model_name="flash",dp_rank="1"} 57600.0
+# HELP sglang:kv_evictable_tokens Number of evictable (radix-cached) token slots in the KV cache pool.
+# TYPE sglang:kv_evictable_tokens gauge
+sglang:kv_evictable_tokens{model_name="flash",dp_rank="0"} 16000.0
+sglang:kv_evictable_tokens{model_name="flash",dp_rank="1"} 15200.0
+# HELP sglang:kv_used_tokens Number of actively used token slots in the KV cache pool.
+# TYPE sglang:kv_used_tokens gauge
+sglang:kv_used_tokens{model_name="flash",dp_rank="0"} 27648.0
+sglang:kv_used_tokens{model_name="flash",dp_rank="1"} 26624.0
+# HELP sglang:max_total_num_tokens Maximum total number of tokens in the KV cache pool.
+# TYPE sglang:max_total_num_tokens gauge
+sglang:max_total_num_tokens{model_name="flash",dp_rank="0"} 102400.0
+sglang:max_total_num_tokens{model_name="flash",dp_rank="1"} 102400.0
+# HELP sglang:generation_tokens_total Number of generation tokens processed.
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{model_name="flash",dp_rank="0"} 900.0
+sglang:generation_tokens_total{model_name="flash",dp_rank="1"} 334.0
+# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="flash",dp_rank="0"} 3000.0
+sglang:prompt_tokens_total{model_name="flash",dp_rank="1"} 2000.0

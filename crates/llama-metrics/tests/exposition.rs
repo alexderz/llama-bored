@@ -505,7 +505,7 @@ fn every_engine_gets_the_same_series_names() {
     ];
     let has = |name: &str, model: &str| find(&all, name, model).is_some();
     // name: the engines whose source has it.
-    let table: [(&str, &[&str]); 16] = [
+    let table: [(&str, &[&str]); 21] = [
         (
             "llamabored_model_info",
             &["llamacpp", "sglang", "vllm", "strata", "openai"],
@@ -566,7 +566,25 @@ fn every_engine_gets_the_same_series_names() {
             "llamabored_model_inter_token_latency_seconds_count",
             &["sglang", "vllm"],
         ),
-        ("llamabored_model_kv_cache_usage_ratio", &["sglang", "vllm"]),
+        // #79: used / capacity, so llama.cpp and Strata have it too.
+        (
+            "llamabored_model_kv_cache_usage_ratio",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_kv_used_tokens",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        (
+            "llamabored_model_kv_capacity_tokens",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        ("llamabored_model_kv_cached_tokens", &["sglang"]),
+        (
+            "llamabored_model_kv_sessions",
+            &["llamacpp", "sglang", "vllm", "strata"],
+        ),
+        ("llamabored_model_kv_unified", &["llamacpp"]),
     ];
     for (name, want) in table {
         for (model, engine) in engines {
@@ -793,6 +811,14 @@ fn no_prompt_or_output_text_is_exported() {
         "ai.models.running",
         "ai.models.queued",
         "ai.models.kv_fill",
+        // #79: numbers and flags only.
+        "ai.models.kv",
+        "ai.models.kv.u",
+        "ai.models.kv.t",
+        "ai.models.kv.c",
+        "ai.models.kv.s",
+        "ai.models.kv.h",
+        "ai.models.kv.a",
         "ai.models.slots_total",
         "ai.models.max_running",
         "ai.models.prompt_tokens",
@@ -1031,6 +1057,11 @@ const EXPORTED: &[(&str, &str)] = &[
     ("ai.models.slots_total", "llamabored_model_slots"),
     ("ai.models.max_running", "llamabored_model_slots"),
     ("ai.models.kv_fill", "llamabored_model_kv_cache_usage_ratio"),
+    ("ai.models.kv.u", "llamabored_model_kv_used_tokens"),
+    ("ai.models.kv.t", "llamabored_model_kv_capacity_tokens"),
+    ("ai.models.kv.c", "llamabored_model_kv_cached_tokens"),
+    ("ai.models.kv.s", "llamabored_model_kv_sessions"),
+    ("ai.models.kv.h", "llamabored_model_kv_unified"),
     (
         "ai.models.prompt_tokens",
         "llamabored_model_prompt_tokens_total",
@@ -1194,6 +1225,10 @@ const NOT_EXPORTED: &[(&str, &str)] = &[
     (
         "ai.models.detail.ncmoe",
         "#71: launch tuning shown on the LCD and tty; not a model_info string",
+    ),
+    (
+        "ai.models.kv.a",
+        "#79: vLLM's used tokens are its block-rounded ratio times the capacity; kv_used_tokens' HELP says so",
     ),
     (
         "ai.models.detail.fa",
@@ -1462,4 +1497,43 @@ fn temperatures_and_chip_fans_are_exported() {
     snap.temps.clear();
     let text = render(&Ok(snap), T0);
     assert!(!text.contains("llamabored_temperature_celsius"));
+}
+
+/// #79: the KV ratio is used / capacity tokens; without them (an older
+/// watcher, or an engine that reports only a ratio) it is the engine's own.
+#[test]
+fn kv_ratio_is_used_over_capacity_else_the_engines_own() {
+    let mut snap = load("snapshot-loaded.json");
+    let ratio = "llamabored_model_kv_cache_usage_ratio";
+    let vllm = snap
+        .ai
+        .models
+        .iter_mut()
+        .find(|m| m.id.as_deref() == Some("qwen3.8-27b-vllm"))
+        .expect("vllm model");
+    vllm.kv_fill = Some(0.75);
+    vllm.kv = Some(wire::KvWire {
+        used: Some(50_960),
+        capacity: Some(203_840),
+        ..wire::KvWire::default()
+    });
+    let text = render(&Ok(snap.clone()), T0);
+    let all = samples(&text);
+    assert_eq!(
+        value(&all, ratio, "qwen3.8-27b-vllm").as_deref(),
+        Some("0.25")
+    );
+    for model in &mut snap.ai.models {
+        model.kv = None;
+    }
+    let all = samples(&render(&Ok(snap), T0));
+    assert_eq!(
+        value(&all, ratio, "qwen3.8-27b-vllm").as_deref(),
+        Some("0.75")
+    );
+    assert_eq!(value(&all, ratio, "qwen3-coder-30b"), None);
+    assert_eq!(
+        value(&all, "llamabored_model_kv_used_tokens", "qwen3-coder-30b"),
+        None
+    );
 }

@@ -38,6 +38,7 @@ fn valid() -> WireSnapshot {
             state: AiWire::Loaded,
             models: vec![
                 ModelWire {
+                    kv: None,
                     backend: None,
                     running: None,
                     queued: None,
@@ -57,6 +58,7 @@ fn valid() -> WireSnapshot {
                     engine: None,
                 },
                 ModelWire {
+                    kv: None,
                     backend: None,
                     running: None,
                     queued: None,
@@ -126,6 +128,7 @@ fn sanitize_wire_names_pass_validate() {
         }
         let mut snap = valid();
         snap.ai.models = vec![ModelWire {
+            kv: None,
             backend: None,
             running: None,
             queued: None,
@@ -451,6 +454,7 @@ fn model_count_and_loaded_state() {
     let mut snap = valid();
     snap.ai.models = (0..8)
         .map(|index| ModelWire {
+            kv: None,
             backend: None,
             running: None,
             queued: None,
@@ -473,6 +477,7 @@ fn model_count_and_loaded_state() {
     assert_eq!(validate(&snap), Ok(()));
 
     snap.ai.models.push(ModelWire {
+        kv: None,
         backend: None,
         running: None,
         queued: None,
@@ -504,6 +509,7 @@ fn model_count_and_loaded_state() {
 fn name_length_and_canonical_form() {
     let mut snap = valid();
     snap.ai.models = vec![ModelWire {
+        kv: None,
         backend: None,
         running: None,
         queued: None,
@@ -876,6 +882,7 @@ fn metrics_fields_are_additive_on_schema_v1() {
 fn a_full_snapshot_with_eight_long_models_fits_the_cap() {
     let mut snap = full();
     let model = ModelWire {
+        kv: None,
         name: "Qwen3-Coder…".to_owned(),
         state: ModelState::Ready,
         full_name: Some("x".repeat(wire::MAX_FULL_NAME_CHARS)),
@@ -1122,6 +1129,15 @@ fn worst_case() -> WireSnapshot {
     let pair = wire::SumCountWire { ms: MAX, n: MAX };
     let mut snap = full();
     let model = ModelWire {
+        // #79: the KV cache with every field at its widest.
+        kv: Some(wire::KvWire {
+            used: Some(wire::MAX_KV_TOKENS),
+            capacity: Some(wire::MAX_KV_TOKENS),
+            cached: Some(wire::MAX_KV_TOKENS),
+            sessions: Some(wire::MAX_REQS),
+            unified: Some(false),
+            approx: true,
+        }),
         name: "Qwen3-Coder…".to_owned(),
         state: ModelState::Ready,
         full_name: Some("x".repeat(wire::MAX_FULL_NAME_CHARS)),
@@ -1189,12 +1205,14 @@ fn worst_case() -> WireSnapshot {
     snap
 }
 
+/// #79's KV object, eight times at its widest, took 640 of the 859 bytes
+/// this case had left (15,525 to 16,165): it keeps a 128-byte margin.
 #[test]
 fn a_worst_case_snapshot_with_every_slot_row_fits_the_cap() {
     let snap = worst_case();
     let bytes = to_json(&snap).expect("encode");
     assert!(
-        bytes.len() < wire::MAX_BYTES - 512,
+        bytes.len() < wire::MAX_BYTES - 128,
         "worst case is {} bytes",
         bytes.len()
     );
@@ -1521,4 +1539,74 @@ fn hardware_rows_fit_a_realistic_snapshot_and_pass_only_the_worst_case() {
         base,
         bytes.len() - base
     );
+}
+
+/// #79: the KV object is additive (an older watcher sends none, and an
+/// older reader ignores it), compact, and bounded.
+#[test]
+fn kv_is_additive_compact_and_bounded() {
+    let old = parse_validated(base_json().as_bytes()).expect("pre-#79 snapshot");
+    assert!(old.ai.models.iter().all(|model| model.kv.is_none()));
+    let kv = wire::KvWire {
+        used: Some(54_272),
+        capacity: Some(204_800),
+        cached: Some(31_200),
+        sessions: Some(2),
+        unified: None,
+        approx: false,
+    };
+    let mut snap = valid();
+    snap.ai.models[0].kv = Some(kv);
+    let text = String::from_utf8(to_json(&snap).expect("encode")).expect("utf8");
+    assert!(
+        text.contains(r#""kv":{"u":54272,"t":204800,"c":31200,"s":2}"#),
+        "{text}"
+    );
+    assert_eq!(
+        parse_validated(text.as_bytes()).expect("valid").ai.models[0].kv,
+        Some(kv)
+    );
+    assert_eq!(kv.ratio(), Some(0.265));
+    let json = insert_after(
+        &base_json(),
+        r#""state":"ready""#,
+        r#","kv":{"u":5,"t":10,"h":true,"a":true,"z":1}"#,
+    );
+    let read = parse_validated(&json).expect("unknown kv key ignored");
+    let read = read.ai.models[0].kv.expect("kv");
+    assert_eq!((read.unified, read.approx), (Some(true), true));
+
+    let cases: [fn(&mut wire::KvWire); 6] = [
+        |kv| kv.used = Some(kv.capacity.unwrap() + 1),
+        |kv| kv.cached = Some(kv.capacity.unwrap() + 1),
+        |kv| {
+            kv.capacity = None;
+            kv.used = Some(wire::MAX_KV_TOKENS + 1);
+        },
+        |kv| {
+            kv.capacity = Some(wire::MAX_KV_TOKENS + 1);
+            kv.used = None;
+            kv.cached = None;
+        },
+        |kv| {
+            kv.capacity = None;
+            kv.cached = Some(wire::MAX_KV_TOKENS + 1);
+        },
+        |kv| kv.sessions = Some(wire::MAX_REQS + 1),
+    ];
+    for (i, bad) in cases.into_iter().enumerate() {
+        let mut snap = valid();
+        let mut wrong = kv;
+        bad(&mut wrong);
+        snap.ai.models[0].kv = Some(wrong);
+        assert_eq!(validate(&snap), Err(WireError::Gauge), "case {i}");
+    }
+    for extra in [
+        r#","kv":{"u":-1}"#,
+        r#","kv":{"t":"lots"}"#,
+        r#","kv":{"h":1}"#,
+    ] {
+        let json = insert_after(&base_json(), r#""state":"ready""#, extra);
+        assert_eq!(parse_validated(&json), Err(WireError::Parse), "{extra}");
+    }
 }

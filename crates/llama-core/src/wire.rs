@@ -38,6 +38,13 @@
 //! Both lists are ordered by importance, and the watcher drops rows from
 //! their ends (temperatures first) when a snapshot would pass
 //! [`MAX_BYTES`] (only a pathological worst case does), so the cap holds.
+//!
+//! #79 adds each model's `kv`, the KV cache across all its sessions, as a
+//! compact [`KvWire`] (`{"u": used, "t": capacity, "c": cached, "s":
+//! sessions, "h": shared pool, "a": approximate}`), additive on schema 1.
+//! It also redefines `kv_fill` as used / capacity where both are known,
+//! the engine's own ratio otherwise: the same quantity, now from every
+//! engine that reports tokens, so an older reader reads it right.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -101,6 +108,9 @@ pub const MAX_TEMP_SENSOR_CHARS: usize = 24;
 /// other temperature on the wire.
 pub const TEMP_TENTHS: std::ops::RangeInclusive<i16> = -200..=1500;
 
+/// Top of every [`KvWire`] token count (#79).
+pub const MAX_KV_TOKENS: u64 = u32::MAX as u64;
+
 /// Top of every [`CountersWire`] number: 2^53 − 1, the largest integer a
 /// Prometheus sample (a float) carries exactly. The watcher never writes
 /// more (#71).
@@ -148,7 +158,8 @@ pub enum WireError {
     /// cached prompt tokens exceed its prompt tokens, a counter is above
     /// [`MAX_COUNTER`] (#71), or a slot context row is out of range,
     /// repeated, or past [`MAX_SLOT_CTX`] (#10). Also a suspected-load row
-    /// that is repeated, zero, or past [`MAX_SUSPECTED_LOADS`] (#70).
+    /// that is repeated, zero, or past [`MAX_SUSPECTED_LOADS`] (#70), and
+    /// a [`KvWire`] out of range (#79, [`KvWire::is_valid`]).
     #[error("snapshot model gauge is out of range")]
     Gauge,
     /// A full name or llama-swap id is not canonical, or a detail or
@@ -344,7 +355,8 @@ pub struct ModelWire {
     /// `requests_deferred` since 0.5 (#71).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued: Option<u16>,
-    /// KV cache fill 0..=1, from any engine that reports one.
+    /// KV cache fill 0..=1: [`KvWire`]'s used / capacity where both are
+    /// known (#79), else the engine's own ratio.
     #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
     pub kv_fill: Option<f32>,
     /// llama.cpp slots the server has, at most [`MAX_SLOTS`] (#11).
@@ -377,6 +389,70 @@ pub struct ModelWire {
     /// it can (#71). Omitted when none, and by an older watcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counters: Option<CountersWire>,
+    /// The KV cache across all sessions, and its capacity (#79). Omitted
+    /// when the engine reports none, and by an older watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<KvWire>,
+}
+
+/// A model's KV cache across all its sessions (#79), with compact keys:
+/// eight of these ride in the worst-case snapshot. Tokens are at most
+/// [`MAX_KV_TOKENS`], sessions at most [`MAX_REQS`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvWire {
+    /// Tokens held for live sessions. Never above [`Self::capacity`].
+    #[serde(rename = "u", default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<u64>,
+    /// Tokens the cache can hold.
+    #[serde(rename = "t", default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u64>,
+    /// Tokens kept only as reusable cache (SGLang's radix cache), not part
+    /// of [`Self::used`]. Never above [`Self::capacity`].
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    pub cached: Option<u64>,
+    /// Sessions holding KV: slots with tokens, else running requests.
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<u16>,
+    /// llama.cpp: every slot shares one pool (`--kv-unified`).
+    #[serde(rename = "h", default, skip_serializing_if = "Option::is_none")]
+    pub unified: Option<bool>,
+    /// [`Self::used`] comes from a block-rounded ratio (vLLM). Omitted
+    /// when false.
+    #[serde(rename = "a", default, skip_serializing_if = "is_false")]
+    pub approx: bool,
+}
+
+impl KvWire {
+    /// True when every token count is at most [`MAX_KV_TOKENS`], sessions
+    /// at most [`MAX_REQS`], and neither used nor cached tokens exceed a
+    /// known capacity.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let within = |n: Option<u64>| n.is_none_or(|n| n <= MAX_KV_TOKENS);
+        let fits = |n: Option<u64>| match (n, self.capacity) {
+            (Some(n), Some(capacity)) => n <= capacity,
+            _ => true,
+        };
+        within(self.used)
+            && within(self.capacity)
+            && within(self.cached)
+            && fits(self.used)
+            && fits(self.cached)
+            && self.sessions.is_none_or(|n| n <= MAX_REQS)
+    }
+
+    /// `used / capacity`, 0..=1, when both are known and the capacity is
+    /// not zero.
+    #[must_use]
+    pub fn ratio(&self) -> Option<f64> {
+        let (used, capacity) = (self.used?, self.capacity?);
+        (capacity > 0).then(|| used.min(capacity) as f64 / capacity as f64)
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A model's counters since the watcher started (#71), each at most
@@ -820,6 +896,7 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
                 .counters
                 .as_ref()
                 .is_some_and(|counters| !counters.is_valid())
+            || model.kv.is_some_and(|kv| !kv.is_valid())
             || model
                 .prompt_cached_tokens
                 .is_some_and(|cached| model.prompt_tokens.is_none_or(|all| cached > all))

@@ -37,7 +37,7 @@ use crate::tty::layout::{
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
 use crate::tty::writer::FrameWriter;
-use llama_core::backend;
+use llama_core::backend::{self, KvUsage};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::sample::{AiState, LlamaView, ModelInfo, Snapshot, SourceId};
 use llama_core::wire::{SourceWire, Sources};
@@ -1283,9 +1283,11 @@ fn model_stuck(
             .is_some_and(|at| now.saturating_duration_since(*at) > STUCK_STOPPING)
 }
 
-/// `sglang  running 1/4 · queued 0 · KV 37 % · hit 80 %` for each ready model
-/// without `/slots`. Unknown gauges are `--`. Strata has no KV gauge:
-/// `strata  running 1/1 · queued 0`. Engine numbers follow when the server
+/// `sglang  running 1/4 · queued 0 · KV 75k/204k tok 37 % · hit 80 %` for
+/// each ready model without `/slots` (#79: the KV item is [`kv_text`]
+/// where the engine reports tokens, else `KV 37 %`, its own ratio).
+/// Unknown gauges are `--`. Strata has no ratio of its own: `strata
+/// running 1/1 · queued 0`, plus its KV tokens when it reports them. Engine numbers follow when the server
 /// reports them (#31): `· spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms ·
 /// e2e 12.5 s · preempt 3` (preemptions only once there are some), then
 /// the engine-measured speeds of the latest window with finished requests
@@ -1299,11 +1301,70 @@ fn backend_lines(sample: &WatchSample, state: WatchState) -> Vec<String> {
 
 /// One line per ready model without `/slots`: its gauges and engine
 /// numbers, and for an engine that reports what it is doing (Strata, #54)
-/// a second line with its phase and the request's progress.
+/// a second line with its phase and the request's progress. Its KV item
+/// is [`kv_text`] where the engine reports tokens (#79). A ready llama.cpp
+/// model with KV numbers gets one line too, after them all: `llamacpp  KV
+/// 91k/262k tok shared 35 % · 1 session` (its slots are the rows above).
 fn engine_lines(sample: &WatchSample, live: &[ModelEngineLive], state: WatchState) -> Vec<String> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return Vec::new();
     }
+    let mut lines = metrics_engine_lines(sample, live);
+    for info in sample
+        .snapshot
+        .models
+        .iter()
+        .filter(|model| model.state == "ready")
+        .filter_map(|model| model.backend)
+        .filter(|info| info.kind.has_slots())
+    {
+        if let Some(text) = info.kv.as_ref().and_then(|kv| kv_text(kv, true)) {
+            lines.push(format!("{}  {text}", info.kind.as_str()));
+        }
+    }
+    lines
+}
+
+/// The KV item of a SLOTS engine line (#79): `KV 54k/204k tok 26 %`, with
+/// `≈` before a count derived from a block-rounded ratio (vLLM), `shared`
+/// before the percent for a unified llama.cpp cache (`shared?` when that
+/// was assumed from the slots), then `· 2 sessions` when `sessions` (the
+/// slot engines; the others show their running requests already), and
+/// `· +31k cached` for tokens kept only as reusable cache (SGLang). `None`
+/// when neither the use nor the capacity is known.
+fn kv_text(kv: &KvUsage, sessions: bool) -> Option<String> {
+    let sep = llama_core::detail::SEPARATOR;
+    let approx = if kv.approx { "\u{2248}" } else { "" };
+    let mut text = match (kv.used, kv.capacity) {
+        (Some(used), Some(capacity)) => format!(
+            "KV {approx}{}/{} tok",
+            layout::compact_k(used),
+            layout::compact_k(capacity)
+        ),
+        (Some(used), None) => format!("KV {approx}{} tok", layout::compact_k(used)),
+        (None, Some(capacity)) => format!("KV --/{} tok", layout::compact_k(capacity)),
+        (None, None) => return None,
+    };
+    match (kv.unified, kv.unified_assumed) {
+        (Some(true), false) => text.push_str(" shared"),
+        (Some(true), true) => text.push_str(" shared?"),
+        _ => {}
+    }
+    if let Some(permille) = kv.permille() {
+        text.push_str(&format!(" {} %", (u32::from(permille) + 5) / 10));
+    }
+    if sessions && let Some(n) = kv.sessions {
+        let noun = if n == 1 { "session" } else { "sessions" };
+        text.push_str(&format!("{sep}{n} {noun}"));
+    }
+    if let Some(cached) = kv.cached.filter(|n| *n > 0) {
+        text.push_str(&format!("{sep}+{} cached", layout::compact_k(cached)));
+    }
+    Some(text)
+}
+
+/// [`engine_lines`] for the models without `/slots`.
+fn metrics_engine_lines(sample: &WatchSample, live: &[ModelEngineLive]) -> Vec<String> {
     let sep = llama_core::detail::SEPARATOR;
     let num = |value: Option<u16>| value.map_or_else(|| "--".to_owned(), |n| n.to_string());
     let pct = |permille: Option<u16>| {
@@ -1337,7 +1398,13 @@ fn engine_lines(sample: &WatchSample, live: &[ModelEngineLive], state: WatchStat
                 info.kind.as_str(),
                 num(info.queued),
             );
-            if info.kind.has_kv_gauge() {
+            if let Some(text) = info
+                .kv
+                .as_ref()
+                .and_then(|kv| kv_text(kv, info.kind == backend::Backend::Strata))
+            {
+                line.push_str(&format!("{sep}{text}"));
+            } else if info.kind.has_kv_gauge() {
                 line.push_str(&format!("{sep}KV {}", pct(info.kv_permille)));
             }
             if info.hit_permille.is_some() {
@@ -2827,6 +2894,7 @@ mod tests {
             kv_permille: Some(372),
             hit_permille: None,
             engine: Default::default(),
+            kv: None,
         }
     }
 
@@ -3031,6 +3099,115 @@ mod tests {
 
     /// #31: a vLLM model found by its metrics: its cache facts close the
     /// tuning line and its engine numbers follow the gauges.
+    /// #79: the KV item on each engine line, and a llama.cpp line after
+    /// the metrics engines' lines.
+    #[test]
+    fn kv_items_on_the_engine_lines() {
+        use llama_core::backend::KvUsage;
+        let info = |kind: Backend, running: Option<u16>, kv: KvUsage| {
+            Some(BackendInfo {
+                kind,
+                running,
+                queued: Some(0),
+                kv_permille: Some(999),
+                kv: Some(kv),
+                ..BackendInfo::default()
+            })
+        };
+        let llama = served(
+            "qwen",
+            "ready",
+            info(
+                Backend::LlamaCpp,
+                None,
+                KvUsage {
+                    used: Some(91_204),
+                    capacity: Some(262_144),
+                    sessions: Some(1),
+                    unified: Some(true),
+                    ..KvUsage::default()
+                },
+            ),
+        );
+        let sglang = served(
+            "flash",
+            "ready",
+            info(
+                Backend::SgLang,
+                Some(2),
+                KvUsage {
+                    used: Some(54_272),
+                    capacity: Some(204_800),
+                    cached: Some(31_200),
+                    sessions: Some(2),
+                    ..KvUsage::default()
+                },
+            ),
+        );
+        let vllm = served(
+            "q",
+            "ready",
+            info(
+                Backend::Vllm,
+                Some(1),
+                KvUsage {
+                    used: Some(77_319),
+                    capacity: Some(187_440),
+                    sessions: Some(1),
+                    approx: true,
+                    ..KvUsage::default()
+                },
+            ),
+        );
+        let strata = served(
+            "b",
+            "ready",
+            info(
+                Backend::Strata,
+                Some(1),
+                KvUsage {
+                    used: Some(6960),
+                    capacity: Some(524_288),
+                    sessions: Some(2),
+                    ..KvUsage::default()
+                },
+            ),
+        );
+        let sample = backend_sample(vec![llama, sglang, vllm, strata]);
+        assert_eq!(
+            backend_lines(&sample, WatchState::Ready),
+            vec![
+                "sglang  running 2 · queued 0 · KV 54k/204k tok 27 % · +31k cached".to_owned(),
+                "vllm  running 1 · queued 0 · KV \u{2248}77k/187k tok 41 %".to_owned(),
+                "strata  running 1 · queued 0 · KV 6k/524k tok 1 % · 2 sessions".to_owned(),
+                "llamacpp  KV 91k/262k tok shared 35 % · 1 session".to_owned(),
+            ]
+        );
+        // Per-slot llama.cpp says nothing of sharing; an assumed pool asks.
+        let kv = |unified, unified_assumed| KvUsage {
+            used: Some(38_000),
+            capacity: Some(65_536),
+            sessions: Some(2),
+            unified: Some(unified),
+            unified_assumed,
+            ..KvUsage::default()
+        };
+        assert_eq!(
+            kv_text(&kv(false, false), true).as_deref(),
+            Some("KV 38k/65k tok 58 % · 2 sessions")
+        );
+        assert_eq!(
+            kv_text(&kv(true, true), true).as_deref(),
+            Some("KV 38k/65k tok shared? 58 % · 2 sessions")
+        );
+        let unknown = KvUsage {
+            capacity: Some(65_536),
+            ..KvUsage::default()
+        };
+        assert_eq!(kv_text(&unknown, false).as_deref(), Some("KV --/65k tok"));
+        assert_eq!(kv_text(&KvUsage::default(), true), None);
+    }
+
     #[test]
     fn vllm_engine_numbers_on_the_backend_line() {
         use llama_core::backend::EngineStats;

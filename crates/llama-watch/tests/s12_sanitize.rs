@@ -524,7 +524,7 @@ fn parse_number(bytes: &[u8]) -> Option<(u16, usize)> {
 /// Written out here, not taken from `term::GLYPHS`, so a change to the
 /// allowlist has to change this test too.
 const ALLOWED_GLYPHS: &[char] = &[
-    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '▁', '▂', '▃', '▅', '▆', '▇',
+    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
 fn match_glyph(bytes: &[u8]) -> Option<usize> {

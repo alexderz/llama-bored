@@ -14,13 +14,13 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use llama_core::backend::EngineStats;
+use llama_core::backend::{EngineStats, KvUsage};
 use llama_core::detail::{self, MAX_FULL_NAME_CHARS};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::names::{sanitize, sanitize_wire};
 use llama_core::sample::{AiState, LlamaView, Snapshot};
 use llama_core::wire::{
-    self, Ai, AiWire, CountersWire, EngineWire, FanRowWire, Host, ModelState, ModelWire,
+    self, Ai, AiWire, CountersWire, EngineWire, FanRowWire, Host, KvWire, ModelState, ModelWire,
     SlotCtxWire, SlotResetsWire, Sources, SumCountWire, TempWire, Tokens, WireError, WireSnapshot,
 };
 
@@ -472,6 +472,7 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                         Some(info) => engine_of(&info.engine),
                         None => series.and_then(activity_spec),
                     };
+                    let kv = model.backend.and_then(|info| info.kv).and_then(kv_of);
                     ModelWire {
                         full_name: wire_full_name(model.full_name.as_deref(), &name),
                         detail: model.detail.clone().filter(detail::is_valid),
@@ -492,10 +493,16 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                             .and_then(|info| info.queued)
                             .or_else(|| series.and_then(|series| series.waiting))
                             .map(cap_reqs),
-                        kv_fill: gauges
-                            .and_then(|info| info.kv_permille)
-                            .or_else(|| series.and_then(|series| series.kv_permille))
-                            .and_then(ratio),
+                        // #79: used / capacity where both are known.
+                        kv_fill: kv
+                            .and_then(|kv| kv.ratio())
+                            .map(|fill| fill as f32)
+                            .or_else(|| {
+                                gauges
+                                    .and_then(|info| info.kv_permille)
+                                    .or_else(|| series.and_then(|series| series.kv_permille))
+                                    .and_then(ratio)
+                            }),
                         slots_total: slot_total,
                         max_running: gauges.and_then(|info| info.max_running).map(cap_reqs),
                         prompt_tokens,
@@ -503,6 +510,7 @@ fn ai_of(snapshot: &Snapshot, extras: &Extras) -> Ai {
                         slot_ctx,
                         engine,
                         counters: series.and_then(counters_of),
+                        kv,
                     }
                 })
                 .collect(),
@@ -602,6 +610,30 @@ fn slot_ctx_of(rows: &[SlotCtx], model: &str, left: &mut usize) -> Vec<SlotCtxWi
     out.truncate(*left);
     *left -= out.len();
     out
+}
+
+/// The wire form of a model's KV cache (#79); `None` when it has none.
+/// Tokens are capped at [`wire::MAX_KV_TOKENS`], used and cached tokens
+/// at the capacity, sessions at [`wire::MAX_REQS`].
+fn kv_of(kv: KvUsage) -> Option<KvWire> {
+    if kv.is_empty() {
+        return None;
+    }
+    let capacity = kv.capacity.map(|n| n.min(wire::MAX_KV_TOKENS));
+    let within = |n: Option<u64>| {
+        n.map(|n| {
+            let n = n.min(wire::MAX_KV_TOKENS);
+            capacity.map_or(n, |capacity| n.min(capacity))
+        })
+    };
+    Some(KvWire {
+        used: within(kv.used),
+        capacity,
+        cached: within(kv.cached),
+        sessions: kv.sessions.map(cap_reqs),
+        unified: kv.unified,
+        approx: kv.approx && kv.used.is_some(),
+    })
 }
 
 /// The wire form of a model's engine numbers (#31); `None` when it has

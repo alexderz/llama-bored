@@ -113,13 +113,14 @@ use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
 use crate::metrics::{
-    DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, MetricsSample,
-    PromptCache, detect_backend, parse_metrics_full,
+    DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, KvTokens,
+    MetricsSample, PromptCache, detect_backend, parse_metrics_full,
 };
 use crate::recent::{Merged, Recent};
 use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
+use crate::sources::cmdline::KvLayout;
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
 use crate::tty::grid::Cell;
@@ -433,6 +434,8 @@ struct Gauges {
     queued: Option<u16>,
     kv_permille: Option<u16>,
     hit_permille: Option<u16>,
+    /// KV cache tokens (#79).
+    kv: KvTokens,
     engine: EngineStats,
     /// The engine's own `live` report (Strata, #54).
     live: Option<EngineLive>,
@@ -451,6 +454,7 @@ impl Gauges {
             queued: sample.queued.and_then(backend::reqs),
             kv_permille: sample.kv_fill.and_then(backend::permille),
             hit_permille: sample.cache_hit.and_then(backend::permille),
+            kv: sample.kv,
             engine,
             live,
             at,
@@ -479,6 +483,9 @@ struct State<L> {
     models: Vec<ModelInfo>,
     /// Raw id of each entry of `models`, in the same order.
     model_ids: Vec<String>,
+    /// llama.cpp KV layout of each entry of `models`, from its launch
+    /// command (#79), in the same order.
+    model_kv: Vec<Option<KvLayout>>,
     /// SETUP values of each entry of `models`, in the same order (#52).
     model_setup: Vec<ModelSetup>,
     ready: Vec<ReadyModel>,
@@ -586,6 +593,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         ai: AiState::Down,
         models: Vec::new(),
         model_ids: Vec::new(),
+        model_kv: Vec::new(),
         model_setup: Vec::new(),
         ready: Vec::new(),
         down_ready: Vec::new(),
@@ -737,6 +745,7 @@ impl<L: Sink> State<L> {
             })
             .collect();
         self.model_ids = models.iter().map(|info| info.id.clone()).collect();
+        self.model_kv = models.iter().map(|info| info.kv).collect();
         self.model_setup = models
             .iter()
             .map(|info| ModelSetup {
@@ -1624,17 +1633,27 @@ impl<L: Sink> State<L> {
     }
 
     /// [`Self::models`] with each backend's fresh gauges filled in, and
-    /// engine facts where the launch command gave no ctx or KV.
+    /// engine facts where the launch command gave no ctx or KV. A
+    /// llama.cpp model's KV comes from its slots (#79).
     fn models_with_gauges(&self, now: Instant) -> Vec<ModelInfo> {
         let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
         let mut models = self.models.clone();
-        for (model, id) in models.iter_mut().zip(&self.model_ids) {
+        let slots = self.slots.slots();
+        for ((model, id), layout) in models.iter_mut().zip(&self.model_ids).zip(&self.model_kv) {
             if let Some(facts) = self.engine_facts.get(id) {
                 with_facts(&mut model.detail, facts);
             }
+            let ctx = model.detail.as_ref().and_then(|detail| detail.ctx);
             let Some(info) = model.backend.as_mut() else {
                 continue;
             };
+            if info.kind.has_slots() {
+                let own: Vec<&SlotView> = slots
+                    .iter()
+                    .filter(|slot| slot.model == model.name)
+                    .collect();
+                info.kv = crate::kv::llamacpp(&own, *layout, ctx);
+            }
             let Some(gauges) = self
                 .gauges
                 .get(id)
@@ -1647,6 +1666,7 @@ impl<L: Sink> State<L> {
             info.kv_permille = gauges.kv_permille;
             info.hit_permille = gauges.hit_permille;
             info.engine = gauges.engine;
+            info.kv = crate::kv::from_metrics(gauges.kv, gauges.running);
         }
         models
     }

@@ -1161,7 +1161,8 @@ sglang:generation_tokens_total{{model_name=\"flash\"}} {generated}.0\n\
 sglang:prompt_tokens_total{{model_name=\"flash\"}} 900.0\n\
 sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n\
 sglang:num_queue_reqs{{model_name=\"flash\"}} {queued}.0\n\
-sglang:token_usage{{model_name=\"flash\"}} {usage}\n\
+sglang:token_usage{{model_name=\"flash\"}} 0.99\n\
+sglang:full_token_usage{{model_name=\"flash\"}} {usage}\n\
 sglang:cache_hit_rate{{model_name=\"flash\"}} 0.5\n"
     )
     .into_bytes()
@@ -1193,9 +1194,14 @@ fn activity_page(rows: &[(i64, &str, i64)]) -> Vec<u8> {
 #[test]
 fn sglang_reads_its_own_metrics_and_never_slots() {
     let mut world = World::running(running_cmd("flash", SGLANG_CMD));
-    world
-        .metrics
-        .insert("flash".to_owned(), sglang_metrics(1000, 1, 2, 0.37));
+    let mut body = sglang_metrics(1000, 1, 2, 0.37);
+    // #79: the KV token gauges; the fill becomes used / capacity.
+    body.extend_from_slice(
+        b"sglang:kv_used_tokens{model_name=\"flash\"} 75776.0\n\
+sglang:kv_evictable_tokens{model_name=\"flash\"} 31744.0\n\
+sglang:max_total_num_tokens{model_name=\"flash\"} 204800.0\n",
+    );
+    world.metrics.insert("flash".to_owned(), body);
     let server = Server::start(world);
     let log = MemLog::new();
     let config = watch(server.port, 12, 4_194_304, 0.15);
@@ -1210,9 +1216,19 @@ fn sglang_reads_its_own_metrics_and_never_slots() {
     assert_eq!(info.kind, llama_core::backend::Backend::SgLang);
     assert_eq!(info.running, Some(1));
     assert_eq!(info.queued, Some(2));
-    assert_eq!(info.kv_permille, Some(370));
+    assert_eq!(
+        info.kv_permille,
+        Some(370),
+        "75,776 / 204,800, not token_usage"
+    );
     assert_eq!(info.hit_permille, Some(500));
     assert_eq!(info.max_running, Some(4));
+    let kv = info.kv.expect("#79 kv");
+    assert_eq!(
+        (kv.used, kv.capacity, kv.cached, kv.sessions),
+        (Some(75_776), Some(204_800), Some(31_744), Some(1))
+    );
+    assert_eq!((kv.unified, kv.approx), (None, false));
     let detail = view.models[0].detail.as_ref().expect("detail");
     assert_eq!(detail.ctx, Some(204_800));
     assert_eq!(detail.quant.as_deref(), Some("exl3"));
@@ -1262,7 +1278,12 @@ fn sglang_reads_a_large_metrics_document() {
     });
     let info = view.models[0].backend.expect("backend");
     assert_eq!(info.running, Some(1));
-    assert_eq!(info.kv_permille, Some(250));
+    assert_eq!(
+        info.kv_permille,
+        Some(250),
+        "full_token_usage without the token gauges"
+    );
+    assert_eq!(info.kv, None);
     let lines = log.lines().join("\n");
     assert!(!lines.contains("no /metrics"), "{lines}");
 }
@@ -1798,7 +1819,13 @@ fn strata_reads_its_json_metrics_and_never_slots() {
     assert_eq!(info.running, Some(1));
     assert_eq!(info.queued, Some(2));
     assert_eq!(info.max_running, Some(1));
-    assert_eq!(info.kv_permille, None);
+    // #79: two batch slots holding 1,840 and 5,120 tokens of 2 × 262,144.
+    assert_eq!(info.kv_permille, Some(13));
+    let kv = info.kv.expect("#79 kv");
+    assert_eq!(
+        (kv.used, kv.capacity, kv.sessions),
+        (Some(6960), Some(524_288), Some(2))
+    );
     assert_eq!(info.hit_permille, None);
     // ctx and KV come from `engine`, which the launch command lacks.
     let model_detail = view.models[0].detail.as_ref().expect("detail");
@@ -3724,7 +3751,7 @@ fn llamacpp_series_are_cumulative_and_count_activity_rows() {
     assert_eq!(series.model, "Qwen 35B");
     assert_eq!(series.running, Some(1), "requests_processing");
     assert_eq!(series.waiting, Some(2), "requests_deferred");
-    assert_eq!(series.kv_permille, Some(250));
+    assert_eq!(series.kv_permille, None, "#79: b11429 has no KV gauge");
     assert_eq!(
         series.prefill_seconds,
         Some(0.0),
@@ -3798,4 +3825,45 @@ fn vllm_series_fill_the_same_fields() {
         assert_eq!((hist.sum, hist.count), (0.0, 0.0), "baseline, unchanged");
     }
     assert_eq!(series.spec_draft_tokens, None, "vLLM's are engine counters");
+}
+
+/// #79: a llama.cpp model's KV is its slots' held tokens, idle ones
+/// included. Without `-np` the cache is unified (one 65,536 pool all three
+/// slots report); with `-np 3` each slot has its own 65,536.
+#[test]
+fn llamacpp_kv_is_the_slots_held_tokens_shared_or_per_slot() {
+    for (cmd, capacity, unified) in [
+        ("llama-server -m /m/x-Q4_K_M.gguf -c 65536", 65_536, true),
+        (
+            "llama-server -m /m/x-Q4_K_M.gguf -c 196608 -np 3",
+            196_608,
+            false,
+        ),
+        (
+            "llama-server -m /m/x-Q4_K_M.gguf -np 3 --kv-unified",
+            65_536,
+            true,
+        ),
+    ] {
+        let mut world = World::running(running_cmd("l", cmd));
+        world.metrics.insert("l".to_owned(), metrics_body(5, 1.0));
+        world.slots.insert("l".to_owned(), fixture("slots-kv.json"));
+        let server = Server::start(world);
+        let log = MemLog::new();
+        let config = watch(server.port, 12, 4_194_304, 0.15);
+        let (_poller, rx) = spawn(&config, &log);
+        let (view, _) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+            view.models
+                .first()
+                .and_then(|model| model.backend)
+                .is_some_and(|info| info.kv.is_some())
+        });
+        let kv = view.models[0].backend.and_then(|info| info.kv).expect("kv");
+        assert_eq!(kv.used, Some(50_000), "{cmd}: 41,000 busy + 9,000 idle");
+        assert_eq!(kv.capacity, Some(capacity), "{cmd}");
+        assert_eq!(kv.sessions, Some(2), "{cmd}: the empty slot holds none");
+        assert_eq!(kv.unified, Some(unified), "{cmd}");
+        assert!(!kv.unified_assumed && !kv.approx, "{cmd}");
+        assert_eq!(kv.cached, None, "{cmd}");
+    }
 }

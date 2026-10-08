@@ -38,6 +38,8 @@ pub struct RunningModel {
     pub backend: Backend,
     /// Request cap from an SGLang or vLLM launch command.
     pub max_running: Option<u16>,
+    /// llama.cpp's KV layout from its launch command (#79).
+    pub kv: Option<super::cmdline::KvLayout>,
     /// What the `[setup]` rules took from the launch command (#52): numbers
     /// and short tokens only.
     pub setup: Vec<Found>,
@@ -216,6 +218,7 @@ fn parse_running(
                 detail: parsed.detail,
                 backend: parsed.backend,
                 max_running: parsed.max_running,
+                kv: parsed.kv,
                 // The `name` rules (#54) read llama-swap's own `name`.
                 setup: rules.extract_as(
                     launch.unwrap_or_default(),

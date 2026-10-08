@@ -25,7 +25,8 @@
     "conversation_cache_min_free_mib": 2048,
     "tail_role_token": -1,
     "vram_elastic": 0,
-    "engine": "0.1.41"
+    "engine": "0.1.41",
+    "batch_slots": 2
   },
   "live": {
     "state": "generating",
@@ -40,7 +41,13 @@
     "tok_s": 31.5,
     "tok_s_mean": 30.1,
     "prefill_tok_s_mean": 612.4,
-    "tok_s_window_s": 3
+    "tok_s_window_s": 3,
+    "parallel": 2,
+    "running": 1,
+    "slots": [
+      {"slot": 0, "state": "generating", "prompt_tokens": 1800, "generated": 40, "elapsed_s": 3.2, "tok_s": 31.5},
+      {"slot": 1, "state": "idle", "held_tokens": 5120}
+    ]
   },
   "requests": [
     {
