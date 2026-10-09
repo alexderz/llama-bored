@@ -1,10 +1,18 @@
-import struct, zlib, sys
+import os, re, struct, zlib, sys
 from PIL import Image
-FONT = open('/usr/local/share/llama-bored/llama-hack-12x24.psfu','rb').read()
+# The font tty11 uses (watch.toml [tty] font); override with TTYRENDER_FONT.
+FONT = open(os.environ.get('TTYRENDER_FONT',
+            '/usr/local/share/llama-bored/llama-hack-10x18.psfu'), 'rb').read()
 _, _, hdr, _, NG, CB, GH, GW = struct.unpack('<8I', FONT[:32])
+VGA = '000000 aa0000 00aa00 aa5500 0000aa aa00aa 00aaaa aaaaaa 555555 ff5555 55ff55 ffff55 5555ff ff55ff 55ffff ffffff'.split()
+def llama_palette():
+    # The heat palette tty11 loads by default ([tty] palette = "llama"),
+    # read from llama-core so the render matches the console.
+    src = open(os.path.join(os.path.dirname(__file__), '../../crates/llama-core/src/palette.rs')).read()
+    body = src[src.index('pub const LLAMA'):]
+    return re.findall(r'hex\(0x([0-9A-Fa-f]{6})\)', body[:body.index('];')])
 PAL = [tuple(int(h[i:i+2],16) for i in (0,2,4)) for h in
-       '000000 aa0000 00aa00 aa5500 0000aa aa00aa 00aaaa aaaaaa 555555 ff5555 55ff55 ffff55 5555ff ff55ff 55ffff ffffff'.split()]
-ROWS, COLS = 60, 286
+       (VGA if os.environ.get('TTYRENDER_PALETTE') == 'vga' else llama_palette())]
 V2A = [(v & 0b1010) | ((v & 1) << 2) | ((v & 4) >> 2) for v in range(16)]
 glyph_cache = {}
 def glyph(i):
@@ -21,6 +29,7 @@ def glyph(i):
         glyph_cache[i] = g
     return g
 def render(vcsa, hi512=True):
+    ROWS, COLS = vcsa[0], vcsa[1]   # the vcsa header: lines, columns, x, y
     img = Image.new('RGB', (COLS*GW, ROWS*GH))
     cells = vcsa[4:]
     for r in range(ROWS):

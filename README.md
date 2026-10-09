@@ -18,18 +18,19 @@ keyboard. Without a Kraken Z the installer sets up everything except the
 LCD writer.
 
 <p align="center">
-  <img src="docs/media/kraken-lcd.gif" width="560" alt="The Kraken LCD while a new model loads and starts generating: the activity gauge swings from idle into the redline">
+  <img src="docs/media/kraken-lcd.gif" width="560" alt="The Kraken LCD while a 27B model decodes: the activity gauge in the redline, the current 24 tok/s over the tokens chart">
 </p>
 
 <p align="center">
-  <img src="docs/media/tty11.gif" alt="The tty11 dashboard during the same 12 seconds">
+  <img src="docs/media/tty11.gif" alt="The tty11 dashboard during the same 15 seconds: OUT scrolls the live answer, the RECENT context bar and SLOTS fill as tokens arrive">
 </p>
 
-<sub>Both recorded from the same 12 seconds on a real box: one model unloads,
-Qwen3-Coder loads onto the GPU, and generation ramps to about 160 tok/s. The
-LCD frames are rendered by kraken-lcd from recorded snapshots and set into a
+<sub>Both recorded from the same 15 seconds on a real box: a 27B model on
+llama.cpp works through a long answer, its thinking and code scrolling live
+in OUT while the in-flight RECENT row, SLOTS and the KV line grow. The LCD
+frames are rendered by kraken-lcd from recorded snapshots and set into a
 drawn pump-head scene; the tty11 frames come from the console's own screen
-buffer.</sub>
+buffer (192x60 with the 10x18 font).</sub>
 
 ## Components
 
@@ -376,9 +377,9 @@ falls back to utilisation.
   instead of flicker. The example file has a full layout. On stop the
   keyboard gets its own lighting back.
 
-  <img src="docs/media/keyboard.gif" alt="The keyboard layout during the same 12 seconds: activity on the F-row, GPU and busiest cores as two-row bars, GPU temperature on the navigation keys, tokens/s as a dial on the number pad">
+  <img src="docs/media/keyboard.gif" alt="The keyboard layout during the same 15 seconds: activity on the F-row, GPU and busiest cores as two-row bars, GPU temperature on the navigation keys, tokens/s as a dial on the number pad">
 
-  <sub>The keyboard layout during the same 12 seconds, computed by llama-light
+  <sub>The keyboard layout during the same 15 seconds, computed by llama-light
   from the recorded snapshots and drawn with simulated keycap bleed.</sub>
 - Live reload: edits to `light.toml` apply within 2 s; a bad file is logged
   and ignored.
