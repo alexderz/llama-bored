@@ -1425,6 +1425,10 @@ impl<L: Sink> State<L> {
             .collect();
         if busy.is_empty() {
             self.latencies.slots = None;
+            // Nothing is processing, so `/slots` is not read this round
+            // (#98): whatever prefill episode was running is over, and the
+            // held rate must not stay published as if it still were.
+            self.slots.idle();
             return;
         }
         let started = Instant::now();
@@ -1735,15 +1739,11 @@ impl<L: Sink> State<L> {
             self.gen_rate = GenRate::default();
             None
         };
-        // The `/metrics` gauge alone can miss a beat (not yet scraped this
-        // round) while `/slots` still shows a slot busy (#98); either one
-        // seeing work in flight is enough, so that miss cannot force the
-        // published rate to a false 0.
         let busy = self.ready.iter().any(|model| {
             self.counter
                 .requests_processing(&model.id, now)
                 .is_some_and(|value| value > 0.0)
-        }) || self.slots.busy();
+        });
         // Prompt tok/s from SGLang/vLLM's prompt counter, for when no
         // `/slots` gave one.
         let prompt_rate = self.prompt_rate.observe(now, self.prompt_counter.total());

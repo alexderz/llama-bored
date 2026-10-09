@@ -310,13 +310,24 @@ impl SlotBook {
         self.round_prefilling = false;
     }
 
-    /// Any tracked slot is busy right now (#98): a steadier signal than a
-    /// `/metrics` gauge that may not have been scraped this round, used so
-    /// a momentary miss there cannot force the published rate to zero while
-    /// `/slots` still shows work in flight.
-    #[must_use]
-    pub fn busy(&self) -> bool {
-        self.slots.iter().any(|row| row.is_processing)
+    /// The round that drives `/slots` found no model busy (#98): whatever
+    /// prefill episode was running, if any, is over, and nothing will call
+    /// [`Self::apply`] or [`Self::finish_round`] again until one is. Without
+    /// this, the last body `/slots` gave stays cached forever (a request
+    /// that just ended still reads `is_processing`), and the held rate
+    /// would publish as if it were still live.
+    ///
+    /// Reports a true 0 and drops the progress baseline, so the next busy
+    /// episode's first round only sets a baseline — as on startup — rather
+    /// than dividing its first batch by however long this idle gap was.
+    /// [`Self::last_processed`]'s per-slot counters are left alone: a new
+    /// task's lower count already reads as a reset ([`counter_delta`]),
+    /// and that reset's delta lands in the fresh baseline round, never
+    /// applied to the rate.
+    pub fn idle(&mut self) {
+        self.prompt_tps = Some(0.0);
+        self.last_at = None;
+        self.last_progress_at = None;
     }
 
     /// A book that keeps text and shows prompts as `view` says.
@@ -1757,28 +1768,63 @@ mod tests {
         assert_eq!(book.prompt_tps(), Some(0.0));
     }
 
-    /// #98: `busy()` is the slot-level signal `publish()` ORs with the
-    /// `/metrics` gauge, so a gauge that has not been scraped this round
-    /// cannot force the published rate to a false 0 while `/slots` still
-    /// shows work in flight.
+    /// #98: `poll_slots` calls [`SlotBook::idle`] when the `/metrics` gauge
+    /// finds nothing processing, instead of leaving `/slots` unpolled and
+    /// its held rate stuck at whatever it last was. Without `idle`, a
+    /// request that just ended would publish its last rate forever.
     #[test]
-    fn busy_follows_is_processing() {
+    fn idle_clears_the_held_rate_after_a_busy_episode() {
         let mut book = SlotBook::default();
-        assert!(!book.busy());
+        let t0 = Instant::now();
+        book.begin_round();
+        assert!(book.apply("m", "Model", &prefilling(0), 64, 64));
+        book.finish_round(t0);
+        book.begin_round();
+        assert!(book.apply("m", "Model", &prefilling(2048), 64, 64));
+        book.finish_round(t0 + Duration::from_secs(1));
+        assert_eq!(book.prompt_tps(), Some(2048.0), "rate established");
+
+        book.idle();
+        assert_eq!(book.prompt_tps(), Some(0.0), "not the stale held rate");
+    }
+
+    /// #98: `idle` drops the progress baseline too, so a new busy episode
+    /// does not divide its first batch by however long the gap since the
+    /// last one was (minutes, in the real symptom). Its first round after
+    /// `idle` is a baseline only, like startup; the rate reads once a tight
+    /// window has passed.
+    #[test]
+    fn a_fresh_episode_after_idle_is_not_diluted_by_the_gap() {
+        let mut book = SlotBook::default();
+        let t0 = Instant::now();
+        book.begin_round();
+        assert!(book.apply("m", "Model", &prefilling(0), 64, 64));
+        book.finish_round(t0);
+        book.begin_round();
+        assert!(book.apply("m", "Model", &prefilling(2048), 64, 64));
+        book.finish_round(t0 + Duration::from_secs(1));
+        assert_eq!(book.prompt_tps(), Some(2048.0));
+
+        book.idle();
+        // Minutes pass with nothing busy; nothing calls apply/finish_round.
+        let resumed = t0 + Duration::from_secs(300);
+
+        // The next request's first /slots read is a fresh baseline, not a
+        // rate divided by the five-minute gap.
+        book.begin_round();
         assert!(book.apply("m", "Model", &prefilling(10), 64, 64));
-        assert!(book.busy());
-        // Idle: is_processing false.
-        let idle = serde_json::to_vec(&serde_json::json!([{
-            "id": 0,
-            "id_task": -1,
-            "is_processing": false,
-            "n_prompt_tokens_processed": 10,
-            "next_token": [],
-            "prompt": "p",
-            "generated": "",
-        }]))
-        .expect("json");
-        assert!(book.apply("m", "Model", &idle, 64, 64));
-        assert!(!book.busy());
+        book.finish_round(resumed);
+        assert_eq!(
+            book.prompt_tps(),
+            Some(0.0),
+            "baseline only, no diluted rate"
+        );
+
+        // A tight window later, the real rate reads again.
+        book.begin_round();
+        assert!(book.apply("m", "Model", &prefilling(10 + 2048), 64, 64));
+        book.finish_round(resumed + Duration::from_secs(1));
+        let rate = book.prompt_tps().expect("rate");
+        assert!((rate - 2048.0).abs() < 1e-6, "{rate}");
     }
 }
