@@ -955,9 +955,10 @@ long) fails `watch.toml` validation with its index:
 has a copy-paste block for a vLLM container configured by `-e` env vars.
 
 **tty11 colours** (`watch.toml`, `[tty]`): the console has 16 colour slots,
-and llama-watch loads its own palette into them, built from the same heat
-ramp as the LCD and the RGB (deep blue through violet and magenta to red,
-blackbody gold for warnings, greys for text, black background):
+and llama-watch loads its own palette into them, built from the LCD's heat
+ramp (deep blue through violet and magenta to red, blackbody gold for
+warnings, greys for text, black background). The RGB LEDs follow the same
+ramp up to red, then hold deep red instead of the gold tail (#93):
 
 ```toml
 [tty]
