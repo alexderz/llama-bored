@@ -6,6 +6,8 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+- README demo GIFs re-recorded on the 0.5 dashboard: 15 s of a live llama.cpp decode with OUT scrolling; `scripts/demo` renders the 10x18 font, the console's real size and the llama palette, and gains `scan.py` and `build.py` (#87).
+
 ## 0.5.0 — 2026-10-07
 
 The exporter's series change incompatibly (#71): update dashboards with the mapping below.
