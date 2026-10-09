@@ -22,12 +22,12 @@ LCD writer.
 </p>
 
 <p align="center">
-  <img src="docs/media/tty11.gif" alt="The tty11 dashboard during the same 15 seconds: OUT scrolls the live answer, the RECENT context bar and SLOTS fill as tokens arrive">
+  <img src="docs/media/tty11.gif" alt="The tty11 dashboard during the same 15 seconds: OUT scrolls a short story as the model writes it, the RECENT context bar and SLOTS fill as tokens arrive">
 </p>
 
 <sub>Both recorded from the same 15 seconds on a real box: a 27B model on
-llama.cpp works through a long answer, its thinking and code scrolling live
-in OUT while the in-flight RECENT row, SLOTS and the KV line grow. The LCD
+llama.cpp writes a long short story, the text scrolling live in OUT while
+the in-flight RECENT row, SLOTS and the KV line grow. The LCD
 frames are rendered by kraken-lcd from recorded snapshots and set into a
 drawn pump-head scene; the tty11 frames come from the console's own screen
 buffer (192x60 with the 10x18 font).</sub>
