@@ -10,6 +10,7 @@ All notable changes to llama-bored. Versions follow
 ### Changed
 
 - llama-light's `act` palette is now its own LED ramp — blue through violet, purple, magenta and crimson to pure red at 100 %, held at red through 125 % — instead of reusing the LCD's `act_color`, whose blackbody tail above 100 % read as weak white light on RGB LEDs rather than heat (#93). The LCD is unchanged.
+- tty11's stacked bar graphs (FANS, RECENT's per-request bars, SLOTS' progress and ctx bars) no longer leave a hairline between adjacent rows: a full cell draws the same short block the meters have used since #52 (`▇` in eighths mode, `▄` in halves) instead of a full-height `█`/`▐`/`▌` that bridged into the row above or below (#95). GENERATION/PROMPT's isolated rate bars are unchanged.
 
 ## 0.5.0 — 2026-10-07
 

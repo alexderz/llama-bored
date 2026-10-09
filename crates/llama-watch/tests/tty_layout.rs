@@ -235,12 +235,12 @@ fn slot_context_fits_at_160x48_and_240x67() {
         );
         let meter = ctx_meter_cells(&grid, row, value as u16);
         assert!(
-            meter.iter().any(|(ch, _)| matches!(*ch, '█' | '▐' | '▌')),
+            meter.iter().any(|(ch, _)| is_lit_meter_cell(*ch)),
             "{cols}x{rows} context meter missing: {text}"
         );
         let lit: Vec<C16> = meter
             .iter()
-            .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
+            .filter(|(ch, _)| is_lit_meter_cell(*ch))
             .map(|(_, fg)| *fg)
             .collect();
         assert_eq!(
@@ -288,7 +288,7 @@ fn zero_n_ctx_shows_the_ratio_without_a_fill() {
     assert!(
         meter
             .iter()
-            .all(|(ch, _)| !matches!(*ch, '█' | '▐' | '▌' | '░')),
+            .all(|(ch, _)| !is_lit_meter_cell(*ch) && *ch != '░'),
         "zero n_ctx must not draw a meter: {meter:?} in {text}"
     );
 }
@@ -315,7 +315,7 @@ fn context_above_n_ctx_clamps_the_meter_to_a_full_spectrum() {
     let value = char_at(&text, "300k/262k");
     let meter = ctx_meter_cells(&grid, row, value as u16);
     assert!(
-        meter.iter().any(|(ch, _)| matches!(*ch, '█' | '▐' | '▌')),
+        meter.iter().any(|(ch, _)| is_lit_meter_cell(*ch)),
         "overfull context should still draw a meter: {text}"
     );
     assert!(
@@ -324,7 +324,7 @@ fn context_above_n_ctx_clamps_the_meter_to_a_full_spectrum() {
     );
     let lit: Vec<C16> = meter
         .iter()
-        .filter(|(ch, _)| matches!(*ch, '█' | '▐' | '▌'))
+        .filter(|(ch, _)| is_lit_meter_cell(*ch))
         .map(|(_, fg)| *fg)
         .collect();
     assert_eq!(
@@ -343,6 +343,8 @@ fn char_at(text: &str, needle: &str) -> usize {
 }
 
 /// Cells of the context meter: the glyph run immediately left of `value_col`.
+/// #95: the slot rows stack with no blank row between, so the meter keeps
+/// #52's whole-cell glyph (`▇`/`▄`) instead of the half-cell `█`/`▐`/`▌`.
 fn ctx_meter_cells(
     grid: &llama_watch::tty::grid::Grid,
     row: u16,
@@ -356,13 +358,18 @@ fn ctx_meter_cells(
         if cell.ch == ' ' && cells.is_empty() {
             continue;
         }
-        if !matches!(cell.ch, '█' | '▐' | '▌' | '░' | '▓' | '▒') {
+        if !matches!(cell.ch, '█' | '▐' | '▌' | '▇' | '▄' | '░' | '▓' | '▒') {
             break;
         }
         cells.push((cell.ch, cell.fg));
     }
     cells.reverse();
     cells
+}
+
+/// A meter's lit cells (#95: `▇` in eighths mode, `▄` in halves).
+fn is_lit_meter_cell(ch: char) -> bool {
+    matches!(ch, '█' | '▐' | '▌' | '▇' | '▄')
 }
 
 #[test]
@@ -2827,11 +2834,13 @@ fn in_out_wrap_inside_the_left_part_when_fans_are_beside_them() {
     assert!(seen > 0, "IN text drawn");
 }
 
+/// #95: fan rows stack with no blank row between, so the meter keeps #52's
+/// whole-cell glyph (`▇`/`▄`) instead of the half-cell `█`/`▐`/`▌`.
 fn meter_cells(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<C16> {
     (0..grid.cols())
         .filter_map(|col| {
             let cell = grid.get(col, row).unwrap();
-            matches!(cell.ch, '█' | '▌' | '▐').then_some(cell.fg)
+            is_lit_meter_cell(cell.ch).then_some(cell.fg)
         })
         .collect()
 }
@@ -4771,9 +4780,12 @@ fn bar_colours_eighths_and_the_halves_fallback() {
         RAINBOW.contains(&first.1),
         "remainder in a rainbow colour: {bar:?}"
     );
+    // #95: a whole cell draws `▇`, not the full-height `█`, so RECENT rows
+    // stacked with no blank row between keep the same hairline gap #52
+    // gave the meters.
     let fulls: Vec<C16> = bar
         .iter()
-        .filter(|(ch, _)| *ch == '█')
+        .filter(|(ch, _)| *ch == '▇')
         .map(|(_, fg)| *fg)
         .collect();
     assert!(
@@ -4785,7 +4797,9 @@ fn bar_colours_eighths_and_the_halves_fallback() {
             .any(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightBlack),
         "track"
     );
-    // Halves: ▄ or █ only, `_` for the track; colours unchanged.
+    assert!(bar.iter().all(|(ch, _)| *ch != '█'), "{bar:?}");
+    // Halves: `▄` only (never the full-height `█`, #95), `_` for the track;
+    // colours unchanged.
     let grid = draw(
         &bar_model(vec![row(Some(262_144))], ChartGlyphs::Halves),
         240,
@@ -4793,7 +4807,7 @@ fn bar_colours_eighths_and_the_halves_fallback() {
     );
     let halves = bar_of(&grid, header + 1);
     assert!(
-        halves.iter().all(|(ch, _)| matches!(ch, '▄' | '█' | '_')),
+        halves.iter().all(|(ch, _)| matches!(ch, '▄' | '_')),
         "{halves:?}"
     );
     assert_eq!(halves.len(), bar.len());
@@ -4834,7 +4848,8 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
     );
     let header = row_with(&grid, "RECENT");
     let big = bar_of(&grid, header + 1);
-    assert!(big.iter().all(|(ch, _)| *ch == '█'), "{big:?}");
+    // #95: a full cell draws `▇`, never the full-height `█`.
+    assert!(big.iter().all(|(ch, _)| *ch == '▇'), "{big:?}");
     let small = bar_of(&grid, header + 2);
     assert!(
         small.iter().any(|(_, fg)| *fg == C16::BrightBlack),
@@ -5040,7 +5055,8 @@ fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
         .count();
     let done = bar
         .iter()
-        .filter(|(ch, fg)| *ch == '█' && *fg == C16::BrightCyan)
+        // #95: a whole "done" cell draws `▇`, not the full-height `█`.
+        .filter(|(ch, fg)| *ch == '▇' && *fg == C16::BrightCyan)
         .count();
     assert!(pending > done && done > 0, "40 % done: {bar:?}");
     // No finished row is marked `gen` while in-flight rows are shown.
@@ -5083,8 +5099,131 @@ fn an_open_prefill_reads_as_a_lower_bound_with_no_target() {
         .count();
     let done = bar
         .iter()
-        .filter(|(ch, fg)| *ch == '█' && *fg == C16::BrightCyan)
+        // #95: a whole "done" cell draws `▇`, not the full-height `█`.
+        .filter(|(ch, fg)| *ch == '▇' && *fg == C16::BrightCyan)
         .count();
     assert_eq!(pending, 0, "no target track: {bar:?}");
     assert!(done > 0, "{bar:?}");
+}
+
+// ---- #95: stacked bars never merge into one block -------------------------
+
+/// A full-height block glyph: the plain full block and the half-width caps
+/// used by the half-cell bars (`bar_glyph` in layout.rs). All three span the
+/// whole cell height, so two of them in the same column on adjacent rows is
+/// the hairline bug: the rows merge into one block with no gap between.
+fn is_full_height_bar_glyph(ch: char) -> bool {
+    matches!(ch, '█' | '▌' | '▐')
+}
+
+/// No column in `rows` has [`is_full_height_bar_glyph`] true on both a row
+/// and the row right under it.
+fn assert_no_hairline(
+    grid: &llama_watch::tty::grid::Grid,
+    rows: std::ops::Range<u16>,
+    label: &str,
+) {
+    let mut row = rows.start;
+    while row + 1 < rows.end {
+        for col in 0..grid.cols() {
+            let above = grid.get(col, row).unwrap().ch;
+            let below = grid.get(col, row + 1).unwrap().ch;
+            assert!(
+                !(is_full_height_bar_glyph(above) && is_full_height_bar_glyph(below)),
+                "{label}: rows {row}/{} col {col} both full height ({above:?} over {below:?})",
+                row + 1
+            );
+        }
+        row += 1;
+    }
+}
+
+/// Fans maxed out, slots near-full, RECENT rows near their context limit:
+/// every stacked bar #95 touches is lit edge to edge, which is exactly where
+/// a hairline bug would show up as two adjacent full-height cells.
+fn hairline_fixture(glyphs: ChartGlyphs, text_on: bool) -> TtyModel {
+    let mut model = if text_on {
+        fans_model()
+    } else {
+        let mut model = text_off_model(WatchState::Generating);
+        model.fans = Some(ref_fans());
+        model
+    };
+    model.chart_glyphs = glyphs;
+    if let Some(panel) = model.fans.as_mut() {
+        for fan in &mut panel.fans {
+            fan.pwm = Some(255);
+            fan.rpm = Some(2500);
+        }
+    }
+    model.slots = (0..4)
+        .map(|id| Slot {
+            id,
+            generating: true,
+            done: 95,
+            cached: 0,
+            open: false,
+            done_known: true,
+            total: 100,
+            decoded: 50_000,
+            ctx_prompt: Some(250_000),
+            n_ctx: Some(262_144),
+            ctx_history: Vec::new(),
+        })
+        .collect();
+    model.requests = (0..8)
+        .map(|i| {
+            activity(
+                i == 0,
+                4_900 - i,
+                &format!("18:{:02}:{:02}", i, i),
+                "192.0.2.83",
+                "Qwen 35B",
+                260_000,
+                250_000,
+                5_000,
+                1200.0,
+                50.0,
+                "10.0s",
+                false,
+            )
+        })
+        .collect();
+    model
+}
+
+#[test]
+fn stacked_bars_never_merge_into_one_block() {
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        for text_on in [true, false] {
+            for (cols, rows) in [(192u16, 60u16), (240u16, 67u16)] {
+                let model = hairline_fixture(glyphs, text_on);
+                let grid = draw(&model, cols, rows);
+                let at = format!("{cols}x{rows} {glyphs:?} text_on={text_on}");
+
+                let fans_header = row_with(&grid, "FANS  nct6798");
+                let fans_count = u16::try_from(model.fans.as_ref().unwrap().fans.len()).unwrap();
+                assert_no_hairline(
+                    &grid,
+                    fans_header + 1..fans_header + 1 + fans_count,
+                    &format!("{at} FANS"),
+                );
+
+                let slot_rows: Vec<u16> = (0..model.slots.len())
+                    .map(|id| row_with(&grid, &format!("s{id}")))
+                    .collect();
+                let slots_start = *slot_rows.iter().min().unwrap();
+                let slots_end = *slot_rows.iter().max().unwrap() + 1;
+                assert_no_hairline(&grid, slots_start..slots_end, &format!("{at} SLOTS"));
+
+                let recent_header = row_with(&grid, "RECENT");
+                let recent_end = req_rule_row(&grid);
+                assert_no_hairline(
+                    &grid,
+                    recent_header + 1..recent_end,
+                    &format!("{at} RECENT"),
+                );
+            }
+        }
+    }
 }
