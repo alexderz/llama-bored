@@ -4602,18 +4602,16 @@ fn temps_alone_and_temps_off() {
         assert!(!all.contains("TEMPS"), "{cols}x{rows}");
     }
 }
-// ---- #75: RECENT context bar and in-flight rows ---------------------------
+// ---- #75, #96: RECENT context bar and in-flight rows ----------------------
 
-use llama_watch::tty::layout::{CtxCell, CtxPart, InFlight, RAINBOW, ctx_cells};
+use llama_watch::tty::layout::{CtxCell, CtxPart, InFlight, SPIN, Spin, ctx_cells};
 
-const K: u64 = RAINBOW.len() as u64;
-
-/// 30 cells of 6,400 tokens: an eighth is 800 tokens, a rainbow step 100.
+/// 30 cells of 6,400 tokens: an eighth is 800 tokens.
 const W: usize = 30;
-const SCALE: u64 = 30 * 8 * K * 100;
+const SCALE: u64 = W as u64 * 8 * 800;
 
 fn one(value: u64) -> Vec<CtxCell> {
-    ctx_cells(&[(CtxPart::Cached, value)], SCALE, W)
+    ctx_cells(&[(CtxPart::Cached, value)], SCALE, W, None)
 }
 
 fn lit(cells: &[CtxCell]) -> Vec<CtxCell> {
@@ -4628,20 +4626,20 @@ fn full(part: CtxPart) -> CtxCell {
     CtxCell {
         part,
         eighths: 8,
-        shade: None,
+        cursor: None,
     }
 }
 
-fn rem(part: CtxPart, eighths: u8, shade: u8) -> CtxCell {
+fn rem(part: CtxPart, eighths: u8) -> CtxCell {
     CtxCell {
         part,
         eighths,
-        shade: Some(shade),
+        cursor: None,
     }
 }
 
 #[test]
-fn ctx_cells_are_linear_with_eighths_and_rainbow_steps_at_the_boundaries() {
+fn ctx_cells_are_linear_with_eighths_and_a_floor_of_two() {
     use CtxPart::Cached;
     assert_eq!(
         one(0),
@@ -4649,87 +4647,158 @@ fn ctx_cells_are_linear_with_eighths_and_rainbow_steps_at_the_boundaries() {
             CtxCell {
                 part: CtxPart::Track,
                 eighths: 1,
-                shade: None
+                cursor: None
             };
             W
         ]
     );
     // Exactly one cell: no remainder cell.
     assert_eq!(lit(&one(6_400)), [full(Cached)]);
-    // One step short of a cell: 7 eighths, the last rainbow colour.
-    assert_eq!(lit(&one(6_399)), [rem(Cached, 7, 7)]);
-    // One step past a cell: the remainder first, then the whole cell.
-    assert_eq!(lit(&one(6_500)), [rem(Cached, 1, 1), full(Cached)]);
-    assert_eq!(lit(&one(800)), [rem(Cached, 1, 0)]);
-    assert_eq!(lit(&one(1_600)), [rem(Cached, 2, 0)]);
-    assert_eq!(lit(&one(799)), [rem(Cached, 1, 7)]);
-    // A non-zero segment is at least a ▁, whatever its size.
-    assert_eq!(lit(&one(1)), [rem(Cached, 1, 0)]);
-    assert_eq!(
-        lit(&ctx_cells(&[(Cached, 200)], 262_144, W)),
-        [rem(Cached, 1, 1)]
-    );
-    // 13 cells and 5/8 and 3 steps.
-    let cells = lit(&one(13 * 6_400 + 5 * 800 + 300));
+    // One eighth short of a cell: 7 eighths, well above the floor.
+    assert_eq!(lit(&one(5_600)), [rem(Cached, 7)]);
+    // Three eighths: still above the floor, shown exactly.
+    assert_eq!(lit(&one(2_400)), [rem(Cached, 3)]);
+    // One eighth past a cell: the whole cell first, then the remainder,
+    // floored to ▂ since one eighth alone is under the floor (#96).
+    assert_eq!(lit(&one(7_200)), [full(Cached), rem(Cached, 2)]);
+    // A non-zero segment at or under one eighth still shows at least `▂`
+    // (#96): MIN_E is 2, not 1.
+    assert_eq!(lit(&one(1)), [rem(Cached, 2)]);
+    assert_eq!(lit(&one(799)), [rem(Cached, 2)]);
+    assert_eq!(lit(&one(800)), [rem(Cached, 2)]);
+    assert_eq!(lit(&one(1_600)), [rem(Cached, 2)]);
+    // 13 cells and 5/8.
+    let cells = lit(&one(13 * 6_400 + 5 * 800));
     assert_eq!(cells.len(), 14);
-    assert_eq!(cells[0], rem(Cached, 5, 3));
-    assert!(cells[1..].iter().all(|c| *c == full(Cached)));
+    assert!(cells[..13].iter().all(|c| *c == full(Cached)));
+    assert_eq!(cells[13], rem(Cached, 5));
     // Over the scale: clipped to the width, no track left.
     assert_eq!(lit(&one(SCALE * 2)).len(), W);
 }
 
 #[test]
-fn growing_counts_cycle_the_rainbow_then_step_an_eighth() {
-    for units in 1..64u64 {
-        let cells = lit(&one(units * 100));
-        assert_eq!(cells.len(), 1, "{units}");
-        assert_eq!(
-            cells[0].shade,
-            Some(u8::try_from(units % K).unwrap()),
-            "{units}"
-        );
-        assert_eq!(
-            cells[0].eighths,
-            u8::try_from((units / K).max(1)).unwrap(),
-            "{units}"
-        );
-    }
-    // The same counts always give the same cells.
+fn no_spin_draws_no_cursor_and_the_same_counts_give_the_same_cells() {
     let parts = [
         (CtxPart::Cached, 88_960),
         (CtxPart::New, 2_244),
         (CtxPart::Out, 612),
     ];
-    assert_eq!(
-        ctx_cells(&parts, 262_144, 24),
-        ctx_cells(&parts, 262_144, 24)
-    );
+    let a = ctx_cells(&parts, 262_144, 24, None);
+    let b = ctx_cells(&parts, 262_144, 24, None);
+    assert_eq!(a, b, "a finished row draws the same bar every time");
+    assert!(a.iter().all(|c| c.cursor.is_none()), "{a:?}");
 }
 
 #[test]
-fn each_segment_starts_with_its_own_remainder_cell() {
-    use CtxPart::{Cached, New, Out};
-    // 2 cells + 3/8 + 2 steps, 1 cell + 6/8 + 5 steps, 0 cells + 1/8 + 4.
+fn each_segment_ends_with_its_own_remainder_cell() {
+    use CtxPart::{Cached, Out};
+    // 2 cells + 3/8, 1 cell + 3/8.
     let cells = lit(&ctx_cells(
-        &[
-            (Cached, 2 * 6_400 + 3 * 800 + 200),
-            (New, 6_400 + 6 * 800 + 500),
-            (Out, 800 + 400),
-        ],
+        &[(Cached, 2 * 6_400 + 3 * 800), (Out, 6_400 + 3 * 800)],
         SCALE,
         W,
+        None,
     ));
     assert_eq!(
         cells,
         [
-            rem(Cached, 3, 2),
             full(Cached),
             full(Cached),
-            rem(New, 6, 5),
-            full(New),
-            rem(Out, 1, 4),
+            rem(Cached, 3),
+            full(Out),
+            rem(Out, 3),
         ]
     );
+}
+
+#[test]
+fn the_new_segment_steps_lower_than_cached_and_out() {
+    use CtxPart::{Cached, New};
+    // Same value, same scale: cached is a full `▇` (8 eighths); new, the
+    // step option (#96), draws the same whole cell lower, `▄` (4 eighths).
+    assert_eq!(
+        lit(&ctx_cells(&[(Cached, 6_400)], SCALE, W, None)),
+        [full(Cached)]
+    );
+    assert_eq!(
+        lit(&ctx_cells(&[(New, 6_400)], SCALE, W, None)),
+        [rem(New, 4)]
+    );
+    // A partial new cell clamps to 2..=3, rounded from its eighths height,
+    // never reaching the whole cell's 4 until it is whole.
+    for (value, want) in [
+        (800u64, 2),
+        (1_600, 2),
+        (2_400, 2),
+        (3_200, 2),
+        (4_000, 3),
+        (4_800, 3),
+        (5_600, 3),
+    ] {
+        let cells = lit(&ctx_cells(&[(New, value)], SCALE, W, None));
+        assert_eq!(cells, [rem(New, want)], "{value}");
+    }
+}
+
+#[test]
+fn the_head_cursor_is_the_growing_segments_last_cell_and_cycles_with_beats() {
+    use CtxPart::{Cached, New, Out};
+    // Prefill: new is growing. Its last cell becomes a full `▇` cursor in
+    // SPIN[beats % 4], cycling beat by beat (#96).
+    for beats in 0..8u32 {
+        let spin = Spin {
+            decoding: false,
+            beats,
+        };
+        let cells = lit(&ctx_cells(
+            &[(Cached, 6_400), (New, 6_400 + 3 * 800)],
+            SCALE,
+            W,
+            Some(spin),
+        ));
+        let last = *cells.last().unwrap();
+        assert_eq!(last.part, New, "{beats}");
+        assert_eq!(last.eighths, 8, "a full cursor, not the stepped height");
+        assert_eq!(last.cursor, Some(SPIN[(beats % 4) as usize]), "{beats}");
+        assert!(
+            cells[..cells.len() - 1].iter().all(|c| c.cursor.is_none()),
+            "only the head cell spins: {cells:?}"
+        );
+    }
+    // Decoding: out is growing instead.
+    let cells = lit(&ctx_cells(
+        &[(Cached, 6_400), (New, 800), (Out, 1_600)],
+        SCALE,
+        W,
+        Some(Spin {
+            decoding: true,
+            beats: 1,
+        }),
+    ));
+    let last = *cells.last().unwrap();
+    assert_eq!(last.part, Out);
+    assert_eq!(last.cursor, Some(SPIN[1]));
+}
+
+#[test]
+fn an_empty_growing_segment_gets_a_one_cell_cursor() {
+    use CtxPart::{Cached, New, Out};
+    // Decoding has just started: `out` is growing but still empty, so a
+    // single cursor cell is inserted after `new` (#96).
+    let spin = Spin {
+        decoding: true,
+        beats: 2,
+    };
+    let cells = lit(&ctx_cells(
+        &[(Cached, 6_400), (New, 800)],
+        SCALE,
+        W,
+        Some(spin),
+    ));
+    let last = *cells.last().unwrap();
+    assert_eq!(last.part, Out);
+    assert_eq!(last.eighths, 8);
+    assert_eq!(last.cursor, Some(SPIN[2]));
 }
 
 /// A Qwen row of known context, drawn at `cols`.
@@ -4760,7 +4829,7 @@ fn bar_of(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<(char, C16)> {
 }
 
 #[test]
-fn bar_colours_eighths_and_the_halves_fallback() {
+fn bar_segments_use_fixed_colours_and_the_new_segment_steps_lower() {
     let row = |n_ctx| {
         let mut req = recent_model().requests[0].clone();
         (req.input_tok, req.cached_tok, req.output_tok) = (60_000, 40_000, 3_000);
@@ -4774,32 +4843,27 @@ fn bar_colours_eighths_and_the_halves_fallback() {
     );
     let header = row_with(&grid, "RECENT");
     let bar = bar_of(&grid, header + 1);
-    let first = bar[0];
-    assert!(('\u{2581}'..='\u{2587}').contains(&first.0), "{bar:?}");
-    assert!(
-        RAINBOW.contains(&first.1),
-        "remainder in a rainbow colour: {bar:?}"
-    );
     // #95: a whole cell draws `▇`, not the full-height `█`, so RECENT rows
     // stacked with no blank row between keep the same hairline gap #52
     // gave the meters.
-    let fulls: Vec<C16> = bar
-        .iter()
-        .filter(|(ch, _)| *ch == '▇')
-        .map(|(_, fg)| *fg)
-        .collect();
+    assert!(bar.iter().all(|(ch, _)| *ch != '█'), "{bar:?}");
+    // #96: cached and out are fixed colours; new steps lower, to `▄`.
     assert!(
-        fulls.contains(&C16::Blue) && fulls.contains(&C16::BrightCyan),
-        "{bar:?}"
+        bar.iter().any(|(ch, fg)| *ch == '▇' && *fg == C16::Blue),
+        "cached: {bar:?}"
     );
+    assert!(
+        bar.iter()
+            .any(|(ch, fg)| *ch == '▄' && *fg == C16::BrightCyan),
+        "new, stepped lower: {bar:?}"
+    );
+    assert!(bar.iter().any(|(_, fg)| *fg == C16::Yellow), "out: {bar:?}");
     assert!(
         bar.iter()
             .any(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightBlack),
         "track"
     );
-    assert!(bar.iter().all(|(ch, _)| *ch != '█'), "{bar:?}");
-    // Halves: `▄` only (never the full-height `█`, #95), `_` for the track;
-    // colours unchanged.
+    // Halves: `▄` or `_` only; colours unchanged.
     let grid = draw(
         &bar_model(vec![row(Some(262_144))], ChartGlyphs::Halves),
         240,
@@ -4829,7 +4893,9 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
         let header = row_with(&grid, "RECENT");
         bar_of(&grid, header + 1)
             .iter()
-            .any(|(ch, fg)| *ch == '!' && *fg == C16::Yellow)
+            // #96: out is now yellow, so the warning takes the bright step
+            // of that colour to stay distinct from it.
+            .any(|(ch, fg)| *ch == '!' && *fg == C16::BrightYellow)
     };
     assert!(warn_at(row(90_000, Some(100_000))));
     assert!(!warn_at(row(89_999, Some(100_000))));
@@ -4848,8 +4914,9 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
     );
     let header = row_with(&grid, "RECENT");
     let big = bar_of(&grid, header + 1);
-    // #95: a full cell draws `▇`, never the full-height `█`.
-    assert!(big.iter().all(|(ch, _)| *ch == '▇'), "{big:?}");
+    // #96: these rows are all `new`, so a full bar steps to `▄`, never the
+    // full-height `█` (#95).
+    assert!(big.iter().all(|(ch, _)| *ch == '▄'), "{big:?}");
     let small = bar_of(&grid, header + 2);
     assert!(
         small.iter().any(|(_, fg)| *fg == C16::BrightBlack),
@@ -4860,7 +4927,7 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
         let tilde = line.chars().position(|c| c == '~').expect("~");
         let start = line
             .chars()
-            .position(|c| c == '█' || ('\u{2581}'..='\u{2587}').contains(&c))
+            .position(|c| ('\u{2581}'..='\u{2587}').contains(&c))
             .unwrap();
         assert_eq!(tilde + 1, start, "{line}");
     }
@@ -4873,89 +4940,66 @@ fn legend_row(grid: &llama_watch::tty::grid::Grid) -> u16 {
         .expect("legend")
 }
 
-/// The header row's rainbow key (#77): its first column and its cells.
-fn key_of(grid: &llama_watch::tty::grid::Grid, header: u16) -> (u16, Vec<(char, C16)>) {
-    let start = (0..grid.cols())
-        .find(|col| {
-            let cell = grid.get(*col, header).unwrap();
-            cell.ch == '\u{2588}' && cell.fg == RAINBOW[0]
-        })
-        .expect("rainbow key in the RECENT header");
-    let cells = (start..grid.cols())
-        .map(|col| grid.get(col, header).unwrap())
-        .take_while(|cell| cell.ch == '\u{2588}')
-        .map(|cell| (cell.ch, cell.fg))
-        .collect();
-    (start, cells)
-}
-
 #[test]
-fn rainbow_key_sits_over_the_first_bar_cells_in_rainbow_order() {
+fn header_key_sits_over_the_bar_with_fixed_colours() {
     let mut req = recent_model().requests[0].clone();
     (req.input_tok, req.cached_tok, req.output_tok) = (60_000, 40_000, 3_000);
     req.n_ctx = Some(262_144);
     for (glyphs, cols) in [
         (ChartGlyphs::Eighths, 240),
         (ChartGlyphs::Halves, 240),
-        (ChartGlyphs::Eighths, 160),
         (ChartGlyphs::Eighths, 480),
     ] {
         let grid = draw(&bar_model(vec![req.clone()], glyphs), cols, 67);
         let header = row_with(&grid, "RECENT");
-        let (start, key) = key_of(&grid, header);
-        // Full blocks in RAINBOW order, halves mode too.
-        let want: Vec<(char, C16)> = RAINBOW.iter().map(|fg| ('\u{2588}', *fg)).collect();
-        assert_eq!(key, want, "{glyphs:?} {cols}");
-        // Left-aligned over the bar: bar cell 0 is under key cell 0.
-        let bar = bar_of(&grid, header + 1);
-        let row = row_string(&grid, header + 1);
-        let bar_start = row
-            .chars()
-            .position(is_bar_char)
-            .and_then(|c| u16::try_from(c).ok())
-            .unwrap();
+        let row = row_string(&grid, header);
+        // The marker is `▇` with a llama-hack font, `▄` in halves mode.
+        let mark = llama_watch::tty::layout::meter_glyph(glyphs);
+        let start = row.chars().position(|c| c == mark).expect("segment key");
+        let start_u16 = u16::try_from(start).unwrap();
+        // Left-aligned over the bar: bar cell 0 is under the key's marker.
+        let bar_row = row_string(&grid, header + 1);
+        let bar_start = bar_row.chars().position(is_bar_char).unwrap();
         assert_eq!(start, bar_start, "{glyphs:?} {cols}: {row}");
-        assert!(bar.len() >= RAINBOW.len(), "{bar:?}");
+        assert_eq!(
+            grid.get(start_u16, header).unwrap().fg,
+            C16::Blue,
+            "{glyphs:?} {cols}: cached ▇"
+        );
+        assert!(row.contains("cached"), "{row}");
+        assert!(row.contains("new"), "{row}");
+        assert!(row.contains("out"), "{row}");
         // The header words keep their places left of the key.
-        let words = row_string(&grid, header);
-        assert!(words.contains("DUR"), "{words}");
-        assert!(col_of(&grid, header, "DUR") < start, "{words}");
+        assert!(row.contains("DUR"), "{row}");
+        assert!(col_of(&grid, header, "DUR") < start_u16, "{row}");
     }
 }
 
 #[test]
-fn rainbow_key_is_whole_at_the_smallest_screen() {
-    // Below MIN_COLS the frame is the "too small" line, and from it the bar
-    // is at least BAR_FLOOR = RAINBOW.len() wide, so the whole key fits.
-    // The clip for a narrower bar is a unit test in layout.rs.
+fn header_key_shortens_at_the_narrowest_screen() {
+    // Below MIN_COLS the frame is the "too small" line; from it the bar is
+    // at least BAR_FLOOR = 8 wide, narrower than the key, which then
+    // shortens "cached" to "cach" (#96) and draws what fits.
     let mut req = recent_model().requests[0].clone();
     req.n_ctx = Some(262_144);
     let model = bar_model(vec![req], ChartGlyphs::Eighths);
     let min = llama_watch::tty::layout::MIN_COLS;
     for cols in min..min + 4 {
         let grid = draw(&model, cols, 49);
-        let (start, key) = key_of(&grid, row_with(&grid, "RECENT"));
-        assert_eq!(key.len(), RAINBOW.len(), "{cols}");
-        assert!(
-            start + u16::try_from(RAINBOW.len()).unwrap() < cols - 1,
-            "{cols}"
-        );
+        let row = row_string(&grid, row_with(&grid, "RECENT"));
+        assert!(row.contains('\u{2587}'), "{cols}: {row}");
     }
 }
 
 #[test]
-fn legend_keeps_its_items_in_order_and_fits_160_columns() {
+fn legend_fits_160_columns_without_the_header_key() {
     let mut model = recent_model();
     model.chart_glyphs = ChartGlyphs::Eighths;
     let grid = draw(&model, 240, 67);
     let legend = row_string(&grid, legend_row(&grid));
     assert!(
-        legend.contains("\u{2588}cached \u{2588}new \u{2588}out"),
-        "{legend}"
-    );
-    assert!(
-        !legend.contains("per 1/8"),
-        "the header key replaces the strip (#77): {legend}"
+        !legend.contains('\u{2587}') && !legend.contains("cached"),
+        "the colour key moved to the header (#96): {legend}"
     );
     // 160 columns with every note: items drop, nothing passes the edge.
     model.requests[0].gen_measured = true;
@@ -4963,7 +5007,12 @@ fn legend_keeps_its_items_in_order_and_fits_160_columns() {
     let grid = draw(&model, 160, 48);
     let legend = row_string(&grid, legend_row(&grid));
     assert!(legend.trim_end().chars().count() <= 158, "{legend}");
-    assert!(legend.contains("cached"), "the colour key stays: {legend}");
+    assert!(legend.contains("GEN"), "the base legend stays: {legend}");
+    // A wider screen keeps room for both notes.
+    let grid = draw(&model, 240, 67);
+    let legend = row_string(&grid, legend_row(&grid));
+    assert!(legend.contains("~bar = vs largest row"), "{legend}");
+    assert!(legend.contains("~ = engine-measured"), "{legend}");
 }
 
 fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activity {
@@ -5047,18 +5096,26 @@ fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
         prefill.contains("120,000") && prefill.contains("36.4s"),
         "{prefill}"
     );
-    // Prefill: new input so far, then the pending prompt as a cyan low line.
+    // Prefill: new input so far (its head spinning, #96), then the pending
+    // prompt as a cyan low line. This row has no cached or out tokens, so
+    // every non-pending cell in the span is the new segment.
     let bar = bar_of(&grid, header + 1);
+    let is_track_or_pending =
+        |ch: char, fg: C16| ch == '\u{2581}' && matches!(fg, C16::BrightCyan | C16::BrightBlack);
     let pending = bar
         .iter()
         .filter(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightCyan)
         .count();
     let done = bar
         .iter()
-        // #95: a whole "done" cell draws `▇`, not the full-height `█`.
-        .filter(|(ch, fg)| *ch == '▇' && *fg == C16::BrightCyan)
+        .filter(|(ch, fg)| !is_track_or_pending(*ch, *fg))
         .count();
     assert!(pending > done && done > 0, "40 % done: {bar:?}");
+    assert!(
+        bar.iter()
+            .any(|(ch, fg)| *ch == '\u{2587}' && SPIN.contains(fg)),
+        "the growing segment's head spins: {bar:?}"
+    );
     // No finished row is marked `gen` while in-flight rows are shown.
     let third = row_string(&grid, header + 3);
     assert!(
@@ -5097,13 +5154,8 @@ fn an_open_prefill_reads_as_a_lower_bound_with_no_target() {
         .iter()
         .filter(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightCyan)
         .count();
-    let done = bar
-        .iter()
-        // #95: a whole "done" cell draws `▇`, not the full-height `█`.
-        .filter(|(ch, fg)| *ch == '▇' && *fg == C16::BrightCyan)
-        .count();
     assert_eq!(pending, 0, "no target track: {bar:?}");
-    assert!(done > 0, "{bar:?}");
+    assert!(!bar.is_empty(), "{bar:?}");
 }
 
 // ---- #95: stacked bars never merge into one block -------------------------

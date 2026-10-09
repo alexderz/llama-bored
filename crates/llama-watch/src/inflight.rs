@@ -131,6 +131,10 @@ pub struct Flight {
     /// No engine numbers at all (#80): llama-swap's response bytes so far,
     /// the row's only sign of progress.
     pub bytes: Option<u64>,
+    /// Polls in which the growing count rose (#96): `decoded` while
+    /// decoding, else `processed`. Drives the RECENT bar's head spinner,
+    /// which cycles its colour once per such poll, not per frame.
+    pub beats: u32,
     id: FlightId,
     /// Newest activity `seq` when the flight started.
     head_seq: u64,
@@ -138,6 +142,24 @@ pub struct Flight {
     ended: Option<Instant>,
     /// The slot's reset total before the request.
     start_resets: u64,
+}
+
+impl Flight {
+    /// Bump [`Self::beats`] when the growing segment's token count rose
+    /// since the poll before (#96): `decoded` while [`Self::decoding`],
+    /// else `processed`, both already this poll's new values. `old_*` are
+    /// what they were before this poll set them. Never on a tie, and not
+    /// tied to the frame clock.
+    fn bump_beats(&mut self, old_processed: u64, old_decoded: u64) {
+        let (old, new) = if self.decoding {
+            (old_decoded, self.decoded)
+        } else {
+            (old_processed, self.processed)
+        };
+        if new > old {
+            self.beats = self.beats.wrapping_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +248,7 @@ impl Tracker {
             let Some(flight) = self.flight(&id, &slot.model, mono, wall, head_seq, before) else {
                 continue;
             };
+            let (old_processed, old_decoded) = (flight.processed, flight.decoded);
             flight.polled = mono;
             flight.prompt = prompt;
             flight.prompt_known = total.is_some();
@@ -241,6 +264,7 @@ impl Tracker {
             flight.gen_tps = poll.gen_tps;
             flight.n_ctx = slot.n_ctx.filter(|n| *n > 0);
             flight.engine = Some(Backend::LlamaCpp);
+            flight.bump_beats(old_processed, old_decoded);
             flight.ended = None;
             seen.push(id);
         }
@@ -268,6 +292,7 @@ impl Tracker {
                 continue;
             };
             let decoding = state == "generating";
+            let (old_processed, old_decoded) = (flight.processed, flight.decoded);
             flight.polled = mono;
             flight.prompt = prompt;
             flight.prompt_known = total.is_some();
@@ -283,6 +308,7 @@ impl Tracker {
             flight.prompt_tps = live.prefill_tok_s_mean;
             flight.gen_tps = live.tok_s.or(live.tok_s_mean);
             flight.engine = Some(Backend::Strata);
+            flight.bump_beats(old_processed, old_decoded);
             flight.ended = None;
             seen.push(id);
         }
@@ -380,6 +406,7 @@ impl Tracker {
         else {
             return;
         };
+        let (old_processed, old_decoded) = (flight.processed, flight.decoded);
         flight.polled = mono;
         flight.engine = Some(req.engine);
         // Nothing streamed yet: still in prefill.
@@ -418,6 +445,7 @@ impl Tracker {
                 flight.bytes = Some(req.resp_bytes);
             }
         }
+        flight.bump_beats(old_processed, old_decoded);
         flight.ended = None;
         seen.push(id);
     }
@@ -485,6 +513,7 @@ impl Tracker {
             };
             let decoding = slot.decoding();
             let progress = !decoding && newest == Some(slot.slot);
+            let (old_processed, old_decoded) = (flight.processed, flight.decoded);
             flight.polled = mono;
             flight.prompt = prompt;
             flight.prompt_known = slot.prompt_tokens.is_some();
@@ -504,6 +533,7 @@ impl Tracker {
             };
             flight.gen_tps = slot.tok_s;
             flight.engine = Some(Backend::Strata);
+            flight.bump_beats(old_processed, old_decoded);
             flight.ended = None;
             seen.push(id);
         }
@@ -575,6 +605,7 @@ impl Tracker {
             output_unknown: false,
             held: None,
             bytes: None,
+            beats: 0,
             id: id.clone(),
             head_seq,
             ended: None,
