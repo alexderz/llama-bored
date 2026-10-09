@@ -3380,4 +3380,36 @@ sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 8.0
             .expect("one second of samples");
         assert!((got - 40.0).abs() < 1e-6, "{got}");
     }
+
+    /// #98: the vLLM/SGLang prompt-counter path (`GenRate`, fed by
+    /// [`crate::poller`]'s `prompt_rate`) was suspected of the same
+    /// micro-batch aliasing as `/slots` (a batch-stepped counter polled
+    /// faster than it steps). It is not: a sample is always compared
+    /// against one at least a full second old, so the ~1 s window a poll
+    /// lands in almost always spans exactly one step, and the rate never
+    /// aliases to a near-zero reading between steps.
+    #[test]
+    fn metrics_gen_rate_does_not_alias_a_batch_stepped_counter() {
+        let mut rate = GenRate::default();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(250);
+        let mut total = 0u64;
+        let mut seen_steady = false;
+        for i in 0u64..=16 {
+            if i > 0 && i % 4 == 0 {
+                total += 2048;
+            }
+            let now = t0 + step * u32::try_from(i).unwrap();
+            if let Some(got) = rate.observe(now, total)
+                && i >= 4
+            {
+                seen_steady = true;
+                assert!((got - 2048.0).abs() < 1.0, "poll {i}: {got}");
+            }
+        }
+        assert!(
+            seen_steady,
+            "expected a steady rate once a second had passed"
+        );
+    }
 }

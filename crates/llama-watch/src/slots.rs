@@ -277,6 +277,14 @@ pub struct SlotBook {
     last_at: Option<Instant>,
     round_delta: u64,
     round_seen: bool,
+    /// Any slot was prefilling (`is_processing` with `n_decoded == 0`) in
+    /// the round just closed (#98).
+    round_prefilling: bool,
+    /// The last round whose prompt count moved, or read as a confirmed
+    /// true zero (not prefilling): the reference point the next round
+    /// with progress divides by, instead of the last poll, so a poll that
+    /// landed between two micro-batches does not shrink that window (#98).
+    last_progress_at: Option<Instant>,
     prompt_tps: Option<f64>,
     /// Held context and drop counts by `(model id, slot id)`, at most
     /// [`MAX_TRACKED_SLOTS`]. [`Self::clear`] and [`Self::retain_models`]
@@ -299,6 +307,16 @@ impl SlotBook {
     pub fn begin_round(&mut self) {
         self.round_delta = 0;
         self.round_seen = false;
+        self.round_prefilling = false;
+    }
+
+    /// Any tracked slot is busy right now (#98): a steadier signal than a
+    /// `/metrics` gauge that may not have been scraped this round, used so
+    /// a momentary miss there cannot force the published rate to zero while
+    /// `/slots` still shows work in flight.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.slots.iter().any(|row| row.is_processing)
     }
 
     /// A book that keeps text and shows prompts as `view` says.
@@ -556,6 +574,12 @@ impl SlotBook {
             .saturating_add(counter_delta(previous, slot.n_prompt_tokens_processed));
         self.last_processed
             .insert(key, slot.n_prompt_tokens_processed);
+        // llama.cpp reports `n_decoded == 0` while a slot is still in
+        // prefill (its whole prompt is not known yet, see `whole_prompt`):
+        // not yet sampling, so not yet decoding.
+        if slot.is_processing && slot.n_decoded == 0 {
+            self.round_prefilling = true;
+        }
     }
 
     fn needs_prompt(&self, model_id: &str, id: i64, id_task: i64) -> bool {
@@ -566,14 +590,39 @@ impl SlotBook {
         prev.and_then(|row| row.captured_task) != Some(id_task)
     }
 
-    /// Close the phase and store prompt tok/s. The first phase only sets a baseline.
+    /// Close the phase and store prompt tok/s. The first phase only sets a
+    /// baseline.
+    ///
+    /// llama.cpp advances `n_prompt_tokens_processed` one micro-batch at a
+    /// time, so a round landing between two batches sees no progress even
+    /// mid-prefill (#98). While any slot is still prefilling
+    /// ([`Self::round_prefilling`]), a round with no progress holds the
+    /// last rate instead of reporting 0, and the next progress divides by
+    /// the time since the last progress, not since the last poll. 0 is
+    /// reported only once nothing is prefilling.
     pub fn finish_round(&mut self, now: Instant) {
         if !self.round_seen {
             return;
         }
-        if let Some(then) = self.last_at {
-            let window = now.saturating_duration_since(then);
+        let prefilling = self.round_prefilling;
+        if self.last_at.is_none() {
+            // First round: a baseline only, no rate yet.
+            self.last_at = Some(now);
+            self.last_progress_at = Some(now);
+            return;
+        }
+        if self.round_delta > 0 {
+            let since = self.last_progress_at.unwrap_or(now);
+            let window = now.saturating_duration_since(since);
             self.prompt_tps = Some(delta_per_s(self.round_delta, window));
+            self.last_progress_at = Some(now);
+        } else if prefilling {
+            // Still prefilling with no progress this round: hold the last
+            // rate instead of reading it as a near-zero alias.
+        } else {
+            // Decoding only, or idle: no prefill, so the rate really is 0.
+            self.prompt_tps = Some(0.0);
+            self.last_progress_at = Some(now);
         }
         self.last_at = Some(now);
     }
@@ -1651,5 +1700,85 @@ mod tests {
         book.finish_round(t0 + Duration::from_secs(2));
         let reset = book.prompt_tps().expect("reset rate");
         assert!((reset - 5.0).abs() < 1e-6, "{reset}");
+    }
+
+    /// A slot in prefill, `is_processing` with `n_decoded == 0`, whose
+    /// prompt text.
+    fn prefilling(processed: u64) -> Vec<u8> {
+        body(1, "p", "", processed, 0)
+    }
+
+    /// A slot that moved on to decoding: the prompt is done, so the
+    /// processed count holds still.
+    fn decoding(processed: u64, decoded: u64) -> Vec<u8> {
+        body(1, "p", "g", processed, decoded)
+    }
+
+    /// #98: llama.cpp advances `n_prompt_tokens_processed` one micro-batch
+    /// at a time (here, +2048 every 1.0 s). A poll every 0.25 s sees no
+    /// progress on three of every four rounds; while the slot is still
+    /// prefilling, those rounds must hold the last rate, never read as a
+    /// near-zero alias, and the rate itself must track ~2048 tok/s once
+    /// established. Once prefill ends, the rate reads 0.
+    #[test]
+    fn prompt_tps_holds_through_a_batch_stepped_prefill_and_zeros_after() {
+        let mut book = SlotBook::default();
+        let t0 = Instant::now();
+        let step = Duration::from_millis(250);
+        let mut processed = 0u64;
+        let mut established = false;
+        for i in 0u64..=16 {
+            if i > 0 && i % 4 == 0 {
+                processed += 2048;
+            }
+            let now = t0 + step * u32::try_from(i).unwrap();
+            book.begin_round();
+            assert!(book.apply("m", "Model", &prefilling(processed), 64, 64));
+            book.finish_round(now);
+            match book.prompt_tps() {
+                // No reading yet is fine; a false zero mid-prefill is not.
+                None => {}
+                Some(rate) => {
+                    established = true;
+                    assert!((rate - 2048.0).abs() < 1e-6, "poll {i}: {rate}");
+                }
+            }
+        }
+        assert!(
+            established,
+            "expected the rate to settle once a batch landed"
+        );
+
+        // Prefill ends: the slot starts decoding, with no further prompt
+        // progress. The rate now reads 0, not the held ~2048.
+        book.begin_round();
+        assert!(book.apply("m", "Model", &decoding(processed, 1), 64, 64));
+        book.finish_round(t0 + step * 17);
+        assert_eq!(book.prompt_tps(), Some(0.0));
+    }
+
+    /// #98: `busy()` is the slot-level signal `publish()` ORs with the
+    /// `/metrics` gauge, so a gauge that has not been scraped this round
+    /// cannot force the published rate to a false 0 while `/slots` still
+    /// shows work in flight.
+    #[test]
+    fn busy_follows_is_processing() {
+        let mut book = SlotBook::default();
+        assert!(!book.busy());
+        assert!(book.apply("m", "Model", &prefilling(10), 64, 64));
+        assert!(book.busy());
+        // Idle: is_processing false.
+        let idle = serde_json::to_vec(&serde_json::json!([{
+            "id": 0,
+            "id_task": -1,
+            "is_processing": false,
+            "n_prompt_tokens_processed": 10,
+            "next_token": [],
+            "prompt": "p",
+            "generated": "",
+        }]))
+        .expect("json");
+        assert!(book.apply("m", "Model", &idle, 64, 64));
+        assert!(!book.busy());
     }
 }
