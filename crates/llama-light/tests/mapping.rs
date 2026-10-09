@@ -1,10 +1,10 @@
-//! Mapping and colour: the shared act ramp, stops, scales, every style,
-//! smoothing, the brightness cap and the tokens rate.
+//! Mapping and colour: the act ramp, stops, scales, every style, smoothing,
+//! the brightness cap and the tokens rate.
 
 mod common;
 
 use common::{SEC, snap};
-use llama_core::color::{Rgb, act_color, hex, mix};
+use llama_core::color::{Rgb, hex, mix};
 use llama_light::config::parse;
 use llama_light::mapping::{NEUTRAL, Renderer, cap, fade, gauge_count, pulse_level};
 use llama_light::metric::{Metric, TokenRate};
@@ -20,31 +20,33 @@ fn frame(config: &str, activity: f32) -> Vec<Rgb> {
 const FULL: &str = "[aura]\nbrightness_max = 100\n";
 
 #[test]
-fn the_default_is_act_color_of_activity_on_all_six_leds() {
+fn the_default_is_the_act_palette_color_of_activity_on_all_six_leds() {
     for activity in [0.0, 25.0, 50.0, 100.0, 112.0, 125.0] {
         let got = frame(FULL, activity);
         assert_eq!(got.len(), 6);
         assert!(
-            got.iter().all(|led| *led == act_color(activity)),
+            got.iter().all(|led| *led == Palette::Act.color(activity)),
             "{activity}: {got:?}"
         );
     }
 }
 
 #[test]
-fn act_is_blue_to_red_then_orange_gold_hot() {
-    // Same stops as the LCD (kraken-lcd render::color re-exports these).
-    assert_eq!(act_color(0.0), hex(0x1428D8));
-    assert_eq!(act_color(100.0), hex(0xFF2A14));
-    assert_eq!(act_color(125.0), hex(0xFFD050));
-    assert_eq!(Palette::Act.color(60.0), hex(0xC21CC8));
+fn act_is_blue_to_red_held_at_red_past_100() {
+    // llama-light's own LED ramp (#93): no blackbody tail, unlike the LCD's
+    // act_color (crates/llama-light/src/palette.rs has the shape tests).
+    assert_eq!(Palette::Act.color(0.0), hex(0x0010FF));
+    assert_eq!(Palette::Act.color(100.0), hex(0xFF0000));
+    assert_eq!(Palette::Act.color(125.0), hex(0xFF0000));
+    assert_eq!(Palette::Act.color(60.0), hex(0xC000E0));
 }
 
 #[test]
 fn brightness_max_caps_every_led() {
     let got = frame("[aura]\nbrightness_max = 50\n", 100.0);
     assert!(
-        got.iter().all(|led| *led == dim(act_color(100.0), 50.0)),
+        got.iter()
+            .all(|led| *led == dim(Palette::Act.color(100.0), 50.0)),
         "{got:?}"
     );
     assert_eq!(
@@ -138,7 +140,7 @@ fn solid_fills_every_fan_in_a_chain() {
     let config = "[aura]\nbrightness_max = 100\nfans = \"chain\"\nchain_len = 3\n";
     let got = frame(config, 50.0);
     assert_eq!(got.len(), 18);
-    assert!(got.iter().all(|l| *l == act_color(50.0)));
+    assert!(got.iter().all(|l| *l == Palette::Act.color(50.0)));
 }
 
 #[test]
@@ -148,11 +150,11 @@ fn per_fan_chain_entries_light_only_their_fan() {
     let got = frame(config, 50.0);
     assert_eq!(got.len(), 12);
     assert!(
-        got[..6].iter().all(|l| *l == act_color(40.0)),
+        got[..6].iter().all(|l| *l == Palette::Act.color(40.0)),
         "fan 0 is gpu 40"
     );
     assert!(
-        got[6..].iter().all(|l| *l == act_color(20.0)),
+        got[6..].iter().all(|l| *l == Palette::Act.color(20.0)),
         "fan 1 is cpu 20"
     );
 }
@@ -166,7 +168,7 @@ fn ring_lights_k_of_six_from_led_zero() {
     assert_eq!(gauge_count(100.0, 6), 6);
     assert_eq!(gauge_count(125.0, 6), 6);
     let got = frame("[aura]\nbrightness_max = 100\nstyle = \"ring\"\n", 50.0);
-    let color = act_color(50.0);
+    let color = Palette::Act.color(50.0);
     assert_eq!(&got[..3], &[color; 3]);
     assert_eq!(&got[3..], &[Rgb::default(); 3], "unlit LEDs are off");
 }
@@ -178,7 +180,11 @@ fn a_ring_over_a_solid_leaves_the_solid_on_unlit_leds() {
                   [[light]]\nmetric = \"gpu\"\nstyle = \"ring\"\n";
     let got = frame(config, 0.0);
     let base = Palette::named("mono").expect("mono").color(60.0);
-    assert_eq!(&got[..2], &[act_color(40.0); 2], "gpu 40 % is 2 of 6");
+    assert_eq!(
+        &got[..2],
+        &[Palette::Act.color(40.0); 2],
+        "gpu 40 % is 2 of 6"
+    );
     assert_eq!(&got[2..], &[base; 4]);
 }
 
@@ -212,9 +218,9 @@ fn pulse_breathes_faster_with_the_value() {
     let fast_frame = fast.aura_frame(&high, 0.25);
     assert_eq!(
         slow_frame[0],
-        dim(act_color(0.0), pulse_level(0.25) * 100.0)
+        dim(Palette::Act.color(0.0), pulse_level(0.25) * 100.0)
     );
-    assert_eq!(fast_frame[0], dim(act_color(100.0), 35.0));
+    assert_eq!(fast_frame[0], dim(Palette::Act.color(100.0), 35.0));
     // The frame moves every tick while pulsing.
     let next = fast.aura_frame(&high, 0.1);
     assert_ne!(next, fast_frame);
@@ -263,7 +269,7 @@ fn per_entry_brightness_scales_under_the_cap() {
         "[aura]\nbrightness_max = 50\n[[light]]\nbrightness = 50\n",
         100.0,
     );
-    assert_eq!(got[0], dim(dim(act_color(100.0), 50.0), 50.0));
+    assert_eq!(got[0], dim(dim(Palette::Act.color(100.0), 50.0), 50.0));
 }
 
 #[test]

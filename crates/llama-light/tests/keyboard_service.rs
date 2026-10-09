@@ -11,6 +11,7 @@ use llama_light::config::parse;
 use llama_light::keyboard::KeyboardBackend;
 use llama_light::keyboard::device::OpenError;
 use llama_light::keyboard::keymap::{KEYS, key_index};
+use llama_light::palette::Palette;
 use llama_light::service::{self, Light, Parts, RunEnd};
 
 type TestLight = Light<ManualClock, Feed, FakeConfig, NoNotify, Lines>;
@@ -122,7 +123,7 @@ fn the_first_open_enters_software_mode_then_sends_one_frame() {
         g: 0x10,
         b: 0x10,
     };
-    let lit = llama_core::color::act_color(50.0);
+    let lit = Palette::Act.color(50.0);
     for name in ["F1", "F6"] {
         assert_eq!(slots[slot_of(name)], lit, "{name}");
     }

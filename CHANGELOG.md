@@ -7,6 +7,9 @@ All notable changes to llama-bored. Versions follow
 ## Unreleased
 
 - README demo GIFs re-recorded on the 0.5 dashboard: 15 s of a live llama.cpp decode with OUT scrolling; `scripts/demo` renders the 10x18 font, the console's real size and the llama palette, and gains `scan.py` and `build.py` (#87).
+### Changed
+
+- llama-light's `act` palette is now its own LED ramp — blue through violet, purple, magenta and crimson to pure red at 100 %, held at red through 125 % — instead of reusing the LCD's `act_color`, whose blackbody tail above 100 % read as weak white light on RGB LEDs rather than heat (#93). The LCD is unchanged.
 
 ## 0.5.0 — 2026-10-07
 

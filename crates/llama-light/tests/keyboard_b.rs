@@ -6,7 +6,7 @@
 mod common;
 
 use common::{FakeConfig, FakeKbOpener, FakeOpener, Feed, Lines, ManualClock, NoNotify, SEC, snap};
-use llama_core::color::{BLACK, Rgb, act_color, hex, mix};
+use llama_core::color::{BLACK, Rgb, hex, mix};
 use llama_core::wire::SnapshotV1;
 use llama_light::aura::AuraBackend;
 use llama_light::config::{Style, Target, parse};
@@ -14,7 +14,7 @@ use llama_light::keyboard::KeyboardBackend;
 use llama_light::keyboard::keymap::{KEYS, key_index};
 use llama_light::mapping::{Renderer, ema, fade};
 use llama_light::metric::TokenRate;
-use llama_light::palette::dim;
+use llama_light::palette::{Palette, dim};
 use llama_light::service::{Light, Parts};
 
 const MS: u64 = 1_000_000;
@@ -141,22 +141,25 @@ fn ladder_rungs_light_at_their_thresholds_with_a_fractional_last_rung() {
     ];
     let mut r = renderer(LADDER);
     let frame = r.frames(&gpu_snap(1, SEC, 15.0), 0.1).keyboard;
-    assert_eq!(frame[key(rungs[0])], act_color(1.0), "full at 1");
-    assert_eq!(frame[key(rungs[1])], act_color(10.0), "full at 10");
+    assert_eq!(frame[key(rungs[0])], Palette::Act.color(1.0), "full at 1");
+    assert_eq!(frame[key(rungs[1])], Palette::Act.color(10.0), "full at 10");
     assert_eq!(
         frame[key(rungs[2])],
-        mix(BLACK, act_color(20.0), 0.5),
+        mix(BLACK, Palette::Act.color(20.0), 0.5),
         "15 is half way from 10 to 20"
     );
     assert_eq!(frame[key(rungs[3])], BLACK, "30 not reached");
     let mut r = renderer(LADDER);
     let frame = r.frames(&gpu_snap(1, SEC, 0.5), 0.1).keyboard;
-    assert_eq!(frame[key(rungs[0])], mix(BLACK, act_color(1.0), 0.5));
+    assert_eq!(
+        frame[key(rungs[0])],
+        mix(BLACK, Palette::Act.color(1.0), 0.5)
+    );
     assert_eq!(frame[key(rungs[1])], BLACK);
     // Over the top: every rung lit, colours clipped at 125 %.
     let mut r = renderer(&LADDER.replace("[1, 10, 20, 30]", "[1, 10, 20, 130]"));
     let frame = r.frames(&gpu_snap(1, SEC, 200.0), 0.1).keyboard;
-    assert_eq!(frame[key(rungs[3])], act_color(125.0));
+    assert_eq!(frame[key(rungs[3])], Palette::Act.color(125.0));
 }
 
 #[test]
@@ -166,8 +169,8 @@ fn a_round_edge_ladder_lights_whole_rungs_and_value_gradient_uses_one_colour() {
         .replace("gradient = \"position\"", "gradient = \"value\"");
     let mut r = renderer(&body);
     let frame = r.frames(&gpu_snap(1, SEC, 15.0), 0.1).keyboard;
-    assert_eq!(frame[key("Number Pad 0")], act_color(15.0));
-    assert_eq!(frame[key("Number Pad 1")], act_color(15.0));
+    assert_eq!(frame[key("Number Pad 0")], Palette::Act.color(15.0));
+    assert_eq!(frame[key("Number Pad 1")], Palette::Act.color(15.0));
     assert_eq!(frame[key("Number Pad 2")], BLACK);
 }
 
@@ -281,7 +284,7 @@ brightness = 0.6
     let plus = key("Number Pad +");
     let mut r = renderer(body);
     let f = r.frames(&gpu_snap(1, SEC, 80.0), 0.1);
-    assert_eq!(f.keyboard[plus], dim(act_color(80.0), 60.0));
+    assert_eq!(f.keyboard[plus], dim(Palette::Act.color(80.0), 60.0));
     let mut t = SEC;
     let mut seq = 2;
     let mut step = |r: &mut Renderer| {
@@ -293,7 +296,7 @@ brightness = 0.6
     for _ in 0..19 {
         let f = step(&mut r);
         assert_eq!(r.values()[0], Some(80.0));
-        assert_eq!(f.keyboard[plus], dim(act_color(80.0), 60.0));
+        assert_eq!(f.keyboard[plus], dim(Palette::Act.color(80.0), 60.0));
     }
     // Then 50 per second (the range in peak_s): 0.5 s later about 55.
     for _ in 0..5 {
@@ -377,13 +380,13 @@ gradient = "position"
     let frame = r.frames(&gpu_snap(1, SEC, 100.0), 0.1).keyboard;
     for i in 0..10 {
         let at = (i as f32 + 0.5) * 10.0;
-        assert_eq!(frame[f1 + i], act_color(at), "F{}", i + 1);
+        assert_eq!(frame[f1 + i], Palette::Act.color(at), "F{}", i + 1);
     }
     // 45 %: four whole keys, the fifth half lit, the rest unlit.
     let mut r = renderer(body);
     let frame = r.frames(&gpu_snap(1, SEC, 45.0), 0.1).keyboard;
-    assert_eq!(frame[f1 + 3], act_color(35.0));
-    assert_eq!(frame[f1 + 4], mix(BLACK, act_color(45.0), 0.5));
+    assert_eq!(frame[f1 + 3], Palette::Act.color(35.0));
+    assert_eq!(frame[f1 + 4], mix(BLACK, Palette::Act.color(45.0), 0.5));
     assert_eq!(frame[f1 + 5], BLACK);
 }
 
@@ -406,15 +409,15 @@ gradient = "position"
     let frame = r.frames(&s, 0.1).keyboard;
     assert_eq!(
         frame[f1 + 11],
-        act_color(11.5 / 12.0 * 125.0),
-        "F12 is blackbody"
+        Palette::Act.color(11.5 / 12.0 * 125.0),
+        "F12 is over range, held at red"
     );
     let mut r = renderer(body);
     s.host.activity_pct = Some(62.5);
     let frame = r.frames(&s, 0.1).keyboard;
     assert_eq!(
         frame[f1 + 5],
-        act_color(5.5 / 12.0 * 125.0),
+        Palette::Act.color(5.5 / 12.0 * 125.0),
         "F6 full at half"
     );
     assert_eq!(frame[f1 + 6], BLACK, "F7 unlit at half");
@@ -435,12 +438,12 @@ brightness = [0.35, 1.0]
     s.host.coolant_c = Some(25.0);
     assert_eq!(
         r.frames(&s, 0.1).keyboard[key("Insert")],
-        dim(act_color(0.0), 35.0)
+        dim(Palette::Act.color(0.0), 35.0)
     );
     let mut r = renderer(body);
     s.host.coolant_c = Some(60.0);
     let frame = r.frames(&s, 0.1).keyboard;
-    assert_eq!(frame[key("Delete")], act_color(100.0));
+    assert_eq!(frame[key("Delete")], Palette::Act.color(100.0));
 }
 
 #[test]
@@ -461,7 +464,7 @@ smooth_s = 2.0
     let mut r = renderer(&body.replace("attack_s = 0.5\nsmooth_s = 2.0\n", ""));
     assert_eq!(
         r.frames(&gpu_snap(1, SEC, 60.0), 0.1).keyboard[enter],
-        dim(act_color(60.0), 60.0)
+        dim(Palette::Act.color(60.0), 60.0)
     );
 }
 
@@ -482,8 +485,8 @@ range = [0, 100]
 "#;
     let f1 = key("F1");
     let mut r = renderer(body);
-    let low = act_color(0.0);
-    let high = act_color(100.0);
+    let low = Palette::Act.color(0.0);
+    let high = Palette::Act.color(100.0);
     let mut shown = Vec::new();
     for tick in 0..12_u64 {
         let gpu = if tick < 3 { 0.0 } else { 100.0 };
@@ -514,7 +517,7 @@ fn without_an_engine_section_every_tick_is_its_own_target() {
     let mut r = renderer(body);
     r.frames(&gpu_snap(1, SEC, 0.0), 0.1);
     let f = r.frames(&gpu_snap(2, SEC + 100 * MS, 100.0), 0.1);
-    assert_eq!(f.keyboard[key("F1")], act_color(100.0));
+    assert_eq!(f.keyboard[key("F1")], Palette::Act.color(100.0));
     let config = parse(&kb(body)).expect("ok");
     assert_eq!(config.engine.tick_hz, config.aura.fps);
     assert_eq!(config.engine.target_period_s, 0.0);
@@ -523,7 +526,7 @@ fn without_an_engine_section_every_tick_is_its_own_target() {
 }
 
 fn low() -> Rgb {
-    act_color(0.0)
+    Palette::Act.color(0.0)
 }
 
 #[test]
@@ -609,7 +612,7 @@ style = "bar"
     assert_eq!(base, Rgb { r: 2, g: 4, b: 22 });
     let mut r = renderer(body);
     let frame = r.frames(&gpu_snap(1, SEC, 30.0), 0.1).keyboard;
-    assert_eq!(frame[key("F1")], act_color(30.0));
+    assert_eq!(frame[key("F1")], Palette::Act.color(30.0));
     assert_eq!(frame[key("F4")], base, "an unlit bar key shows the base");
     for name in ["Escape", "Space", "Up Arrow", "Number Pad ."] {
         assert_eq!(frame[key(name)], base, "{name}");
