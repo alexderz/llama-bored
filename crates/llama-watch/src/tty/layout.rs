@@ -4374,7 +4374,8 @@ mod tests {
             fit_ellipsis(&"M".repeat(80), 8),
             format!("{}…", "M".repeat(7))
         );
-        assert_eq!(fit_ellipsis("PRE\u{1b}[2JPOST\u{db}", 32), "PRE[2JPOST?");
+        // #90: Û (U+00DB) now transliterates to its base letter 'U'.
+        assert_eq!(fit_ellipsis("PRE\u{1b}[2JPOST\u{db}", 32), "PRE[2JPOSTU");
         assert_eq!(fit_ellipsis("ab", 1), "…");
     }
 

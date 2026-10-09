@@ -21,12 +21,19 @@ const MAX_ROWS: u16 = 512;
 /// ASCII is handled separately. These are the only non-ASCII scalars `emit_char`
 /// will write as UTF-8.
 ///
-/// The first ten are present in eurlatgr (parsed
-/// `/usr/lib/kbd/consolefonts/eurlatgr.psfu.gz`, 2026-09-25) and are all that
-/// `chart_glyphs = "halves"` draws. `…` (U+2026) is glyph 491 in that font; the
-/// RECENT table uses it to mark a name or address cut to the column. `≈`
-/// (U+2248, glyph 484 there; appended to llama-hack's extras) marks an
-/// approximate KV count on a SLOTS engine line (#79).
+/// The first nineteen are present in eurlatgr (parsed
+/// `/usr/lib/kbd/consolefonts/eurlatgr.psfu.gz`, 2026-09-25). The first
+/// eleven (`█` through `≈`) are all that `chart_glyphs = "halves"` draws.
+/// `…` (U+2026) is glyph 491 in that font; the RECENT table uses it to mark
+/// a name or address cut to the column. `≈` (U+2248, glyph 484 there;
+/// appended to llama-hack's extras) marks an approximate KV count on a
+/// SLOTS engine line (#79).
+///
+/// The next eight (`’ ‘ “ ” – — •` and the replacement character U+FFFD) are
+/// #90: `tty::sanitize` transliterates common typography and an unmappable
+/// scalar to these instead of a literal `?`, no font rebuild needed because
+/// `packaging/fonts/build-psf.py`'s slot table already carried them (parsed
+/// from the committed PSF Unicode tables, and from eurlatgr, 2026-10-09).
 ///
 /// The last six are the lower eighths U+2581–2583 and U+2585–2587 (`▄` is
 /// above). eurlatgr lacks them; they are verified present in
@@ -35,7 +42,8 @@ const MAX_ROWS: u16 = 512;
 /// single-spaced meter bars (`▇`; `▄` in halves mode). `▔` (U+2594) is in that font too but
 /// is not drawn, so it is not here.
 pub const GLYPHS: &[char] = &[
-    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '▁', '▂', '▃', '▅', '▆', '▇',
+    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
+    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
 /// Columns and rows reported for the terminal.

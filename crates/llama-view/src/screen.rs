@@ -138,9 +138,13 @@ pub fn detect_layout(vcsa: &[u8], vcsu: Option<&[u8]>) -> Option<AttrLayout> {
 /// Glyphs the tty11 font actually draws. Same set `llama-watch` emits
 /// (`llama_watch::tty::term::GLYPHS`), including the lower eighths that
 /// `chart_glyphs = "eighths"` draws with llama-hack-12x24, the meter bars'
-/// `▇` included (#52).
+/// `▇` included (#52), the approximate-KV marker `≈` (#79), and #90's
+/// typography the tty sanitiser now lets through as themselves
+/// (`’ ‘ “ ” – — •` and the replacement character U+FFFD) instead of
+/// collapsing to `?` here too.
 const GLYPHS: &[char] = &[
-    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '▁', '▂', '▃', '▅', '▆', '▇',
+    '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
+    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
 /// Printable ASCII and [`GLYPHS`] stay. Every other scalar, including ESC,

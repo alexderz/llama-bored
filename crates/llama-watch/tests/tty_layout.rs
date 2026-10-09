@@ -102,7 +102,9 @@ fn llama_text_is_placed_only_as_sanitised_cells() {
     }
     let text: String = chars.iter().collect();
     assert!(
-        text.contains("PRE[2JPOST?END"),
+        // #90: Û (U+00DB) now transliterates to its base letter 'U' rather
+        // than becoming '?'.
+        text.contains("PRE[2JPOSTUEND"),
         "sanitised llama text missing from {text}"
     );
     assert!(!text.contains('\u{1b}'));
@@ -116,7 +118,7 @@ fn llama_text_is_placed_only_as_sanitised_cells() {
         "latin-1 leaked into the byte stream"
     );
     assert!(
-        bytes.windows(14).any(|w| w == b"PRE[2JPOST?END"),
+        bytes.windows(14).any(|w| w == b"PRE[2JPOSTUEND"),
         "sanitised text was not emitted"
     );
 }
@@ -591,7 +593,8 @@ fn recent_model_and_source_ellipsis_only_when_the_column_is_short() {
             "{cols}: second timestamp truncated: {long_name}"
         );
         let hostile = full_row(&grid, header + 3);
-        assert!(hostile.contains("PRE[2JPOST?"), "{cols}: {hostile}");
+        // #90: Û (U+00DB) now transliterates to its base letter 'U'.
+        assert!(hostile.contains("PRE[2JPOSTU"), "{cols}: {hostile}");
         assert!(hostile.contains("[2J10.1.2.3"), "{cols}: {hostile}");
         assert!(!hostile.contains("ip:"), "{cols}: {hostile}");
         assert!(!hostile.contains('\u{1b}') && !hostile.contains('\u{db}'));
@@ -1600,7 +1603,28 @@ fn row_with(grid: &llama_watch::tty::grid::Grid, needle: &str) -> u16 {
 fn is_console_char(ch: char) -> bool {
     matches!(
         ch,
-        ' '..='~' | '█' | '▌' | '▐' | '░' | '▒' | '▓' | '▀' | '▄' | '·' | '…' | '≈'
+        ' '..='~'
+            | '█'
+            | '▌'
+            | '▐'
+            | '░'
+            | '▒'
+            | '▓'
+            | '▀'
+            | '▄'
+            | '·'
+            | '…'
+            | '≈'
+            // #90: typography the tty sanitiser lets through as itself, and
+            // the distinct unknown-scalar placeholder.
+            | '’'
+            | '‘'
+            | '“'
+            | '”'
+            | '–'
+            | '—'
+            | '•'
+            | '\u{fffd}'
     )
 }
 
