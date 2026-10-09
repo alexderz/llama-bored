@@ -1209,6 +1209,9 @@ fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64
             frac,
             ink: BarInk::Spectrum { hot },
             rows,
+            // #95: GENERATION and PROMPT each draw one isolated bar (the
+            // tick row sits right below, no other bar directly above or
+            // under it), so the half-cell caps may keep full height here.
             cells: None,
         },
     );
@@ -1442,7 +1445,11 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 frac,
                 ink: BarInk::Fixed(fill, fill),
                 rows: 1,
-                cells: None,
+                // #95: slot rows stack with no blank row between. The
+                // half-cell caps (`▐`/`▌`) are full height and a solid `█`
+                // would merge with the row above or below, so this bar
+                // keeps #52's whole-cell glyph instead.
+                cells: Some(meter_glyph(model.chart_glyphs)),
             },
         );
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
@@ -1465,7 +1472,7 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         let after_decoded = g.prompt_x().saturating_add(decoded_w);
         match &spark {
             Some(plan) => paint_slot_spark(grid, row, after_decoded, plan, slot, model),
-            None => paint_slot_ctx(grid, row, after_decoded, g.cols, slot),
+            None => paint_slot_ctx(grid, row, after_decoded, g.cols, slot, model.chart_glyphs),
         }
     }
     let first = u16::try_from(model.slots.len()).unwrap_or(u16::MAX);
@@ -1648,7 +1655,9 @@ fn paint_slot_spark(
                 frac: Some(frac),
                 ink: BarInk::Spectrum { hot: false },
                 rows: 1,
-                cells: None,
+                // #95: one ctx meter per slot row, stacked with no blank
+                // row between, so it needs #52's whole-cell glyph too.
+                cells: Some(meter_glyph(model.chart_glyphs)),
             },
         );
     }
@@ -1709,8 +1718,11 @@ fn paint_slot_spark(
     }
 }
 
-/// One-row sparkline cell: `▄ █` in halves, `▁`..`█` in eighths. Any used
-/// context shows at least the smallest step.
+/// One-row sparkline cell: `▄` in halves, `▁`..`▇` in eighths. Any used
+/// context shows at least the smallest step. #95: one sparkline per slot
+/// row, stacked with no blank row between, so a full cell never draws the
+/// full-height `█` either — the same non-bridging fallback #52 gave the
+/// meters (`▇` in eighths, `▄` in halves).
 fn spark_glyph(frac: f64, any: bool, glyphs: ChartGlyphs) -> Option<char> {
     let (level, top) = match glyphs {
         ChartGlyphs::Halves => (chart::halves(frac, 1), 2),
@@ -1719,8 +1731,8 @@ fn spark_glyph(frac: f64, any: bool, glyphs: ChartGlyphs) -> Option<char> {
     let level = if any { level.max(1) } else { level };
     match (glyphs, level) {
         (_, 0) => None,
-        (_, l) if l >= top => Some('\u{2588}'),
         (ChartGlyphs::Halves, _) => Some('\u{2584}'),
+        (ChartGlyphs::Eighths, l) if l >= top => Some('\u{2587}'),
         (ChartGlyphs::Eighths, l) => char::from_u32(0x2580 + l),
     }
 }
@@ -1768,7 +1780,14 @@ fn ctx_colour(frac: f64) -> C16 {
 
 /// `ctx 91k/262k` and a fill meter, right of the decoded count. Missing inputs
 /// draw `ctx --` and no meter. The console has no em dash, so the gap is `--`.
-fn paint_slot_ctx(grid: &mut Grid, row: u16, after_decoded: u16, cols: u16, slot: &Slot) {
+fn paint_slot_ctx(
+    grid: &mut Grid,
+    row: u16,
+    after_decoded: u16,
+    cols: u16,
+    slot: &Slot,
+    glyphs: ChartGlyphs,
+) {
     let right = usize::from(cols.saturating_sub(2));
     let left_limit = usize::from(after_decoded.saturating_add(1));
     if left_limit > right {
@@ -1822,7 +1841,8 @@ fn paint_slot_ctx(grid: &mut Grid, row: u16, after_decoded: u16, cols: u16, slot
                 frac: Some(frac),
                 ink: BarInk::Spectrum { hot: false },
                 rows: 1,
-                cells: None,
+                // #95: stacks with the slot rows above and below it.
+                cells: Some(meter_glyph(glyphs)),
             },
         );
         meter_x.saturating_sub(gap + label_w)
@@ -2091,14 +2111,18 @@ fn track_glyph(glyphs: ChartGlyphs) -> char {
     }
 }
 
-/// `e` eighths: `▁`..`▇`, `█`; halves: `▄` up to four, else `█`.
+/// `e` eighths: `▁`..`▇`; halves: `▄`. #95: RECENT rows stack with no blank
+/// row between, same as the meters (#52), so a "whole" cell (`e == 8`) never
+/// draws the full-height `█` either — it keeps the lower seven-eighths block
+/// (or, in halves, the same `▄` fallback the meters use), leaving the same
+/// hairline gap above every row.
 fn eighth_glyph(eighths: u8, glyphs: ChartGlyphs) -> char {
     match glyphs {
         ChartGlyphs::Eighths if eighths < 8 => {
-            char::from_u32(0x2580 + u32::from(eighths.max(1))).unwrap_or('\u{2588}')
+            char::from_u32(0x2580 + u32::from(eighths.max(1))).unwrap_or('\u{2587}')
         }
-        ChartGlyphs::Halves if eighths <= 4 => '\u{2584}',
-        _ => '\u{2588}',
+        ChartGlyphs::Eighths => '\u{2587}',
+        ChartGlyphs::Halves => '\u{2584}',
     }
 }
 
@@ -2274,7 +2298,15 @@ fn draw_text_off(grid: &mut Grid, model: &TtyModel, g: &Geom, req_header: u16) {
         Some(Strip::Block(height)) => {
             let strip_rule = g.rows - 3 - reserve;
             draw_rule(grid, strip_rule, g.cols);
-            draw_strip(grid, g, fans, temps, strip_rule + 1, height);
+            draw_strip(
+                grid,
+                g,
+                fans,
+                temps,
+                strip_rule + 1,
+                height,
+                model.chart_glyphs,
+            );
         }
         Some(Strip::Line) => {
             if let Some(panel) = temps {
@@ -3207,15 +3239,14 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
             for row in in_label..health_rule {
                 paint(grid, split, row, '|', C16::BrightBlack, C16::Black);
             }
-            let (left, end) = fans_span(g);
             draw_side_column(
                 grid,
                 fans,
                 temps,
-                left,
-                end,
+                fans_span(g),
                 in_label,
                 health_rule - in_label,
+                model.chart_glyphs,
             );
         } else {
             // Under IN/OUT: a rule, then the blocks side by side, if IN and
@@ -3225,7 +3256,15 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
                 Some(Strip::Block(height)) => {
                     health_rule -= 1 + height;
                     draw_rule(grid, health_rule, g.cols);
-                    draw_strip(grid, g, fans, temps, health_rule + 1, height);
+                    draw_strip(
+                        grid,
+                        g,
+                        fans,
+                        temps,
+                        health_rule + 1,
+                        height,
+                        model.chart_glyphs,
+                    );
                 }
                 Some(Strip::Line) => {
                     health_rule -= 1;
@@ -3383,6 +3422,7 @@ fn draw_strip(
     temps: Option<&TempPanel>,
     top: u16,
     rows: u16,
+    glyphs: ChartGlyphs,
 ) {
     let wide = g.cols >= FANS_SIDE_COLS;
     match (fans, temps) {
@@ -3398,12 +3438,12 @@ fn draw_strip(
             for row in top..top + rows {
                 paint(grid, sep, row, '|', C16::BrightBlack, C16::Black);
             }
-            draw_fans(grid, fans, fans_span.0, fans_span.1, top, rows);
+            draw_fans(grid, fans, fans_span.0, fans_span.1, top, rows, glyphs);
             draw_temps(grid, temps, temps_span.0, temps_span.1, top, rows);
         }
         (Some(fans), None) => {
             let (left, right) = fans_span(g);
-            draw_fans(grid, fans, left, right, top, rows);
+            draw_fans(grid, fans, left, right, top, rows, glyphs);
         }
         (None, Some(temps)) => draw_temps(grid, temps, 2, g.cols - 3, top, rows),
         (None, None) => {}
@@ -3416,15 +3456,16 @@ fn draw_side_column(
     grid: &mut Grid,
     fans: Option<&FanPanel>,
     temps: Option<&TempPanel>,
-    left: u16,
-    right: u16,
+    span: (u16, u16),
     top: u16,
     rows: u16,
+    glyphs: ChartGlyphs,
 ) {
+    let (left, right) = span;
     let mut used = 0;
     if let Some(panel) = fans {
         used = fans_block_rows(panel).min(rows);
-        draw_fans(grid, panel, left, right, top, used);
+        draw_fans(grid, panel, left, right, top, used, glyphs);
         used += 1;
     }
     if let Some(panel) = temps {
@@ -3611,7 +3652,15 @@ fn fans_block_rows(panel: &FanPanel) -> u16 {
 
 /// `FANS  <chip>`, then one row per fan: label, rpm, pwm meter, percent and
 /// mode. A stalled fan (0 rpm while pwm > 0) is drawn in dim red.
-fn draw_fans(grid: &mut Grid, panel: &FanPanel, left: u16, right: u16, top: u16, rows: u16) {
+fn draw_fans(
+    grid: &mut Grid,
+    panel: &FanPanel,
+    left: u16,
+    right: u16,
+    top: u16,
+    rows: u16,
+    glyphs: ChartGlyphs,
+) {
     if rows == 0 || right <= left {
         return;
     }
@@ -3652,7 +3701,7 @@ fn draw_fans(grid: &mut Grid, panel: &FanPanel, left: u16, right: u16, top: u16,
         if i + 1 >= rows {
             break;
         }
-        draw_fan_row(grid, fan, left, width, top + 1 + i);
+        draw_fan_row(grid, fan, left, width, top + 1 + i, glyphs);
     }
 }
 
@@ -3662,7 +3711,14 @@ pub fn fan_stalled(fan: &FanReading) -> bool {
     fan.rpm == Some(0) && fan.pwm.is_some_and(|pwm| pwm > 0)
 }
 
-fn draw_fan_row(grid: &mut Grid, fan: &FanReading, left: u16, width: usize, row: u16) {
+fn draw_fan_row(
+    grid: &mut Grid,
+    fan: &FanReading,
+    left: u16,
+    width: usize,
+    row: u16,
+    glyphs: ChartGlyphs,
+) {
     let stalled = fan_stalled(fan);
     let (label_fg, value_fg, dim_fg) = if stalled {
         (C16::Red, C16::Red, C16::Red)
@@ -3702,7 +3758,8 @@ fn draw_fan_row(grid: &mut Grid, fan: &FanReading, left: u16, width: usize, row:
                     BarInk::Spectrum { hot: false }
                 },
                 rows: 1,
-                cells: None,
+                // #95: one fan per row, stacked with no blank row between.
+                cells: Some(meter_glyph(glyphs)),
             },
         );
         col += col_u16(bar_w) + 1;
