@@ -186,6 +186,51 @@ fn a_flight_changes_only_on_a_poll() {
     }
 }
 
+/// #96: `beats` drives the RECENT bar's head spinner, one step per poll in
+/// which the growing count actually rose — `processed` in prefill,
+/// `decoded` once decoding — never on a tie, and not per frame.
+#[test]
+fn beats_bump_only_when_the_growing_count_rises() {
+    let mut feed = Feed::new();
+    // Prefill: 0 -> 1,000 processed is a rise.
+    let got = feed.poll(0, &[busy(41, Some(20_000), 1_000, 0)], &[]);
+    assert_eq!(got[0].beats, 1);
+    // Same processed count, a later poll: no rise, no bump.
+    let got = feed.poll(100, &[busy(41, Some(20_000), 1_000, 0)], &[]);
+    assert_eq!(got[0].beats, 1);
+    // Processed grows again: another beat.
+    let got = feed.poll(200, &[busy(41, Some(20_000), 2_000, 0)], &[]);
+    assert_eq!(got[0].beats, 2);
+    // Decoding starts: 0 -> 1 decoded is itself a rise, its own metric now.
+    let got = feed.poll(300, &[busy(41, Some(20_000), 2_000, 1)], &[]);
+    assert_eq!(got[0].beats, 3);
+    // Decoding, the same decoded count: no bump.
+    let got = feed.poll(400, &[busy(41, Some(20_000), 2_000, 1)], &[]);
+    assert_eq!(got[0].beats, 3);
+    // Decoded grows again: another beat.
+    let got = feed.poll(500, &[busy(41, Some(20_000), 2_000, 4)], &[]);
+    assert_eq!(got[0].beats, 4);
+}
+
+/// #96: the vLLM/SGLang path (#80) bumps `beats` the same way, from
+/// `decoded` once a byte streamed.
+#[test]
+fn beats_bump_on_the_live_request_path_too() {
+    let mut feed = Feed::new();
+    let tokens = |output: u64| LiveTokens {
+        prompt: Some(9_000),
+        cached: Some(8_192),
+        output: Some(output),
+        ..LiveTokens::default()
+    };
+    let got = feed.poll_requests(0, &[vllm(&feed, "30", 0, 4_096, Some(tokens(10)))], &[]);
+    assert_eq!(got[0].beats, 1);
+    let got = feed.poll_requests(100, &[vllm(&feed, "30", 0, 4_096, Some(tokens(10)))], &[]);
+    assert_eq!(got[0].beats, 1, "same output: no bump");
+    let got = feed.poll_requests(200, &[vllm(&feed, "30", 0, 8_192, Some(tokens(20)))], &[]);
+    assert_eq!(got[0].beats, 2);
+}
+
 #[test]
 fn a_reset_before_a_cold_prefill_shows_its_reason() {
     let mut feed = Feed::new();

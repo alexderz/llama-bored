@@ -107,30 +107,38 @@ llama-swap's own speeds.
 - The model's full name and engine in the header, and a **SETUP** block with
   the loaded model's settings (below).
 
-**Context bar.** RECENT's bar (#75) shows how much of the model's
-context each request used, as three runs in a row: cached input (blue),
-new input (input minus cached; sky blue) and output (magenta). The full
-width is the model's context size (`n_ctx` from the engine or the launch
-command, remembered after the model unloads), so a cell is `n_ctx / width`
-tokens, linearly. Each run starts with its remainder cell: its height is
-the fraction of a cell in eighths (`▁`..`▇`, at least `▁` for any tokens at
-all), and its colour the fraction of an eighth, in this fixed order of
-eight palette slots, the same on tty11, in llama-view (16, 256 and
-truecolor) and on llama-cast: red, orange, amber, yellow, light green,
-green, sky, blue (slots 1, 6, 3, 11, 10, 2, 14, 4): red is the smallest step,
-blue the largest. At 30
-cells and a 262,144-token context one colour step is about 136 tokens.
-The RECENT header row carries the order as a key (#77): the eight
-colours as full blocks, left-aligned directly over the bar's first cells,
-so a remainder cell's colour reads as the start, middle or end of its
-eighth by matching it to the key; a bar narrower than eight cells shows
-what fits. The legend keeps `█cached █new █out`.
-The colours are a function of the counts only: a finished row never
-changes. Empty cells are a dim baseline. A request at 90 % of the context
-or more gets a yellow `!` after its bar. Without a context size the bar is
-scaled to the largest such row shown and marked `~`. With `chart_glyphs =
-"halves"` the heights fall back to `▄` and `█` and the colours carry the
-rest. Engines that report no cached count show all input as new.
+**Context bar.** RECENT's bar (#75, #96) shows how much of the model's
+context each request used, as three runs in a row, each a fixed colour:
+cached input (blue), new input (input minus cached; cyan, drawn a step
+lower than the other two) and output (yellow). The full width is the
+model's context size (`n_ctx` from the engine or the launch command,
+remembered after the model unloads), so a cell is `n_ctx / width` tokens,
+linearly. A whole cell is `▇`; a run's last cell, if it is not whole, is
+the fraction of a cell in eighths, floored to at least `▂` for any tokens
+at all, so a run is never invisible. The new run's cells sit a step
+lower — a whole one is `▄`, a partial one `▂`/`▃` — so cached, new and out
+read as three distinct steps rather than one continuous colour run. The
+RECENT header row carries the key (#96) in the same place a rainbow strip
+used to: `▇cached ▇new ▇out`, each mark in its run's colour and its label
+dim (`▇cach` below 17 columns of bar). The colours are a function of the
+counts only, except for the head spinner below: a finished row's colours
+never change. Empty cells are a dim baseline. A request at 90 % of the
+context or more gets a bright yellow `!` after its bar (a step brighter
+than the out run, since out is yellow too). Without a context size the
+bar is scaled to the largest such row shown and marked `~`. With
+`chart_glyphs = "halves"` the heights fall back to `▄` (and the header
+key's mark with them) and the colours carry the rest. Engines that
+report no cached count show all input as new.
+
+**Head spinner** (#96). An in-flight row's growing run — new while it is
+still in prefill, out once it decodes — carries a one-cell cursor at its
+leading edge: a full `▇` that cycles red, light green, white, magenta
+one step per poll in which that run's token count actually rose, not per
+frame, so it never spins on a repeat of the same numbers. If the growing
+run is still empty (decoding has just started, or prefill has not
+computed anything new yet) the cursor is a single cell on its own. A
+finished row never spins.
+
 IN is always the whole prompt and CACHED its reused part (#82):
 llama-swap's `input_tokens` leaves the cached tokens out for llama.cpp
 and Strata (it takes their `timings`) and counts them for vLLM, SGLang
@@ -141,9 +149,9 @@ loaded reads as the OpenAI form unless its cached count is above its
 input, which only the other form can give.
 
 ```text
- RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ████████
->       18:47:20              Qwen 35B  69,632+   61,440     0  ...  36.4s ▅███████▁█▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp
-   4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▁███████████▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+ RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ▇cached ▇new ▇out
+>       18:47:20              Qwen 35B  69,632+   61,440     0  ...  36.4s ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▄▄▇▁▁▁▁▁ pp
+   4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▇▇▇▇▇▇▇▇▇▇▇▇▄▂▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 ```
 
 The first row is a llama.cpp request in prefill (#78): `/slots` gives

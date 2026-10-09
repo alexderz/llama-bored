@@ -137,6 +137,9 @@ pub struct InFlight {
     /// and llama-swap's response bytes so far, or stays empty before the
     /// first byte.
     pub bytes: Option<u64>,
+    /// Polls in which the growing count rose (#96): the bar's head
+    /// spinner cycles [`SPIN`] by this, once per such poll.
+    pub beats: u32,
 }
 
 /// One item on a SETUP row (#52): `kv q8_0`, drawn after `sep`.
@@ -1883,22 +1886,18 @@ const LEGEND_NARROW: &str = "PROMPT = prompt processing (prefill) · GEN = token
 const LEGEND_WIDE: &str = "PROMPT tok/s = prompt processing speed · GEN tok/s = generation speed";
 /// Added to the legend while a shown row has an engine-measured rate (#35).
 const LEGEND_MEASURED: &str = " · ~ = engine-measured";
-/// #75: the bar's colours, painted over the `█`s.
-const LEGEND_KEY: &str = " · █cached █new █out";
 /// #75: a bar without a context size is scaled to the largest row.
 const LEGEND_RELATIVE: &str = " · ~bar = vs largest row";
 
 /// The RECENT legend: the column words, then what fits of the measured
-/// note, the bar's colour key and the relative note, dropped in reverse
-/// order of that list when the row is short. The rainbow order is the key
-/// in the header row (#77).
+/// note and the relative note, dropped in reverse order of that list when
+/// the row is short. The bar's own colour key is the header row (#96).
 fn paint_legend(grid: &mut Grid, row: u16, cols: u16, base: &str, measured: bool, relative: bool) {
     let room = usize::from(cols.saturating_sub(3));
     let mut items: Vec<&str> = Vec::new();
     if measured {
         items.push(LEGEND_MEASURED);
     }
-    items.push(LEGEND_KEY);
     if relative {
         items.push(LEGEND_RELATIVE);
     }
@@ -1906,7 +1905,7 @@ fn paint_legend(grid: &mut Grid, row: u16, cols: u16, base: &str, measured: bool
         base.chars().count() + items.iter().map(|i| i.chars().count()).sum::<usize>()
     };
     while !items.is_empty() && len(&items) > room {
-        let drop = [LEGEND_RELATIVE, LEGEND_MEASURED, LEGEND_KEY]
+        let drop = [LEGEND_RELATIVE, LEGEND_MEASURED]
             .iter()
             .find_map(|d| items.iter().position(|i| i == d));
         match drop {
@@ -1920,54 +1919,48 @@ fn paint_legend(grid: &mut Grid, row: u16, cols: u16, base: &str, measured: bool
     paint_fixed(grid, col, row, base, C16::BrightBlack);
     col += u16_from(base.chars().count());
     for item in items {
-        let mut key = 0usize;
-        for ch in item.chars() {
-            match ch {
-                '█' => {
-                    let fg = [C16::Blue, C16::BrightCyan, C16::BrightMagenta][key.min(2)];
-                    paint(grid, col, row, '█', fg, C16::Black);
-                    key += 1;
-                }
-                _ => paint_fixed(grid, col, row, &ch.to_string(), C16::BrightBlack),
-            }
-            col = col.saturating_add(1);
-        }
+        paint_fixed(grid, col, row, item, C16::BrightBlack);
+        col += u16_from(item.chars().count());
     }
 }
 
-/// #75, #83: the order of the remainder cell's colours, by palette slot,
-/// smallest step first. Under the llama palette it runs red to green to
-/// blue: red, orange, amber, yellow, light green, green, sky, blue. Red and
-/// yellow also mark `gen` and the context warning, but those are text
-/// (`gen`, `!`), never a bar cell. The same slots in every mode (tty11,
-/// llama-view 16 / 256 / truecolor, llama-cast), so the order reads the
-/// same everywhere.
-pub const RAINBOW: [C16; 8] = [
+/// The head spinner's cursor colour cycle (#96): red, light green, white,
+/// magenta. One step per poll in which the growing segment's token count
+/// rose ([`crate::inflight::Flight::beats`] / [`InFlight::beats`]), not
+/// per frame, so the cursor animates only when the request made progress.
+pub const SPIN: [C16; 4] = [
     C16::Red,
-    C16::Cyan,
-    C16::Yellow,
-    C16::BrightYellow,
     C16::BrightGreen,
-    C16::Green,
-    C16::BrightCyan,
-    C16::Blue,
+    C16::BrightWhite,
+    C16::BrightMagenta,
 ];
 
-/// RECENT's rainbow key (#77): [`RAINBOW`] as full blocks, one cell per
-/// colour, from the bar's first cell, so key cell `i` sits over bar cell
-/// `i` and a remainder cell's colour reads as the start, middle or end of
-/// its eighth. Full blocks in halves mode too. A bar narrower than the
-/// key, or one that runs off the screen, shows what fits.
-fn paint_rainbow_key(grid: &mut Grid, bar: Span, row: u16) {
-    for (i, fg) in RAINBOW.iter().take(usize::from(bar.w)).enumerate() {
-        paint(
-            grid,
-            bar.x.saturating_add(u16_from(i)),
-            row,
-            '\u{2588}',
-            *fg,
-            C16::Black,
-        );
+/// RECENT's header key (#75, #96): a fixed marker per segment with its dim
+/// label, in the bar's first cells, replacing the rainbow strip (#77) now
+/// that a segment is always one colour. Below 17 cells "cached" shortens
+/// to "cach" so the key still fits a 160-column console; narrower still,
+/// it draws what fits and the rest runs off the edge of the grid. The
+/// marker is [`meter_glyph`]: `▇` with a llama-hack font, `▄` in halves
+/// mode, since eurlatgr lacks the eighths block.
+fn paint_segment_key(grid: &mut Grid, bar: Span, row: u16, glyphs: ChartGlyphs) {
+    let mark = meter_glyph(glyphs).to_string();
+    let cached_label = if bar.w >= 17 { "cached" } else { "cach" };
+    let items: [(&str, C16); 8] = [
+        (mark.as_str(), C16::Blue),
+        (cached_label, C16::BrightBlack),
+        (" ", C16::BrightBlack),
+        (mark.as_str(), C16::BrightCyan),
+        ("new", C16::BrightBlack),
+        (" ", C16::BrightBlack),
+        (mark.as_str(), C16::Yellow),
+        ("out", C16::BrightBlack),
+    ];
+    let mut col = bar.x;
+    for (text, fg) in items {
+        for ch in text.chars() {
+            paint(grid, col, row, ch, fg, C16::Black);
+            col = col.saturating_add(1);
+        }
     }
 }
 
@@ -1976,7 +1969,8 @@ fn paint_rainbow_key(grid: &mut Grid, bar: Span, row: u16) {
 pub enum CtxPart {
     /// Cached input.
     Cached,
-    /// New input (input minus cached, never below 0).
+    /// New input (input minus cached, never below 0). Drawn a step lower
+    /// than the other segments (#96) so cached → new → out read as steps.
     New,
     /// In flight: prompt not yet computed, the target the new part fills.
     Pending,
@@ -1993,62 +1987,160 @@ pub struct CtxCell {
     pub part: CtxPart,
     /// Height in eighths, 1..=8 (8 is a full cell).
     pub eighths: u8,
-    /// A segment's remainder cell: its index in [`RAINBOW`].
-    pub shade: Option<u8>,
+    /// This is the growing segment's head: a full cell in this colour
+    /// instead of [`CtxPart`]'s fixed one (#96), the spinner cursor.
+    pub cursor: Option<C16>,
+}
+
+/// `▇`: a whole cell, the hairline rule (#95). Never `█` (#96).
+const FULL: u8 = 8;
+/// A non-zero segment is at least `▂`, whatever its size (#96).
+const MIN_E: u8 = 2;
+
+/// Which flight segment is growing, and the head spinner's step (#96).
+/// `None` (a finished row, or a row with no engine numbers) draws no
+/// cursor and no segment spins.
+#[derive(Clone, Copy, Debug)]
+pub struct Spin {
+    /// The growing segment is `out` while decoding, else `new`.
+    pub decoding: bool,
+    /// Polls in which the growing count rose: the index into [`SPIN`].
+    pub beats: u32,
+}
+
+/// One segment's heights in eighths, in bar order (cached, new, out):
+/// whole cells are [`FULL`], then a remainder cell of at least [`MIN_E`];
+/// a non-zero segment under one eighth still shows one [`MIN_E`] cell.
+/// Exact integer maths: the same count always gives the same heights.
+fn seg_heights(value: u64, scale: u64, width: usize) -> Vec<u8> {
+    let scale = u128::from(scale.max(1));
+    let units = u128::from(value) * width as u128 * 8 / scale;
+    let whole = usize::try_from(units / 8).unwrap_or(usize::MAX).min(width);
+    let rem = u8::try_from(units % 8).unwrap_or(0);
+    let mut heights = vec![FULL; whole];
+    if rem > 0 {
+        heights.push(rem.max(MIN_E));
+    } else if whole == 0 && value > 0 {
+        heights.push(MIN_E);
+    }
+    heights
+}
+
+/// The pending target's cell count: the eighths it would take (rounded up),
+/// then floored to whole cells, at least one while `value > 0`. Drawn as a
+/// low `▁` track, never stepped or spun.
+fn pending_cells(value: u64, scale: u64, width: usize) -> usize {
+    let scale = u128::from(scale.max(1));
+    let eighths = u128::from(value) * width as u128 * 8;
+    let ceil_eighths = eighths.div_ceil(scale);
+    usize::try_from((ceil_eighths / 8).max(1))
+        .unwrap_or(usize::MAX)
+        .min(width)
+}
+
+/// The step option (#96): the new-input chunk sits lower than cached and
+/// out, so a whole cell is `▄` (4 eighths) and a partial one is `▂`/`▃`
+/// (clamped to 2..=3, rounded from its eighths height).
+fn step_new(heights: &mut [u8]) {
+    for h in heights {
+        *h = if *h == FULL {
+            4
+        } else {
+            MIN_E.max((*h).div_ceil(2).min(3))
+        };
+    }
 }
 
 /// The cells of a context bar `width` cells wide where the full width is
-/// `scale` tokens (#75). Each segment is `value / scale × width` cells,
-/// in order. A segment with a fractional part (or under one cell) starts
-/// with its remainder cell: `e = ⌊frac × 8⌋` eighths high (at least one)
-/// and coloured `RAINBOW[⌊(frac × 8 − e) × 8⌋]`; then its whole cells.
-/// Exact integer maths: the same counts always give the same cells.
-/// Pending draws its cells (rounded up) as a low track. The rest is
-/// [`CtxPart::Track`], and nothing passes `width`.
+/// `scale` tokens (#75, #96). Segments draw in order (cached, new, out),
+/// each a run of [`seg_heights`]; pending draws its rounded cell count as a
+/// low track between new and out. `spin` names the growing segment (new
+/// while in prefill, out while decoding): its last cell becomes a full
+/// cursor in [`SPIN`]`[beats % 4]`, or, if the segment has no cells yet, a
+/// single cursor cell is inserted (before pending, when it is shown). The
+/// rest is [`CtxPart::Track`], and nothing passes `width`.
 #[must_use]
-pub fn ctx_cells(parts: &[(CtxPart, u64)], scale: u64, width: usize) -> Vec<CtxCell> {
-    const K: u128 = RAINBOW.len() as u128;
-    let scale = u128::from(scale.max(1));
-    let mut cells: Vec<CtxCell> = Vec::with_capacity(width);
+pub fn ctx_cells(
+    parts: &[(CtxPart, u64)],
+    scale: u64,
+    width: usize,
+    spin: Option<Spin>,
+) -> Vec<CtxCell> {
+    enum Seg {
+        Part(CtxPart, Vec<u8>),
+        Pending(usize),
+    }
+    let mut segs: Vec<Seg> = Vec::new();
     for (part, value) in parts {
         if *value == 0 {
             continue;
         }
-        // Sub-steps: one cell is 8 eighths of K colours each.
-        let units = u128::from(*value) * width as u128 * 8 * K / scale;
-        let whole = usize::try_from(units / (8 * K)).unwrap_or(usize::MAX);
-        let rem = units % (8 * K);
-        if *part == CtxPart::Pending {
-            let n = whole.saturating_add(usize::from(rem > 0));
-            cells.extend(std::iter::repeat_n(
-                CtxCell {
-                    part: *part,
-                    eighths: 1,
-                    shade: None,
-                },
-                n.min(width),
-            ));
+        segs.push(match part {
+            CtxPart::Pending => Seg::Pending(pending_cells(*value, scale, width)),
+            _ => Seg::Part(*part, seg_heights(*value, scale, width)),
+        });
+    }
+    let growing = spin.map(|s| {
+        if s.decoding {
+            CtxPart::Out
         } else {
-            if rem > 0 || whole == 0 {
-                let e = u8::try_from(rem / K).unwrap_or(0).max(1);
-                let s = u8::try_from(rem % K).unwrap_or(0);
-                cells.push(CtxCell {
-                    part: *part,
-                    eighths: e,
-                    shade: Some(s),
-                });
-            }
-            cells.extend(std::iter::repeat_n(
+            CtxPart::New
+        }
+    });
+    if let Some(growing) = growing {
+        let present = segs
+            .iter()
+            .any(|s| matches!(s, Seg::Part(part, _) if *part == growing));
+        if !present {
+            let at = segs
+                .iter()
+                .position(|s| matches!(s, Seg::Pending(_)))
+                .unwrap_or(segs.len());
+            segs.insert(at, Seg::Part(growing, Vec::new()));
+        }
+    }
+    for seg in &mut segs {
+        if let Seg::Part(CtxPart::New, heights) = seg {
+            step_new(heights);
+        }
+    }
+    let mut cells: Vec<CtxCell> = Vec::with_capacity(width);
+    'segs: for seg in &segs {
+        match seg {
+            Seg::Pending(n) => cells.extend(std::iter::repeat_n(
                 CtxCell {
-                    part: *part,
-                    eighths: 8,
-                    shade: None,
+                    part: CtxPart::Pending,
+                    eighths: 1,
+                    cursor: None,
                 },
-                whole.min(width),
-            ));
+                *n,
+            )),
+            Seg::Part(part, heights) => {
+                let mut drawn: Vec<CtxCell> = heights
+                    .iter()
+                    .map(|h| CtxCell {
+                        part: *part,
+                        eighths: *h,
+                        cursor: None,
+                    })
+                    .collect();
+                if Some(*part) == growing {
+                    let cursor = spin.map(|s| SPIN[(s.beats % 4) as usize]);
+                    let head = CtxCell {
+                        part: *part,
+                        eighths: FULL,
+                        cursor,
+                    };
+                    match drawn.last_mut() {
+                        Some(last) => *last = head,
+                        None => drawn.push(head),
+                    }
+                }
+                cells.extend(drawn);
+            }
         }
         if cells.len() >= width {
-            break;
+            break 'segs;
         }
     }
     cells.truncate(width);
@@ -2057,7 +2149,7 @@ pub fn ctx_cells(parts: &[(CtxPart, u64)], scale: u64, width: usize) -> Vec<CtxC
         CtxCell {
             part: CtxPart::Track,
             eighths: 1,
-            shade: None,
+            cursor: None,
         },
     );
     cells
@@ -2126,9 +2218,12 @@ fn eighth_glyph(eighths: u8, glyphs: ChartGlyphs) -> char {
     }
 }
 
-/// RECENT's bar (#75): the request's context, cached / new / output,
-/// against the model's context size; `~` before a bar scaled to the
-/// largest row instead; a yellow `!` after one at 90 % of the context.
+/// RECENT's bar (#75, #96): the request's context, cached / new / output in
+/// fixed colours (the header key), against the model's context size; `~`
+/// before a bar scaled to the largest row instead; a `!` after one at 90 %
+/// of the context. An in-flight row's growing segment carries the head
+/// spinner (#96): its cursor cell cycles [`SPIN`] a step per poll its
+/// token count rose. A finished row never spins.
 fn draw_ctx_bar(
     grid: &mut Grid,
     req: &Activity,
@@ -2143,7 +2238,11 @@ fn draw_ctx_bar(
     let n_ctx = req.n_ctx.filter(|n| *n > 0);
     let scale = n_ctx.unwrap_or(relative_scale);
     let width = usize::from(span.w);
-    let cells = ctx_cells(&parts, scale, width);
+    let spin = req.inflight.map(|flight| Spin {
+        decoding: flight.decoding,
+        beats: flight.beats,
+    });
+    let cells = ctx_cells(&parts, scale, width, spin);
     for (i, cell) in cells.iter().enumerate() {
         let (ch, fg) = match cell.part {
             CtxPart::Track => (track_glyph(glyphs), C16::BrightBlack),
@@ -2152,10 +2251,12 @@ fn draw_ctx_bar(
                 let base = match part {
                     CtxPart::Cached => C16::Blue,
                     CtxPart::New => C16::BrightCyan,
-                    _ => C16::BrightMagenta,
+                    _ => C16::Yellow,
                 };
-                let fg = cell.shade.map_or(base, |s| RAINBOW[usize::from(s)]);
-                (eighth_glyph(cell.eighths, glyphs), fg)
+                (
+                    eighth_glyph(cell.eighths, glyphs),
+                    cell.cursor.unwrap_or(base),
+                )
             }
         };
         let fg = if dim { C16::BrightBlack } else { fg };
@@ -2173,7 +2274,13 @@ fn draw_ctx_bar(
             .rposition(|c| c.part != CtxPart::Track)
             .map_or(0, |i| i + 1);
         let at = used.min(width - 1);
-        let fg = if dim { C16::BrightBlack } else { C16::Yellow };
+        // #96: the out segment is now yellow, so the warning takes the
+        // brighter step of that colour to stay distinct from it.
+        let fg = if dim {
+            C16::BrightBlack
+        } else {
+            C16::BrightYellow
+        };
         paint(grid, span.x + u16_from(at), row, '!', fg, C16::Black);
     }
 }
@@ -2597,7 +2704,7 @@ fn u16_from(n: usize) -> u16 {
 fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots: u16) {
     let plan = request_plan(g.cols);
     paint_request_headers(grid, header, &plan);
-    paint_rainbow_key(grid, plan.bar, header);
+    paint_segment_key(grid, plan.bar, header, model.chart_glyphs);
     let legend = if plan.wide {
         LEGEND_WIDE
     } else {
@@ -4189,28 +4296,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rainbow_key_clips_to_a_bar_narrower_than_the_key() {
+    fn segment_key_is_fixed_colour_and_shortens_below_17_cells() {
         let mut grid = Grid::new(40, 4);
-        paint_rainbow_key(&mut grid, Span { x: 10, w: 5 }, 1);
-        let row: Vec<(char, C16)> = (0..40)
-            .map(|col| {
-                let cell = grid.get(col, 1).unwrap();
-                (cell.ch, cell.fg)
-            })
-            .collect();
-        let want: Vec<(char, C16)> = RAINBOW[..5].iter().map(|fg| ('\u{2588}', *fg)).collect();
-        assert_eq!(&row[10..15], want.as_slice());
-        assert!(row[15..].iter().all(|(ch, _)| *ch == ' '), "{row:?}");
-        assert!(row[..10].iter().all(|(ch, _)| *ch == ' '), "{row:?}");
-        // A bar running off the screen: what fits before the last column.
+        paint_segment_key(&mut grid, Span { x: 10, w: 17 }, 1, ChartGlyphs::Eighths);
+        let text: String = (10..40).map(|c| grid.get(c, 1).unwrap().ch).collect();
+        assert!(
+            text.starts_with("\u{2587}cached \u{2587}new \u{2587}out"),
+            "{text:?}"
+        );
+        assert_eq!(grid.get(10, 1).unwrap().fg, C16::Blue, "cached ▇");
+        assert_eq!(grid.get(11, 1).unwrap().fg, C16::BrightBlack, "dim label");
+        assert_eq!(grid.get(18, 1).unwrap().fg, C16::BrightCyan, "new ▇");
+        assert_eq!(grid.get(23, 1).unwrap().fg, C16::Yellow, "out ▇");
+
+        // Narrower than 17 cells: "cached" shortens to "cach" (#96).
+        let mut grid = Grid::new(40, 4);
+        paint_segment_key(&mut grid, Span { x: 10, w: 16 }, 1, ChartGlyphs::Eighths);
+        let text: String = (10..40).map(|c| grid.get(c, 1).unwrap().ch).collect();
+        assert!(
+            text.starts_with("\u{2587}cach \u{2587}new \u{2587}out"),
+            "{text:?}"
+        );
+
+        // A key running off the right edge draws only what the grid holds.
         let mut grid = Grid::new(16, 4);
-        paint_rainbow_key(&mut grid, Span { x: 12, w: 30 }, 1);
-        let drawn: Vec<C16> = (0..16)
-            .map(|col| grid.get(col, 1).unwrap())
-            .filter(|cell| cell.ch == '\u{2588}')
-            .map(|cell| cell.fg)
-            .collect();
-        assert_eq!(drawn, RAINBOW[..3]);
+        paint_segment_key(&mut grid, Span { x: 12, w: 30 }, 1, ChartGlyphs::Eighths);
+        assert_eq!(grid.get(12, 1).unwrap().ch, '\u{2587}');
+        assert_eq!(grid.get(13, 1).unwrap().ch, 'c');
+        assert_eq!(grid.get(14, 1).unwrap().ch, 'a');
+
+        // Halves: `▄`, not `▇` — eurlatgr lacks the eighths block.
+        let mut grid = Grid::new(40, 4);
+        paint_segment_key(&mut grid, Span { x: 10, w: 17 }, 1, ChartGlyphs::Halves);
+        assert_eq!(grid.get(10, 1).unwrap().ch, '\u{2584}');
     }
 
     #[test]

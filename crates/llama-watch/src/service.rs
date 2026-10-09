@@ -1748,6 +1748,7 @@ fn layout_requests(
                 held: flight.held,
                 bytes: flight.bytes,
                 reset: flight.reset,
+                beats: flight.beats,
             }),
         }
     });
