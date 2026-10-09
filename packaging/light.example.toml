@@ -310,7 +310,7 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # range    = [100, 125]          # below 100 tok/s nothing is drawn (base shows)
 # style    = "ring"
 # edge     = "fractional"
-# stops    = [[100, "#FF2A14"], [107, "#FF5A12"], [114, "#FF8A1E"], [120, "#FFB030"], [125, "#FFD050"]]
+# stops    = [[100, "#F00090"], [112, "#FF0030"], [125, "#FF0000"]]   # crimson to deep red, no white-hot on LEDs
 # gradient = "value"
 # brightness = 1.0
 # attack_s = 1.0
