@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- tty11 no longer shows `?` for common Unicode in model text (#90). `tty::sanitize` now transliterates before its old fallback: curly quotes, en/em dash, the ellipsis and the bullet pass through as themselves (already in all three committed fonts and in eurlatgr, so `term::GLYPHS` widens to include them, no font rebuild); a hyphen variant, arrows and `×` fall back to one ASCII character each (`-`, `< > ^ v`, `x`); NBSP and other narrow spaces become a plain space; zero-width joiners/spacers and the BOM are dropped; `ﬁ`/`ﬂ` become `f`/`l`; and accented Latin-1/Latin Extended-A letters (`café`, `Zürich`, `Æ`, `ß`, …) become their base ASCII letter, a hand table standing in for `unicode-normalization`'s NFKD (not a dependency here). Every mapping stays exactly one cell, so columns never drift. What is left unmapped (CJK, emoji, bidi direction overrides, a bare combining mark) becomes the Unicode replacement character (already in the fonts) instead of `?`, so a `?` the model actually sent is never ambiguous with a missing glyph. llama-view's own glyph allowlist (`screen.rs`) widens to match, so it and llama-cast follow automatically
+
 ## 0.5.1 — 2026-10-09
 
 Dashboard readability: clearer RECENT context bars, a hairline between stacked bars, a steady PROMPT tok/s, and deep-red LEDs.

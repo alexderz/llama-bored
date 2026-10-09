@@ -1203,7 +1203,8 @@ mod tests {
             "<|im_start|>user\n\u{1b}[2Jhi\u{9b}31m\u{e9}<|im_end|>\n<|im_start|>assistant\n";
         assert!(book.apply("m", "Model", &body(1, prompt, "g", 1, 1), 8192, 8192));
         let input = cells(&book.slots()[0].input);
-        assert_eq!(input, "-- user --\n[2Jhi31m?");
+        // #90: é (U+00E9) now transliterates to its base letter 'e'.
+        assert_eq!(input, "-- user --\n[2Jhi31me");
     }
 
     /// A slot whose task has a `prompt`-token prompt, all computed, and
