@@ -10,7 +10,9 @@
 # that fails the check is logged once and ignored; the running config stays.
 #
 # With no [[light]] entries (as shipped), every fan shows `activity` on the
-# LCD's colour ramp: blue -> red for 0-100 %, then white-hot up to 125 %.
+# built-in `act` ramp: blue -> violet -> purple -> magenta -> crimson -> red
+# for 0-100 %, held at red up to 125 % (the LCD shows its own blue-to-red-to
+# -white-hot ramp for the same values; the two ramps are not identical).
 
 [aura]
 enabled = true            # ASUS Aura USB controller (0b05:18f3), addressable header 1
@@ -42,7 +44,7 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # brightness = 0.10
 #
 # [palette.NAME]          # optional: a named palette for palette = "NAME".
-# stops = [[0, "#1428D8"], [100, "#FF2A14"], [125, "#FFD050"]]
+# stops = [[0, "#0010FF"], [100, "#FF0000"], [125, "#FF0000"]]
 #                         # positions are percent of range, 0..=125, ascending;
 #                         # [palette.act] replaces the built-in act.
 
@@ -197,8 +199,8 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # # bleed between neighbours only ever mixes a colour with itself.
 # #
 # #   F1-F12                   activity 0-125 (F1-F10 = 0-100, F11-F12 the
-# #                            blackbody over-range). Own bar: gap above the
-# #                            number row.
+# #                            over-range, held at red). Own bar: gap above
+# #                            the number row.
 # #   ` 1 2 .. Backspace  +    GPU % as ONE bar two rows tall, keys in x
 # #   Tab Q W .. \             order so it grows in half-key steps (28 steps)
 # #   Caps A S .. Enter   +    busiest cores % (cpu_topk) as one bar two rows
@@ -227,16 +229,17 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # color      = "#1428D8"
 # brightness = 0.08
 #
-# [palette.act]        # percent of range; 100-125 is the blackbody tail
-# stops = [[0,"#1428D8"],[20,"#3A1EF0"],[40,"#7A1FE8"],[60,"#C21CC8"],[80,"#F21E5A"],[100,"#FF2A14"],
-#          [107,"#FF5A12"],[114,"#FF8A1E"],[120,"#FFB030"],[125,"#FFD050"]]
+# [palette.act]        # percent of range; held at red from 100-125 (redundant
+#                      # with the built-in act, spelled out here on purpose)
+# stops = [[0,"#0010FF"],[20,"#3800FF"],[40,"#7A00FF"],[60,"#C000E0"],[75,"#F00090"],
+#          [88,"#FF0030"],[100,"#FF0000"],[125,"#FF0000"]]
 #
 # # --- bar 1: F-row = activity ------------------------------------------------
 # [[light]]
 # target   = 'keyboard.keys["F1".."F12"]'
 # metric   = "activity_pct"
 # range    = [0, 100]
-# fill_to  = 125       # F1-F10 cover 0-100, F11-F12 the blackbody 100-125
+# fill_to  = 125       # F1-F10 cover 0-100, F11-F12 the held-red 100-125
 # style    = "bar"
 # edge     = "fractional"
 # palette  = "act"

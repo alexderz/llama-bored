@@ -4,11 +4,11 @@
 mod common;
 
 use common::{FakeConfig, FakeOpener, Feed, Lines, ManualClock, NoNotify, SEC, snap};
-use llama_core::color::act_color;
 use llama_light::aura::AuraBackend;
 use llama_light::backend::Backend;
 use llama_light::config::{LightConfig, parse};
 use llama_light::mapping::{NEUTRAL, cap, neutral_frame};
+use llama_light::palette::Palette;
 use llama_light::service::{self, Light, Parts, Phase, phase};
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ fn the_first_open_enters_direct_mode_then_sends_one_frame() {
     assert_eq!(reports.len(), 2);
     assert_eq!(&reports[0][..6], &[0xEC, 0x35, 0x01, 0x00, 0x00, 0xFF]);
     assert_eq!(&reports[1][..5], &[0xEC, 0x40, 0x80, 0x00, 0x06]);
-    let color = act_color(50.0);
+    let color = Palette::Act.color(50.0);
     assert_eq!(&reports[1][5..8], &[color.r, color.g, color.b]);
 }
 
