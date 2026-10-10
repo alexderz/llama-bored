@@ -84,7 +84,12 @@ pub fn sanitize(input: &str, out: &mut Vec<Cell>) {
 }
 
 /// One scalar outside ASCII to one cell: a mapped character, or [`UNKNOWN`].
-fn transliterate(c: char) -> char {
+///
+/// `pub(crate)` so [`super::layout`]'s own detail painters (`paint_detail`,
+/// `paint_detail_fg`, #90) can map a character the same way [`sanitize`]
+/// does, without going through its tab/newline/zero-width column-tracking
+/// loop that those callers do not need.
+pub(crate) fn transliterate(c: char) -> char {
     typography(c)
         .or_else(|| latin_base_letter(c))
         .unwrap_or(UNKNOWN)

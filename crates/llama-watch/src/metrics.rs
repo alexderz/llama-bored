@@ -835,8 +835,11 @@ pub struct EngineFacts {
 pub struct EngineLive {
     /// `reading`, `generating`, `idle` or another short token.
     pub state: Option<String>,
-    /// `live.phase`: printable ASCII, single-spaced, at most
-    /// [`MAX_PHASE_CHARS`]. Shown on tty11 only; never exported.
+    /// `live.phase`: control and bidi-override scalars dropped, runs of
+    /// blanks collapsed to one space, at most [`MAX_PHASE_CHARS`]. Any
+    /// other scalar (typography, accents, CJK, …) survives for tty11's own
+    /// glyph mapping (#90) when this is painted. Shown on tty11 only; never
+    /// exported.
     pub phase: Option<String>,
     /// Prompt tokens of the request.
     pub prompt_tokens: Option<u64>,
@@ -1244,8 +1247,22 @@ fn newest_request<'de, D: Deserializer<'de>>(
     Ok(newest)
 }
 
-/// Strata's `live.phase` for tty11: printable ASCII, runs of blanks as one
-/// space, at most [`MAX_PHASE_CHARS`] characters. Empty is `None`.
+/// Strata's `live.phase` for tty11: control and bidi-override scalars
+/// dropped, runs of blanks as one space, at most [`MAX_PHASE_CHARS`]
+/// characters. Empty is `None`.
+///
+/// This used to keep `is_ascii_graphic` characters only, so typography in a
+/// phase (an em dash, a curly quote, an accented model name) was dropped
+/// silently rather than drawn as `?` or lost outright (#90). It now only
+/// drops what has no business surviving into a phase at all — C0/C1/DEL
+/// control characters ([`char::is_control`]) and the bidi direction
+/// overrides/isolates, which are not in that category — and leaves every
+/// other scalar as-is. The one consumer, [`crate::service::live_line`],
+/// shows this on tty11 only (the field's own doc) through
+/// `tty::layout::paint_detail`, which runs the same per-character mapping
+/// [`crate::tty::sanitize::sanitize`] uses for IN/OUT and RECENT
+/// (`tty::sanitize::transliterate`), so the typography this keeps now
+/// renders as the mapped glyph or the placeholder, never `?`.
 #[must_use]
 pub fn clean_phase(raw: &str) -> Option<String> {
     let mut out = String::new();
@@ -1255,7 +1272,7 @@ pub fn clean_phase(raw: &str) -> Option<String> {
             space = !out.is_empty();
             continue;
         }
-        if !ch.is_ascii_graphic() {
+        if is_dropped_control(ch) {
             continue;
         }
         if out.chars().count() + usize::from(space) + 1 > MAX_PHASE_CHARS {
@@ -1268,6 +1285,23 @@ pub fn clean_phase(raw: &str) -> Option<String> {
         out.push(ch);
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// C0, C1 and DEL ([`char::is_control`]), plus the bidi direction
+/// overrides/embeds and isolates (LRM/RLM, LRE/RLE/PDF/LRO/RLO,
+/// LRI/RLI/FSI/PDI): format scalars with no glyph of their own that a phase
+/// can never legitimately need. `tty::sanitize::sanitize` keeps a bidi
+/// override visible as its placeholder instead of dropping it (a
+/// Trojan-Source-style reorder must stay visible, its own module doc);
+/// `clean_phase` drops it here instead because a 40-character status phase
+/// has no legitimate use for one and a stray mark reordering a short
+/// SETUP/Strata line is worse than one fewer placeholder cell.
+fn is_dropped_control(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// `value` rounded to three decimals.
@@ -2368,14 +2402,16 @@ mod tests {
             Some("0.1.41")
         );
         let phase = facts.live.and_then(|live| live.phase).expect("phase");
-        // Cut at a whole word's end here: one more would pass 40.
-        assert_eq!(phase, "[31mwriting a tool call: write_file and");
+        // ESC is dropped but `[31m` (plain printable ASCII) is not; `é`
+        // (#90: no longer a dropped non-ASCII-graphic scalar) survives for
+        // tty11's own glyph mapping to turn into `e`. One more would pass 40.
+        assert_eq!(phase, "[31mwriting a tool call: write_file éand");
         assert!(phase.chars().count() <= MAX_PHASE_CHARS);
         assert_eq!(
             clean_phase(&"x".repeat(99)).map(|p| p.len()),
             Some(MAX_PHASE_CHARS)
         );
-        assert!(phase.chars().all(|ch| ch.is_ascii_graphic() || ch == ' '));
+        assert!(!phase.chars().any(char::is_control), "ESC must be dropped");
         assert_eq!(clean_phase("  \t "), None);
         assert_eq!(
             clean_phase(" reading  the prompt "),
@@ -2395,6 +2431,50 @@ mod tests {
                 .get("conversation_cache_mib")
                 .map(String::as_str),
             Some("2560")
+        );
+    }
+
+    /// #90: `clean_phase` drops control and bidi-override scalars but keeps
+    /// typography for tty11's own glyph mapping to handle, instead of
+    /// dropping anything outside `is_ascii_graphic` the way it used to.
+    #[test]
+    fn clean_phase_keeps_typography_and_drops_only_controls() {
+        // An em dash survives; a control character (here ESC) does not;
+        // width is otherwise unaffected.
+        assert_eq!(
+            clean_phase("loading model \u{2014} warming up\u{1b}"),
+            Some("loading model \u{2014} warming up".to_owned())
+        );
+        assert_eq!(
+            clean_phase("a\u{7f}b\u{1b}c\u{9f}d"),
+            Some("abcd".to_owned()),
+            "DEL and C1 are control characters too"
+        );
+        // Bidi direction overrides and isolates: a phase has no legitimate
+        // use for one, so `clean_phase` drops it outright (unlike
+        // `tty::sanitize::sanitize`, which keeps it visible as a
+        // placeholder for Trojan-Source-style text).
+        for mark in [
+            "\u{200e}", "\u{200f}", "\u{202a}", "\u{202b}", "\u{202c}", "\u{202d}", "\u{202e}",
+            "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}",
+        ] {
+            assert_eq!(
+                clean_phase(&format!("a{mark}b")),
+                Some("ab".to_owned()),
+                "bidi mark {mark:?}"
+            );
+        }
+        // CJK, emoji and other scalars with no ASCII meaning are kept too:
+        // tty11's own mapping turns them into the placeholder, not `?`,
+        // when this is painted.
+        assert_eq!(clean_phase("\u{6027}"), Some("\u{6027}".to_owned()));
+        // The cap counts scalars, not bytes, and is unaffected by any of
+        // this: a run of 2-byte-wide em dashes still cuts at
+        // `MAX_PHASE_CHARS` characters.
+        let dashes = "\u{2014}".repeat(MAX_PHASE_CHARS + 5);
+        assert_eq!(
+            clean_phase(&dashes).map(|p| p.chars().count()),
+            Some(MAX_PHASE_CHARS)
         );
     }
 
