@@ -4295,6 +4295,21 @@ fn setup_title_drops_controls_and_zero_width_like_in_and_out() {
     assert_eq!(rows[1], "  SETUP  abc\u{fffd}de");
 }
 
+/// #90: a dropped character in the id takes no cell, so the name follows
+/// the id's drawn width, not its character count.
+#[test]
+fn setup_title_name_follows_the_drawn_id() {
+    let mut model = setup_model();
+    let mut setup = model.setup.clone().expect("setup");
+    setup.id = "a\u{200d}b".to_owned();
+    setup.name = "NAME".to_owned();
+    setup.more = 0;
+    model.setup = Some(setup);
+    let grid = draw(&model, 160, 49);
+    let rows = left_rows(&grid, 10, 2);
+    assert_eq!(rows[1], "  SETUP  ab \u{b7} NAME");
+}
+
 /// Rows from the label column of `grid`, `count` from `top`, trimmed.
 fn left_rows(grid: &llama_watch::tty::grid::Grid, top: u16, count: u16) -> Vec<String> {
     let end = grid.cols() / 2 - 2;

@@ -742,14 +742,13 @@ fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
     }
     let room = end.saturating_sub(x);
     let id = cut_text(&view.id, room);
-    paint_detail_fg(grid, x, usize::from(row), &id, room, C16::BrightWhite);
+    let after = x + paint_detail_fg(grid, x, usize::from(row), &id, room, C16::BrightWhite);
     let name = &view.name;
     if name.is_empty() || *name == view.id {
         return;
     }
-    let after = x + id.chars().count();
     let text = format!("{}{name}", llama_core::detail::SEPARATOR);
-    if after + text.chars().count() <= end {
+    if after + detail_width(&text) <= end {
         paint_detail(grid, after, usize::from(row), &text, end - after);
     }
 }
@@ -808,10 +807,18 @@ fn setup_items_width(items: &[SetupItem]) -> usize {
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let sep = if i > 0 { item.sep.chars().count() } else { 0 };
-            sep + item.text.chars().count()
+            let sep = if i > 0 { detail_width(&item.sep) } else { 0 };
+            sep + detail_width(&item.text)
         })
         .sum()
+}
+
+/// Cells [`paint_detail_fg`] draws for `text`: characters [`detail_char`]
+/// drops (zero-width, controls) take none (#90).
+fn detail_width(text: &str) -> usize {
+    text.chars()
+        .filter(|&ch| matches!(ch, '\u{00B7}' | '\u{2248}') || detail_char(ch).is_some())
+        .count()
 }
 
 fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
