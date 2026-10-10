@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.5.3 — 2026-10-10
+
+llama-view gains `--kiosk` for a dedicated console.
+
 ### Added
 
 - llama-view gains `--kiosk` (env `LLAMA_VIEW_KIOSK`) for running as the only program on a dedicated console under a respawning supervisor such as kmscon (#104): the keyboard is ignored, focus reporting stays off, a missing or unreadable console source (an llama-watch restart briefly frees the VT) shows a status line and retries every 2 s instead of exiting, and a terminal write failure exits 0 instead of 1 so the supervisor can respawn it; usage errors still exit 2.
