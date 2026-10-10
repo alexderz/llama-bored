@@ -7,7 +7,7 @@
 use super::chart::{self, ChartBucket, Ink};
 use super::ctx_history::{self, CtxPoint};
 use super::grid::{C16, Cell, Grid};
-use super::sanitize::sanitize;
+use super::sanitize::{sanitize, transliterate};
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
@@ -571,9 +571,19 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
     col_u16(end.saturating_add(3))
 }
 
-/// Grey detail text. Printable ASCII, the `·` separator, `…` and `≈` (an
-/// approximate KV count, #79) are drawn, any other scalar is `?`. Returns
-/// the cells used.
+/// Grey detail text: SETUP's title, rows, and `model.backend_lines` (#90).
+/// Printable ASCII is drawn as itself. `·` (the SETUP/[`cut_text`] separator)
+/// and `≈` (an approximate KV count, #79) are this crate's own glyphs, not
+/// model text, and stay literal here for the same reason [`sanitize`] leaves
+/// them out of its table (its module doc: a model-sent one must not be
+/// confused with the chart dot or the bullet fallback). Every other
+/// non-ASCII scalar, including `…`, goes through [`transliterate`], the same
+/// per-character mapping [`sanitize`] uses for IN/OUT and RECENT, so `'s`,
+/// an em dash or an accented letter in a model id or name reads correctly
+/// here too, and an unmapped scalar draws the placeholder rather than a
+/// literal `?` (never ambiguous with a `?` the text actually had). One cell
+/// in, one cell out, same as [`transliterate`] promises, so the cap and the
+/// returned count are unchanged by this. Returns the cells used.
 fn paint_detail(grid: &mut Grid, col: usize, row: usize, text: &str, cap: usize) -> usize {
     paint_detail_fg(grid, col, row, text, cap, C16::BrightBlack)
 }
@@ -589,12 +599,10 @@ fn paint_detail_fg(
 ) -> usize {
     let mut drawn = 0;
     for ch in text.chars().take(cap) {
-        let ch = if matches!(ch, '\u{00B7}' | '\u{2026}' | '\u{2248}')
-            || ('\u{20}'..='\u{7e}').contains(&ch)
-        {
+        let ch = if matches!(ch, '\u{00B7}' | '\u{2248}') || ('\u{20}'..='\u{7e}').contains(&ch) {
             ch
         } else {
-            '?'
+            transliterate(ch)
         };
         paint_at(grid, col.saturating_add(drawn), row, ch, fg, C16::Black);
         drawn += 1;
@@ -773,8 +781,9 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     }
 }
 
-/// `text`, or its first `width - 1` characters and `…`. No sanitising:
-/// [`paint_detail_fg`] draws only printable ASCII, `·` and `…`.
+/// `text`, or its first `width - 1` characters and `…`. The cut itself does
+/// not sanitise: [`paint_detail_fg`] maps every non-ASCII scalar it is
+/// handed (including the `…` this appends) when it draws the result.
 fn cut_text(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();

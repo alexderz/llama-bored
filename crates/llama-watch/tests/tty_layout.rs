@@ -4242,6 +4242,43 @@ fn strata_setup_rows_at_160x49() {
     );
 }
 
+/// #90: SETUP's title (`draw_setup_title`, through `paint_detail_fg`) runs
+/// the model id/name through the same per-character mapping IN/OUT and
+/// RECENT use (`tty::sanitize::transliterate`): a curly quote and an em
+/// dash are real glyphs and pass through as themselves, an accented letter
+/// becomes its base ASCII letter, an unmapped CJK character becomes the
+/// placeholder rather than `?`, and a `?` the text actually had stays `?`
+/// right next to it. Before this the title's own filter turned every one
+/// of those but the quote into a literal `?`.
+#[test]
+fn setup_title_maps_typography_like_in_and_out() {
+    let mut model = setup_model();
+    let mut setup = model.setup.clone().expect("setup");
+    setup.id = "qwen\u{2019}s \u{2014} caf\u{e9} \u{6027}?".to_owned();
+    setup.name = String::new();
+    setup.more = 0;
+    model.setup = Some(setup);
+    let grid = draw(&model, 160, 49);
+    let rows = left_rows(&grid, 10, 2);
+    assert_eq!(rows[1], "  SETUP  qwen\u{2019}s \u{2014} cafe \u{fffd}?");
+}
+
+/// #90: `model.backend_lines` (drawn by [`layout::layout`] with the same
+/// `paint_detail`) maps the same way: typography and an accented letter
+/// render as the mapped glyph, an unmapped CJK character becomes the
+/// placeholder instead of `?`, and a real `?` passes through unchanged.
+#[test]
+fn backend_lines_map_typography_like_setup() {
+    let mut model = setup_model();
+    model.backend_lines = vec!["engine \u{201c}now\u{201d} caf\u{e9} \u{6027}?".to_owned()];
+    let grid = draw(&model, 160, 49);
+    let all = whole(&grid);
+    assert!(
+        all.contains("engine \u{201c}now\u{201d} cafe \u{fffd}?"),
+        "{all}"
+    );
+}
+
 /// Rows from the label column of `grid`, `count` from `top`, trimmed.
 fn left_rows(grid: &llama_watch::tty::grid::Grid, top: u16, count: u16) -> Vec<String> {
     let end = grid.cols() / 2 - 2;
