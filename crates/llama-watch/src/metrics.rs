@@ -1261,7 +1261,7 @@ fn newest_request<'de, D: Deserializer<'de>>(
 /// shows this on tty11 only (the field's own doc) through
 /// `tty::layout::paint_detail`, which runs the same per-character mapping
 /// [`crate::tty::sanitize::sanitize`] uses for IN/OUT and RECENT
-/// (`tty::sanitize::transliterate`), so the typography this keeps now
+/// (`tty::sanitize::detail_char`), so the typography this keeps now
 /// renders as the mapped glyph or the placeholder, never `?`.
 #[must_use]
 pub fn clean_phase(raw: &str) -> Option<String> {

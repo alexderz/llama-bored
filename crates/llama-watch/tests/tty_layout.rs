@@ -4244,7 +4244,7 @@ fn strata_setup_rows_at_160x49() {
 
 /// #90: SETUP's title (`draw_setup_title`, through `paint_detail_fg`) runs
 /// the model id/name through the same per-character mapping IN/OUT and
-/// RECENT use (`tty::sanitize::transliterate`): a curly quote and an em
+/// RECENT use (`tty::sanitize::detail_char`): a curly quote and an em
 /// dash are real glyphs and pass through as themselves, an accented letter
 /// becomes its base ASCII letter, an unmapped CJK character becomes the
 /// placeholder rather than `?`, and a `?` the text actually had stays `?`
@@ -4277,6 +4277,22 @@ fn backend_lines_map_typography_like_setup() {
         all.contains("engine \u{201c}now\u{201d} cafe \u{fffd}?"),
         "{all}"
     );
+}
+
+/// #90: SETUP drops what IN/OUT drop. An escape, a zero-width joiner and a
+/// soft hyphen take no cell, so the title reads exactly as `sanitize` would
+/// render it; a bidi override is not dropped but drawn as the placeholder.
+#[test]
+fn setup_title_drops_controls_and_zero_width_like_in_and_out() {
+    let mut model = setup_model();
+    let mut setup = model.setup.clone().expect("setup");
+    setup.id = "a\u{1b}b\u{200d}c\u{ad}\u{202e}d\te".to_owned();
+    setup.name = String::new();
+    setup.more = 0;
+    model.setup = Some(setup);
+    let grid = draw(&model, 160, 49);
+    let rows = left_rows(&grid, 10, 2);
+    assert_eq!(rows[1], "  SETUP  abc\u{fffd}de");
 }
 
 /// Rows from the label column of `grid`, `count` from `top`, trimmed.

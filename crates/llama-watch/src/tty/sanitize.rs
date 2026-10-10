@@ -73,8 +73,7 @@ pub fn sanitize(input: &str, out: &mut Vec<Cell>) {
             // normally invisible outside a line break; it is grouped here
             // rather than with the dash table because, unlike a visible
             // dash, it should not appear as anything at all.
-            '\u{ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' => {}
-            c if c.is_control() => {}
+            c if dropped(c) => {}
             c => {
                 push(out, transliterate(c));
                 col += 1;
@@ -83,13 +82,31 @@ pub fn sanitize(input: &str, out: &mut Vec<Cell>) {
     }
 }
 
+/// Zero-width format characters and controls: [`sanitize`] gives them no
+/// cell at all, and neither does [`detail_char`].
+fn dropped(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+    ) || c.is_control()
+}
+
+/// One scalar of single-line text to its cell, the way [`sanitize`] maps it:
+/// `None` for what it drops (zero-width characters and controls, including
+/// tab and newline), printable ASCII as itself, anything else through
+/// [`transliterate`]. For [`super::layout`]'s detail painters (#90).
+pub(crate) fn detail_char(c: char) -> Option<char> {
+    if dropped(c) {
+        None
+    } else if ('\u{20}'..='\u{7e}').contains(&c) {
+        Some(c)
+    } else {
+        Some(transliterate(c))
+    }
+}
+
 /// One scalar outside ASCII to one cell: a mapped character, or [`UNKNOWN`].
-///
-/// `pub(crate)` so [`super::layout`]'s own detail painters (`paint_detail`,
-/// `paint_detail_fg`, #90) can map a character the same way [`sanitize`]
-/// does, without going through its tab/newline/zero-width column-tracking
-/// loop that those callers do not need.
-pub(crate) fn transliterate(c: char) -> char {
+fn transliterate(c: char) -> char {
     typography(c)
         .or_else(|| latin_base_letter(c))
         .unwrap_or(UNKNOWN)

@@ -7,7 +7,7 @@
 use super::chart::{self, ChartBucket, Ink};
 use super::ctx_history::{self, CtxPoint};
 use super::grid::{C16, Cell, Grid};
-use super::sanitize::{sanitize, transliterate};
+use super::sanitize::{detail_char, sanitize};
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
@@ -577,13 +577,13 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
 /// model text, and stay literal here for the same reason [`sanitize`] leaves
 /// them out of its table (its module doc: a model-sent one must not be
 /// confused with the chart dot or the bullet fallback). Every other
-/// non-ASCII scalar, including `…`, goes through [`transliterate`], the same
-/// per-character mapping [`sanitize`] uses for IN/OUT and RECENT, so `'s`,
+/// character goes through [`detail_char`], the same per-character mapping
+/// [`sanitize`] uses for IN/OUT and RECENT (zero-width characters and
+/// controls take no cell; `…` and other typography are mapped), so `'s`,
 /// an em dash or an accented letter in a model id or name reads correctly
 /// here too, and an unmapped scalar draws the placeholder rather than a
-/// literal `?` (never ambiguous with a `?` the text actually had). One cell
-/// in, one cell out, same as [`transliterate`] promises, so the cap and the
-/// returned count are unchanged by this. Returns the cells used.
+/// literal `?` (never ambiguous with a `?` the text actually had). `cap`
+/// counts cells drawn, not characters read. Returns the cells used.
 fn paint_detail(grid: &mut Grid, col: usize, row: usize, text: &str, cap: usize) -> usize {
     paint_detail_fg(grid, col, row, text, cap, C16::BrightBlack)
 }
@@ -598,11 +598,16 @@ fn paint_detail_fg(
     fg: C16,
 ) -> usize {
     let mut drawn = 0;
-    for ch in text.chars().take(cap) {
-        let ch = if matches!(ch, '\u{00B7}' | '\u{2248}') || ('\u{20}'..='\u{7e}').contains(&ch) {
+    for ch in text.chars() {
+        if drawn == cap {
+            break;
+        }
+        let ch = if matches!(ch, '\u{00B7}' | '\u{2248}') {
+            ch
+        } else if let Some(ch) = detail_char(ch) {
             ch
         } else {
-            transliterate(ch)
+            continue;
         };
         paint_at(grid, col.saturating_add(drawn), row, ch, fg, C16::Black);
         drawn += 1;
