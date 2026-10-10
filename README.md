@@ -1040,6 +1040,24 @@ and SIGTERM or SIGHUP end it without a restore. After a SIGTERM run `reset`,
 or just start llama-view again: its exit turns canonical input and echo back
 on whatever state it found.
 
+**Dedicated console (#104).** `--kiosk` (or `LLAMA_VIEW_KIOSK=1`) is for
+running llama-view as the only program on a console of its own, started and
+respawned by a display manager such as kmscon rather than typed by hand:
+
+```sh
+runuser -u <llama-view-user> -- \
+  /usr/local/libexec/llama-bored/llama-view --kiosk --colors truecolor --fit center
+```
+
+`<llama-view-user>` is an account in the `llama-view` group, as above. In
+kiosk mode the keyboard does nothing (raw mode still turns off local echo
+and `Ctrl-C`, but every byte read is discarded), stdin closing exits 0 so
+the supervisor can respawn it, and a missing or unreadable console source
+(for example while `llama-watch` restarts and briefly deallocates the VT)
+shows a status line and keeps retrying every 2 seconds instead of exiting.
+A terminal write failure (the console is gone) also exits 0; only a usage
+error exits 2.
+
 ## Watch tty11 on a TV
 
 `llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players
