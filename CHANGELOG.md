@@ -6,11 +6,15 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
-- README demo GIFs re-recorded on the 0.5 dashboard: 15 s of a live llama.cpp decode with OUT scrolling; `scripts/demo` renders the 10x18 font, the console's real size and the llama palette, and gains `scan.py` and `build.py` (#87).
+## 0.5.1 — 2026-10-09
+
+Dashboard readability: clearer RECENT context bars, a hairline between stacked bars, a steady PROMPT tok/s, and deep-red LEDs.
+
 ### Changed
 
+- README demo GIFs re-recorded on the 0.5 dashboard: 15 s of a live llama.cpp decode with OUT scrolling; `scripts/demo` renders the 10x18 font, the console's real size and the llama palette, and gains `scan.py` and `build.py` (#87).
 - llama-light's `act` palette is now its own LED ramp — blue through violet, purple, magenta and crimson to pure red at 100 %, held at red through 125 % — instead of reusing the LCD's `act_color`, whose blackbody tail above 100 % read as weak white light on RGB LEDs rather than heat (#93). The LCD is unchanged.
-- tty11's stacked bar graphs (FANS, RECENT's per-request bars, SLOTS' progress and ctx bars) no longer leave a hairline between adjacent rows: a full cell draws the same short block the meters have used since #52 (`▇` in eighths mode, `▄` in halves) instead of a full-height `█`/`▐`/`▌` that bridged into the row above or below (#95). GENERATION/PROMPT's isolated rate bars are unchanged.
+- tty11's stacked bar graphs (FANS, RECENT's per-request bars, SLOTS' progress and ctx bars) now keep a hairline between adjacent rows instead of merging into one block: a full cell draws the same short block the meters have used since #52 (`▇` in eighths mode, `▄` in halves) instead of a full-height `█`/`▐`/`▌` that bridged into the row above or below (#95). GENERATION/PROMPT's isolated rate bars are unchanged.
 - tty11 RECENT's context bar drops the sub-eighth rainbow shading for three fixed colours — cached (blue), new (cyan, drawn a step lower so cached/new/out read as steps) and out (yellow) — with a `▇cached ▇new ▇out` key in the header row where the rainbow strip used to sit (#96). An in-flight row's growing segment now carries a head spinner: its leading cell is a full `▇` cursor that cycles red, light green, white and magenta one step per poll in which that segment's token count actually rose, never per frame and never on a repeat. The 90 %-of-context warning moves to bright yellow so it stays distinct from the now-yellow out segment; every other number the bar showed is unchanged.
 
 ### Fixed
