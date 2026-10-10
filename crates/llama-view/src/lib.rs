@@ -3,18 +3,20 @@
 mod cli;
 mod color;
 mod input;
+mod kiosk;
 mod pane;
 mod render;
 mod screen;
 mod session;
 
 pub use cli::{
-    CliError, ColorSettings, HELP, Options, color_settings, device_paths, parse_args,
+    CliError, ColorSettings, HELP, Options, color_settings, device_paths, kiosk_wanted, parse_args,
     tmux_window_name as tmux_window_wanted,
 };
 
 pub use color::{ColorChoice, ColorMode, SgrTable, nearest_xterm256, xterm256_rgb};
 pub use input::{RawInput, Wait, raw, restored, wait_input};
+pub use kiosk::{RETRY_PERIOD, SourceWatch, source_name, wants_focus_reports};
 pub use llama_core::palette::Palette;
 pub use pane::{
     Fit, HOST_CAP, InputEvent, InputParser, MODEL_CAP, Titler, frame_period, header_engine,

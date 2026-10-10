@@ -31,6 +31,10 @@ pub struct Options {
     pub fit: Fit,
     /// `--tmux-window-name`. Also `LLAMA_VIEW_TMUX_WINDOW`; only inside tmux.
     pub tmux_window_name: bool,
+    /// `--kiosk`. Also `LLAMA_VIEW_KIOSK`. Keys do nothing, and a missing or
+    /// unreadable console source shows a status line and retries instead of
+    /// exiting (#104).
+    pub kiosk: bool,
 }
 
 impl Default for Options {
@@ -47,6 +51,7 @@ impl Default for Options {
             font_glyphs: None,
             fit: Fit::Crop,
             tmux_window_name: false,
+            kiosk: false,
         }
     }
 }
@@ -86,6 +91,10 @@ Keys: q or Ctrl-C quits and restores the terminal.
                   inside tmux, also name the window after the model (ESC k);
                   needs `set -g allow-rename on`; env LLAMA_VIEW_TMUX_WINDOW=1
   --once          paint one frame, restore the terminal, and exit
+  --kiosk         run as the only program on a dedicated console (#104): keys
+                  do nothing, focus reporting stays off, and a missing or
+                  unreadable console source shows a status line and retries
+                  every 2s instead of exiting; env LLAMA_VIEW_KIOSK=1
   --help          show this text
 
 A flag wins over its environment variable.
@@ -99,6 +108,11 @@ tmux turns 24-bit colour into its own 256.
 Signals: SIGWINCH is not caught (the size is read every frame). SIGTERM and
 SIGHUP end llama-view without a restore; the next run, or `reset`, puts the
 terminal back.
+
+Kiosk mode (--kiosk): stdin HUP/EOF, or a terminal write failure (the
+console is gone), exits 0 instead of 1 — a supervisor such as kmscon
+respawns it. Usage errors still exit 2. Outside --kiosk, q/Q/Ctrl-C/Ctrl-\\
+quit with exit 0; any vcsa open, read or decode error exits 1.
 ";
 
 /// `--tmux-window-name` or `LLAMA_VIEW_TMUX_WINDOW` (`1`, `yes`, `true`,
@@ -111,6 +125,17 @@ where
         || env("LLAMA_VIEW_TMUX_WINDOW")
             .is_some_and(|v| matches!(v.as_str(), "1" | "yes" | "true" | "on"));
     wanted && env("TMUX").is_some_and(|v| !v.is_empty())
+}
+
+/// `--kiosk` or `LLAMA_VIEW_KIOSK` (`1`, `yes`, `true`, `on`). The flag wins
+/// over the environment, the same as [`tmux_window_name`] (#104).
+pub fn kiosk_wanted<F>(opts: &Options, env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    opts.kiosk
+        || env("LLAMA_VIEW_KIOSK")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "yes" | "true" | "on"))
 }
 
 /// Colours resolved from the flags, the environment and `COLORTERM`.
@@ -197,6 +222,7 @@ where
                 })?;
             }
             "--tmux-window-name" => opts.tmux_window_name = true,
+            "--kiosk" => opts.kiosk = true,
             "--colors" => {
                 let value = need(&mut args, "--colors")?;
                 opts.colors = Some(ColorChoice::parse(&value).ok_or_else(|| {
@@ -454,6 +480,45 @@ mod tests {
         ] {
             assert!(HELP.contains(needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn help_documents_kiosk_mode() {
+        for needle in [
+            "--kiosk",
+            "LLAMA_VIEW_KIOSK",
+            "exits 0",
+            "exits 1",
+            "exit 2",
+        ] {
+            assert!(HELP.contains(needle), "{needle}");
+        }
+    }
+
+    #[test]
+    fn kiosk_flag_and_env() {
+        let bare = parse_args(["llama-view"]).unwrap();
+        assert!(!bare.kiosk);
+        assert!(!kiosk_wanted(&bare, env_of(&[])));
+
+        let flagged = parse_args(["llama-view", "--kiosk"]).unwrap();
+        assert!(flagged.kiosk);
+        assert!(kiosk_wanted(&flagged, env_of(&[])), "flag alone");
+
+        for value in ["1", "yes", "true", "on"] {
+            assert!(
+                kiosk_wanted(&bare, env_of(&[("LLAMA_VIEW_KIOSK", value)])),
+                "{value}"
+            );
+        }
+        for value in ["0", "no", "false", "off", "2", ""] {
+            assert!(
+                !kiosk_wanted(&bare, env_of(&[("LLAMA_VIEW_KIOSK", value)])),
+                "{value}"
+            );
+        }
+        // The flag wins: it stays on even if the environment disagreed.
+        assert!(kiosk_wanted(&flagged, env_of(&[("LLAMA_VIEW_KIOSK", "0")])));
     }
 
     #[test]

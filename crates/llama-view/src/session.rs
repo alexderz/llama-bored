@@ -9,7 +9,7 @@ use crate::pane::{
     Fit, InputEvent, InputParser, Titler, frame_period, header_engine, header_model, place,
 };
 use crate::render::Renderer;
-use crate::screen::{AttrLayout, DecodeError, decode_screen_with, detect_layout};
+use crate::screen::{AttrLayout, Cell, Color, DecodeError, decode_screen_with, detect_layout};
 
 /// What the input asked for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,12 +34,20 @@ pub struct Session {
     offset_y: u16,
     vt: u8,
     fps: u8,
+    kiosk: bool,
 }
 
 impl Session {
     /// `host` is read once by the caller; `tmux_window` is the resolved
-    /// `--tmux-window-name` (opted in and inside tmux).
-    pub fn new(opts: &Options, colors: ColorSettings, host: &str, tmux_window: bool) -> Self {
+    /// `--tmux-window-name` (opted in and inside tmux); `kiosk` is the
+    /// resolved `--kiosk` (#104): the keyboard is ignored (see [`Self::input`]).
+    pub fn new(
+        opts: &Options,
+        colors: ColorSettings,
+        host: &str,
+        tmux_window: bool,
+        kiosk: bool,
+    ) -> Self {
         Self {
             renderer: Renderer::with_colors(colors.mode, colors.palette).synchronized(true),
             titler: Titler::new(host, tmux_window),
@@ -54,6 +62,7 @@ impl Session {
             offset_y: opts.offset_y,
             vt: opts.vt,
             fps: opts.fps,
+            kiosk,
         }
     }
 
@@ -97,8 +106,35 @@ impl Session {
         Ok(())
     }
 
-    /// Bytes from stdin.
+    /// `--kiosk` (#104), while the console source is down: a blank screen
+    /// with `text` on its top row, through the same renderer a real frame
+    /// uses. An unchanged line costs nothing (the renderer's own diff), and
+    /// [`Self::invalidate`] forces a full repaint once the source returns,
+    /// so the renderer does not try to diff real cells against this one.
+    pub fn status_frame(&mut self, pane: (u16, u16), text: &str, out: &mut Vec<u8>) {
+        let (cols, rows) = pane;
+        let mut cells = vec![Cell::blank(); usize::from(cols).saturating_mul(usize::from(rows))];
+        for (cell, ch) in cells.iter_mut().take(usize::from(cols)).zip(text.chars()) {
+            *cell = Cell::new(ch, Color::White, Color::Black);
+        }
+        out.extend_from_slice(self.renderer.render(cols, rows, &cells));
+    }
+
+    /// Forget the last painted frame, so the next one (real or
+    /// [`Self::status_frame`]) is a full repaint. `--kiosk` calls this when
+    /// the console source comes back, so the renderer does not diff real
+    /// cells against the status screen it last drew.
+    pub fn invalidate(&mut self) {
+        self.renderer.invalidate();
+    }
+
+    /// Bytes from stdin. `--kiosk` (#104) discards every byte: the keyboard
+    /// does nothing, so `focused` never flips and the frame rate never
+    /// drops (see [`Self::period`]).
     pub fn input(&mut self, bytes: &[u8]) -> Next {
+        if self.kiosk {
+            return Next::Continue;
+        }
         self.events.clear();
         self.parser.feed(bytes, &mut self.events);
         for event in &self.events {
@@ -149,6 +185,10 @@ mod tests {
     }
 
     fn session(fit: Fit) -> Session {
+        session_with(fit, false)
+    }
+
+    fn session_with(fit: Fit, kiosk: bool) -> Session {
         let opts = Options {
             fit,
             ..Options::default()
@@ -157,7 +197,7 @@ mod tests {
             mode: ColorMode::Truecolor,
             palette: Palette::Llama,
         };
-        Session::new(&opts, colors, "box", false)
+        Session::new(&opts, colors, "box", false, kiosk)
     }
 
     fn has(hay: &[u8], needle: &[u8]) -> bool {
@@ -241,5 +281,71 @@ mod tests {
         assert_eq!(s.input(b"x"), Next::Continue);
         assert_eq!(s.input(b"\x03"), Next::Quit, "Ctrl-C is a clean quit");
         assert_eq!(s.input(b"q"), Next::Quit);
+    }
+
+    /// #104: kiosk discards every byte, so none of the quit keys, Ctrl-C,
+    /// or a focus report change anything.
+    #[test]
+    fn kiosk_ignores_every_input_byte() {
+        let mut s = session_with(Fit::Crop, true);
+        assert_eq!(s.period(), Duration::from_millis(100));
+        for bytes in [&b"q"[..], b"Q", b"\x03", b"\x1c", b"\x1b[O", b"anything"] {
+            assert_eq!(s.input(bytes), Next::Continue, "{bytes:?}");
+        }
+        // No FocusOut was ever applied: still the focused frame rate.
+        assert!(s.focused());
+        assert_eq!(s.period(), Duration::from_millis(100));
+    }
+
+    /// #104: a blank status screen, through the same diffing renderer a
+    /// real frame uses, and `invalidate` forces the next real frame to be a
+    /// full repaint rather than a diff against the status screen's cells.
+    #[test]
+    fn status_frame_then_recovery_forces_a_full_repaint() {
+        let mut s = session_with(Fit::Crop, true);
+        let mut out = Vec::new();
+        s.status_frame(
+            (60, 3),
+            "llama-view: waiting for tty11 \u{2014} gone",
+            &mut out,
+        );
+        assert!(!out.is_empty(), "the first status frame has to paint");
+        assert!(has(&out, b"waiting for tty11"));
+
+        // The same text again: nothing new (no flicker).
+        out.clear();
+        s.status_frame(
+            (60, 3),
+            "llama-view: waiting for tty11 \u{2014} gone",
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+
+        // The source comes back: without invalidate, a same-size real frame
+        // would just diff against the status cells. invalidate forces 2J.
+        s.invalidate();
+        out.clear();
+        let (vcsa, vcsu) = tty(60, 3, HEADER);
+        s.frame((60, 3), &vcsa, None, Some(&vcsu), &mut out)
+            .unwrap();
+        assert!(
+            has(&out, b"\x1b[2J"),
+            "full repaint after recovery: {out:?}"
+        );
+    }
+
+    /// Longer than the pane: truncated to `cols`, never wraps into row 1.
+    /// Two calls with the same overlong text truncate the same way, so the
+    /// second repaints nothing — if the text had spilled into row 1 with a
+    /// different split each time this would not hold.
+    #[test]
+    fn status_frame_truncates_to_the_pane_width() {
+        let mut s = session_with(Fit::Crop, true);
+        let mut out = Vec::new();
+        s.status_frame((4, 2), "much too long", &mut out);
+        assert!(!out.is_empty());
+        out.clear();
+        s.status_frame((4, 2), "much too long", &mut out);
+        assert!(out.is_empty(), "{out:?}");
     }
 }
