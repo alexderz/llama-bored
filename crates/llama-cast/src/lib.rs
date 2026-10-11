@@ -5,6 +5,7 @@
 //! with one live `object.item.videoItem`, and streams `/live.ts`: tty11
 //! (`/dev/vcsa11`, read-only) rendered with the console font at `fps`,
 //! encoded to MPEG-TS by the configured ffmpeg, one encoder per client.
+//! At start it probes that ffmpeg once and picks an H.264 encoder.
 //!
 //! It is one of two processes in this workspace with a listening socket
 //! (llama-metrics is the other). It binds one TCP listener and one UDP

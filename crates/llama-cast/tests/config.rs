@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 
 use llama_cast::acl::CidrError;
 use llama_cast::config::{Config, ConfigError, Font, Palette, expand, host_label};
-use llama_cast::encoder::Settings;
+use llama_cast::encoder::{Codec, EncoderChoice, Settings};
 use llama_cast::service::{Command, parse_args};
 
 const GOOD: &str = r#"
@@ -40,6 +40,7 @@ fn the_documented_config_parses() {
     assert_eq!(cfg.fps, 2);
     assert_eq!(cfg.max_clients, 2);
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
+    assert_eq!(cfg.encoder, EncoderChoice::Auto);
     assert_eq!(cfg.font, Font::Hack12x24);
     assert_eq!(cfg.palette, Palette::Llama);
     assert_eq!(cfg.base_url(), "http://192.168.1.20:19478");
@@ -68,6 +69,7 @@ fn defaults_fill_everything_but_listen_and_allow() {
         }
     );
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
+    assert_eq!(cfg.encoder, EncoderChoice::Auto);
     assert_eq!(cfg.font, Font::Hack12x24);
     assert_eq!(cfg.font.file_name(), "llama-hack-12x24.psfu");
     assert_eq!(
@@ -75,6 +77,48 @@ fn defaults_fill_everything_but_listen_and_allow() {
         Palette::Llama,
         "matches the [tty] palette default"
     );
+}
+
+/// #108: absent `encoder` is `auto`. A known name is kept. Anything else
+/// is a config error, before ffmpeg is asked.
+#[test]
+fn encoder_defaults_to_auto_and_rejects_an_unknown_name() {
+    assert_eq!(
+        Config::from_toml(GOOD).unwrap().encoder,
+        EncoderChoice::Auto
+    );
+    assert_eq!(
+        with(
+            "font = \"12x24\"",
+            "font = \"12x24\"\nencoder = \"libx264\""
+        )
+        .unwrap()
+        .encoder,
+        EncoderChoice::Pinned(Codec::Libx264)
+    );
+    for name in [
+        "libopenh264",
+        "h264_nvenc",
+        "h264_qsv",
+        "h264_vaapi",
+        "h264_amf",
+        "h264_v4l2m2m",
+        "auto",
+    ] {
+        let cfg = with(
+            "font = \"12x24\"",
+            &format!("font = \"12x24\"\nencoder = \"{name}\""),
+        )
+        .unwrap();
+        assert_eq!(cfg.encoder.label(), name);
+    }
+    for bad in ["libx265", "x264", "LIBX264", "", "h264_vulkan", "auto "] {
+        let err = with(
+            "font = \"12x24\"",
+            &format!("font = \"12x24\"\nencoder = \"{bad}\""),
+        );
+        assert!(matches!(err, Err(ConfigError::Encoder)), "{bad}: {err:?}");
+    }
 }
 
 /// #26: `palette` names tty11's colours, the same words as `[tty] palette`.

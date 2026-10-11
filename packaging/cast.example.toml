@@ -69,9 +69,22 @@ keyframe_s = 1
 # tty11. 0 sends frames only as they are rendered.
 preroll_s = 3
 
-# The encoder, an absolute path. It needs libx264. Run with a fixed
-# argument list, no shell and an empty environment.
+# The encoder program, an absolute path. llama-cast runs it with a fixed
+# argument list, no shell and an empty environment. Install it from the
+# distribution; it is not part of llama-bored (see THIRD-PARTY.md).
 ffmpeg = "/usr/bin/ffmpeg"
+
+# Which H.264 encoder that program is asked for. "auto" (the default, used
+# when this line is absent) runs `ffmpeg -encoders` once at start and picks
+# libx264, then libopenh264, then a hardware encoder (h264_nvenc, h264_qsv,
+# h264_vaapi, h264_amf, h264_v4l2m2m) only when neither software encoder
+# exists. Software x264 gives the best text quality at 2 fps, plays
+# everywhere, and takes nothing from a GPU busy with inference; hardware
+# encoders need a device and are a last resort. The shipped unit sets
+# DevicePolicy=closed and allows only /dev/vcsa11, so a hardware encoder
+# usually cannot open its device. Pin one of the names above to require it.
+# An unknown name is a config error.
+# encoder = "auto"
 
 # tty11's console font: "12x24" (default), "12x22" or "10x18". Must match
 # `[tty] font` in watch.toml, or the picture is garbled.

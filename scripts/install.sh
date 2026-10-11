@@ -1129,7 +1129,9 @@ print_cast_steps() {
 TV cast (llama-cast) is installed, not enabled. It shows the tty11
 dashboard as a live video to DLNA/UPnP players on the LAN (Roku Media
 Player is tested). LAN-exposed by design: anyone in `allow` can watch
-tty11. It needs ffmpeg with libx264 (/usr/bin/ffmpeg by default).
+tty11. It needs ffmpeg installed on the host (/usr/bin/ffmpeg by default).
+llama-cast picks an H.264 encoder that build offers (libx264, else
+libopenh264, else a hardware encoder). llama-bored does not bundle ffmpeg.
 To turn it on:
   Set interface_addr (this host's LAN address) and allow in
   /etc/llama-bored/cast.toml, and font to match [tty] font in watch.toml.
@@ -4596,7 +4598,9 @@ self_test() {
     && "$cast_out" == *"--add-port=19478/tcp"* \
     && "$cast_out" == *"--add-port=1900/udp"* \
     && "$cast_out" == *"239.255.255.250/32"* \
-    && "$cast_out" == *"IPAddressAllow="* ]] || {
+    && "$cast_out" == *"IPAddressAllow="* \
+    && "$cast_out" == *"libopenh264"* \
+    && "$cast_out" == *"does not bundle ffmpeg"* ]] || {
     echo "install self-test: next steps do not explain how to enable llama-cast" >&2
     printf '%s\n' "$cast_out" >&2
     exit 1
