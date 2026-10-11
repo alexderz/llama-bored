@@ -23,7 +23,7 @@
 # step.
 #
 # `--self-test` refuses root and does not call sudo, udevadm,
-# systemd-sysusers, setfacl, or systemctl.
+# systemd-sysusers, systemd-tmpfiles, setfacl, or systemctl.
 #
 # Usage: sudo scripts/install.sh [--enable-light]
 #        scripts/install.sh --self-test
@@ -147,6 +147,10 @@ freeze_staging() {
     return 1
   }
   copy_regular "$repo/packaging/llama-bored.sysusers" "$dir/llama-bored.sysusers" || {
+    rm -rf -- "$dir"
+    return 1
+  }
+  copy_regular "$repo/packaging/llama-bored.tmpfiles" "$dir/llama-bored.tmpfiles" || {
     rm -rf -- "$dir"
     return 1
   }
@@ -350,6 +354,7 @@ show_staging_hashes() {
     "$staging/llama-metrics.service"
     "$staging/llama-cast.service"
     "$staging/llama-bored.sysusers"
+    "$staging/llama-bored.tmpfiles"
     "$staging/71-kraken-lcd.rules"
     "$staging/72-llama-view.rules"
     "$staging/93-kraken-lcd-hidraw.rules"
@@ -423,6 +428,7 @@ verify_staged_matches_disk() {
     kraken-lcd.service:packaging/kraken-lcd.service
     llama-watch.service:packaging/llama-watch.service
     llama-bored.sysusers:packaging/llama-bored.sysusers
+    llama-bored.tmpfiles:packaging/llama-bored.tmpfiles
     71-kraken-lcd.rules:packaging/71-kraken-lcd.rules
     72-llama-view.rules:packaging/72-llama-view.rules
     93-kraken-lcd-hidraw.rules:packaging/93-kraken-lcd-hidraw.rules
@@ -1680,7 +1686,7 @@ commit_installed_sha() {
 # never started, restarted or enabled.
 apply_from_staging() {
   local staging=$1 dest_root=$2 sys_root=$3 head=$4
-  local config_dest min_interval unit watch_unit sysusers rule71 rule93
+  local config_dest min_interval unit watch_unit sysusers tmpfiles rule71 rule93
   local binary_dest watch_binary view_binary view_rule watch_mode watch_dest user_dir font_dest
   local font22_dest font18_dest
   local node hidraw_name mode_group pin sha_dest prev interval_src config_bak
@@ -1865,12 +1871,17 @@ apply_from_staging() {
       "$user_dir/kraken-lcd-halt-notify.service" "staged halt-notify.service.new" || return 1
   fi
 
-  # udev and sysusers have to be in place before the hidraw check.
+  # udev, sysusers and the grid directory's tmpfiles entry are in place
+  # before the hidraw check. systemd-tmpfiles runs immediately after
+  # systemd-sysusers: the llama-view group has to exist first.
   sysusers="$(dest_path "$dest_root" /etc/sysusers.d/llama-bored.conf)"
+  tmpfiles="$(dest_path "$dest_root" /etc/tmpfiles.d/llama-bored.conf)"
   rule71="$(dest_path "$dest_root" /etc/udev/rules.d/71-kraken-lcd.rules)"
   rule93="$(dest_path "$dest_root" /etc/udev/rules.d/93-kraken-lcd-hidraw.rules)"
   must stage_new_file 0644 "$staging/llama-bored.sysusers" "$sysusers" "staged sysusers.new" || return 1
   must commit_new_file "$sysusers" || return 1
+  must stage_new_file 0644 "$staging/llama-bored.tmpfiles" "$tmpfiles" "staged tmpfiles.new" || return 1
+  must commit_new_file "$tmpfiles" || return 1
   if [[ "$INSTALL_KRAKEN" == 1 ]]; then
     must stage_new_file 0644 "$staging/71-kraken-lcd.rules" "$rule71" "staged 71-rules.new" || return 1
     must commit_new_file "$rule71" || return 1
@@ -1884,6 +1895,8 @@ apply_from_staging() {
 
   must host_cmd systemd-sysusers || return 1
   mark_write "systemd-sysusers"
+  must host_cmd systemd-tmpfiles --create /etc/tmpfiles.d/llama-bored.conf || return 1
+  mark_write "systemd-tmpfiles --create"
   must host_cmd udevadm control --reload || return 1
   mark_write "udev reload"
   must host_cmd udevadm trigger --action=change \
@@ -2636,6 +2649,7 @@ self_test() {
   mkdir -p "$repo/packaging/user" "$repo/packaging/fonts" "$repo/target/release"
   cp -- "$ROOT/packaging/kraken-lcd.service" "$repo/packaging/kraken-lcd.service"
   cp -- "$ROOT/packaging/llama-bored.sysusers" "$repo/packaging/llama-bored.sysusers"
+  cp -- "$ROOT/packaging/llama-bored.tmpfiles" "$repo/packaging/llama-bored.tmpfiles"
   cp -- "$ROOT/packaging/71-kraken-lcd.rules" "$repo/packaging/71-kraken-lcd.rules"
   cp -- "$ROOT/packaging/93-kraken-lcd-hidraw.rules" "$repo/packaging/93-kraken-lcd-hidraw.rules"
   cp -- "$ROOT/packaging/72-llama-view.rules" "$repo/packaging/72-llama-view.rules"
@@ -2873,6 +2887,7 @@ self_test() {
     exit 1
   }
   log_has 'systemd-sysusers'
+  log_has 'systemd-tmpfiles --create /etc/tmpfiles.d/llama-bored.conf'
   log_has 'udevadm control --reload'
   log_has 'udevadm trigger --action=change --attr-match=idVendor=1e71 --attr-match=idProduct=3008'
   log_has "udevadm trigger --action=change $sys/class/hidraw/hidraw0"
@@ -2887,15 +2902,27 @@ self_test() {
     echo "install self-test: dry-run log starts, restarts, or enables kraken-lcd" >&2
     exit 1
   fi
-  local sysusers_line udev_line reload_line enable_line
+  cmp -s "$ROOT/packaging/llama-bored.tmpfiles" \
+    "$(dest_path "$dest" /etc/tmpfiles.d/llama-bored.conf)" || {
+    echo "install self-test: tmpfiles entry was not installed from staging" >&2
+    exit 1
+  }
+  assert_eq "$(stat -c '%a' -- "$(dest_path "$dest" /etc/tmpfiles.d/llama-bored.conf)")" \
+    "644" "tmpfiles mode"
+  [[ "$(rollback_section "$out")" == *"rm -f -- /etc/tmpfiles.d/llama-bored.conf"* ]] || {
+    echo "install self-test: rollback record does not remove the tmpfiles entry this run created" >&2
+    exit 1
+  }
+  local sysusers_line tmpfiles_line udev_line reload_line enable_line
   sysusers_line="$(log_line_number 'systemd-sysusers')"
+  tmpfiles_line="$(log_line_number 'systemd-tmpfiles --create')"
   udev_line="$(log_line_number 'udevadm')"
   reload_line="$(log_line_number 'systemctl daemon-reload')"
   enable_line="$(log_line_number 'systemctl enable llama-watch.service')"
-  if [[ -z "$sysusers_line" || -z "$udev_line" || -z "$reload_line" || -z "$enable_line" \
-    || "$sysusers_line" -ge "$udev_line" || "$udev_line" -ge "$reload_line" \
-    || "$reload_line" -ge "$enable_line" ]]; then
-    echo "install self-test: host command order is not sysusers, udev, daemon-reload, enable llama-watch" >&2
+  if [[ -z "$sysusers_line" || -z "$tmpfiles_line" || -z "$udev_line" || -z "$reload_line" || -z "$enable_line" \
+    || "$sysusers_line" -ge "$tmpfiles_line" || "$tmpfiles_line" -ge "$udev_line" \
+    || "$udev_line" -ge "$reload_line" || "$reload_line" -ge "$enable_line" ]]; then
+    echo "install self-test: host command order is not sysusers, tmpfiles, udev, daemon-reload, enable llama-watch" >&2
     cat -- "$INSTALL_LOG" >&2
     exit 1
   fi
@@ -2959,6 +2986,7 @@ self_test() {
   assert_rollback_order "$bad_err"
   hid_section="$(rollback_section "$bad_err")"
   [[ "$hid_section" == *"/etc/sysusers.d/llama-bored.conf"* \
+    && "$hid_section" == *"/etc/tmpfiles.d/llama-bored.conf"* \
     && "$hid_section" == *"/etc/udev/rules.d/71-kraken-lcd.rules"* \
     && "$hid_section" == *"/etc/udev/rules.d/93-kraken-lcd-hidraw.rules"* \
     && "$hid_section" != *"llama-watch"* ]] || {
@@ -3696,7 +3724,8 @@ self_test() {
   }
   assert_eq "$(cat -- "$roll_link_target")" "sentinel" "symlink marker was followed"
   if [[ -e "$(dest_path "$roll_link" /usr/local/libexec/llama-bored/kraken-lcd)" \
-    || -e "$(dest_path "$roll_link" /etc/sysusers.d/llama-bored.conf)" ]]; then
+    || -e "$(dest_path "$roll_link" /etc/sysusers.d/llama-bored.conf)" \
+    || -e "$(dest_path "$roll_link" /etc/tmpfiles.d/llama-bored.conf)" ]]; then
     echo "install self-test: symlink marker refusal still wrote install files" >&2
     exit 1
   fi
@@ -4687,6 +4716,7 @@ self_test() {
     /etc/udev/rules.d/72-llama-view.rules \
     /etc/udev/rules.d/94-llama-light-hidraw.rules \
     /etc/sysusers.d/llama-bored.conf \
+    /etc/tmpfiles.d/llama-bored.conf \
     /etc/llama-bored/config.toml \
     /etc/llama-bored/watch.toml; do
     [[ -f "$(dest_path "$nok" "$p")" ]] || {

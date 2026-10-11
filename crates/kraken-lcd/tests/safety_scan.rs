@@ -36,8 +36,8 @@ const WRITE_FILES: &[&str] = &[
     // #107: llama-watch's grid file (`[grid]`, off by default): the frame as a
     // `Write::write_all` into a create_new temp file next to the target, then
     // rename. It names no /sys or /proc path; its target is a configured
-    // absolute path (default /run/llama-watch-grid/grid, a directory the unit
-    // creates and the service owns).
+    // absolute path (default /run/llama-watch-grid/grid, a directory tmpfiles
+    // creates that the watcher may write).
     "crates/llama-watch/src/grid_out.rs",
     // #23: llama-view paints its own terminal (stdout) with
     // `Write::write_all`; it opens /dev/vcsa* read-only.
