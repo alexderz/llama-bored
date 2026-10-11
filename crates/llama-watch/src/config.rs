@@ -949,7 +949,7 @@ pub struct Config {
 }
 
 /// Where `[grid] path` points unless the config says otherwise: a directory
-/// the unit creates for it (`RuntimeDirectory=llama-watch-grid`), apart from
+/// tmpfiles creates for it (`/etc/tmpfiles.d/llama-bored.conf`), apart from
 /// the snapshot's so the group that reads this one cannot read that one.
 pub const DEFAULT_GRID_PATH: &str = "/run/llama-watch-grid/grid";
 
@@ -966,7 +966,7 @@ pub struct GridFile {
     #[serde(default)]
     pub enabled: bool,
     /// The file. Absolute; its directory has to exist and be writable by the
-    /// watcher (the unit's `RuntimeDirectory=` does that for the default).
+    /// watcher (tmpfiles does that for the default).
     #[serde(default = "defaults::grid_path")]
     pub path: PathBuf,
 }

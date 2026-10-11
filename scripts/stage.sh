@@ -46,13 +46,12 @@ Group=llama-watch
 ExecStartPre=-+/usr/local/libexec/llama-bored/llama-watch tty-setup --config /etc/llama-bored/watch.toml
 ExecStartPre=-+/usr/bin/sh -c 'exec /usr/bin/setterm --term linux --powersave powerdown </dev/tty11 >/dev/tty11'
 ExecStart=/usr/local/libexec/llama-bored/llama-watch run --config /etc/llama-bored/watch.toml
-ExecStartPost=-+/usr/bin/sh -c 'chgrp llama-view /run/llama-watch-grid && chmod 2750 /run/llama-watch-grid'
 ExecStopPost=-/usr/local/libexec/llama-bored/llama-watch tty-reset
 Restart=on-failure
 RestartSec=5
 WatchdogSec=10
 UMask=0027
-RuntimeDirectory=llama-watch llama-watch-grid
+RuntimeDirectory=llama-watch
 RuntimeDirectoryMode=0750
 StandardInput=null
 StandardOutput=tty
@@ -86,6 +85,7 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ReadOnlyPaths=/sys
+ReadWritePaths=-/run/llama-watch-grid
 DevicePolicy=closed
 DeviceAllow=/dev/nvidiactl rw
 DeviceAllow=/dev/nvidia0 rw
@@ -141,27 +141,45 @@ assert_packaging_contract() {
     echo "stage self-test: llama-watch.service must have exactly two ExecStartPre, the non-fatal root tty-setup (font and size) and the non-fatal setterm powersave" >&2
     exit 1
   fi
-  # #107: the grid file's directory (a second RuntimeDirectory=, apart from
-  # the snapshot's, which stays 0750 llama-watch:llama-watch) is made readable
-  # by group llama-view, the group that reads /dev/vcsa11, without giving the
-  # watcher any privilege: its seccomp filter blocks chown (@privileged), so
-  # root does it in one `+` step. It is ExecStartPost, not ExecStartPre, and
-  # one command, not two: systemd re-applies RuntimeDirectoryMode and the
-  # service's ownership to the directory before every command it runs, so a
-  # pre-step is undone by ExecStart and a second post-step undoes the first
-  # (measured on systemd 259: chgrp then chmod as two steps ends
-  # llama-watch:llama-watch 2750). Setgid (2750) makes the files the watcher
-  # writes (UMask=0027 gives 0640) inherit the group; the heartbeat rewrites
-  # the file within a second, so the first file (written before the chgrp)
-  # is replaced. `-` keeps a missing group from stopping the watcher: the
-  # directory is then just group llama-watch and llama-view cannot read the
-  # grid.
-  local grid_group="ExecStartPost=-+/usr/bin/sh -c 'chgrp llama-view /run/llama-watch-grid && chmod 2750 /run/llama-watch-grid'"
-  if [[ "$(grep -c '^ExecStartPost=' "$watch")" -ne 1 ]] \
-    || ! grep -F -q -x -- "$grid_group" "$watch"; then
-    echo "stage self-test: llama-watch.service must have exactly one ExecStartPost, the non-fatal root chgrp-and-chmod of the grid directory" >&2
+  # #107: /run/llama-watch-grid is not created by this unit. The unit has
+  # StandardOutput=tty, TTYReset=yes, TTYVHangup=yes and TTYVTDisallocate=yes,
+  # and systemd applies that reset and hangup to every command it runs for
+  # the unit. An ExecStartPost (the old chgrp/chmod) or an ExecReload while
+  # the main process is alive hangs up tty11 underneath it: the watcher logs
+  # "console draw failed: Input/output error (os error 5)" once and the
+  # console stays blank. ExecStartPre runs before the main process and
+  # ExecStopPost after it, so those stay. No ExecStartPost= and no
+  # ExecReload= line. RuntimeDirectory= is only the snapshot directory
+  # (0750 llama-watch:llama-watch). packaging/llama-bored.tmpfiles creates
+  # the grid directory (2750 llama-watch:llama-view, setgid, so the files
+  # the watcher writes with UMask=0027 are 0640 llama-watch:llama-view).
+  # ProtectSystem=strict leaves that directory read-only, so
+  # ReadWritePaths=-/run/llama-watch-grid opens it; the leading `-` ignores
+  # a missing directory (no tmpfiles entry, or no llama-view group).
+  if grep -q '^ExecStartPost=' "$watch" || grep -q '^ExecReload=' "$watch"; then
+    echo "stage self-test: llama-watch.service must not have ExecStartPost= or ExecReload= (a command while the main process holds tty11 hangs it up)" >&2
     exit 1
   fi
+  if [[ "$(grep -c '^RuntimeDirectory=' "$watch")" -ne 1 ]] \
+    || ! grep -F -q -x -- 'RuntimeDirectory=llama-watch' "$watch"; then
+    echo "stage self-test: llama-watch.service RuntimeDirectory must be exactly llama-watch" >&2
+    exit 1
+  fi
+  if ! grep -F -q -x -- 'ReadWritePaths=-/run/llama-watch-grid' "$watch"; then
+    echo "stage self-test: llama-watch.service missing ReadWritePaths=-/run/llama-watch-grid" >&2
+    exit 1
+  fi
+  local tmpfiles expected_tmp
+  tmpfiles="$root/packaging/llama-bored.tmpfiles"
+  expected_tmp="$(mktemp)"
+  printf '%s\n' 'd /run/llama-watch-grid 2750 llama-watch llama-view -' >"$expected_tmp"
+  if ! cmp -s -- "$expected_tmp" "$tmpfiles"; then
+    echo "stage self-test: llama-bored.tmpfiles must be exactly 'd /run/llama-watch-grid 2750 llama-watch llama-view -'" >&2
+    diff -u -- "$expected_tmp" "$tmpfiles" >&2 || true
+    rm -f -- "$expected_tmp"
+    exit 1
+  fi
+  rm -f -- "$expected_tmp"
   # #26: the watcher loads llama-bored's palette into tty11 (ESC ] P) and
   # SIGTERM keeps its default action, so the stop step puts the kernel's
   # colours back: `llama-watch tty-reset` writes ESC ] R to stdout (tty11),

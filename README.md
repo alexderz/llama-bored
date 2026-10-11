@@ -1105,10 +1105,11 @@ runuser -u <llama-view-user> -- \
   /usr/local/libexec/llama-bored/llama-view --kiosk --source grid --colors truecolor --fit center
 ```
 
-The unit creates `/run/llama-watch-grid` next to the snapshot directory and
-one root `ExecStartPost=` step gives it to group `llama-view` (mode 2750:
-setgid, so the files inherit the group, `0640`). The service itself gets no
-privilege, and `/run/llama-watch` stays `0750 llama-watch:llama-watch`.
+`/etc/tmpfiles.d/llama-bored.conf` creates `/run/llama-watch-grid` next to
+the snapshot directory as `2750 llama-watch:llama-view` (setgid, so the
+files inherit the group, `0640`). The unit does not run a command to do
+this: with the tty11 hangup options, that command would hang up the console
+under the running watcher. `/run/llama-watch` stays `0750 llama-watch:llama-watch`.
 
 **Privacy.** The grid file holds the same prompt and response text tty11
 shows (`--no-text` and `[tty] show_text = false` leave it out here too). It
