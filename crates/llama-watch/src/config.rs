@@ -297,6 +297,13 @@ pub enum InvalidWatchConfig {
         /// What is wrong with it.
         reason: String,
     },
+    /// `[setup] specs_dir` is not an absolute path of a sane length (#92).
+    /// The directory is not opened here.
+    #[error("setup.specs_dir: {reason}")]
+    SpecsDir {
+        /// What is wrong with the path.
+        reason: String,
+    },
     /// `tty.size` is below the layout floor or above the console bound.
     #[error(
         "tty.size {cols}x{rows} is outside {min_cols}x{min_rows}..={max_cols}x{max_rows}",
@@ -1000,13 +1007,15 @@ impl GridFile {
 }
 
 /// `[setup]`: the rules that pick tty11's SETUP rows from a model's
-/// launch command and its engine's own reports (#52).
+/// launch command, its engine's own reports, and an optional per-model
+/// spec file (#52, #92).
 ///
 /// The built-in rules (`src/setup_defaults.toml`) cover the upstream
 /// llama.cpp, vLLM and SGLang flags. `[[setup.field]]` entries extend them;
 /// `defaults = false` drops the built-in set so only the listed fields
 /// apply. [`crate::setup_rules`] checks every rule at load and enforces the
-/// display limits whatever a rule says.
+/// display limits whatever a rule says. `specs_dir` is checked here and
+/// not opened; an unset directory reads no spec files.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Setup {
@@ -1016,6 +1025,10 @@ pub struct Setup {
     /// Field rules, in addition to (or instead of) the built-in ones.
     #[serde(default)]
     pub field: Vec<SetupField>,
+    /// Directory of `<model-id>.json` entry specs (#92). Unset reads nothing.
+    /// Absolute, and not opened at load.
+    #[serde(default)]
+    pub specs_dir: Option<PathBuf>,
 }
 
 impl Default for Setup {
@@ -1023,6 +1036,7 @@ impl Default for Setup {
         Self {
             defaults: true,
             field: Vec::new(),
+            specs_dir: None,
         }
     }
 }
@@ -1041,13 +1055,13 @@ pub struct SetupField {
     #[serde(default, rename = "match")]
     pub matches: Option<String>,
     /// `flag:-c,--ctx-size`, `env:NAME`, `json:--flag:key`, `live:name`,
-    /// `engine:key` or `name` (#54). Absent: the field only ever shows its
-    /// `default`.
+    /// `engine:key`, `spec:dotted.path` or `name` (#54, #92). Absent: the
+    /// field only ever shows its `default`.
     #[serde(default)]
     pub source: Option<String>,
     /// `number`, `token`, `quant`, `present` or `mib`. Required for `flag`,
-    /// `env` and `json` sources, `quant` for `name`; optional for `engine`;
-    /// not allowed with `live`.
+    /// `env`, `json` and `spec` sources, `quant` for `name`; optional for
+    /// `engine`; not allowed with `live`.
     #[serde(default)]
     pub kind: Option<String>,
     /// Text before the value: `kv` draws `kv q8_0`.
@@ -1492,10 +1506,40 @@ impl Config {
         self.temps
             .validate()
             .map_err(|reason| InvalidWatchConfig::Temps { reason })?;
+        if let Some(dir) = &self.setup.specs_dir {
+            specs_dir_ok(dir).map_err(|reason| InvalidWatchConfig::SpecsDir { reason })?;
+        }
         crate::setup_rules::Rules::compile(&self.setup)
             .map_err(|(field, reason)| InvalidWatchConfig::Setup { field, reason })?;
         Ok(())
     }
+}
+
+/// Longest `specs_dir`, in bytes. Long enough for a temp dir under this
+/// worktree; short enough that a config cannot name an absurd path.
+const MAX_SPECS_DIR: usize = 4096;
+
+/// `specs_dir` is an absolute path with no `.` or `..` component. It is
+/// not opened: a missing directory is a read error later, not a bad config.
+fn specs_dir_ok(dir: &Path) -> Result<(), String> {
+    let text = dir
+        .to_str()
+        .ok_or_else(|| "must be valid UTF-8".to_owned())?;
+    if text.is_empty() || text.len() > MAX_SPECS_DIR {
+        return Err(format!("must be 1..={MAX_SPECS_DIR} bytes"));
+    }
+    if text.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
+        return Err("must not contain a control character".to_owned());
+    }
+    if !dir.is_absolute() {
+        return Err("must be an absolute path".to_owned());
+    }
+    // `Path::components` omits a mid-path `.` (it only yields `CurDir` as a
+    // prefix) and still yields `..`. Split the text so both are rejected.
+    if text.split('/').any(|part| part == "." || part == "..") {
+        return Err("must not contain . or ..".to_owned());
+    }
+    Ok(())
 }
 
 const MAX_RATE_CEILING_TPS: f64 = 100_000.0;

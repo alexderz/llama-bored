@@ -172,9 +172,10 @@ enabled = true
 # tty11's SETUP block (#52): the settings of the model generating now (or
 # the one used last) under the meters. Rules pick each value from the
 # llama-swap launch command (a flag, a `-e NAME=V` env, or a key of a JSON
-# flag), or from what the engine reports (`live:`, and `engine:` for the
-# settings Strata reports, #54). Only numbers and short tokens are ever
-# shown, never a path or a raw argument. Built-in rules cover upstream
+# flag), from what the engine reports (`live:`, and `engine:` for the
+# settings Strata reports, #54), or from a per-model entry spec (`spec:`,
+# a JSON file under `specs_dir`, #92). Only numbers and short tokens are
+# ever shown, never a path or a raw argument. Built-in rules cover upstream
 # llama.cpp, vLLM and SGLang flags and Strata's report
 # (crates/llama-watch/src/setup_defaults.toml); rules here are added to
 # them, and `defaults = false` keeps only the rules here. README "SETUP
@@ -251,3 +252,199 @@ enabled = true
 #label = "offload"
 #order = 30
 # <<< setup example
+
+# Example: per-model entry specs (#92). `specs_dir` is an absolute directory
+# of `<model-id>.json` files. The watcher does not open it while loading
+# this file, and it does not follow a symlink. `defaults = false` keeps only
+# these rules. `report.label` is drawn only when it is a short token; a
+# sentence in the file shows nothing. Copy the block below, without the
+# leading "#", into watch.toml.
+# >>> spec example
+#specs_dir = "/etc/llama-bored/specs"
+#defaults = false
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:report.label"
+#kind = "token"
+#order = 10
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:engine"
+#kind = "token"
+#order = 11
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:engine_version"
+#kind = "token"
+#sep = " "
+#order = 12
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:model.quant"
+#kind = "token"
+#order = 13
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:model.params_total_b"
+#kind = "number"
+#label = "params"
+#suffix = "B"
+#order = 14
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:model.params_active_b"
+#kind = "number"
+#sep = " / "
+#suffix = "B"
+#order = 15
+#
+#[[setup.field]]
+#row = "engine"
+#source = "spec:model.arch"
+#kind = "token"
+#order = 16
+#
+#[[setup.field]]
+#row = "ctx"
+#source = "spec:served_context"
+#kind = "number"
+#order = 20
+#
+#[[setup.field]]
+#row = "ctx"
+#source = "spec:kv_type"
+#kind = "token"
+#label = "kv"
+#order = 22
+#
+#[[setup.field]]
+#row = "experts"
+#source = "spec:placement.experts_on_cpu"
+#kind = "number"
+#suffix = " layers in RAM"
+#order = 30
+#
+#[[setup.field]]
+#row = "experts"
+#source = "spec:placement.gpu_layers"
+#kind = "number"
+#label = "gpu"
+#order = 31
+#
+#[[setup.field]]
+#row = "experts"
+#source = "spec:placement.mmap"
+#kind = "token"
+#map = { "true" = "mmap on", "false" = "mmap off" }
+#order = 32
+#
+#[[setup.field]]
+#row = "experts"
+#source = "spec:placement.ram_pinned_gb"
+#kind = "number"
+#label = "pinned"
+#suffix = " GB"
+#order = 33
+#
+#[[setup.field]]
+#row = "spec"
+#source = "spec:speculative.type"
+#kind = "token"
+#order = 40
+#
+#[[setup.field]]
+#row = "spec"
+#source = "spec:speculative.draft_model"
+#kind = "token"
+#label = "draft"
+#order = 41
+#
+#[[setup.field]]
+#row = "think"
+#source = "spec:thinking.default_on"
+#kind = "token"
+#map = { "true" = "on", "false" = "off" }
+#order = 50
+#
+#[[setup.field]]
+#row = "think"
+#source = "spec:thinking.server_budget"
+#kind = "number"
+#label = "budget"
+#order = 51
+#
+#[[setup.field]]
+#row = "serve"
+#source = "spec:parallel"
+#kind = "number"
+#label = "parallel"
+#order = 60
+#
+#[[setup.field]]
+#row = "serve"
+#source = "spec:multi_agent_ok"
+#kind = "token"
+#map = { "true" = "multi-agent", "false" = "single" }
+#order = 61
+#
+#[[setup.field]]
+#row = "serve"
+#source = "spec:storage"
+#kind = "token"
+#label = "store"
+#order = 62
+#
+#[[setup.field]]
+#row = "serve"
+#source = "spec:role.daily_driver"
+#kind = "token"
+#order = 63
+#
+#[[setup.field]]
+#row = "serve"
+#source = "spec:role.bakeoff_status"
+#kind = "token"
+#label = "role"
+#order = 64
+#
+#[[setup.field]]
+#row = "sample"
+#source = "spec:sampling.temp"
+#kind = "number"
+#label = "temp"
+#order = 70
+#
+#[[setup.field]]
+#row = "sample"
+#source = "spec:sampling.top_p"
+#kind = "number"
+#label = "top-p"
+#order = 71
+#
+#[[setup.field]]
+#row = "sample"
+#source = "spec:sampling.top_k"
+#kind = "number"
+#label = "top-k"
+#order = 72
+#
+#[[setup.field]]
+#row = "sample"
+#source = "spec:sampling.min_p"
+#kind = "number"
+#label = "min-p"
+#order = 73
+#
+#[[setup.field]]
+#row = "sample"
+#source = "spec:sampling.presence_penalty"
+#kind = "number"
+#label = "pres"
+#order = 74
+# <<< spec example

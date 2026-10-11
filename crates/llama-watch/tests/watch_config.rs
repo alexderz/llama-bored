@@ -38,6 +38,14 @@ fn packaged_example_parses_and_validates() {
     assert!(text.contains("#hwmon = \"nct6798\""), "{text}");
     // T72: backend overrides ship as a commented example.
     assert!(text.contains("#[llama.backends]"), "{text}");
+    // #92: the entry-spec rules stay commented, so this file still loads
+    // with specs_dir unset and opens nothing.
+    assert!(text.contains("# >>> spec example"), "{text}");
+    assert!(
+        text.contains("#specs_dir = \"/etc/llama-bored/specs\""),
+        "{text}"
+    );
+    assert!(!text.contains("\nspecs_dir"), "{text}");
     assert!(text.contains("#\"my-sglang-model\" = \"sglang\""), "{text}");
     assert!(text.contains("#channels = [2, 3, 5, 6]"), "{text}");
 
@@ -309,6 +317,7 @@ enum Rule {
     Fans,
     Temps,
     Setup,
+    SpecsDir,
     TtySize,
     GridPath,
 }
@@ -345,6 +354,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::Fans { .. }) => Rule::Fans,
         Err(InvalidWatchConfig::Temps { .. }) => Rule::Temps,
         Err(InvalidWatchConfig::Setup { .. }) => Rule::Setup,
+        Err(InvalidWatchConfig::SpecsDir { .. }) => Rule::SpecsDir,
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
         Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
     }
@@ -1781,4 +1791,54 @@ fn backend_overrides_parse_known_words_only() {
             "{bad} must not parse"
         );
     }
+}
+
+/// #92: `specs_dir` is an absolute path of a sane length. It is not opened,
+/// and a `spec:` rule is valid when the directory is unset.
+#[test]
+fn specs_dir_is_an_absolute_path_and_is_not_opened() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    let invalid = |dir: PathBuf| {
+        let mut cfg = Config::default();
+        cfg.setup.specs_dir = Some(dir);
+        cfg.validate(8).expect_err("bad specs_dir")
+    };
+    let relative = invalid(PathBuf::from("specs"));
+    assert_eq!(rule_of(Err(relative)), Rule::SpecsDir);
+    let text = invalid(PathBuf::from("specs")).to_string();
+    assert!(text.contains("setup.specs_dir:"), "{text}");
+    assert!(text.contains("absolute"), "{text}");
+
+    let mut cfg = Config::default();
+    // Not created and not read. Validation only looks at the path text.
+    cfg.setup.specs_dir = Some(PathBuf::from("/var/lib/llama-bored/specs"));
+    cfg.validate(8).expect("an absolute path is not opened");
+
+    let mut cfg = Config::default();
+    cfg.setup.specs_dir = Some(PathBuf::from(format!("/{}", "a".repeat(4095))));
+    cfg.validate(8).expect("4096 bytes is allowed");
+    let long = invalid(PathBuf::from(format!("/{}", "a".repeat(4096)))).to_string();
+    assert!(long.contains("1..=4096"), "{long}");
+
+    let dotted = invalid(PathBuf::from("/var/lib/../llama-bored/specs")).to_string();
+    assert!(dotted.contains(". or .."), "{dotted}");
+    let here = invalid(PathBuf::from("/var/lib/./specs")).to_string();
+    assert!(here.contains(". or .."), "{here}");
+    let empty = invalid(PathBuf::from("")).to_string();
+    assert!(empty.contains("1..=4096"), "{empty}");
+
+    let mut bytes = b"/var/lib/llama".to_vec();
+    bytes.push(0);
+    let nul = invalid(PathBuf::from(OsString::from_vec(bytes))).to_string();
+    assert!(nul.contains("control") || nul.contains("UTF-8"), "{nul}");
+
+    let cfg = Config::from_toml(
+        "[[setup.field]]\nrow = \"ctx\"\nsource = \"spec:served_context\"\nkind = \"number\"\n",
+    )
+    .expect("parses");
+    assert!(cfg.setup.specs_dir.is_none());
+    cfg.validate(8).expect("a spec rule with no directory");
 }

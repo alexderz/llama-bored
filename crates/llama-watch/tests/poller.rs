@@ -3894,3 +3894,109 @@ fn llamacpp_kv_is_the_slots_held_tokens_shared_or_per_slot() {
         assert_eq!(kv.cached, None, "{cmd}");
     }
 }
+
+/// #92: a spec file's number lands beside the flag source. The other model
+/// has no file, so its spec field stays blank and its flag still shows.
+#[test]
+fn a_spec_file_fills_setup_and_a_missing_file_leaves_the_flags() {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "running": [
+            {
+                "model": "example-35b-q6",
+                "name": "Example 35B",
+                "state": "ready",
+                "cmd": "llama-server -c 4096"
+            },
+            {
+                "model": "other-model",
+                "state": "ready",
+                "cmd": "llama-server -c 4096"
+            }
+        ]
+    }))
+    .expect("json");
+    let server = Server::start(World::running(body));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("specs-{}", server.port));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("specs dir");
+    std::fs::write(
+        dir.join("example-35b-q6.json"),
+        br#"{"served_context":131072}"#,
+    )
+    .expect("spec");
+    let spec = dir.display().to_string();
+    assert!(dir.is_absolute(), "{spec}");
+    assert!(!spec.contains(['"', '\\']), "{spec}");
+    let path =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("watch-spec-{}.toml", server.port));
+    let text = format!(
+        r#"
+[llama]
+url = "http://127.0.0.1:{port}"
+running_interval_s = 0.35
+running_timeout_s = 0.15
+metrics_interval_s = 0.2
+metrics_timeout_s = 0.1
+slots_interval_s = 0.5
+slots_timeout_s = 0.3
+slots_max_bytes = 4194304
+activity_interval_s = 0.35
+activity_timeout_s = 0.1
+input_tail_chars = 256
+output_tail_chars = 256
+
+[models]
+max_name_chars = 12
+
+[setup]
+defaults = false
+specs_dir = "{spec}"
+
+[[setup.field]]
+row = "ctx"
+source = "spec:served_context"
+kind = "number"
+order = 20
+
+[[setup.field]]
+row = "ctx"
+source = "flag:-c"
+kind = "number"
+order = 21
+"#,
+        port = server.port
+    );
+    std::fs::write(&path, text).expect("write watch.toml");
+    let config = Config::load_validated(&path, 8).expect("valid watch config");
+    let log = MemLog::new();
+    let (_poller, rx) = spawn(&config, &log);
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.setup.iter().any(|setup| {
+            setup.id == "example-35b-q6"
+                && setup.found.iter().any(|found| found.value == "131072")
+                && setup.found.iter().any(|found| found.value == "4096")
+        })
+    });
+    let values = |id: &str| -> Vec<String> {
+        detail
+            .setup
+            .iter()
+            .find(|setup| setup.id == id)
+            .unwrap_or_else(|| panic!("no setup for {id}"))
+            .found
+            .iter()
+            .map(|found| found.value.clone())
+            .collect()
+    };
+    let example = values("example-35b-q6");
+    assert!(example.iter().any(|value| value == "131072"), "{example:?}");
+    assert!(example.iter().any(|value| value == "4096"), "{example:?}");
+    let other = values("other-model");
+    assert!(other.iter().any(|value| value == "4096"), "{other:?}");
+    assert!(!other.iter().any(|value| value == "131072"), "{other:?}");
+    assert!(
+        log.lines().iter().all(|line| !line.contains("setup spec:")),
+        "{:?}",
+        log.lines()
+    );
+}

@@ -18,6 +18,7 @@ pub mod resets;
 pub mod series;
 pub mod service;
 pub mod setup_rules;
+mod setup_specs;
 pub mod slots;
 pub mod sources;
 pub mod speeds;

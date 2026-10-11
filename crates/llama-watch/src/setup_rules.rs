@@ -25,6 +25,10 @@
 //! - `name` (#54) scans the llama-swap model name for a GGUF quant tag
 //!   ([`cmdline::name_quant`]), for an engine whose command names no
 //!   weights file.
+//! - `spec:<dotted.path>` (#92) reads one value from the model's entry
+//!   spec, a JSON file the poller already loaded. A missing path, null,
+//!   object or array leaves the field blank. The file itself is not opened
+//!   here.
 //!
 //! [`Rules::rows`] turns the extracted values plus the live engine numbers
 //! into the rows the layout draws.
@@ -62,6 +66,13 @@ pub const MAX_MAP: usize = 16;
 pub const MAX_JSON_BYTES: usize = 4096;
 /// Longest number kept from a command, sign and point included.
 pub const MAX_NUMBER_CHARS: usize = 16;
+/// Most dot-separated segments in a `spec:` path.
+pub const MAX_SPEC_SEGMENTS: usize = 8;
+/// Longest one segment of a `spec:` path.
+pub const MAX_SPEC_SEGMENT: usize = 32;
+/// Longest spec string handed to [`clean`]. A longer string yields nothing,
+/// rather than a file stem taken from the tail of an untrusted value.
+pub const MAX_SPEC_VALUE_CHARS: usize = 1024;
 
 /// Separator between items on one row unless a rule names its own.
 const SEP: &str = " \u{00B7} ";
@@ -137,6 +148,8 @@ enum Source {
     Engine(&'static str),
     /// A quant tag in the llama-swap model name (#54).
     Name,
+    /// A dotted path into the model's entry spec (#92).
+    Spec(Vec<String>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +259,20 @@ impl Rules {
     /// its server flags after the image and its env before it.
     #[must_use]
     pub fn extract_as(&self, cmd: &str, name: &str, known: Option<Backend>) -> Vec<Found> {
+        self.extract_with(cmd, name, known, None)
+    }
+
+    /// [`Self::extract_as`] plus the model's entry spec (#92). `None`, and
+    /// a path that misses, leaves those rules with no value. The document
+    /// is not kept.
+    #[must_use]
+    pub fn extract_with(
+        &self,
+        cmd: &str,
+        name: &str,
+        known: Option<Backend>,
+        spec: Option<&serde_json::Value>,
+    ) -> Vec<Found> {
         let tokens = tokenize(cmd);
         let words: Vec<&str> = tokens.iter().map(|(_, word)| *word).collect();
         // A server's flags come after its entry point (or its container
@@ -270,6 +297,7 @@ impl Rules {
                 Source::Flag(names) => flag_value(&words[flags_from..], names, rule.kind),
                 Source::Env(name) => env_value(&words[..env_to], name),
                 Source::Json { flags, key } => json_value(cmd, &tokens[flags_from..], flags, key),
+                Source::Spec(path) => spec.and_then(|doc| spec_at(doc, path)),
                 // Already a checked tag, not a file name to read one from.
                 Source::Name => {
                     if let Some(tag) = cmdline::name_quant(name) {
@@ -478,7 +506,7 @@ fn parse_source(source: Option<&str>) -> Result<Source, String> {
     }
     let bad = || {
         format!(
-            "source {:?} is not flag:NAMES, env:NAME, json:NAMES:KEY, live:NAME, engine:KEY or name",
+            "source {:?} is not flag:NAMES, env:NAME, json:NAMES:KEY, live:NAME, engine:KEY, spec:PATH or name",
             printable(source)
         )
     };
@@ -527,8 +555,35 @@ fn parse_source(source: Option<&str>) -> Result<Source, String> {
                     printable(rest)
                 )
             }),
+        "spec" => spec_path(rest).map(Source::Spec),
         _ => Err(bad()),
     }
+}
+
+/// `a.b.c`: 1..=[`MAX_SPEC_SEGMENTS`] pieces of `[A-Za-z0-9_]`, each at
+/// most [`MAX_SPEC_SEGMENT`] bytes. Anything else is a bad rule.
+fn spec_path(path: &str) -> Result<Vec<String>, String> {
+    let bad = || {
+        format!(
+            "spec path must be 1..={MAX_SPEC_SEGMENTS} dot-separated segments of letters, digits and _"
+        )
+    };
+    if path.is_empty() || path.starts_with('.') || path.ends_with('.') || path.contains("..") {
+        return Err(bad());
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() || parts.len() > MAX_SPEC_SEGMENTS {
+        return Err(bad());
+    }
+    for part in &parts {
+        let ok = !part.is_empty()
+            && part.len() <= MAX_SPEC_SEGMENT
+            && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !ok {
+            return Err(bad());
+        }
+    }
+    Ok(parts.iter().map(|part| (*part).to_owned()).collect())
 }
 
 fn flag_names(list: &str) -> Result<Vec<String>, String> {
@@ -742,6 +797,47 @@ fn json_key(object: &str, key: &str) -> Option<String> {
     }
 }
 
+/// The scalar at `path` of a spec document. An object, array, null or a
+/// missing key is nothing. A string longer than [`MAX_SPEC_VALUE_CHARS`]
+/// is nothing, so a huge path cannot become a file stem in [`clean`].
+fn spec_at(doc: &serde_json::Value, path: &[String]) -> Option<String> {
+    let mut cur = doc;
+    for segment in path {
+        cur = cur.as_object()?.get(segment)?;
+    }
+    match cur {
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            None
+        }
+        serde_json::Value::Bool(on) => Some(on.to_string()),
+        serde_json::Value::String(text) => {
+            (text.chars().count() <= MAX_SPEC_VALUE_CHARS).then(|| text.clone())
+        }
+        serde_json::Value::Number(number) => Some(spec_number(number)),
+    }
+}
+
+/// Integral floats such as `20.0` print as `20`. A fraction stays as the
+/// JSON number wrote it (`0.95`). `json:` values are not rewritten here.
+fn spec_number(number: &serde_json::Number) -> String {
+    if let Some(n) = number.as_i64() {
+        return n.to_string();
+    }
+    if let Some(n) = number.as_u64() {
+        return n.to_string();
+    }
+    // 1e15 is inside the range where every integer is an exact f64, so the
+    // cast does not round. -0.0 passes fract() and prints as 0.
+    if let Some(n) = number.as_f64()
+        && n.is_finite()
+        && n.fract() == 0.0
+        && n.abs() < 1e15
+    {
+        return (n as i64).to_string();
+    }
+    number.to_string()
+}
+
 fn strip_quotes(text: &str) -> &str {
     for quote in ['\'', '"'] {
         if let Some(inner) = text
@@ -895,6 +991,7 @@ mod tests {
         Rules::compile(&Setup {
             defaults: false,
             field: fields,
+            ..Setup::default()
         })
         .expect("compile")
     }
@@ -904,6 +1001,13 @@ mod tests {
         let rules = Rules::builtin();
         assert!(rules.rules.len() > 30, "{}", rules.rules.len());
         assert!(rules.rules.windows(2).all(|w| w[0].order <= w[1].order));
+        assert!(
+            rules
+                .rules
+                .iter()
+                .all(|rule| !matches!(rule.source, Source::Spec(_))),
+            "built-in rules do not read spec files"
+        );
     }
 
     #[test]
@@ -1028,6 +1132,7 @@ mod tests {
             Rules::compile(&Setup {
                 defaults: true,
                 field: vec![SetupField::default(), field],
+                ..Setup::default()
             })
             .expect_err("bad rule")
         };
@@ -1038,6 +1143,7 @@ mod tests {
         let (index, reason) = Rules::compile(&Setup {
             defaults: true,
             field: vec![ok.clone(), field("ctx", Some("flag:-c"), Some("nubmer"))],
+            ..Setup::default()
         })
         .expect_err("kind");
         assert_eq!(index, 1);
@@ -1066,12 +1172,24 @@ mod tests {
             ),
             (field("ctx", Some("env:X"), Some("present")), "present"),
             (field("ctx", Some("http:x"), Some("token")), "source"),
+            (field("ctx", Some("spec:"), Some("number")), "spec path"),
+            (field("ctx", Some("spec:a-b"), Some("number")), "spec path"),
+            (field("ctx", Some("spec:a..b"), Some("number")), "spec path"),
+            (field("ctx", Some("spec:.a"), Some("number")), "spec path"),
+            (field("ctx", Some("spec:a."), Some("number")), "spec path"),
+            (
+                field("ctx", Some("spec:a.b.c.d.e.f.g.h.i"), Some("number")),
+                "spec path",
+            ),
+            (field("ctx", Some("spec:x"), None), "kind is required"),
+            (field("ctx", Some("spec:x"), Some("present")), "present"),
             (field("ctx", None, None), "needs a default"),
         ];
         for (rule, want) in cases {
             let (index, reason) = Rules::compile(&Setup {
                 defaults: false,
                 field: vec![rule.clone()],
+                ..Setup::default()
             })
             .expect_err(want);
             assert_eq!(index, 0);
@@ -1089,6 +1207,7 @@ mod tests {
         Rules::compile(&Setup {
             defaults: false,
             field: vec![field],
+            ..Setup::default()
         })
         .expect_err("bad")
         .1
@@ -1157,6 +1276,213 @@ mod tests {
         assert!(
             rules
                 .extract("podman run -e SPEC=mtp ghcr.io/x/other single")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn spec_paths_read_scalars_like_json_values() {
+        let eight = (0..MAX_SPEC_SEGMENTS)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
+        assert_eq!(
+            only(vec![field(
+                "ctx",
+                Some(&format!("spec:{eight}")),
+                Some("number")
+            )])
+            .rules
+            .len(),
+            1
+        );
+        let wide = "a".repeat(MAX_SPEC_SEGMENT);
+        assert_eq!(
+            only(vec![field(
+                "ctx",
+                Some(&format!("spec:{wide}")),
+                Some("token")
+            )])
+            .rules
+            .len(),
+            1
+        );
+        let wider = "a".repeat(MAX_SPEC_SEGMENT + 1);
+        assert!(
+            only_err(field("ctx", Some(&format!("spec:{wider}")), Some("number")))
+                .contains("spec path")
+        );
+
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"served_context":131072,"on":true,"off":false,"quant":"/models/Example-Q6_K_XL.gguf","stem":"/models/example.gguf","mib":2048,"top_k":20.0,"min_p":0.0,"top_p":0.95,"neg":-0.0,"thinking":{"server_budget":24000},"gone":null,"obj":{"a":1},"arr":[1],"text":"f16","blank":"","esc":"a\u001bb"}"#,
+        )
+        .expect("doc");
+        let mut huge = doc.clone();
+        huge.as_object_mut().unwrap().insert(
+            "huge".to_owned(),
+            serde_json::Value::String("x".repeat(2000)),
+        );
+        // A long path whose tail would be a token, if clean() saw it.
+        huge.as_object_mut().unwrap().insert(
+            "long_path".to_owned(),
+            serde_json::Value::String(format!("/models/{}/ok.gguf", "a".repeat(2000))),
+        );
+
+        let mut ctx = field("ctx", Some("spec:served_context"), Some("number"));
+        ctx.order = 20;
+        let mut flag = field("think", Some("spec:on"), Some("token"));
+        flag.map.insert("true".to_owned(), "on".to_owned());
+        flag.map.insert("false".to_owned(), "off".to_owned());
+        flag.order = 50;
+        let mut off = field("think", Some("spec:off"), Some("token"));
+        off.map.insert("true".to_owned(), "on".to_owned());
+        off.map.insert("false".to_owned(), "off".to_owned());
+        off.order = 51;
+        let mut quant = field("engine", Some("spec:quant"), Some("quant"));
+        quant.order = 13;
+        let mut stem = field("engine", Some("spec:stem"), Some("token"));
+        stem.order = 14;
+        let mut mib = field("experts", Some("spec:mib"), Some("mib"));
+        mib.order = 30;
+        let mut top_k = field("sample", Some("spec:top_k"), Some("number"));
+        top_k.label = Some("top-k".to_owned());
+        top_k.order = 72;
+        let mut min_p = field("sample", Some("spec:min_p"), Some("number"));
+        min_p.label = Some("min-p".to_owned());
+        min_p.sep = Some(" ".to_owned());
+        min_p.order = 73;
+        let mut top_p = field("sample", Some("spec:top_p"), Some("number"));
+        top_p.label = Some("top-p".to_owned());
+        top_p.order = 71;
+        let mut neg = field("sample", Some("spec:neg"), Some("number"));
+        neg.order = 74;
+        let mut budget = field("think", Some("spec:thinking.server_budget"), Some("number"));
+        budget.label = Some("budget".to_owned());
+        budget.order = 52;
+        let mut text = field("ctx", Some("spec:text"), Some("token"));
+        text.label = Some("kv".to_owned());
+        text.order = 22;
+        let vllm = {
+            let mut rule = field("ctx", Some("spec:served_context"), Some("number"));
+            rule.engines = vec![Backend::Vllm];
+            rule.order = 21;
+            rule
+        };
+        let mut matched = field("ctx", Some("spec:text"), Some("token"));
+        matched.matches = Some("only-this".to_owned());
+        matched.order = 23;
+        let rules = only(vec![
+            ctx,
+            flag,
+            off,
+            quant,
+            stem,
+            mib,
+            top_k,
+            min_p,
+            top_p,
+            neg,
+            budget,
+            text,
+            vllm,
+            matched,
+            field("ctx", Some("spec:gone"), Some("token")),
+            field("ctx", Some("spec:obj"), Some("token")),
+            field("ctx", Some("spec:arr"), Some("token")),
+            field("ctx", Some("spec:missing"), Some("token")),
+            field("ctx", Some("spec:obj.a"), Some("number")),
+            field("ctx", Some("spec:blank"), Some("token")),
+            field("ctx", Some("spec:esc"), Some("token")),
+            field("ctx", Some("spec:huge"), Some("token")),
+            field("ctx", Some("spec:long_path"), Some("token")),
+            field("think", Some("spec:on"), Some("number")),
+        ]);
+        let found = rules.extract_with("llama-server", "example", None, Some(&huge));
+        let values: Vec<&str> = found.iter().map(|item| item.value.as_str()).collect();
+        assert!(values.contains(&"131072"), "{values:?}");
+        assert!(values.contains(&"true"), "{values:?}");
+        assert!(values.contains(&"false"), "{values:?}");
+        assert!(values.contains(&"Q6_K_XL"), "{values:?}");
+        assert!(values.contains(&"example"), "{values:?}");
+        assert!(values.contains(&"2048"), "{values:?}");
+        assert!(values.contains(&"20"), "{values:?}");
+        assert!(values.contains(&"0"), "{values:?}");
+        assert!(values.contains(&"0.95"), "{values:?}");
+        assert!(values.contains(&"24000"), "{values:?}");
+        assert!(values.contains(&"f16"), "{values:?}");
+        assert!(
+            !values
+                .iter()
+                .any(|v| v.contains('\u{1b}') || v.contains('/')),
+            "{values:?}"
+        );
+        // A bool is not a number, and the hostile strings are not tokens.
+        assert_eq!(
+            values.iter().filter(|v| **v == "true").count(),
+            1,
+            "{values:?}"
+        );
+
+        let live = |backend| LiveCtx {
+            backend,
+            detail: None,
+            info: None,
+            engine: None,
+        };
+        let row_text = |backend| -> Vec<String> {
+            rules
+                .rows(&found, &live(backend))
+                .into_iter()
+                .map(|row| {
+                    row.items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            if i == 0 {
+                                item.text.clone()
+                            } else {
+                                format!("{}{}", item.sep, item.text)
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        let llama = row_text(Backend::LlamaCpp);
+        // `kv` is the label. `1` is the nested `obj.a` number on the same row.
+        assert!(
+            llama.iter().any(|row| row == "131,072 · kv f16 · 1"),
+            "{llama:?}"
+        );
+        assert!(llama.iter().any(|row| row.contains("on")), "{llama:?}");
+        assert!(llama.iter().any(|row| row.contains("off")), "{llama:?}");
+        assert!(llama.iter().any(|row| row.contains("2.0 GiB")), "{llama:?}");
+        assert!(
+            llama.iter().any(|row| row.contains("top-p 0.95")
+                && row.contains("top-k 20")
+                && row.contains(" min-p 0")),
+            "{llama:?}"
+        );
+        assert!(
+            llama.iter().any(|row| row.contains("budget 24,000")),
+            "{llama:?}"
+        );
+        // `match` did not see "only-this", so the second f16 is absent.
+        assert_eq!(
+            llama.iter().filter(|row| row.contains("f16")).count(),
+            1,
+            "{llama:?}"
+        );
+        let vllm_rows = row_text(Backend::Vllm);
+        assert!(
+            vllm_rows
+                .iter()
+                .any(|row| row.contains("131,072 · 131,072")),
+            "engines filter adds the vllm copy: {vllm_rows:?}"
+        );
+        assert!(
+            rules
+                .extract_with("llama-server", "example", None, None)
                 .is_empty()
         );
     }

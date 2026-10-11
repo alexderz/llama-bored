@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use llama_core::backend::{Backend, BackendInfo, EngineStats};
 use llama_core::detail::ModelDetail;
 use llama_watch::collector::LoadSource;
-use llama_watch::config::ChartGlyphs;
+use llama_watch::config::{ChartGlyphs, Config};
 use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
@@ -4447,6 +4447,158 @@ fn setup_block_height_follows_the_screen() {
     );
     assert!(!rows[2].contains("kv"), "{rows:#?}");
     assert_blank_edges(&grid);
+}
+
+/// The commented `# >>> spec example` block, as a watch.toml would hold it.
+fn spec_example_rules() -> Rules {
+    let text = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/watch.example.toml"),
+    )
+    .expect("example");
+    let block: String = text
+        .split("# >>> spec example\n")
+        .nth(1)
+        .expect("start marker")
+        .split("# <<< spec example")
+        .next()
+        .expect("end marker")
+        .lines()
+        .filter(|line| !line.starts_with("# "))
+        .map(|line| line.strip_prefix('#').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config::from_toml(&format!("[setup]\n{block}\n")).expect("spec example parses");
+    // The absolute path is checked and not opened.
+    config
+        .validate(8)
+        .expect("spec example validates without opening specs_dir");
+    assert!(!config.setup.defaults);
+    assert_eq!(
+        config
+            .setup
+            .specs_dir
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        Some("/etc/llama-bored/specs".to_owned())
+    );
+    Rules::compile(&config.setup).expect("compile")
+}
+
+/// #92: the example rules over `fixtures/llama/example-spec.json`. A tall
+/// screen shows every row; 160x49 keeps the first five and drops serve
+/// and sample. The long report label and the file's paths stay off the grid.
+#[test]
+fn spec_example_rules_draw_the_fixture() {
+    let rules = spec_example_rules();
+    let body = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/llama/example-spec.json"),
+    )
+    .expect("fixture");
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let found = rules.extract_with("", "example-35b-q6", None, Some(&doc));
+    let live = LiveCtx {
+        backend: Backend::LlamaCpp,
+        detail: None,
+        info: None,
+        engine: None,
+    };
+    let rows = rules.rows(&found, &live);
+    let drawn: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            let text = row
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if i == 0 {
+                        item.text.clone()
+                    } else {
+                        format!("{}{}", item.sep, item.text)
+                    }
+                })
+                .collect();
+            (row.label.clone(), text)
+        })
+        .collect();
+    assert_eq!(
+        drawn,
+        [
+            (
+                "engine".to_owned(),
+                "llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe".to_owned()
+            ),
+            ("ctx".to_owned(), "131,072 · kv f16".to_owned()),
+            (
+                "experts".to_owned(),
+                "18 layers in RAM · gpu 999 · mmap off".to_owned()
+            ),
+            ("spec".to_owned(), "none".to_owned()),
+            ("think".to_owned(), "on · budget 24,000".to_owned()),
+            (
+                "serve".to_owned(),
+                "multi-agent · store nas · role untested".to_owned()
+            ),
+            (
+                "sample".to_owned(),
+                "temp 0.6 · top-p 0.95 · top-k 20 · min-p 0 · pres 0".to_owned()
+            ),
+        ]
+    );
+
+    let mut model = sample(WatchState::Generating);
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    model.setup = Some(SetupView {
+        id: "example-35b-q6".to_owned(),
+        name: "Example 35B".to_owned(),
+        more: 0,
+        rows,
+    });
+    let tall = draw(&model, 160, 60);
+    let shown = left_rows(&tall, 10, 9);
+    assert_eq!(shown[0], "", "a blank row under ACTIVITY");
+    assert_eq!(shown[1], "  SETUP  example-35b-q6 · Example 35B");
+    assert_eq!(
+        shown[2..],
+        [
+            "    engine   llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe",
+            "    ctx      131,072 · kv f16",
+            "    experts  18 layers in RAM · gpu 999 · mmap off",
+            "    spec     none",
+            "    think    on · budget 24,000",
+            "    serve    multi-agent · store nas · role untested",
+            "    sample   temp 0.6 · top-p 0.95 · top-k 20 · min-p 0 · pres 0",
+        ]
+    );
+    let short = draw(&model, 160, 49);
+    let shown = left_rows(&short, 10, 7);
+    assert_eq!(shown[1], "  SETUP  example-35b-q6 · Example 35B");
+    assert_eq!(
+        shown[2..],
+        [
+            "    engine   llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe",
+            "    ctx      131,072 · kv f16",
+            "    experts  18 layers in RAM · gpu 999 · mmap off",
+            "    spec     none",
+            "    think    on · budget 24,000",
+        ]
+    );
+    let short_text = whole(&short);
+    assert!(!short_text.contains("multi-agent"), "{short_text}");
+    assert!(!short_text.contains("temp 0.6"), "{short_text}");
+    for grid in [&tall, &short] {
+        let all = whole(grid);
+        for leak in [
+            "Example-35B",
+            "/models",
+            "sha256",
+            "d77d5bc",
+            "retry wave",
+            "8096",
+        ] {
+            assert!(!all.contains(leak), "{leak} in {all}");
+        }
+    }
 }
 
 #[test]

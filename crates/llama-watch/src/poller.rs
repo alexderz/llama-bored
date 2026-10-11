@@ -2,8 +2,9 @@
 //!
 //! The thread owns a single [`ureq::Agent`] (`proxy(None)`, `max_redirects(0)`,
 //! per-call `timeout_global`) and uses it for every tap, including `/running`
-//! via [`crate::sources::llamaswap::read_with`]. One `/running` body supplies
-//! each model's raw id and state. Tails use `input_tail_chars` and
+//! via [`crate::sources::llamaswap::fetch_running`]. One `/running` body supplies
+//! each model's raw id and state, and the spec files for those ids are read
+//! here, off the frame path (#92). Tails use `input_tail_chars` and
 //! `output_tail_chars`.
 //! With `tty.show_text = false` the `/slots` bodies are parsed for numbers
 //! only: no prompt or generated text is kept (RR-LV1).
@@ -110,6 +111,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -132,6 +134,7 @@ use crate::metrics::{
 use crate::recent::{Merged, Recent};
 use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
+use crate::setup_specs::Specs;
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::KvLayout;
 use crate::sources::events::{Events, EventsView};
@@ -425,6 +428,8 @@ struct Limits {
     backends: HashMap<String, Backend>,
     /// `[setup]` rules read from each launch command (#52).
     setup: Rules,
+    /// `[setup] specs_dir`. `None` reads no spec files (#92).
+    specs_dir: Option<PathBuf>,
 }
 
 impl Limits {
@@ -458,6 +463,7 @@ impl Limits {
                 .map(|(model, kind)| (model.clone(), *kind))
                 .collect(),
             setup: Rules::compile(&config.setup).unwrap_or_default(),
+            specs_dir: config.setup.specs_dir.clone(),
         }
     }
 }
@@ -533,6 +539,8 @@ struct State<L> {
     model_kv: Vec<Option<KvLayout>>,
     /// SETUP values of each entry of `models`, in the same order (#52).
     model_setup: Vec<ModelSetup>,
+    /// Per-model spec files, read with `/running` (#92).
+    specs: Specs,
     ready: Vec<ReadyModel>,
     /// While `/running` fails: the models ready at the last good read and
     /// their servers, for the first good read after it (#46).
@@ -642,6 +650,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
     } else {
         SlotBook::without_text()
     };
+    let specs = Specs::new(limits.specs_dir.clone());
     let mut state = State {
         limits,
         agent,
@@ -656,6 +665,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         model_ids: Vec::new(),
         model_kv: Vec::new(),
         model_setup: Vec::new(),
+        specs,
         ready: Vec::new(),
         down_ready: Vec::new(),
         gauges: HashMap::new(),
@@ -768,14 +778,33 @@ impl<L: Sink> State<L> {
                 known.entry(id.clone()).or_insert(*kind);
             }
         }
-        let reading = llamaswap::read_with(
+        let reading = match llamaswap::fetch_running(
             &self.agent,
             &self.limits.url,
             self.limits.running_timeout,
-            &self.limits.aliases,
-            &self.limits.setup,
-            &known,
-        );
+        ) {
+            llamaswap::Fetch::Down(reason) => llamaswap::down_reading(reason),
+            llamaswap::Fetch::Body(bytes) => {
+                // Spec files are local and slow, so they stay on this thread.
+                // The command is still in the body, so a rule's `match` applies.
+                let ids = llamaswap::running_ids(&bytes);
+                self.specs.refresh(&ids, Instant::now(), &mut self.log);
+                let mut docs = HashMap::new();
+                for id in &ids {
+                    if let Some(doc) = self.specs.value(id) {
+                        docs.insert(id.clone(), doc.clone());
+                    }
+                }
+                llamaswap::parse_body(
+                    &bytes,
+                    &self.limits.aliases,
+                    &self.limits.setup,
+                    &known,
+                    &docs,
+                )
+                .unwrap_or_else(|_| llamaswap::down_reading("malformed json"))
+            }
+        };
         let (ai, down) = match reading.ai {
             llamaswap::RunningStatus::Down(reason) => (AiState::Down, Some(reason)),
             llamaswap::RunningStatus::Idle => (AiState::Idle, None),
