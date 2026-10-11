@@ -130,6 +130,8 @@ pub fn nearest_xterm256(rgb: Rgb) -> u8 {
 pub struct SgrTable {
     fg: Vec<Vec<u8>>,
     bg: Vec<Vec<u8>>,
+    mode: ColorMode,
+    palette: Palette,
 }
 
 impl SgrTable {
@@ -153,18 +155,93 @@ impl SgrTable {
             fg.push(format!("\x1b[{f}m").into_bytes());
             bg.push(format!("\x1b[{b}m").into_bytes());
         }
-        Self { fg, bg }
+        Self {
+            fg,
+            bg,
+            mode,
+            palette,
+        }
     }
 
-    /// Foreground sequence of `color`.
+    /// Foreground sequence of an indexed `color`. For an [`Color::Rgb`] (the
+    /// grid source, #107) this is the nearest slot's; [`Self::push_fg`] is
+    /// the exact one.
     pub fn fg(&self, color: Color) -> &[u8] {
-        &self.fg[usize::from(color.index())]
+        &self.fg[usize::from(self.slot(color))]
     }
 
-    /// Background sequence of `color`.
+    /// Background sequence of an indexed `color`; see [`Self::fg`].
     pub fn bg(&self, color: Color) -> &[u8] {
-        &self.bg[usize::from(color.index())]
+        &self.bg[usize::from(self.slot(color))]
     }
+
+    /// Append the foreground sequence of `color`.
+    pub fn push_fg(&self, out: &mut Vec<u8>, color: Color) {
+        match color {
+            Color::Rgb(r, g, b) => self.push_rgb(out, 38, Rgb { r, g, b }),
+            _ => out.extend_from_slice(self.fg(color)),
+        }
+    }
+
+    /// Append the background sequence of `color`.
+    pub fn push_bg(&self, out: &mut Vec<u8>, color: Color) {
+        match color {
+            Color::Rgb(r, g, b) => self.push_rgb(out, 48, Rgb { r, g, b }),
+            _ => out.extend_from_slice(self.bg(color)),
+        }
+    }
+
+    /// An exact RGB in this mode. An RGB equal to one of the palette's 16
+    /// slots is exactly what the vcsa path sends for that slot in every
+    /// mode. Any other: truecolor sends it as is, 256 the nearest xterm
+    /// colour (16..=255), 16 the nearest palette slot.
+    fn push_rgb(&self, out: &mut Vec<u8>, base: u8, rgb: Rgb) {
+        if let Some(index) = self.palette.slots().iter().position(|slot| *slot == rgb) {
+            let table = if base == 38 { &self.fg } else { &self.bg };
+            out.extend_from_slice(&table[index]);
+            return;
+        }
+        let text = match self.mode {
+            ColorMode::Truecolor => format!("\x1b[{base};2;{};{};{}m", rgb.r, rgb.g, rgb.b),
+            ColorMode::Xterm256 => format!("\x1b[{base};5;{}m", nearest_xterm256(rgb)),
+            ColorMode::Ansi16 => {
+                let table = if base == 38 { &self.fg } else { &self.bg };
+                out.extend_from_slice(&table[usize::from(nearest_slot(self.palette, rgb))]);
+                return;
+            }
+        };
+        out.extend_from_slice(text.as_bytes());
+    }
+
+    fn slot(&self, color: Color) -> u8 {
+        if let Color::Rgb(r, g, b) = color {
+            nearest_slot(self.palette, Rgb { r, g, b })
+        } else {
+            color.index().unwrap_or(0)
+        }
+    }
+}
+
+/// The palette slot nearest to `rgb` by squared RGB distance. Ties go to
+/// the lower slot.
+pub fn nearest_slot(palette: Palette, rgb: Rgb) -> u8 {
+    let dist = |c: Rgb| {
+        let d = |a: u8, b: u8| {
+            let x = i32::from(a) - i32::from(b);
+            x * x
+        };
+        d(c.r, rgb.r) + d(c.g, rgb.g) + d(c.b, rgb.b)
+    };
+    let mut best = 0u8;
+    let mut best_d = i32::MAX;
+    for (index, slot) in (0u8..).zip(palette.slots()) {
+        let d = dist(*slot);
+        if d < best_d {
+            best = index;
+            best_d = d;
+        }
+    }
+    best
 }
 
 impl Default for SgrTable {

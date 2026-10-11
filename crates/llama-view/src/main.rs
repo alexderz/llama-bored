@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use llama_view::{
     CliError, ColorSettings, FOCUS_ON, HELP, MAX_VCSA_BYTES, Next, Options, RESTORE, RawInput,
-    Session, SourceWatch, TermGuard, Wait, color_settings, device_paths, kiosk_wanted, parse_args,
-    restored, source_name, tmux_window_wanted, vcsa_geometry, wait_input, wants_focus_reports,
+    Session, SourceKind, SourceWatch, TermGuard, Wait, color_settings, device_paths, kiosk_wanted,
+    load_grid, now_unix_ms, parse_args, restored, source_kind, source_name, stale_secs,
+    tmux_window_wanted, vcsa_geometry, wait_input, wants_focus_reports,
 };
 
 fn main() -> ExitCode {
@@ -43,7 +44,8 @@ fn mirror_with_env(opts: Options) -> Result<(), MirrorError> {
     let colors = color_settings(&opts, env).map_err(MirrorError::Usage)?;
     let tmux_window = tmux_window_wanted(&opts, env);
     let kiosk = kiosk_wanted(&opts, env);
-    mirror(opts, colors, tmux_window, kiosk).map_err(MirrorError::Io)
+    let source = source_kind(&opts, env).map_err(MirrorError::Usage)?;
+    mirror(opts, colors, tmux_window, kiosk, source).map_err(MirrorError::Io)
 }
 
 enum MirrorError {
@@ -58,7 +60,15 @@ fn host_name() -> String {
         .unwrap_or_default()
 }
 
-fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) -> io::Result<()> {
+fn mirror(
+    opts: Options,
+    colors: ColorSettings,
+    tmux_window: bool,
+    kiosk: bool,
+    kind: SourceKind,
+) -> io::Result<()> {
+    let grid_path = opts.grid_path();
+    let grid = kind == SourceKind::Grid;
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         write_restore_stdout();
@@ -71,7 +81,7 @@ fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) 
     // kiosk mode it can be missing at any time (#104: an llama-watch
     // restart frees tty11 for a moment), so opening happens in the loop and
     // a failure is a status line, not an exit.
-    let mut source = if kiosk {
+    let mut source = if kiosk || grid {
         None
     } else {
         Some(open_source(
@@ -80,6 +90,12 @@ fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) 
             vcsu_path.as_deref(),
         )?)
     };
+
+    // The grid source (#107) is the same: outside kiosk mode a missing or
+    // bad file exits 1 before the terminal is touched.
+    if grid && !kiosk {
+        read_grid(&grid_path)?;
+    }
 
     // Keyboard and focus reports, only when stdin is a terminal. Dropped
     // after the guard (declared first), so the screen is restored before the
@@ -94,7 +110,11 @@ fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) 
     }
     let mut session = Session::new(&opts, colors, &host_name(), tmux_window, kiosk);
     let mut watch = SourceWatch::default();
-    let source_name = source_name(opts.vt, opts.device.as_deref());
+    let source_name = if grid {
+        "grid".to_string()
+    } else {
+        source_name(opts.vt, opts.device.as_deref())
+    };
     let mut vcsa_buf = Vec::new();
     let mut vcs_buf = Vec::new();
     let mut vcsu_buf = Vec::new();
@@ -103,7 +123,17 @@ fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) 
     loop {
         // Every frame: the pane and tty11 can both change size at any time.
         let size = terminal_size();
-        if kiosk {
+        if grid {
+            grid_frame(
+                &grid_path,
+                kiosk,
+                &mut watch,
+                &source_name,
+                &mut session,
+                size,
+                &mut out,
+            )?;
+        } else if kiosk {
             kiosk_frame(
                 &vcsa_path,
                 vcs_path.as_deref(),
@@ -167,6 +197,59 @@ fn mirror(opts: Options, colors: ColorSettings, tmux_window: bool, kiosk: bool) 
     }
     if let Some(raw) = input.as_mut() {
         raw.restore()?;
+    }
+    Ok(())
+}
+
+/// [`load_grid`] with the path in the error, for stderr.
+fn read_grid(path: &Path) -> io::Result<llama_core::gridfile::GridImage> {
+    load_grid(path).map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", path.display())))
+}
+
+/// One frame of the grid source (#107). The file is opened afresh every
+/// frame (the writer replaces it with a rename). Outside kiosk mode a read or
+/// decode error is returned (exit 1); a stale file is shown as it is, like a
+/// frozen console. In kiosk mode any failure, and a file with no update for
+/// over 5 s, becomes a status line, retried every 2 s like the vcsa source.
+fn grid_frame(
+    path: &Path,
+    kiosk: bool,
+    watch: &mut SourceWatch,
+    source_name: &str,
+    session: &mut Session,
+    size: (u16, u16),
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.clear();
+    if !kiosk {
+        session.frame_grid(size, &read_grid(path)?, out);
+        return Ok(());
+    }
+    let now = Instant::now();
+    if !watch.due(now) {
+        // Down and not yet due: the status line, which costs nothing when
+        // it has not changed.
+        if let Some(line) = watch.status_line() {
+            session.status_frame(size, line, out);
+        }
+        return Ok(());
+    }
+    let failure = match load_grid(path) {
+        Ok(image) => match stale_secs(image.unix_ms, now_unix_ms()) {
+            Some(secs) => Some(format!("no update for {secs} s")),
+            None => {
+                if watch.recovered() {
+                    session.invalidate();
+                }
+                session.frame_grid(size, &image, out);
+                None
+            }
+        },
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(reason) = failure {
+        let line = watch.failed(source_name, &reason, now).to_string();
+        session.status_frame(size, &line, out);
     }
     Ok(())
 }

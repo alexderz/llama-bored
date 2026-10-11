@@ -310,6 +310,7 @@ enum Rule {
     Temps,
     Setup,
     TtySize,
+    GridPath,
 }
 
 fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
@@ -345,6 +346,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::Temps { .. }) => Rule::Temps,
         Err(InvalidWatchConfig::Setup { .. }) => Rule::Setup,
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
+        Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
     }
 }
 

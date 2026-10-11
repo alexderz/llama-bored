@@ -2,6 +2,7 @@
 
 mod cli;
 mod color;
+mod gridsrc;
 mod input;
 mod kiosk;
 mod pane;
@@ -10,11 +11,12 @@ mod screen;
 mod session;
 
 pub use cli::{
-    CliError, ColorSettings, HELP, Options, color_settings, device_paths, kiosk_wanted, parse_args,
-    tmux_window_name as tmux_window_wanted,
+    CliError, ColorSettings, HELP, Options, SourceKind, color_settings, device_paths, kiosk_wanted,
+    parse_args, source_kind, tmux_window_name as tmux_window_wanted,
 };
 
 pub use color::{ColorChoice, ColorMode, SgrTable, nearest_xterm256, xterm256_rgb};
+pub use gridsrc::{STALE_AFTER_MS, load_grid, now_unix_ms, screen_of, stale_secs};
 pub use input::{RawInput, Wait, raw, restored, wait_input};
 pub use kiosk::{RETRY_PERIOD, SourceWatch, source_name, wants_focus_reports};
 pub use llama_core::palette::Palette;

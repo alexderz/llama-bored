@@ -7,7 +7,7 @@
 use super::chart::{self, ChartBucket, Ink};
 use super::ctx_history::{self, CtxPoint};
 use super::grid::{C16, Cell, Grid};
-use super::sanitize::{detail_char, sanitize};
+use super::sanitize::{detail_char, detail_glyph, sanitize};
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
@@ -602,14 +602,14 @@ fn paint_detail_fg(
         if drawn == cap {
             break;
         }
-        let ch = if matches!(ch, '\u{00B7}' | '\u{2248}') {
-            ch
-        } else if let Some(ch) = detail_char(ch) {
-            ch
+        let glyph = if matches!(ch, '\u{00B7}' | '\u{2248}') {
+            (ch, ch)
+        } else if let Some(glyph) = detail_glyph(ch) {
+            glyph
         } else {
             continue;
         };
-        paint_at(grid, col.saturating_add(drawn), row, ch, fg, C16::Black);
+        paint_glyph(grid, col.saturating_add(drawn), row, glyph, fg, C16::Black);
         drawn += 1;
     }
     drawn
@@ -3099,11 +3099,11 @@ fn paint_fixed(grid: &mut Grid, mut col: u16, row: u16, text: &str, fg: C16) {
 
 fn paint_span_left(grid: &mut Grid, span: Span, row: u16, text: &str, fg: C16, bg: C16) {
     let width = usize::from(span.w);
-    for (i, ch) in one_line(text).chars().take(width).enumerate() {
+    for (i, glyph) in one_line_glyphs(text).into_iter().take(width).enumerate() {
         let Ok(dx) = u16::try_from(i) else {
             break;
         };
-        paint(grid, span.x.saturating_add(dx), row, ch, fg, bg);
+        paint_rich(grid, span.x.saturating_add(dx), row, glyph, fg, bg);
     }
 }
 
@@ -3112,14 +3112,14 @@ fn paint_span_right(grid: &mut Grid, span: Span, row: u16, text: &str, fg: C16, 
     if width == 0 {
         return;
     }
-    let chars: Vec<char> = one_line(text).chars().collect();
+    let chars = one_line_glyphs(text);
     let skip = chars.len().saturating_sub(width);
     let start = width.saturating_sub(chars.len());
-    for (i, ch) in chars.iter().skip(skip).enumerate() {
+    for (i, glyph) in chars.iter().skip(skip).enumerate() {
         let Ok(dx) = u16::try_from(start + i) else {
             break;
         };
-        paint(grid, span.x.saturating_add(dx), row, *ch, fg, bg);
+        paint_rich(grid, span.x.saturating_add(dx), row, *glyph, fg, bg);
     }
 }
 
@@ -3901,7 +3901,11 @@ fn draw_fan_row(
     paint_str(grid, col, row, mode_word(fan.mode), dim_fg, C16::Black);
 }
 
-fn revealed_lines(model: &TtyModel) -> Vec<String> {
+/// One sanitised character of model text: the console `ch` and the `rich`
+/// scalar (#107). `'\n'` is the line-end marker in a stream.
+type Glyph = (char, char);
+
+fn revealed_lines(model: &TtyModel) -> Vec<Vec<Glyph>> {
     let stream = tail_stream(&model.out_lines);
     let total = stream.len();
     let keep = match model.replay_frame {
@@ -3918,7 +3922,7 @@ fn revealed_lines(model: &TtyModel) -> Vec<String> {
     split_chars(&stream[..keep])
 }
 
-fn logical_lines(parts: &[String]) -> Vec<String> {
+fn logical_lines(parts: &[String]) -> Vec<Vec<Glyph>> {
     let stream = tail_stream(parts);
     if stream.is_empty() {
         return Vec::new();
@@ -3928,32 +3932,32 @@ fn logical_lines(parts: &[String]) -> Vec<String> {
 
 /// Sanitised tail. Parts are joined with a line-end, and a `\n` inside a
 /// part is a line-end too. The result uses `\n` only as that marker.
-fn tail_stream(parts: &[String]) -> Vec<char> {
+fn tail_stream(parts: &[String]) -> Vec<Glyph> {
     let mut out = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
-            out.push('\n');
+            out.push(('\n', '\n'));
         }
         let mut cells = Vec::new();
         sanitize(part, &mut cells);
         for cell in cells {
             if cell.is_line_end() {
-                out.push('\n');
+                out.push(('\n', '\n'));
             } else {
-                out.push(cell.ch);
+                out.push((cell.ch, cell.rich));
             }
         }
     }
     out
 }
 
-fn split_chars(chars: &[char]) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    for ch in chars {
-        if *ch == '\n' {
-            lines.push(String::new());
+fn split_chars(chars: &[Glyph]) -> Vec<Vec<Glyph>> {
+    let mut lines = vec![Vec::new()];
+    for glyph in chars {
+        if glyph.0 == '\n' {
+            lines.push(Vec::new());
         } else {
-            lines.last_mut().expect("line").push(*ch);
+            lines.last_mut().expect("line").push(*glyph);
         }
     }
     lines
@@ -3963,7 +3967,7 @@ fn place_lines(
     grid: &mut Grid,
     start: u16,
     rows: u16,
-    lines: &[String],
+    lines: &[Vec<Glyph>],
     live: bool,
     out: bool,
     right: u16,
@@ -3975,12 +3979,12 @@ fn place_lines(
     let pad = rows_n.saturating_sub(view.len());
     let total = view
         .iter()
-        .filter(|line| line.chars().any(|ch| ch != ' '))
+        .filter(|line| line.iter().any(|g| g.0 != ' '))
         .count();
     let third = total.div_ceil(3);
     let mut seen = 0usize;
     for (offset, line) in view.iter().enumerate() {
-        if !line.chars().any(|ch| ch != ' ') {
+        if !line.iter().any(|g| g.0 != ' ') {
             continue;
         }
         seen += 1;
@@ -4000,10 +4004,10 @@ fn place_lines(
     }
 }
 
-fn cursor_col(text: &str) -> u16 {
+fn cursor_col(text: &[Glyph]) -> u16 {
     let mut last = None;
-    for (i, ch) in text.chars().enumerate() {
-        if ch != ' ' {
+    for (i, glyph) in text.iter().enumerate() {
+        if glyph.0 != ' ' {
             last = Some(i);
         }
     }
@@ -4015,15 +4019,15 @@ fn cursor_col(text: &str) -> u16 {
 
 /// Last `limit` visual rows. Wrapping walks back from the end and stops
 /// once the window is full, so a long tail is not wrapped in full.
-fn visual_tail(lines: &[String], width: usize, limit: usize) -> Vec<String> {
+fn visual_tail(lines: &[Vec<Glyph>], width: usize, limit: usize) -> Vec<Vec<Glyph>> {
     if limit == 0 || lines.is_empty() {
         return Vec::new();
     }
     let width = width.max(1);
-    let mut picked: Vec<&str> = Vec::new();
+    let mut picked: Vec<&[Glyph]> = Vec::new();
     let mut rows = 0usize;
     for line in lines.iter().rev() {
-        picked.push(line.as_str());
+        picked.push(line.as_slice());
         rows = rows.saturating_add(visual_row_count(line, width));
         if rows >= limit {
             break;
@@ -4046,16 +4050,15 @@ fn visual_tail(lines: &[String], width: usize, limit: usize) -> Vec<String> {
     wrapped
 }
 
-fn visual_row_count(line: &str, width: usize) -> usize {
-    let n = line.chars().count();
+fn visual_row_count(line: &[Glyph], width: usize) -> usize {
+    let n = line.len();
     if n == 0 { 1 } else { n.div_ceil(width.max(1)) }
 }
 
-fn hard_wrap_skip(text: &str, width: usize, skip_rows: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
+fn hard_wrap_skip(chars: &[Glyph], width: usize, skip_rows: usize) -> Vec<Vec<Glyph>> {
     if chars.is_empty() {
         return if skip_rows == 0 {
-            vec![String::new()]
+            vec![Vec::new()]
         } else {
             Vec::new()
         };
@@ -4068,19 +4071,18 @@ fn hard_wrap_skip(text: &str, width: usize, skip_rows: usize) -> Vec<String> {
     let mut i = start;
     while i < chars.len() {
         let end = (i + width).min(chars.len());
-        out.push(chars[i..end].iter().collect());
+        out.push(chars[i..end].to_vec());
         i = end;
     }
     out
 }
 
-fn paint_line(grid: &mut Grid, row: u16, text: &str, fg: C16) {
-    let chars: Vec<char> = text.chars().collect();
-    let Some(last) = chars.iter().rposition(|ch| *ch != ' ') else {
+fn paint_line(grid: &mut Grid, row: u16, chars: &[Glyph], fg: C16) {
+    let Some(last) = chars.iter().rposition(|g| g.0 != ' ') else {
         return;
     };
-    for (i, ch) in chars.iter().enumerate().take(last + 1) {
-        paint_at(grid, 2 + i, usize::from(row), *ch, fg, C16::Black);
+    for (i, glyph) in chars.iter().enumerate().take(last + 1) {
+        paint_glyph(grid, 2 + i, usize::from(row), *glyph, fg, C16::Black);
     }
 }
 
@@ -4201,23 +4203,23 @@ fn status_colour(status: HealthStatus) -> (C16, C16) {
 }
 
 fn right_align(grid: &mut Grid, end: u16, row: u16, text: &str, fg: C16, bg: C16) {
-    let chars: Vec<char> = one_line(text).chars().collect();
+    let chars = one_line_glyphs(text);
     let end_u = usize::from(end);
     let len = chars.len().min(end_u.saturating_add(1));
     let start = end_u.saturating_add(1).saturating_sub(len);
     let skip = chars.len().saturating_sub(len);
-    for (i, ch) in chars.iter().skip(skip).enumerate() {
-        paint_at(grid, start + i, usize::from(row), *ch, fg, bg);
+    for (i, glyph) in chars.iter().skip(skip).enumerate() {
+        paint_glyph(grid, start + i, usize::from(row), *glyph, fg, bg);
     }
 }
 
 fn center_in(grid: &mut Grid, left: u16, right: u16, row: u16, text: &str, fg: C16, bg: C16) {
     let width = usize::from(right.saturating_sub(left).saturating_add(1));
-    let chars: Vec<char> = one_line(text).chars().collect();
+    let chars = one_line_glyphs(text);
     let len = chars.len().min(width);
     let start = usize::from(left) + width.saturating_sub(len) / 2;
-    for (i, ch) in chars.iter().take(len).enumerate() {
-        paint_at(grid, start + i, usize::from(row), *ch, fg, bg);
+    for (i, glyph) in chars.iter().take(len).enumerate() {
+        paint_glyph(grid, start + i, usize::from(row), *glyph, fg, bg);
     }
 }
 
@@ -4228,12 +4230,20 @@ fn fill_span(grid: &mut Grid, left: u16, right: u16, row: u16, ch: char, fg: C16
 }
 
 fn one_line(text: &str) -> String {
+    one_line_glyphs(text)
+        .into_iter()
+        .map(|(ch, _)| ch)
+        .collect()
+}
+
+/// [`one_line`] keeping each cell's `rich` scalar: `(ch, rich)` pairs (#107).
+fn one_line_glyphs(text: &str) -> Vec<Glyph> {
     let mut cells = Vec::new();
     sanitize(text, &mut cells);
     cells
         .into_iter()
         .take_while(|cell| !cell.is_line_end())
-        .map(|cell| cell.ch)
+        .map(|cell| (cell.ch, cell.rich))
         .collect()
 }
 
@@ -4251,25 +4261,41 @@ fn paint_fit(grid: &mut Grid, col: u16, row: u16, text: &str, fg: C16, bg: C16, 
         if cell.is_line_end() {
             break;
         }
-        paint_at(grid, origin + drawn, usize::from(row), cell.ch, fg, bg);
+        paint_glyph(
+            grid,
+            origin + drawn,
+            usize::from(row),
+            (cell.ch, cell.rich),
+            fg,
+            bg,
+        );
     }
 }
 
 fn paint_at(grid: &mut Grid, col: usize, row: usize, ch: char, fg: C16, bg: C16) {
+    paint_glyph(grid, col, row, (ch, ch), fg, bg);
+}
+
+/// [`paint_at`] for a `(ch, rich)` pair (#107).
+fn paint_glyph(grid: &mut Grid, col: usize, row: usize, glyph: Glyph, fg: C16, bg: C16) {
     let Ok(col) = u16::try_from(col) else {
         return;
     };
     let Ok(row) = u16::try_from(row) else {
         return;
     };
-    paint(grid, col, row, ch, fg, bg);
+    paint_rich(grid, col, row, glyph, fg, bg);
 }
 
 fn paint(grid: &mut Grid, col: u16, row: u16, ch: char, fg: C16, bg: C16) {
+    paint_rich(grid, col, row, (ch, ch), fg, bg);
+}
+
+fn paint_rich(grid: &mut Grid, col: u16, row: u16, (ch, rich): Glyph, fg: C16, bg: C16) {
     if row >= grid.rows().saturating_sub(1) || col >= grid.cols().saturating_sub(1) {
         return;
     }
-    grid.put(col, row, Cell::new(ch, fg, bg));
+    grid.put(col, row, Cell::with_rich(ch, rich, fg, bg));
 }
 
 pub(crate) fn commas(n: u64) -> String {

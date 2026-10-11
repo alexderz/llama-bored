@@ -1058,6 +1058,63 @@ shows a status line and keeps retrying every 2 seconds instead of exiting.
 A terminal write failure (the console is gone) also exits 0; only a usage
 error exits 2.
 
+**Original characters and exact RGB: the grid source (#107).** `llama-view`
+mirrors the console, so it can only show what the console font has: model
+text is transliterated to ASCII there (`café` reads `cafe`, `→` reads `>`).
+llama-watch can also publish each frame as a file that keeps the original
+characters, and `llama-view --source grid` draws that on a full-Unicode
+terminal. In `watch.toml` (off by default; with it off nothing is written):
+
+```toml
+[grid]
+enabled = true
+path = "/run/llama-watch-grid/grid"   # default
+```
+
+The file is rewritten atomically (temp file and rename) when the frame
+changes and at least once a second, so a reader can tell a live writer from a
+stale file; writing happens on a thread of its own and a failure is logged
+once and never stops the dashboard. Each cell is one Unicode scalar and the
+RGB of its palette slot (`[tty] palette`). A character is shown when a
+terminal draws it as exactly one cell (ASCII, Latin, Greek, Cyrillic,
+punctuation, arrows, maths, box drawing); CJK, emoji, bidi controls, zero-width
+and combining characters fall back to the console's glyph. The format is in
+`llama_core::gridfile`.
+
+```sh
+llama-view --source grid                       # /run/llama-watch-grid/grid
+llama-view --grid /path/to/grid --colors truecolor
+```
+
+`--grid PATH` implies `--source grid`; `LLAMA_VIEW_SOURCE=grid` is the
+environment form. `--colors`, `--palette`, `--fit`, `--offset-x/y`, `--once`
+and the title work as with the console; in 256 and 16 colours an RGB equal
+to a palette slot gives exactly what the console path gives for that slot.
+llama-view reads the file as untrusted data: a bad magic, a size over
+1024x512 or a length that does not match is refused, and a scalar that is
+not safe as one cell is drawn as U+FFFD. Without `--kiosk` a missing or bad
+file exits 1; a file with no update for over 5 s is shown as it is. With
+`--kiosk` any of those, and a stale file, show a status line (`waiting for
+grid - no update for 17 s`) and retry every 2 seconds.
+
+For a dedicated console (kmscon, as in #104), use the grid source with the
+account in group `llama-view`:
+
+```sh
+runuser -u <llama-view-user> -- \
+  /usr/local/libexec/llama-bored/llama-view --kiosk --source grid --colors truecolor --fit center
+```
+
+The unit creates `/run/llama-watch-grid` next to the snapshot directory and
+two root `ExecStartPost=` steps give it to group `llama-view` (mode 2750:
+setgid, so the files inherit the group, `0640`). The service itself gets no
+privilege, and `/run/llama-watch` stays `0750 llama-watch:llama-watch`.
+
+**Privacy.** The grid file holds the same prompt and response text tty11
+shows (`--no-text` and `[tty] show_text = false` leave it out here too). It
+is readable by group `llama-view` only; do not widen that, and do not point
+`path` into a directory other accounts can read.
+
 ## Watch tty11 on a TV
 
 `llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players

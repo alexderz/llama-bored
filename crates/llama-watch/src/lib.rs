@@ -4,6 +4,7 @@ pub mod activity;
 pub mod capture;
 pub mod collector;
 pub mod config;
+pub mod grid_out;
 pub mod inflight;
 pub mod kv;
 pub mod live;

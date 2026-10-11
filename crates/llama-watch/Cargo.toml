@@ -17,5 +17,8 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 ureq = { workspace = true }
 
+[dev-dependencies]
+llama-view = { path = "../llama-view" }
+
 [lints]
 workspace = true

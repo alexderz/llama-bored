@@ -130,6 +130,9 @@ pub struct Term<W> {
     /// tty11's line settings from before [`quiet_stdout`], put back by
     /// [`Self::restore_console`].
     modes: Option<SavedModes>,
+    /// `[grid] enabled` (#107): where each laid-out frame is also offered.
+    /// Never written to the console.
+    grid_tap: Option<crate::grid_out::GridTap>,
 }
 
 impl<W: Write> Term<W> {
@@ -162,7 +165,20 @@ impl<W: Write> Term<W> {
             palette: Palette::Vga,
             palette_set: false,
             modes: None,
+            grid_tap: None,
         })
+    }
+
+    /// Also offer every laid-out frame to `tap` (#107). The console output
+    /// does not change.
+    pub fn with_grid_tap(mut self, tap: crate::grid_out::GridTap) -> Self {
+        self.grid_tap = Some(tap);
+        self
+    }
+
+    /// The grid tap, if `[grid]` is on.
+    pub fn grid_tap(&self) -> Option<&crate::grid_out::GridTap> {
+        self.grid_tap.as_ref()
     }
 
     /// The console palette (#26, `[tty] palette`). [`Palette::Llama`] loads
@@ -236,7 +252,12 @@ impl<W: Write> Term<W> {
     pub fn render(&mut self, grid: &Grid, now: Instant) -> io::Result<()> {
         self.poll_size(now);
         let full = self.need_full(grid, now);
-        if !full && self.written.as_ref().is_some_and(|prev| prev == grid) {
+        if !full
+            && self
+                .written
+                .as_ref()
+                .is_some_and(|prev| prev.same_console(grid))
+        {
             return Ok(());
         }
 

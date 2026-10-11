@@ -33,6 +33,12 @@ const WRITE_FILES: &[&str] = &[
     // #23: llama-watch's atomic snapshot publish, `rustix::io::write` into
     // an O_EXCL temp file under the snapshot directory fd, then renameat.
     "crates/llama-watch/src/publish.rs",
+    // #107: llama-watch's grid file (`[grid]`, off by default): the frame as a
+    // `Write::write_all` into a create_new temp file next to the target, then
+    // rename. It names no /sys or /proc path; its target is a configured
+    // absolute path (default /run/llama-watch-grid/grid, a directory the unit
+    // creates and the service owns).
+    "crates/llama-watch/src/grid_out.rs",
     // #23: llama-view paints its own terminal (stdout) with
     // `Write::write_all`; it opens /dev/vcsa* read-only.
     "crates/llama-view/src/main.rs",
@@ -225,6 +231,7 @@ fn s1_sees_the_qualified_writers_in_the_tree() {
     for rel in [
         "crates/llama-watch/src/tty/term.rs",
         "crates/llama-watch/src/publish.rs",
+        "crates/llama-watch/src/grid_out.rs",
         "crates/llama-view/src/main.rs",
         "crates/llama-view/src/render.rs",
     ] {

@@ -19,6 +19,7 @@ use thiserror::Error;
 use crate::activity::ActivityRow;
 use crate::collector::{WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
+use crate::grid_out::{GridTap, GridWriter};
 use crate::localtime::{HostZone, Zone, format_local, local_request_time};
 use crate::metrics::EngineLive;
 use crate::poller::{self, CaptureView, LlamaDetail, ModelEngineLive, ModelSetup, PollLatencies};
@@ -142,6 +143,9 @@ impl<L: Sink> PublishStep for Publisher<L> {
 impl<W: Write> RenderStep for Term<W> {
     fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()> {
         let grid = layout::layout(model, self.cols(), self.rows());
+        if let Some(tap) = self.grid_tap() {
+            tap.offer(&grid);
+        }
         self.render(&grid, now)
     }
 
@@ -858,13 +862,16 @@ pub fn run(args: &RunArgs) -> i32 {
         }
     };
     let term = match Term::for_stdout(Duration::from_secs(prepared.config.tty.full_redraw_s), now) {
-        Ok(term) => term
-            .with_console_blank(ConsoleBlank::from_minutes(
-                prepared.config.tty.blank_min,
-                prepared.config.tty.sleep_min,
-            ))
-            .with_palette(prepared.config.tty.palette)
-            .with_saved_modes(modes),
+        Ok(term) => {
+            let term = term
+                .with_console_blank(ConsoleBlank::from_minutes(
+                    prepared.config.tty.blank_min,
+                    prepared.config.tty.sleep_min,
+                ))
+                .with_palette(prepared.config.tty.palette)
+                .with_saved_modes(modes);
+            with_grid_file(term, &prepared.config)
+        }
         Err(err) => {
             eprintln!("console: {err}");
             return 1;
@@ -916,6 +923,27 @@ pub fn run(args: &RunArgs) -> i32 {
     });
     drop(poller);
     exit.code()
+}
+
+/// `[grid] enabled` (#107): start the grid writer thread and tap the
+/// terminal's frames into it. A failure to start is logged and the dashboard
+/// runs without the file; it never stops llama-watch.
+fn with_grid_file<W: Write>(term: Term<W>, config: &Config) -> Term<W> {
+    if !config.grid.enabled {
+        return term;
+    }
+    let writer = GridWriter::new(&config.grid.path, config.tty.palette);
+    match GridTap::spawn(writer, log::Stderr) {
+        Ok(tap) => term.with_grid_tap(tap),
+        Err(err) => {
+            log::emit(
+                &mut log::Stderr,
+                Priority::Err,
+                &format!("grid: writer thread not started: {err}"),
+            );
+            term
+        }
+    }
 }
 
 fn tty_model(

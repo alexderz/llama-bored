@@ -395,6 +395,7 @@ name = "llama-watch"
 version = "0.5.3"
 dependencies = [
  "llama-core",
+ "llama-view",
  "nvml-wrapper",
  "rustix",
  "sd-notify",
