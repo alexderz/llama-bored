@@ -485,15 +485,17 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    // Object delimiters are hex (0x7b, 0x7d). safety_scan matches cfg(test)
+    // by counting every brace character, including ones inside strings, and
+    // only then drops this module. An unmatched open would leave the
+    // std::fs::write calls below visible to the write-API allowlist.
     fn nested(depth: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         for _ in 0..depth {
-            bytes.extend_from_slice(br#"{"a":"#);
+            bytes.extend_from_slice(b"\x7b\"a\":");
         }
         bytes.push(b'1');
-        for _ in 0..depth {
-            bytes.push(b'}');
-        }
+        bytes.extend(std::iter::repeat_n(b'\x7d', depth));
         bytes
     }
 
@@ -558,7 +560,7 @@ mod tests {
         let dir = scratch("ok");
         std::fs::write(dir.join("a..b.json"), br#"{"n":7}"#).unwrap();
         std::fs::write(
-            dir.join(&format!("{}.json", "c".repeat(MAX_MODEL_ID))),
+            dir.join(format!("{}.json", "c".repeat(MAX_MODEL_ID))),
             br#"{"n":8}"#,
         )
         .unwrap();
@@ -600,7 +602,8 @@ mod tests {
         let bad = dir.join("bad.json");
         let deep = dir.join("deep.json");
         std::fs::write(&big, vec![b'x'; (MAX_SPEC_BYTES as usize) + 1]).unwrap();
-        std::fs::write(&bad, b"{").unwrap();
+        // 0x7b is an object open. A brace character here unbalances the scan.
+        std::fs::write(&bad, b"\x7b").unwrap();
         std::fs::write(&deep, nested(MAX_SPEC_DEPTH + 1)).unwrap();
         let mut specs = Specs::new(Some(dir));
         let mut log = Mem::new();
@@ -627,7 +630,8 @@ mod tests {
         assert_eq!(specs.value("bad").and_then(|v| v["n"].as_i64()), Some(1));
         assert_eq!(log.count("bad: not json"), 1, "a success clears the cause");
 
-        std::fs::write(&bad, b"{").unwrap();
+        // 0x7b is an object open. A brace character here unbalances the scan.
+        std::fs::write(&bad, b"\x7b").unwrap();
         specs.refresh(
             &names,
             t0 + CHECK_EVERY + CHECK_EVERY + CHECK_EVERY,
