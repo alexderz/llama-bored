@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.5.4 — 2026-10-11
+
+A full-Unicode grid source for llama-view, llama-cast picks the H.264 encoder the local ffmpeg offers, and SETUP rules can read per-model spec files.
+
 ### Added
 
 - A grid source (#107): llama-watch can publish each laid-out tty11 frame as a file (`[grid] enabled = true`, `path`, default `/run/llama-watch-grid/grid`; off by default, nothing is written when off), and `llama-view --source grid` (or `--grid PATH`, env `LLAMA_VIEW_SOURCE`) shows it with the original characters (any single-width Unicode, not just the console font's glyphs) and the exact RGB, for a userspace console such as kmscon. Every cell now carries a `rich` scalar next to the console `ch` (`é`, `→`, `×`, Cyrillic, curly quotes; CJK, emoji, bidi controls and combining marks fall back to the console glyph); tty11's output is unchanged. The file (`llama_core::gridfile`, magic `LBGRID1\n`, 10 bytes a cell) is written atomically on a thread of its own, only when the frame changed plus a heartbeat every second; a failing disk is logged once and never stops the dashboard. llama-view treats the file as untrusted and calls one with no update for 5 s stale (`--kiosk`: status line \"no update for N s\"). `/etc/tmpfiles.d/llama-bored.conf` creates `/run/llama-watch-grid` as `2750 llama-watch:llama-view` (setgid; the watcher's `UMask=0027` makes the file `0640`). The unit's `RuntimeDirectory=` stays the snapshot directory, and `ReadWritePaths=-/run/llama-watch-grid` lets the sandboxed watcher write the grid file. No command runs for the unit while the watcher is up: `TTYVHangup=` would hang up tty11 underneath it.
