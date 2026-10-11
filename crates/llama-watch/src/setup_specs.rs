@@ -147,7 +147,7 @@ impl Specs {
                 }
             }
         }
-        for id in valid {
+        for id in &valid {
             if self.refresh_one(id, set_changed, now, log) {
                 // The directory fd no longer names a directory. The next
                 // refresh opens it again, at the 60 s cadence unless the
@@ -157,6 +157,19 @@ impl Specs {
                 self.log_cause(DIR_CAUSE, log);
                 return;
             }
+        }
+        // A directory that was replaced (recreated, or a new mount over
+        // it) leaves this fd on the old, empty one, where every file is
+        // just missing. Open it again at the next check to tell the two
+        // apart.
+        let none_found = valid.iter().all(|id| {
+            self.files
+                .get(*id)
+                .is_some_and(|entry| entry.stamp.is_none() && entry.cause.is_none())
+        });
+        if none_found {
+            self.fd = None;
+            self.dir_checked = Some(now);
         }
     }
 
@@ -219,7 +232,9 @@ impl Specs {
             match rustix::fs::openat(
                 dir,
                 name.as_str(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                // NONBLOCK: a FIFO swapped in after the stat must not block
+                // the poller. It changes nothing for a regular file.
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
             ) {
                 Ok(file) => file,
@@ -703,6 +718,26 @@ mod tests {
             "{:?}",
             log.lines
         );
+    }
+
+    #[test]
+    fn a_replaced_directory_is_opened_again() {
+        let dir = scratch("replaced");
+        let mut specs = Specs::new(Some(dir.clone()));
+        let mut log = Mem::new();
+        let t0 = Instant::now();
+        specs.refresh(&ids(&["m"]), t0, &mut log);
+        assert!(specs.value("m").is_none());
+
+        let old = dir.with_extension("old");
+        let _ = std::fs::remove_dir_all(&old);
+        std::fs::rename(&dir, &old).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.json"), br#"{"n":7}"#).unwrap();
+        specs.refresh(&ids(&["m"]), t0 + CHECK_EVERY, &mut log);
+        assert_eq!(specs.value("m").and_then(|v| v["n"].as_i64()), Some(7));
+        assert!(log.lines.is_empty(), "{:?}", log.lines);
+        let _ = std::fs::remove_dir_all(&old);
     }
 
     #[test]
