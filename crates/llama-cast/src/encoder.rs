@@ -557,13 +557,15 @@ pub fn ffmpeg_args(codec: Codec, settings: Settings) -> Vec<String> {
         }
         Codec::H264Qsv => {
             // Equal `-b:v` and `-maxrate` is how this wrapper selects CBR.
+            // Its pixel formats are nv12 and qsv, not yuv420p
+            // (`ffmpeg -h encoder=h264_qsv`), so the frame is nv12.
             args.extend([
                 "-c:v",
                 "h264_qsv",
                 "-preset",
                 "veryfast",
                 "-pix_fmt",
-                "yuv420p",
+                "nv12",
                 "-r",
                 &output_fps,
                 "-g",

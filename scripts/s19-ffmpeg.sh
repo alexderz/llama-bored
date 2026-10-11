@@ -37,6 +37,7 @@ s19_path_bad() {
   local path="$1" part lower base
   local -a parts=()
   IFS='/' read -ra parts <<< "$path"
+  local i
   for part in "${parts[@]}"; do
     lower=$(printf '%s' "$part" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
@@ -45,6 +46,17 @@ s19_path_bad() {
         ;;
     esac
   done
+  # A directory whose name is, or starts with, one of those projects
+  # (`ffmpeg-src/`, `x264-master/`). The last component is the file, so a
+  # note named ffmpeg-notes.md is not a vendored tree.
+  if ((${#parts[@]} > 1)); then
+    for ((i = 0; i < ${#parts[@]} - 1; i++)); do
+      lower=$(printf '%s' "${parts[$i]}" | tr '[:upper:]' '[:lower:]')
+      if s19_dir_bad "$lower"; then
+        return 0
+      fi
+    done
+  fi
   base="${path##*/}"
   lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
   case "$lower" in
@@ -65,6 +77,23 @@ s19_path_bad() {
   return 1
 }
 
+# Directory component: the project name itself, or a longer name that
+# starts with it (`ffmpeg-src`, `x264-master`).
+s19_dir_bad() {
+  local name="$1" banned
+  local projects=(
+    ffmpeg ffprobe ffplay x264 x265 openh264
+    libavcodec libavformat libavutil libavdevice libavfilter
+    libswscale libswresample libav
+  )
+  for banned in "${projects[@]}"; do
+    if [[ "$name" == "$banned" || "$name" == "$banned"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 s19_crate_forbidden() {
   local name="$1" crate
   for crate in "${s19_crates[@]}"; do
@@ -75,20 +104,36 @@ s19_crate_forbidden() {
   return 1
 }
 
-# Crate names from Cargo.toml / Cargo.lock lines. `name = "foo"` and
-# `foo = ...` (including `foo.workspace = true`). Exact match only.
+s19_emit_crate() {
+  if s19_crate_forbidden "$1"; then
+    printf '%s\n' "$1"
+  fi
+  return 0
+}
+
+# Crate names from Cargo.toml / Cargo.lock lines. Exact match only:
+# `name = "foo"`, `foo = ...` (including `foo.workspace = true`), a
+# table `[dependencies.foo]` (also dev-, build-, workspace and
+# target-specific tables), and a rename `x = { package = "foo" }`.
 s19_crate_hits() {
   local line key
   while IFS= read -r line || [[ -n "$line" ]]; do
     key=""
     if [[ "$line" =~ ^[[:space:]]*(name|package)[[:space:]]*=[[:space:]]*\"([A-Za-z0-9_+.-]+)\" ]]; then
       key="${BASH_REMATCH[2]}"
+      s19_emit_crate "$key"
     elif [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_+.-]+)[[:space:]]*= ]]; then
       key="${BASH_REMATCH[1]}"
       key="${key%.workspace}"
+      s19_emit_crate "$key"
     fi
-    if [[ -n "$key" ]] && s19_crate_forbidden "$key"; then
-      printf '%s\n' "$key"
+    if [[ "$line" =~ package[[:space:]]*=[[:space:]]*\"([A-Za-z0-9_+.-]+)\" ]]; then
+      s19_emit_crate "${BASH_REMATCH[1]}"
+    fi
+    if [[ "$line" =~ ^[[:space:]]*\[((dev|build)-dependencies|dependencies|workspace\.dependencies)\.([A-Za-z0-9_+.-]+)\] ]]; then
+      s19_emit_crate "${BASH_REMATCH[3]}"
+    elif [[ "$line" =~ ^[[:space:]]*\[[Tt]arget\.[^]]*\.(dev-dependencies|build-dependencies|dependencies)\.([A-Za-z0-9_+.-]+)\] ]]; then
+      s19_emit_crate "${BASH_REMATCH[2]}"
     fi
   done | sort -u
 }
@@ -149,6 +194,11 @@ s19_self_test() {
   s19_expect_path "README.md" allow
   s19_expect_path "scripts/s19-ffmpeg.sh" allow
   s19_expect_path "docs/ffmpeg-notes.md" allow
+  s19_expect_path "ffmpeg-src/libavcodec/utils.c" reject
+  s19_expect_path "x264-master/common/common.c" reject
+  s19_expect_path "openh264-build/src/codec.c" reject
+  s19_expect_path "vendor/not-x264/file.c" allow
+  s19_expect_path "notes/my-ffmpeg-next/readme.md" allow
 
   planted=$(printf '%s\n' \
     'name = "ffmpeg-next"' \
@@ -159,9 +209,19 @@ s19_self_test() {
     'rav1e = "0.7"' \
     'openh264.workspace = true' \
     'serde = "1"' \
-    'name = "serde"')
+    'name = "serde"' \
+    '[dependencies.ffmpeg-next]' \
+    'version = "1"' \
+    '[dev-dependencies.dav1d]' \
+    '[build-dependencies.x264-sys]' \
+    "[target.'cfg(unix)'.dependencies.openh264-sys]" \
+    '[target."cfg(windows)".build-dependencies.rav1e]' \
+    'helper = { package = "ffmpeg-next" }' \
+    'other = { package = "serde" }' \
+    '[dependencies.ffmpeg-next-tools]' \
+    '[workspace.dependencies.aom-sys]')
   hits="$(s19_crate_hits <<<"$planted")"
-  if [[ "$hits" != $'ffmpeg-next\nffmpeg-sys\nopenh264\nrav1e\nx264' ]]; then
+  if [[ "$hits" != $'aom-sys\ndav1d\nffmpeg-next\nffmpeg-sys\nopenh264\nopenh264-sys\nrav1e\nx264\nx264-sys' ]]; then
     echo "S19 self-test: crate hits were:" >&2
     printf '%s\n' "$hits" >&2
     exit 1

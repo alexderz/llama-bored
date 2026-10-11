@@ -393,6 +393,24 @@ pub fn body_length(req: &Request, limits: &Limits) -> Result<usize, Refusal> {
 pub trait Live: Send + Sync + 'static {
     /// Start a stream. Dropping it stops everything behind it.
     fn open(&self) -> io::Result<Box<dyn Read + Send>>;
+
+    /// A refusal already logged at start, when every stream will fail the
+    /// same way. The server stays quiet and still answers 500.
+    fn refused(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Log a failed `open`, unless that refusal was already logged at start.
+pub fn log_stream_open_error(already_logged: bool, err: &io::Error, sink: &mut impl log::Sink) {
+    if already_logged {
+        return;
+    }
+    log::emit(
+        sink,
+        Priority::Err,
+        &format!("stream: cannot start the encoder: {err}"),
+    );
 }
 
 /// What the handlers serve.
@@ -703,11 +721,9 @@ impl Worker {
         let mut source = match self.app.live.open() {
             Ok(source) => source,
             Err(err) => {
-                log::emit(
-                    &mut log::Stderr,
-                    Priority::Err,
-                    &format!("stream: cannot start the encoder: {err}"),
-                );
+                // The start-up line already names a missing encoder. Do not
+                // repeat it for every viewer.
+                log_stream_open_error(self.app.live.refused().is_some(), &err, &mut log::Stderr);
                 let status = "500 Internal Server Error";
                 send(
                     stream,

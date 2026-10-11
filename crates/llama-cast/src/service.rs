@@ -66,6 +66,10 @@ pub struct FfmpegLive {
 }
 
 impl Live for FfmpegLive {
+    fn refused(&self) -> Option<&str> {
+        self.codec.as_ref().err().map(String::as_str)
+    }
+
     fn open(&self) -> io::Result<Box<dyn Read + Send>> {
         // A missing encoder was logged once at start. Refuse here, the
         // same way a failed ffmpeg is refused, without spawning one.
