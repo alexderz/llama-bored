@@ -35,6 +35,65 @@ pub struct Options {
     /// unreadable console source shows a status line and retries instead of
     /// exiting (#104).
     pub kiosk: bool,
+    /// `--source`. `None`: `--grid` implies grid, else `LLAMA_VIEW_SOURCE`,
+    /// else `vcsa` (see [`source_kind`]).
+    pub source: Option<SourceKind>,
+    /// `--grid`: the grid file (#107). `None`: [`DEFAULT_GRID_PATH`].
+    pub grid: Option<PathBuf>,
+}
+
+/// Where the cells come from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SourceKind {
+    /// `/dev/vcsaN`: what the console shows, limited to its font.
+    #[default]
+    Vcsa,
+    /// llama-watch's grid file (#107): the original characters, exact RGB.
+    Grid,
+}
+
+impl SourceKind {
+    /// `vcsa` or `grid`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "vcsa" => Some(Self::Vcsa),
+            "grid" => Some(Self::Grid),
+            _ => None,
+        }
+    }
+}
+
+/// Where llama-watch's `[grid]` writes unless `path` says otherwise.
+pub const DEFAULT_GRID_PATH: &str = "/run/llama-watch-grid/grid";
+
+/// Resolve the source: `--source`, else `grid` when `--grid` was given, else
+/// `LLAMA_VIEW_SOURCE`, else `vcsa`. An unknown value in the variable is an
+/// error, like in the flag.
+pub fn source_kind<F>(opts: &Options, env: F) -> Result<SourceKind, CliError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(kind) = opts.source {
+        return Ok(kind);
+    }
+    if opts.grid.is_some() {
+        return Ok(SourceKind::Grid);
+    }
+    match env("LLAMA_VIEW_SOURCE") {
+        Some(text) => SourceKind::parse(&text).ok_or_else(|| {
+            CliError::Message(format!("LLAMA_VIEW_SOURCE={text} is not vcsa or grid"))
+        }),
+        None => Ok(SourceKind::Vcsa),
+    }
+}
+
+impl Options {
+    /// The grid file to read.
+    pub fn grid_path(&self) -> PathBuf {
+        self.grid
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_GRID_PATH))
+    }
 }
 
 impl Default for Options {
@@ -52,6 +111,8 @@ impl Default for Options {
             fit: Fit::Crop,
             tmux_window_name: false,
             kiosk: false,
+            source: None,
+            grid: None,
         }
     }
 }
@@ -68,6 +129,16 @@ llama-view — read-only mirror of a Linux virtual console
 
 Keys: q or Ctrl-C quits and restores the terminal.
 
+  --source KIND   vcsa (default) or grid; env LLAMA_VIEW_SOURCE
+                  vcsa: read /dev/vcsaN, limited to tty11's font
+                  grid: read the file llama-watch writes with `[grid] enabled`
+                  (#107): the original characters (any single-width Unicode)
+                  and exact RGB, for a userspace console such as kmscon
+  --grid PATH     the grid file (default /run/llama-watch-grid/grid); implies
+                  --source grid. The account must be in group llama-view. The
+                  file holds the same text tty11 shows. A file with no update
+                  for over 5 s is stale: an error, or under --kiosk the status
+                  line \"no update for N s\"
   --vt N          console number (default 11, range 0..=63)
   --device PATH   vcsa path for tests; vcs and vcsu are sibling names
   --fps N         poll rate (default 10, range 1..=20)
@@ -112,7 +183,7 @@ terminal back.
 Kiosk mode (--kiosk): stdin HUP/EOF, or a terminal write failure (the
 console is gone), exits 0 instead of 1 — a supervisor such as kmscon
 respawns it. Usage errors still exit 2. Outside --kiosk, q/Q/Ctrl-C/Ctrl-\\
-quit with exit 0; any vcsa open, read or decode error exits 1.
+quit with exit 0; any vcsa or grid open, read or decode error exits 1.
 ";
 
 /// `--tmux-window-name` or `LLAMA_VIEW_TMUX_WINDOW` (`1`, `yes`, `true`,
@@ -194,6 +265,16 @@ where
         let arg = arg.as_ref();
         match arg {
             "--help" | "-h" => return Err(CliError::Help),
+            "--source" => {
+                let value = need(&mut args, "--source")?;
+                opts.source = Some(SourceKind::parse(&value).ok_or_else(|| {
+                    CliError::Message(format!("--source {value} is not vcsa or grid"))
+                })?);
+            }
+            "--grid" => {
+                let value = need(&mut args, "--grid")?;
+                opts.grid = Some(PathBuf::from(value));
+            }
             "--vt" => {
                 let value = need(&mut args, "--vt")?;
                 opts.vt = parse_vt(&value)?;
@@ -254,6 +335,11 @@ where
                 return Err(CliError::Message(format!("unknown argument {other}")));
             }
         }
+    }
+    if opts.grid.is_some() && opts.source == Some(SourceKind::Vcsa) {
+        return Err(CliError::Message(
+            "--grid needs --source grid, not --source vcsa".to_string(),
+        ));
     }
     Ok(opts)
 }

@@ -186,6 +186,17 @@ enabled = true
 # HyperQwen image). `match` limits the rules to commands naming it; the
 # engine is told from its /metrics, so `engines = ["vllm"]` still applies.
 # Copy the block below, without the leading "#", into watch.toml.
+# Publish each laid-out tty11 frame as a file for llama-view --source grid
+# (#107): the original characters (full Unicode, one cell each) and exact
+# RGB, for a userspace console such as kmscon. Off by default; with it off
+# nothing is written. The file holds the same prompt and response text tty11
+# shows, readable by group llama-view only. The directory below is created by
+# the unit (RuntimeDirectory=llama-watch-grid); a path outside it has to exist
+# and be writable by the llama-watch account.
+#[grid]
+#enabled = true
+#path = "/run/llama-watch-grid/grid"
+
 # >>> setup example
 #[[setup.field]]
 #row = "engine"

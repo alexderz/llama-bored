@@ -29,10 +29,18 @@
 //!    [`UNKNOWN`], not `?`: a `?` in the input now always means a literal
 //!    `?` was there.
 //!
+//! Every cell also carries `rich` (#107): the original scalar when
+//! [`is_showable`] says a full-Unicode terminal draws it as one cell
+//! (`é`, `→`, `×`, Cyrillic), else the same value as `ch`. The console
+//! emitter never reads it; the grid file does. `ch` is exactly what it was
+//! before `rich` existed.
+//!
 //! Printable ASCII is kept. `\n` appends an end-of-line marker and resets the
 //! tab column. `\t` expands to the next multiple of 4 columns (1 to 4 spaces).
 //! `\r` is dropped and does not move the column. Other C0, DEL, and C1 are
 //! dropped. Each call starts at column 0; cells already in `out` stay.
+
+use llama_core::glyph::is_showable;
 
 use super::grid::{C16, Cell};
 
@@ -75,7 +83,8 @@ pub fn sanitize(input: &str, out: &mut Vec<Cell>) {
             // dash, it should not appear as anything at all.
             c if dropped(c) => {}
             c => {
-                push(out, transliterate(c));
+                let ch = transliterate(c);
+                out.push(Cell::with_rich(ch, rich_of(c, ch), C16::White, C16::Black));
                 col += 1;
             }
         }
@@ -96,13 +105,25 @@ fn dropped(c: char) -> bool {
 /// tab and newline), printable ASCII as itself, anything else through
 /// [`transliterate`]. For [`super::layout`]'s detail painters (#90).
 pub(crate) fn detail_char(c: char) -> Option<char> {
+    detail_glyph(c).map(|(ch, _)| ch)
+}
+
+/// [`detail_char`] with the cell's `rich` scalar: `(ch, rich)`.
+pub(crate) fn detail_glyph(c: char) -> Option<(char, char)> {
     if dropped(c) {
         None
     } else if ('\u{20}'..='\u{7e}').contains(&c) {
-        Some(c)
+        Some((c, c))
     } else {
-        Some(transliterate(c))
+        let ch = transliterate(c);
+        Some((ch, rich_of(c, ch)))
     }
+}
+
+/// What a full-Unicode terminal draws for the input scalar `c` whose console
+/// cell is `ch`: `c` itself when it is safe as one cell, else `ch`.
+fn rich_of(c: char, ch: char) -> char {
+    if is_showable(c) { c } else { ch }
 }
 
 /// One scalar outside ASCII to one cell: a mapped character, or [`UNKNOWN`].

@@ -1,43 +1,72 @@
 //! vcsa snapshot: header, attributes, and one character per cell.
 
-/// One of the 16 ANSI console colours. The value is the ANSI index, not the VGA nibble.
+/// One of the 16 ANSI console colours (the value is the ANSI index, not the
+/// VGA nibble), or, from the grid source (#107), an exact RGB.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
 pub enum Color {
-    Black = 0,
-    Red = 1,
-    Green = 2,
-    Yellow = 3,
-    Blue = 4,
-    Magenta = 5,
-    Cyan = 6,
-    White = 7,
-    BrightBlack = 8,
-    BrightRed = 9,
-    BrightGreen = 10,
-    BrightYellow = 11,
-    BrightBlue = 12,
-    BrightMagenta = 13,
-    BrightCyan = 14,
-    BrightWhite = 15,
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    /// An exact colour. Never produced by the vcsa source.
+    Rgb(u8, u8, u8),
 }
 
 impl Color {
-    /// Foreground SGR parameter (`30–37` or `90–97`).
+    /// Foreground SGR parameter (`30–37` or `90–97`). An [`Self::Rgb`] has
+    /// none: it answers as the default foreground, `39`.
     pub fn fg_sgr(self) -> u8 {
-        let n = self as u8;
-        if n < 8 { 30 + n } else { 90 + (n - 8) }
+        match self.index() {
+            Some(n) if n < 8 => 30 + n,
+            Some(n) => 90 + (n - 8),
+            None => 39,
+        }
     }
 
-    /// Background SGR parameter (`40–47` or `100–107`).
+    /// Background SGR parameter (`40–47` or `100–107`). An [`Self::Rgb`]
+    /// answers as the default background, `49`.
     pub fn bg_sgr(self) -> u8 {
-        let n = self as u8;
-        if n < 8 { 40 + n } else { 100 + (n - 8) }
+        match self.index() {
+            Some(n) if n < 8 => 40 + n,
+            Some(n) => 100 + (n - 8),
+            None => 49,
+        }
     }
 
-    /// ANSI index, 0..=15: the slot in `llama_core::palette`.
-    pub fn index(self) -> u8 {
-        self as u8
+    /// ANSI index, 0..=15: the slot in `llama_core::palette`. `None` for
+    /// [`Self::Rgb`].
+    pub fn index(self) -> Option<u8> {
+        Some(match self {
+            Self::Black => 0,
+            Self::Red => 1,
+            Self::Green => 2,
+            Self::Yellow => 3,
+            Self::Blue => 4,
+            Self::Magenta => 5,
+            Self::Cyan => 6,
+            Self::White => 7,
+            Self::BrightBlack => 8,
+            Self::BrightRed => 9,
+            Self::BrightGreen => 10,
+            Self::BrightYellow => 11,
+            Self::BrightBlue => 12,
+            Self::BrightMagenta => 13,
+            Self::BrightCyan => 14,
+            Self::BrightWhite => 15,
+            Self::Rgb(..) => return None,
+        })
     }
 
     /// The colour of ANSI slot `index` (only the low four bits count).

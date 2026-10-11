@@ -5,11 +5,15 @@
 use std::time::Duration;
 
 use crate::cli::{ColorSettings, Options};
+use crate::gridsrc::screen_of;
 use crate::pane::{
     Fit, InputEvent, InputParser, Titler, frame_period, header_engine, header_model, place,
 };
 use crate::render::Renderer;
-use crate::screen::{AttrLayout, Cell, Color, DecodeError, decode_screen_with, detect_layout};
+use crate::screen::{
+    AttrLayout, Cell, Color, DecodeError, Screen, decode_screen_with, detect_layout,
+};
+use llama_core::gridfile::GridImage;
 
 /// What the input asked for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +87,17 @@ impl Session {
             self.layout = found;
         }
         let screen = decode_screen_with(vcsa, vcs, vcsu, self.layout)?;
+        self.paint(screen, pane, out);
+        Ok(())
+    }
+
+    /// [`Self::frame`] for the grid source (#107): the cells and exact
+    /// colours of a decoded grid file, fitted, titled and diffed the same way.
+    pub fn frame_grid(&mut self, pane: (u16, u16), image: &GridImage, out: &mut Vec<u8>) {
+        self.paint(screen_of(image), pane, out);
+    }
+
+    fn paint(&mut self, screen: Screen, pane: (u16, u16), out: &mut Vec<u8>) {
         let sizes = (pane, (screen.cols, screen.rows));
         if self.last_sizes.is_some_and(|last| last != sizes) {
             self.renderer.invalidate();
@@ -103,7 +118,6 @@ impl Session {
             self.vt,
         );
         out.extend_from_slice(self.renderer.render(view.cols, view.rows, &view.cells));
-        Ok(())
     }
 
     /// `--kiosk` (#104), while the console source is down: a blank screen

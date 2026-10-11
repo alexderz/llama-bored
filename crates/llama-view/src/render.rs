@@ -268,11 +268,11 @@ fn emit_diff(
 
 fn emit_sgr(out: &mut Vec<u8>, cell: Cell, pen: &mut Pen<'_>) {
     if *pen.fg != Some(cell.fg) {
-        out.extend_from_slice(pen.sgr.fg(cell.fg));
+        pen.sgr.push_fg(out, cell.fg);
         *pen.fg = Some(cell.fg);
     }
     if *pen.bg != Some(cell.bg) {
-        out.extend_from_slice(pen.sgr.bg(cell.bg));
+        pen.sgr.push_bg(out, cell.bg);
         *pen.bg = Some(cell.bg);
     }
 }

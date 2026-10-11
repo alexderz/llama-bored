@@ -1,5 +1,6 @@
 //! Cell grid. `ch` is a Unicode scalar; the sanitiser and the emitter decide
-//! which scalars are legal.
+//! which scalars are legal. `rich` is the same cell for a full-Unicode
+//! viewer (the grid file, #107); tty11 never reads it.
 
 /// The 16 console colours. Foreground uses all of them (SGR 30–37 and 90–97).
 /// Background SGR is only 40–47, so a bright background is drawn as the
@@ -71,25 +72,43 @@ impl C16 {
 ///
 /// `ch == '\n'` is an end-of-line marker from the sanitiser, not a glyph.
 /// Every other `ch` the sanitiser produces is printable ASCII or `?`.
+///
+/// `rich` is what a full-Unicode terminal should draw instead of `ch`: the
+/// original scalar when it is safe to show as one cell
+/// (`llama_core::glyph::is_showable`), else `ch` itself. The console emitter
+/// ignores it; it is what the grid file carries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cell {
     pub ch: char,
+    pub rich: char,
     pub fg: C16,
     pub bg: C16,
 }
 
 impl Cell {
+    /// A cell whose `rich` is its `ch`.
     pub const fn new(ch: char, fg: C16, bg: C16) -> Self {
-        Self { ch, fg, bg }
+        Self {
+            ch,
+            rich: ch,
+            fg,
+            bg,
+        }
+    }
+
+    /// A cell the console draws as `ch` and a full-Unicode viewer as `rich`.
+    pub const fn with_rich(ch: char, rich: char, fg: C16, bg: C16) -> Self {
+        Self { ch, rich, fg, bg }
     }
 
     /// Space, white on black.
     pub const fn blank() -> Self {
-        Self {
-            ch: ' ',
-            fg: C16::White,
-            bg: C16::Black,
-        }
+        Self::new(' ', C16::White, C16::Black)
+    }
+
+    /// Same console output: `ch`, `fg` and `bg` match, `rich` is ignored.
+    pub const fn same_console(self, other: Self) -> bool {
+        self.ch == other.ch && self.fg as u8 == other.fg as u8 && self.bg as u8 == other.bg as u8
     }
 
     pub const fn is_line_end(self) -> bool {
@@ -159,6 +178,24 @@ impl Grid {
         self.checked_index(col, row).map(|i| self.cells[i])
     }
 
+    /// Every cell has the same console output as `other`'s (see
+    /// [`Cell::same_console`]) and the sizes match. A cell that differs only
+    /// in `rich` writes nothing to tty11.
+    pub(crate) fn same_console(&self, other: &Grid) -> bool {
+        self.cols == other.cols
+            && self.rows == other.rows
+            && self
+                .cells
+                .iter()
+                .zip(&other.cells)
+                .all(|(a, b)| a.same_console(*b))
+    }
+
+    /// Cells in row-major order.
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
     pub(crate) fn cell_at(&self, col: u16, row: u16) -> Cell {
         self.cells[self.index(col, row)]
     }
@@ -192,7 +229,7 @@ impl Grid {
         for row in 0..self.rows {
             for col in 0..self.cols {
                 let cell = self.cell_at(col, row);
-                if cell != written.cell_at(col, row) {
+                if !cell.same_console(written.cell_at(col, row)) {
                     visit(col, row, cell);
                 }
             }

@@ -5371,3 +5371,60 @@ fn stacked_bars_never_merge_into_one_block() {
         }
     }
 }
+
+/// #107, end to end: model text through the layout, the grid file's encoder
+/// and decoder, and llama-view's renderer. The original characters reach the
+/// viewer's terminal; tty11's cells for the same frame stay ASCII.
+#[test]
+fn the_grid_file_carries_the_original_characters_to_the_viewer() {
+    use llama_core::gridfile::{GridCell, GridImage, decode, encode};
+    use llama_core::palette::Palette;
+    use llama_view::{ColorMode, Renderer, screen_of};
+
+    let mut model = sample(WatchState::Generating);
+    model.in_lines = vec!["caf\u{e9} \u{2192} \u{d7} \u{44f}\u{43b}\u{43a} \u{4e2d}".to_string()];
+    model.out_lines = vec!["done \u{2014} \u{201c}ok\u{201d}".to_string()];
+    let grid = layout(&model, 160, 48);
+
+    // What tty11 gets: unchanged transliteration, console glyphs only.
+    let console = grid_text(&grid);
+    assert!(console.contains("cafe > x"), "{console}");
+    assert!(!console.contains('\u{e9}') && !console.contains('\u{2192}'));
+
+    let palette = Palette::Llama;
+    let cells: Vec<GridCell> = grid
+        .cells()
+        .iter()
+        .map(|cell| GridCell {
+            ch: cell.rich,
+            fg: palette.rgb(cell.fg.index()),
+            bg: palette.rgb(cell.bg.index() & 7),
+        })
+        .collect();
+    let image = GridImage {
+        seq: 1,
+        unix_ms: 1,
+        cols: grid.cols(),
+        rows: grid.rows(),
+        cells,
+    };
+    let mut bytes = Vec::new();
+    encode(&image, &mut bytes).expect("encode");
+    let decoded = decode(&bytes).expect("decode");
+    let screen = screen_of(&decoded);
+    let out = Renderer::with_colors(ColorMode::Truecolor, palette)
+        .render(screen.cols, screen.rows, &screen.cells)
+        .to_vec();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("caf\u{e9} \u{2192} \u{d7} "), "{text}");
+    assert!(text.contains("\u{44f}\u{43b}\u{43a}"), "{text}");
+    assert!(text.contains("done \u{2014} \u{201c}ok\u{201d}"), "{text}");
+    // CJK has no single-cell form: the console's placeholder is shown.
+    assert!(!text.contains('\u{4e2d}'), "{text}");
+    assert!(text.contains("\u{fffd}"), "{text}");
+    assert!(text.contains("\u{1b}[38;2;"), "exact RGB");
+}
+
+fn grid_text(grid: &llama_watch::tty::Grid) -> String {
+    grid.cells().iter().map(|cell| cell.ch).collect()
+}

@@ -311,6 +311,14 @@ pub enum InvalidWatchConfig {
         /// Requested rows.
         rows: u16,
     },
+    /// `grid.path` is not an absolute path to a file.
+    #[error("grid.path {path:?}: {reason}")]
+    GridPath {
+        /// The configured path.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
 }
 
 /// `[collector]`.
@@ -935,6 +943,60 @@ pub struct Config {
     /// Which launch settings tty11's SETUP block shows (#52).
     #[serde(default)]
     pub setup: Setup,
+    /// The full-Unicode grid file for llama-view (#107). Off by default.
+    #[serde(default)]
+    pub grid: GridFile,
+}
+
+/// Where `[grid] path` points unless the config says otherwise: a directory
+/// the unit creates for it (`RuntimeDirectory=llama-watch-grid`), apart from
+/// the snapshot's so the group that reads this one cannot read that one.
+pub const DEFAULT_GRID_PATH: &str = "/run/llama-watch-grid/grid";
+
+/// Longest `[grid] path`, in bytes.
+pub const MAX_GRID_PATH_BYTES: usize = 4096;
+
+/// `[grid]`: publish each laid-out frame as a file (`llama_core::gridfile`)
+/// so llama-view can show the dashboard with the original characters and
+/// exact RGB (#107). The file holds the same text tty11 shows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GridFile {
+    /// Write the file. Off by default: with it off nothing is written.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The file. Absolute; its directory has to exist and be writable by the
+    /// watcher (the unit's `RuntimeDirectory=` does that for the default).
+    #[serde(default = "defaults::grid_path")]
+    pub path: PathBuf,
+}
+
+impl Default for GridFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: defaults::grid_path(),
+        }
+    }
+}
+
+impl GridFile {
+    fn validate(&self) -> Result<(), &'static str> {
+        let text = self.path.as_os_str().as_encoded_bytes();
+        if text.len() > MAX_GRID_PATH_BYTES {
+            return Err("is too long");
+        }
+        if text.contains(&0) {
+            return Err("contains a NUL byte");
+        }
+        if !self.path.is_absolute() {
+            return Err("is not absolute");
+        }
+        if self.path.file_name().is_none() {
+            return Err("has no file name");
+        }
+        Ok(())
+    }
 }
 
 /// `[setup]`: the rules that pick tty11's SETUP rows from a model's
@@ -1019,6 +1081,11 @@ pub struct SetupField {
 
 mod defaults {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    pub(super) fn grid_path() -> PathBuf {
+        PathBuf::from(super::DEFAULT_GRID_PATH)
+    }
 
     pub(super) fn tick_s() -> f64 {
         0.1
@@ -1413,6 +1480,12 @@ impl Config {
                 watts: self.load.cpu_idle_w,
             });
         }
+        self.grid
+            .validate()
+            .map_err(|reason| InvalidWatchConfig::GridPath {
+                path: self.grid.path.clone(),
+                reason,
+            })?;
         self.fans
             .validate()
             .map_err(|reason| InvalidWatchConfig::Fans { reason })?;
