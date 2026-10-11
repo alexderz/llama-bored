@@ -1106,7 +1106,7 @@ runuser -u <llama-view-user> -- \
 ```
 
 The unit creates `/run/llama-watch-grid` next to the snapshot directory and
-two root `ExecStartPost=` steps give it to group `llama-view` (mode 2750:
+one root `ExecStartPost=` step gives it to group `llama-view` (mode 2750:
 setgid, so the files inherit the group, `0640`). The service itself gets no
 privilege, and `/run/llama-watch` stays `0750 llama-watch:llama-watch`.
 
