@@ -285,6 +285,45 @@ fn encoder_failure_is_500() {
     assert_eq!(h.stats.streams(), 0);
 }
 
+struct LogLines(Vec<String>);
+
+impl llama_core::log::Sink for LogLines {
+    fn write_line(&mut self, line: &str) {
+        self.0.push(line.to_owned());
+    }
+}
+
+/// A missing encoder was logged at start. Each viewer still gets 500, and
+/// the HTTP path does not repeat the line. A failure that was not known at
+/// start is still logged, once per attempt.
+#[test]
+fn a_known_encoder_refusal_stays_quiet_and_is_still_500() {
+    let err =
+        std::io::Error::other("ffmpeg has no usable H.264 encoder (H.264 encoders it has: none)");
+    let mut quiet = LogLines(Vec::new());
+    llama_cast::http::log_stream_open_error(true, &err, &mut quiet);
+    llama_cast::http::log_stream_open_error(true, &err, &mut quiet);
+    assert!(quiet.0.is_empty(), "{:?}", quiet.0);
+    let mut logged = LogLines(Vec::new());
+    llama_cast::http::log_stream_open_error(false, &err, &mut logged);
+    assert_eq!(
+        logged.0,
+        [
+            "<3>stream: cannot start the encoder: ffmpeg has no usable H.264 encoder (H.264 encoders it has: none)"
+        ]
+    );
+
+    let mut live = FakeLive::new();
+    live.fail = true;
+    live.refused = true;
+    let h = spawn(LOCAL, 2, fast_limits(), live);
+    for _ in 0..2 {
+        let resp = exchange(h.addr, b"GET /live.ts HTTP/1.1\r\n\r\n");
+        assert_eq!(status_line(&resp), "HTTP/1.1 500 Internal Server Error");
+    }
+    assert_eq!(h.opened.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn a_peer_outside_the_allowlist_is_closed_unread() {
     let h = spawn(&["10.0.0.0/8"], 2, fast_limits(), FakeLive::new());

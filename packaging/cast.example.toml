@@ -53,10 +53,12 @@ max_clients = 2
 # Constant video bitrate in kbit/s, 500..=20000, or 0 for none. A still
 # dashboard encodes to a few kbit/s; a TV that waits for a fixed amount of
 # data before it plays (Roku Media Player) then takes tens of seconds to
-# start (#20). At this rate the encoder pads a still screen with filler, so
-# the TV's buffer fills in about a second. 0 is the old quality-based
-# stream: least bandwidth, slowest start. Each viewer costs this much LAN
-# bandwidth.
+# start (#20). Only libx264 pads a still screen to this constant bitrate.
+# libopenh264 and the hardware encoders do not, so a TV that waits for a
+# fixed amount of data starts a still dashboard more slowly with them.
+# With libx264 the buffer fills in about a second. 0 is the old
+# quality-based stream: least bandwidth, slowest start. Each viewer costs
+# this much LAN bandwidth.
 bitrate_kbps = 4000
 
 # Seconds between keyframes, 1..=10. Each viewer's stream starts at a
@@ -80,7 +82,9 @@ ffmpeg = "/usr/bin/ffmpeg"
 # h264_vaapi, h264_amf, h264_v4l2m2m) only when neither software encoder
 # exists. Software x264 gives the best text quality at 2 fps, plays
 # everywhere, and takes nothing from a GPU busy with inference; hardware
-# encoders need a device and are a last resort. The shipped unit sets
+# encoders need a device and are a last resort. The choice is made once,
+# at start. After installing or upgrading ffmpeg, restart llama-cast.
+# The shipped unit sets
 # DevicePolicy=closed and allows only /dev/vcsa11, so a hardware encoder
 # usually cannot open its device. Pin one of the names above to require it.
 # An unknown name is a config error.

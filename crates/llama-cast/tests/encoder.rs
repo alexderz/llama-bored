@@ -574,13 +574,13 @@ fn each_encoder_has_one_fixed_argument_vector() {
     assert_eq!(
         join(Codec::H264Qsv),
         format!(
-            "{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
+            "{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 \
              -b:v 4000k -maxrate 4000k -bufsize 4000k {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::H264Qsv),
-        format!("{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt yuv420p -r 10 -g 10 -bf 0 {TAIL}")
+        format!("{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 {TAIL}")
     );
     let vaapi_head = "-hide_banner -loglevel error -init_hw_device vaapi=cast \
          -filter_hw_device cast -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i -";
@@ -707,11 +707,22 @@ fn a_refused_encoder_does_not_spawn_or_read_a_frame() {
         codec: Err("ffmpeg has no usable H.264 encoder (H.264 encoders it has: none)".to_owned()),
         source: Arc::new(PanicSource),
     };
+    assert_eq!(
+        live.refused(),
+        Some("ffmpeg has no usable H.264 encoder (H.264 encoders it has: none)")
+    );
     let err = match live.open() {
         Err(err) => err,
         Ok(_) => panic!("a refused encoder started a stream"),
     };
     assert!(err.to_string().contains("no usable H.264 encoder"), "{err}");
+    let ready = llama_cast::service::FfmpegLive {
+        ffmpeg: PathBuf::from("/usr/bin/ffmpeg"),
+        settings: DEFAULTS,
+        codec: Ok(Codec::Libx264),
+        source: Arc::new(PanicSource),
+    };
+    assert!(ready.refused().is_none());
 }
 
 fn pmt_says_h264(bytes: &[u8]) -> bool {

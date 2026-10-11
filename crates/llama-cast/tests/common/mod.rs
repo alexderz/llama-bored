@@ -59,6 +59,8 @@ pub struct FakeLive {
     pub opened: Arc<AtomicUsize>,
     pub closed: Arc<AtomicUsize>,
     pub fail: bool,
+    /// The encoder was already refused at start, so the server stays quiet.
+    pub refused: bool,
 }
 
 impl FakeLive {
@@ -67,6 +69,7 @@ impl FakeLive {
             opened: Arc::new(AtomicUsize::new(0)),
             closed: Arc::new(AtomicUsize::new(0)),
             fail: false,
+            refused: false,
         }
     }
 }
@@ -92,6 +95,10 @@ impl Drop for FakeStream {
 }
 
 impl Live for FakeLive {
+    fn refused(&self) -> Option<&str> {
+        self.refused.then_some("already logged")
+    }
+
     fn open(&self) -> io::Result<Box<dyn Read + Send>> {
         if self.fail {
             return Err(io::Error::other("no encoder"));
