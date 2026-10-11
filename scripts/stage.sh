@@ -46,8 +46,7 @@ Group=llama-watch
 ExecStartPre=-+/usr/local/libexec/llama-bored/llama-watch tty-setup --config /etc/llama-bored/watch.toml
 ExecStartPre=-+/usr/bin/sh -c 'exec /usr/bin/setterm --term linux --powersave powerdown </dev/tty11 >/dev/tty11'
 ExecStart=/usr/local/libexec/llama-bored/llama-watch run --config /etc/llama-bored/watch.toml
-ExecStartPost=-+/usr/bin/chgrp llama-view /run/llama-watch-grid
-ExecStartPost=-+/usr/bin/chmod 2750 /run/llama-watch-grid
+ExecStartPost=-+/usr/bin/sh -c 'chgrp llama-view /run/llama-watch-grid && chmod 2750 /run/llama-watch-grid'
 ExecStopPost=-/usr/local/libexec/llama-bored/llama-watch tty-reset
 Restart=on-failure
 RestartSec=5
@@ -146,20 +145,21 @@ assert_packaging_contract() {
   # the snapshot's, which stays 0750 llama-watch:llama-watch) is made readable
   # by group llama-view, the group that reads /dev/vcsa11, without giving the
   # watcher any privilege: its seccomp filter blocks chown (@privileged), so
-  # root does it in two `+` steps. They are ExecStartPost, not ExecStartPre:
-  # systemd re-applies RuntimeDirectoryMode and the service's ownership to
-  # the directory before every command it runs, so a pre-step would be undone
-  # by ExecStart. Setgid (2750) makes the files the watcher writes
-  # (UMask=0027 gives 0640) inherit the group; the heartbeat rewrites the file
-  # within a second, so the first file (written before the chgrp) is replaced.
-  # `-` keeps a missing group from stopping the watcher: the directory is then
-  # just group llama-watch and llama-view cannot read the grid.
-  local grid_chgrp='ExecStartPost=-+/usr/bin/chgrp llama-view /run/llama-watch-grid'
-  local grid_chmod='ExecStartPost=-+/usr/bin/chmod 2750 /run/llama-watch-grid'
-  if [[ "$(grep -c '^ExecStartPost=' "$watch")" -ne 2 ]] \
-    || ! grep -F -q -x -- "$grid_chgrp" "$watch" \
-    || ! grep -F -q -x -- "$grid_chmod" "$watch"; then
-    echo "stage self-test: llama-watch.service must have exactly two ExecStartPost, the non-fatal root chgrp and chmod of the grid directory" >&2
+  # root does it in one `+` step. It is ExecStartPost, not ExecStartPre, and
+  # one command, not two: systemd re-applies RuntimeDirectoryMode and the
+  # service's ownership to the directory before every command it runs, so a
+  # pre-step is undone by ExecStart and a second post-step undoes the first
+  # (measured on systemd 259: chgrp then chmod as two steps ends
+  # llama-watch:llama-watch 2750). Setgid (2750) makes the files the watcher
+  # writes (UMask=0027 gives 0640) inherit the group; the heartbeat rewrites
+  # the file within a second, so the first file (written before the chgrp)
+  # is replaced. `-` keeps a missing group from stopping the watcher: the
+  # directory is then just group llama-watch and llama-view cannot read the
+  # grid.
+  local grid_group="ExecStartPost=-+/usr/bin/sh -c 'chgrp llama-view /run/llama-watch-grid && chmod 2750 /run/llama-watch-grid'"
+  if [[ "$(grep -c '^ExecStartPost=' "$watch")" -ne 1 ]] \
+    || ! grep -F -q -x -- "$grid_group" "$watch"; then
+    echo "stage self-test: llama-watch.service must have exactly one ExecStartPost, the non-fatal root chgrp-and-chmod of the grid directory" >&2
     exit 1
   fi
   # #26: the watcher loads llama-bored's palette into tty11 (ESC ] P) and
