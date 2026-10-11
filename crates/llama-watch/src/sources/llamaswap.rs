@@ -101,6 +101,25 @@ pub fn read_with(
     rules: &Rules,
     known: &HashMap<String, Backend>,
 ) -> Reading {
+    let bytes = match fetch_running(agent, url, timeout) {
+        Fetch::Down(reason) => return down_reading(reason),
+        Fetch::Body(bytes) => bytes,
+    };
+    parse_body(&bytes, aliases, rules, known, &HashMap::new())
+        .unwrap_or_else(|_| down_reading("malformed json"))
+}
+
+/// One `GET {url}/running`, before the body is parsed. The poller peeks
+/// the model ids, reads their spec files, then parses (#92).
+pub(crate) enum Fetch {
+    /// Client or HTTP failure. The label is static.
+    Down(&'static str),
+    /// HTTP 200 body, not yet parsed.
+    Body(Vec<u8>),
+}
+
+/// `GET {url}/running`. Does not parse and does not log.
+pub(crate) fn fetch_running(agent: &ureq::Agent, url: &str, timeout: Duration) -> Fetch {
     let endpoint = running_endpoint(url);
     let mut response = match agent
         .get(&endpoint)
@@ -110,15 +129,15 @@ pub fn read_with(
         .call()
     {
         Ok(response) => response,
-        Err(err) => return down_reading(transport_reason(&err)),
+        Err(err) => return Fetch::Down(transport_reason(&err)),
     };
 
     let status = response.status().as_u16();
     if status != 200 {
-        return down_reading("http status");
+        return Fetch::Down("http status");
     }
 
-    let bytes = match response
+    match response
         .body_mut()
         .with_config()
         // ureq errors once this many bytes have been consumed, so a body of
@@ -126,17 +145,12 @@ pub fn read_with(
         .limit(65_536)
         .read_to_vec()
     {
-        Ok(bytes) => bytes,
-        Err(err) => return down_reading(body_reason(&err)),
-    };
-
-    match parse_running(&bytes, aliases, rules, known) {
-        Ok(reading) => reading,
-        Err(()) => down_reading("malformed json"),
+        Ok(bytes) => Fetch::Body(bytes),
+        Err(err) => Fetch::Down(body_reason(&err)),
     }
 }
 
-fn down_reading(reason: &'static str) -> Reading {
+pub(crate) fn down_reading(reason: &'static str) -> Reading {
     Reading {
         ai: RunningStatus::Down(reason),
         models: Vec::new(),
@@ -177,11 +191,35 @@ fn io_reason(err: &std::io::Error) -> &'static str {
     }
 }
 
-fn parse_running(
+/// Model ids in a `/running` body, in order, at most [`MAX_MODELS`].
+/// Malformed JSON is an empty list: the caller still tries to parse, and
+/// an empty list opens no spec files.
+pub(crate) fn running_ids(bytes: &[u8]) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_slice::<RunningResponse>(bytes) else {
+        return Vec::new();
+    };
+    parsed
+        .running
+        .iter()
+        .take(MAX_MODELS)
+        .map(|value| {
+            value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Parse one `/running` body. `specs` is keyed by the raw model id; a
+/// missing entry leaves `spec:` rules blank. The documents are not stored.
+pub(crate) fn parse_body(
     bytes: &[u8],
     aliases: &HashMap<String, String>,
     rules: &Rules,
     known: &HashMap<String, Backend>,
+    specs: &HashMap<String, serde_json::Value>,
 ) -> Result<Reading, ()> {
     let parsed: RunningResponse = serde_json::from_slice(bytes).map_err(|_| ())?;
     if parsed.running.is_empty() {
@@ -220,10 +258,13 @@ fn parse_running(
                 max_running: parsed.max_running,
                 kv: parsed.kv,
                 // The `name` rules (#54) read llama-swap's own `name`.
-                setup: rules.extract_as(
+                // `spec:` rules read the document while the command is
+                // still here, so `match` still applies (#92).
+                setup: rules.extract_with(
                     launch.unwrap_or_default(),
                     entry.name.as_deref().unwrap_or_default(),
                     kind,
+                    entry.model.as_deref().and_then(|id| specs.get(id)),
                 ),
             }
         })
@@ -267,7 +308,7 @@ fn choose_label<'a>(entry: &'a RunningEntry, aliases: &'a HashMap<String, String
 
 /// The body as a value tree: each entry is read into a [`RunningEntry`],
 /// and its launch command is borrowed from the tree by [`launch_command`].
-/// The tree is dropped when [`parse_running`] returns.
+/// The tree is dropped when [`parse_body`] returns.
 #[derive(Deserialize)]
 struct RunningResponse {
     running: Vec<serde_json::Value>,
@@ -285,7 +326,7 @@ struct RunningEntry {
     state: Option<String>,
 }
 
-/// The entry's launch command, read in place and never kept: [`parse_running`]
+/// The entry's launch command, read in place and never kept: [`parse_body`]
 /// turns it into a [`super::cmdline::Launch`] and the `[setup]` values (#52)
 /// at once. A non-string command gives no detail and counts as llama.cpp,
 /// as before T72.
@@ -299,7 +340,13 @@ mod tests {
 
     /// The built-in `[setup]` rules, as a default watch.toml has them.
     fn parse_with_builtin(bytes: &[u8], aliases: &HashMap<String, String>) -> Result<Reading, ()> {
-        parse_running(bytes, aliases, &Rules::builtin(), &HashMap::new())
+        parse_body(
+            bytes,
+            aliases,
+            &Rules::builtin(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
     }
 
     #[test]

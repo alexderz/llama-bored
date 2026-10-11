@@ -932,14 +932,47 @@ object given to a flag, one level deep), `live:NAME` (`engine`, `ctx`,
 `expert_hit`, `pcie_share`), `engine:KEY` (#54: a setting the engine
 reports about itself, below), `name` (#54: the GGUF quant tag in the
 llama-swap model `name`, `Flash Next Q4_K_M`, with kind `quant`; for an
-engine whose command names no weights file), or no source at all for a
+engine whose command names no weights file), `spec:<dotted.path>` (#92: one
+value from that model's entry spec, below), or no source at all for a
 field that only shows its `default`. Kinds: `number` (drawn with thousands
 separators), `token` (at most 16 characters of `A-Z a-z 0-9 _ . + -`; a
 path-like value gives only its file stem), `quant` (the GGUF quant tag of
 a model file name, `UD-Q4_K_M`), `present` (the flag is there: `on`),
 `mib` (a number of MiB drawn as `16.4 GiB`, or `512 MiB` below 1 GiB).
 An `engine:` source takes `number`, `token` or `mib` (default: as
-reported).
+reported). `present` needs a flag source.
+
+`spec:<dotted.path>` reads `<specs_dir>/<model-id>.json`, the entry spec
+for the llama-swap id. The path is 1 to 8 segments of letters, digits and
+`_` (`served_context`, `thinking.server_budget`, `model.quant`,
+`report.label`). Anything else fails validation: `spec path must be 1..=8
+dot-separated segments of letters, digits and _`. A missing key, null, or
+a value that is an object or an array leaves the field blank. A number,
+boolean or string is read like a `json:` value, and an integral float such
+as `20.0` is shown as `20`. A string longer than 1024 characters is dropped
+before it is cleaned, so a long path cannot become a file stem. Only
+numbers and short tokens are drawn: a sentence in the file shows nothing.
+
+`[setup] specs_dir` is the absolute directory of those files. Leave it
+unset and the watcher opens no spec file; `spec:` fields stay blank and
+the other sources still work. The path is checked when the config loads
+(absolute, no `.` or `..` component, 1 to 4096 bytes, no control character)
+and is not opened then. A missing directory, or a file that is missing,
+larger than 64 KiB, not JSON, nested deeper than 16, or not a regular
+file, leaves that model's spec fields blank. The model id is checked
+before it becomes a file name: empty, `.`, `..`, a slash, a backslash, a
+control character or more than 128 bytes reads nothing, and the path is
+never resolved outside the directory. A symlink is not followed, including
+a `specs_dir` that is itself a symlink. The file is re-read when the
+loaded model set changes; otherwise its mtime is checked about every 60 s
+and the body is read again only when the mtime or the size changed. A read
+error is logged once per cause (`setup spec: …`), not on every poll.
+Nothing is written. The files should hold settings only, not prompts or
+secrets. The unit can read `/etc` (`ProtectSystem=strict` leaves it
+readable, and the unit sets no `InaccessiblePaths` or `TemporaryFileSystem`);
+`ProtectHome=yes` blocks a specs directory under a home directory. The
+built-in rules do not use `spec:`. `packaging/watch.example.toml` has a
+commented block for this shape.
 
 `engine:KEY` keys are a fixed list the engine parser fills, each a plain
 number, a short token or `on`/`off`; nothing else of an engine's report is
