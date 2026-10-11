@@ -17,9 +17,9 @@ per viewer, with a fixed argument list and an empty environment.
 
 ffmpeg is published under the LGPL or the GPL, depending on how that binary
 was built. A build that includes libx264 is GPL. Codec patent terms, where
-they apply, apply to that binary and to whoever distributes it. They do not
-apply to llama-bored, which is MIT. Anyone who packages ffmpeg together with
-llama-bored has to follow ffmpeg's terms for that distribution.
+they apply, concern that binary and whoever distributes it. llama-bored
+itself is MIT and contains no codec. Anyone who packages ffmpeg together
+with llama-bored has to follow ffmpeg's terms for that distribution.
 
 ## Hack
 
