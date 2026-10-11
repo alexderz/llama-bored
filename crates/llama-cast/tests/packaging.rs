@@ -157,6 +157,9 @@ fn example_config_says_it_is_lan_exposed() {
     assert_eq!(cfg.keyframe_s, 1);
     assert_eq!(cfg.preroll_s, 3);
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
+    // The key stays commented, so the example is the default: probe once.
+    assert!(text.contains("# encoder = \"auto\""));
+    assert_eq!(cfg.encoder, llama_cast::encoder::EncoderChoice::Auto);
 }
 
 #[test]

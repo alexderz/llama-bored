@@ -1121,8 +1121,17 @@ is readable by group `llama-view` only; do not widen that, and do not point
 `llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players
 on your LAN. Tested with Roku Media Player on TCL Roku TVs. It announces a
 media server over SSDP and streams 1920x1080 H.264 in MPEG-TS, rendered from
-tty11 at 2 frames per second. Each viewer gets its own `ffmpeg` (libx264
-required), two at a time by default.
+tty11 at 2 frames per second. Each viewer gets its own `ffmpeg`, two at a
+time by default. ffmpeg is a program you install; llama-bored does not
+bundle it ([THIRD-PARTY.md](THIRD-PARTY.md)).
+
+`encoder` defaults to `auto`. At start llama-cast runs that ffmpeg once
+(`-hide_banner -encoders`) and picks libx264, then libopenh264, then a
+hardware H.264 encoder only when neither software encoder exists. Software
+x264 is the one to keep: best text at 2 fps, plays everywhere, and it does
+not use a GPU that is busy with inference. With libx264 the stream is the
+same as before. The shipped unit allows only `/dev/vcsa11`, so a hardware
+encoder usually cannot open a GPU device.
 
 The stream is tuned to start fast on a TV (#20). Each viewer's stream
 begins with PAT, PMT and a keyframe, and is encoded for low latency (no
@@ -1130,9 +1139,10 @@ B-frames, no lookahead). The defaults below are in `cast.toml`:
 
 | Key | Default | What it does |
 |---|---|---|
-| `bitrate_kbps` | `4000` | Constant bitrate, with filler on a still screen. A TV that waits for a fixed amount of data (Roku Media Player) starts in about a second instead of tens of seconds. `0` turns it off: least bandwidth, slowest start. 500..=20000. |
+| `bitrate_kbps` | `4000` | Constant bitrate, with filler on a still screen when the encoder can pad. A TV that waits for a fixed amount of data (Roku Media Player) starts in about a second instead of tens of seconds. `0` turns it off: least bandwidth, slowest start. 500..=20000. |
 | `keyframe_s` | `1` | Seconds between keyframes, 1..=10. |
 | `preroll_s` | `3` | Seconds of the first frame each new viewer gets at once, 0..=10. The picture then runs this far behind tty11. |
+| `encoder` | `auto` | H.264 encoder to ask ffmpeg for. `auto` probes once and picks `libx264`, then `libopenh264`, then `h264_nvenc`, `h264_qsv`, `h264_vaapi`, `h264_amf` or `h264_v4l2m2m` only when neither software encoder exists. Pin one of those names to require it. |
 
 Each viewer uses `bitrate_kbps` of LAN bandwidth. If the TV still waits,
 raise `preroll_s` or `bitrate_kbps`.

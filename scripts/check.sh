@@ -10,6 +10,8 @@ cargo test --workspace --all-targets --locked
 cargo deny --locked check
 scripts/s10-deps.sh
 scripts/s10-deps.sh --self-test
+scripts/s19-ffmpeg.sh
+scripts/s19-ffmpeg.sh --self-test
 cargo audit
 scripts/s6-symbols.sh
 
@@ -36,7 +38,9 @@ scripts/ramp-monitor.sh --self-test
 # S6 still checks only the LCD writer (kraken-lcd); S15 (cargo test) and
 # scripts/s10-deps.sh fence llama-light; S16 (cargo test) and
 # scripts/s10-deps.sh fence llama-metrics; S18 (cargo test) and
-# scripts/s10-deps.sh fence llama-cast.
+# scripts/s10-deps.sh fence llama-cast. scripts/s19-ffmpeg.sh keeps ffmpeg
+# an external program: no vendored encoder source or binary, no Cargo
+# dependency that links one.
 mkdir -p target
 {
   rustc -V

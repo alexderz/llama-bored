@@ -16,7 +16,7 @@ use sd_notify::NotifyState;
 use crate::config::{self, Config};
 use crate::discovery::{self, Advert};
 use crate::dlna::Device;
-use crate::encoder::{Encoder, Settings};
+use crate::encoder::{self, Codec, Encoder, Settings};
 use crate::http::{self, App, Limits, Live, ServerConfig, Stats};
 use crate::render::FRAME_BYTES;
 use crate::source::{self, FrameSource, VcsaSource};
@@ -59,11 +59,20 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
 pub struct FfmpegLive {
     pub ffmpeg: PathBuf,
     pub settings: Settings,
+    /// The encoder chosen at start, or the error already logged once.
+    /// `Err` refuses the stream without spawning ffmpeg.
+    pub codec: Result<Codec, String>,
     pub source: Arc<dyn FrameSource>,
 }
 
 impl Live for FfmpegLive {
     fn open(&self) -> io::Result<Box<dyn Read + Send>> {
+        // A missing encoder was logged once at start. Refuse here, the
+        // same way a failed ffmpeg is refused, without spawning one.
+        let codec = match &self.codec {
+            Ok(codec) => *codec,
+            Err(message) => return Err(io::Error::other(message.clone())),
+        };
         // An unreadable tty11 is a 500 with the reason logged, not an
         // empty 200.
         let mut probe = vec![0_u8; FRAME_BYTES];
@@ -71,7 +80,7 @@ impl Live for FfmpegLive {
             .frame(&mut probe)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", source::VCSA_PATH)))?;
         drop(probe);
-        let encoder = Encoder::start(&self.ffmpeg, self.settings, Arc::clone(&self.source))?;
+        let encoder = Encoder::start(&self.ffmpeg, codec, self.settings, Arc::clone(&self.source))?;
         Ok(Box::new(encoder))
     }
 }
@@ -101,7 +110,7 @@ fn summary(config: &Config) -> String {
         .map(ToString::to_string)
         .collect();
     format!(
-        "listen {} allow [{}] interface_addr {} name {:?} title {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} font {} palette {}",
+        "listen {} allow [{}] interface_addr {} name {:?} title {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} encoder {} font {} palette {}",
         config.listen,
         nets.join(", "),
         config.interface_addr,
@@ -113,6 +122,7 @@ fn summary(config: &Config) -> String {
         config.keyframe_s,
         config.preroll_s,
         config.ffmpeg.display(),
+        config.encoder,
         config.font.label(),
         config.palette.label(),
     )
@@ -159,7 +169,40 @@ fn check(config: &Config) -> i32 {
         config.base_url(),
         crate::dlna::STREAM_PATH
     );
-    0
+    match encoder::resolve(&config.ffmpeg, config.encoder) {
+        Ok(codec) => {
+            println!("encoder: {codec}");
+            0
+        }
+        Err(e) => {
+            err(&format!("encoder: {e}"));
+            1
+        }
+    }
+}
+
+/// Probe once. The choice is logged here; a failure is logged here and
+/// then every stream is refused without spawning ffmpeg.
+fn open_codec(config: &Config) -> Result<Codec, String> {
+    match encoder::resolve(&config.ffmpeg, config.encoder) {
+        Ok(codec) => {
+            log::emit(
+                &mut log::Stderr,
+                Priority::Info,
+                &format!("encoder: {codec}"),
+            );
+            Ok(codec)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            log::emit(
+                &mut log::Stderr,
+                Priority::Err,
+                &format!("encoder: {message}"),
+            );
+            Err(message)
+        }
+    }
 }
 
 fn bye(config: &Config) -> i32 {
@@ -250,6 +293,9 @@ fn run(config: &Config) -> i32 {
             }
         });
     }
+    // The probe runs even when it fails: the process still announces and
+    // serves the description, and streams are refused (see FfmpegLive).
+    let codec = open_codec(config);
     log::emit(
         &mut log::Stderr,
         Priority::Info,
@@ -260,6 +306,7 @@ fn run(config: &Config) -> i32 {
         live: Arc::new(FfmpegLive {
             ffmpeg: config.ffmpeg.clone(),
             settings: config.encode_settings(),
+            codec,
             source: screen,
         }),
     });

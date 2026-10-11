@@ -12,7 +12,7 @@ use thiserror::Error;
 pub use llama_core::palette::Palette;
 
 use crate::acl::{Allowlist, Cidr, CidrError};
-use crate::encoder::Settings;
+use crate::encoder::{EncoderChoice, Settings, parse_choice};
 
 /// Largest config file read.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -50,8 +50,10 @@ pub const MAX_KEYFRAME_S: u32 = 10;
 /// Default and bound of `preroll_s`.
 pub const DEFAULT_PREROLL_S: u32 = 3;
 pub const MAX_PREROLL_S: u32 = 10;
-/// Default encoder.
+/// Default encoder binary.
 pub const DEFAULT_FFMPEG: &str = "/usr/bin/ffmpeg";
+/// Default H.264 encoder: pick from what that binary offers.
+pub const DEFAULT_ENCODER: &str = "auto";
 /// Longest `ffmpeg` path.
 pub const MAX_PATH_BYTES: usize = 255;
 
@@ -132,6 +134,10 @@ pub enum ConfigError {
     Preroll,
     #[error("ffmpeg must be an absolute, normalised path of at most 255 bytes")]
     Ffmpeg,
+    #[error(
+        "encoder must be \"auto\", \"libx264\", \"libopenh264\", \"h264_nvenc\", \"h264_qsv\", \"h264_vaapi\", \"h264_amf\" or \"h264_v4l2m2m\""
+    )]
+    Encoder,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +162,8 @@ struct Raw {
     preroll_s: u32,
     #[serde(default = "default_ffmpeg")]
     ffmpeg: String,
+    #[serde(default = "default_encoder")]
+    encoder: String,
     #[serde(default)]
     font: Font,
     #[serde(default)]
@@ -194,6 +202,10 @@ fn default_ffmpeg() -> String {
     DEFAULT_FFMPEG.to_owned()
 }
 
+fn default_encoder() -> String {
+    DEFAULT_ENCODER.to_owned()
+}
+
 /// A validated config.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -220,6 +232,8 @@ pub struct Config {
     pub preroll_s: u32,
     /// The encoder binary.
     pub ffmpeg: PathBuf,
+    /// Which H.264 encoder to ask that binary for. `auto` probes it.
+    pub encoder: EncoderChoice,
     /// The tty11 console font.
     pub font: Font,
     /// The colours tty11 shows; must match `[tty] palette` in watch.toml.
@@ -276,6 +290,9 @@ impl Config {
         if !clean_absolute(&raw.ffmpeg) || raw.ffmpeg.len() > MAX_PATH_BYTES {
             return Err(ConfigError::Ffmpeg);
         }
+        let Some(encoder) = parse_choice(&raw.encoder) else {
+            return Err(ConfigError::Encoder);
+        };
         Ok(Self {
             listen,
             allow: Allowlist::new(nets),
@@ -288,6 +305,7 @@ impl Config {
             keyframe_s: raw.keyframe_s,
             preroll_s: raw.preroll_s,
             ffmpeg,
+            encoder,
             font: raw.font,
             palette: raw.palette,
         })
