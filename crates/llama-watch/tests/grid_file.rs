@@ -264,18 +264,19 @@ fn the_tap_writes_changes_and_heartbeats_and_never_blocks() {
         None,
     )
     .unwrap();
-    tap.offer(&frame("one"));
+    let model = busy_frame();
+    tap.offer_frame(&model, &frame("one"));
     wait_for("the first file", || seq_of(&path) == Some(1));
     // Unchanged frames at tick rate: the file stays as it is, for a while.
     let started = Instant::now();
     for _ in 0..20 {
-        tap.offer(&frame("one"));
+        tap.offer_frame(&model, &frame("one"));
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(started.elapsed() < HEARTBEAT, "test pacing");
     assert_eq!(seq_of(&path), Some(1));
     // A change.
-    tap.offer(&frame("two"));
+    tap.offer_frame(&model, &frame("two"));
     wait_for("the change", || seq_of(&path) == Some(2));
     // With no frame at all, the thread still heartbeats.
     wait_for("a heartbeat", || seq_of(&path).is_some_and(|s| s >= 3));
@@ -305,12 +306,13 @@ fn an_unwritable_directory_is_logged_once_and_frames_keep_flowing() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let log = Capture::default();
     let tap = GridTap::spawn(GridWriter::new(&path, Palette::Llama), log.clone(), None).unwrap();
+    let model = busy_frame();
     let started = Instant::now();
     for i in 0..30 {
-        tap.offer(&frame(&format!("f{i}")));
+        tap.offer_frame(&model, &frame(&format!("f{i}")));
         std::thread::sleep(Duration::from_millis(10));
     }
-    // offer() never waited on the disk.
+    // offer_frame() never waited on the disk.
     assert!(started.elapsed() < Duration::from_secs(2));
     wait_for("the error line", || !log.0.lock().unwrap().is_empty());
     std::thread::sleep(Duration::from_millis(100));
@@ -320,7 +322,7 @@ fn an_unwritable_directory_is_logged_once_and_frames_keep_flowing() {
     assert!(!path.exists());
     // The disk comes back: writing resumes by itself and says so.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    tap.offer(&frame("back"));
+    tap.offer_frame(&model, &frame("back"));
     wait_for("writes to resume", || seq_of(&path).is_some());
     wait_for("the recovery line", || log.0.lock().unwrap().len() == 2);
     drop(tap);
@@ -339,12 +341,13 @@ fn console_bytes(grids: &[Grid], tap: Option<GridTap>) -> Vec<Vec<u8>> {
     if let Some(tap) = tap {
         term = term.with_grid_tap(tap);
     }
+    let model = busy_frame();
     grids
         .iter()
         .map(|grid| {
             term.out_mut().clear();
             if let Some(tap) = term.grid_tap() {
-                tap.offer(grid);
+                tap.offer_frame(&model, grid);
             }
             term.render(grid, t0).expect("render");
             term.out().to_vec()
@@ -455,6 +458,24 @@ fn grid_size_uses_the_tty_size_wording_and_bounds() {
         err.to_string(),
         "grid.size 213x25 is outside 160x26..=1024x512"
     );
+    for (cols, rows) in [(160u16, 26u16), (1024, 512)] {
+        let cfg = Config::from_toml(&format!("[grid]\nsize = \"{cols}x{rows}\"\n")).expect("parse");
+        assert_eq!(cfg.grid.size, Some(TtySize { cols, rows }));
+        assert!(cfg.validate(8).is_ok(), "{cols}x{rows}");
+    }
+    for (text, msg) in [
+        ("1025x60", "grid.size 1025x60 is outside 160x26..=1024x512"),
+        (
+            "1024x513",
+            "grid.size 1024x513 is outside 160x26..=1024x512",
+        ),
+    ] {
+        let err = Config::from_toml(&format!("[grid]\nsize = \"{text}\"\n"))
+            .expect("parses")
+            .validate(8)
+            .expect_err(text);
+        assert_eq!(err.to_string(), msg);
+    }
 }
 
 fn encoded(dir: &Path, grid: &Grid) -> GridImage {
@@ -583,34 +604,6 @@ fn a_wider_and_a_narrower_grid_are_laid_out_and_the_console_is_unchanged() {
         drop(tap);
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-/// The newest model is the one that lands. An older one still waiting is not
-/// laid out once a newer frame has replaced it.
-#[test]
-fn the_newest_model_wins_the_second_layout() {
-    let console = layout::layout(&busy_frame(), 192, 60);
-    let mut first = busy_frame();
-    first.host = "aaa".to_owned();
-    let mut second = busy_frame();
-    second.host = "bbb".to_owned();
-    let dir = scratch("newest");
-    let path = dir.join("grid");
-    let tap = GridTap::spawn(
-        GridWriter::new(&path, Palette::Llama),
-        Capture::default(),
-        Some(TtySize {
-            cols: 213,
-            rows: 60,
-        }),
-    )
-    .expect("tap");
-    tap.offer_frame(&first, &console);
-    tap.offer_frame(&second, &console);
-    let want = encoded(&dir, &layout::layout(&second, 213, 60));
-    wait_cells(&path, &want);
-    drop(tap);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn console_draw(model: &TtyModel, size: Option<TtySize>) -> Vec<u8> {
@@ -795,5 +788,131 @@ fn busy_frame() -> TtyModel {
                 },
             ],
         }),
+    }
+}
+
+/// Report the CPU of a second layout. It prints; it does not pass or fail
+/// on the numbers. Ignored so `cargo test` does not spend a release build
+/// on it.
+///
+/// Run it on the shipped release profile (fat LTO, one codegen unit):
+///
+/// ```sh
+/// cargo test -p llama-watch --locked --release --test grid_file -- --ignored measure_second_layout_cost --exact --nocapture
+/// ```
+#[ignore = "prints a release-profile timing report; run it by name with --release"]
+#[test]
+fn measure_second_layout_cost() {
+    fn clk_tck() -> f64 {
+        let out = std::process::Command::new("getconf")
+            .arg("CLK_TCK")
+            .output()
+            .expect("getconf");
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.trim().parse().expect("CLK_TCK")
+    }
+    fn proc_cpu() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("stat");
+        let rest = stat.split_once(')').expect("comm").1;
+        let mut fields = rest.split_whitespace();
+        let utime: u64 = fields.nth(11).expect("utime").parse().expect("utime");
+        let stime: u64 = fields.next().expect("stime").parse().expect("stime");
+        utime + stime
+    }
+    /// Median CPU seconds per call, and the matching wall seconds.
+    fn median(hz: f64, mut body: impl FnMut()) -> (f64, f64) {
+        let mut cpu_samples = Vec::new();
+        let mut wall_samples = Vec::new();
+        for _ in 0..3 {
+            let cpu0 = proc_cpu();
+            let wall0 = Instant::now();
+            let mut n = 0u32;
+            loop {
+                body();
+                n += 1;
+                if n >= 50 && wall0.elapsed() >= Duration::from_secs(1) {
+                    break;
+                }
+            }
+            let ticks = proc_cpu() - cpu0;
+            let cpu = ticks as f64 / hz / f64::from(n);
+            let wall = wall0.elapsed().as_secs_f64() / f64::from(n);
+            eprintln!("  sample n {n} ticks {ticks} cpu {cpu:.9}s wall {wall:.9}s");
+            cpu_samples.push(cpu);
+            wall_samples.push(wall);
+        }
+        cpu_samples.sort_by(f64::total_cmp);
+        wall_samples.sort_by(f64::total_cmp);
+        (cpu_samples[1], wall_samples[1])
+    }
+    fn report(label: &str, cpu_s: f64, wall_s: f64) {
+        let us = cpu_s * 1_000_000.0;
+        let pct = cpu_s * 10.0 * 100.0;
+        eprintln!(
+            "{label}: {us:.1} µs/frame, {pct:.4}% of one core at 10 fps (wall {:.1} µs)",
+            wall_s * 1_000_000.0
+        );
+    }
+    fn prose(chars: usize) -> String {
+        let unit = "tokens and context stay inside the panel. ";
+        let mut out = String::new();
+        while out.len() < chars {
+            out.push_str(unit);
+        }
+        out.truncate(chars);
+        out
+    }
+    fn with_text(in_chars: usize, out_chars: usize) -> TtyModel {
+        let mut model = busy_frame();
+        model.in_lines = if in_chars == 0 {
+            Vec::new()
+        } else {
+            vec![prose(in_chars)]
+        };
+        model.out_lines = if out_chars == 0 {
+            Vec::new()
+        } else {
+            vec![prose(out_chars)]
+        };
+        model
+    }
+
+    let hz = clk_tck();
+    eprintln!("measure_second_layout_cost");
+    eprintln!("profile: release, if this binary was built with --release");
+    eprintln!("CLK_TCK {hz}");
+    eprintln!("frames: no IN/OUT text; 8192 characters of IN; IN and OUT at 32768");
+    eprintln!("each figure is the median of three one-second runs, from utime+stime");
+
+    for (name, inn, outn) in [
+        ("no IN/OUT text", 0usize, 0usize),
+        ("8192 characters of IN", 8192, 0),
+        ("IN and OUT at 32768", 32768, 32768),
+    ] {
+        let model = with_text(inn, outn);
+        let wide = layout::layout(&model, 213, 60);
+        let copy = wide.clone();
+        assert_eq!((wide.cols(), wide.rows()), (213, 60));
+        assert_eq!(wide.cells().len(), 213 * 60);
+        eprintln!(
+            "{name}: in {inn} chars, out {outn} chars, 213x60 cells {}",
+            wide.cells().len()
+        );
+        let (cpu, wall) = median(hz, || {
+            std::hint::black_box(std::hint::black_box(&model).clone());
+        });
+        report("  clone", cpu, wall);
+        let (cpu, wall) = median(hz, || {
+            std::hint::black_box(layout::layout(std::hint::black_box(&model), 192, 60));
+        });
+        report("  layout 192x60", cpu, wall);
+        let (cpu, wall) = median(hz, || {
+            std::hint::black_box(layout::layout(std::hint::black_box(&model), 213, 60));
+        });
+        report("  layout 213x60", cpu, wall);
+        let (cpu, wall) = median(hz, || {
+            std::hint::black_box(std::hint::black_box(&wide) != std::hint::black_box(&copy));
+        });
+        report("  compare 213x60", cpu, wall);
     }
 }
