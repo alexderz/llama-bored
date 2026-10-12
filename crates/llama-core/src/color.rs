@@ -428,6 +428,21 @@ mod tests {
         assert_ne!(coolant(38.0), temp::NORMAL);
         assert_eq!(coolant(41.0), temp::WARM);
         assert_eq!(coolant(45.0), temp::WARN);
+        // The ramp has no jump anywhere, for low and negative thresholds
+        // too, and far under the warning it is the normal colour.
+        for (warn, crit) in [(5.0_f32, 15.0_f32), (45.0, 55.0), (-5.0, 5.0), (80.0, 90.0)] {
+            let at = |c| temp::color(c, warn, crit).expect("thresholds");
+            assert_eq!(at(warn - temp::COOL_SPAN - 20.0), temp::NORMAL);
+            let mut celsius = warn - temp::COOL_SPAN - 2.0;
+            let mut last = at(celsius);
+            while celsius < crit + 2.0 {
+                celsius += 0.1;
+                let here = at(celsius);
+                assert!(gap(here, last) <= 12, "warn {warn}: a jump at {celsius}");
+                last = here;
+            }
+            assert_eq!(last, temp::CRIT);
+        }
         assert!(temp::color(70.0, 90.0, 80.0).is_none());
         assert!(temp::color(f32::NAN, warn, crit).is_none());
         assert!(temp::color(70.0, f32::NAN, crit).is_none());
