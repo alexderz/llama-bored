@@ -229,7 +229,7 @@ enabled = true
 # console's colours. llama-view --colors truecolor, one full first render
 # of one busy 192x60 frame (activity past 100, generation past its
 # ceiling), wrote 28103 bytes and 13 colour pairs from the palette and
-# 35908 bytes and 204 colour pairs with the ramps. That is the first
+# 35911 bytes and 197 colour pairs with the ramps. That is the first
 # render, not the steady-state diff. Each distinct colour pair is its own
 # SGR sequence. Both byte counts include the background llama-view sends
 # with a full block in truecolor and 256 colours (#120).

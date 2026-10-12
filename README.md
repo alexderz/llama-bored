@@ -1152,7 +1152,8 @@ slot context bars and the two rate scales) take the activity ramp at that
 cell's position. The big digits take the ramp of their value, shaded by
 row. Each filled chart cell takes the ramp of the level its row stands for.
 A temperature reading with warn and crit thresholds takes a ramp anchored
-to those marks. Capacity bars, the RECENT bars, labels, the empty bar track
+to those marks: the normal colour until 10 degrees under the warning, the
+warn colour at it, the crit colour at the critical mark. Capacity bars, the RECENT bars, labels, the empty bar track
 and other text stay on the palette. The console draws the palette step
 either way. `false` writes each cell's palette RGB, and when the size
 matches it reuses the console frame, so the file is today's. No exact
