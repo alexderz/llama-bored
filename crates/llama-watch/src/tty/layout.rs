@@ -291,6 +291,9 @@ pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
 
 /// [`layout`] plus the exact-colour plane (#116). The grid file's writer
 /// calls this; the console tick does not.
+///
+/// Public for the grid tests.
+#[doc(hidden)]
 pub fn layout_exact(model: &TtyModel, cols: u16, rows: u16) -> Grid {
     layout_with(model, cols, rows, true)
 }
@@ -4789,9 +4792,54 @@ mod tests {
         assert_eq!(grid.get(19, row).unwrap().ch, '9');
         assert_eq!(fg(19), C16::BrightRed);
         assert_eq!(at(19), Some(color::temp::CRIT));
+        // Crit in the file is the ramp's 100 stop (#FF2A14). The console
+        // stays BrightRed (#F21E5A). That difference is intended.
+        assert_eq!(at(19).unwrap(), llama_core::color::hex(0xFF2A14));
+        assert_ne!(at(19).unwrap(), Palette::Llama.rgb(C16::BrightRed.index()));
         assert_eq!(grid.get(24, row).unwrap().ch, '7');
         assert_eq!(fg(24), C16::BrightWhite);
         assert!(at(24).is_none(), "no thresholds, no ramp");
+    }
+
+    /// `rate_frac` is the console's log fraction, clamped to the five bands.
+    /// [`color::spectrum::rate`] is that fraction turned into a ramp
+    /// position, and it is not clamped: above the ceiling it climbs into
+    /// the blackbody tail. On the scale the two are the same fraction.
+    #[test]
+    fn the_rate_fraction_matches_the_ramp_across_the_scale() {
+        let ceiling = 250.0;
+        let step = color::ACT_STOPS[1].0 - color::ACT_STOPS[0].0;
+        let bands = (color::ACT_STOPS.len() - 1) as f32;
+        let frac_of = |value: f64| {
+            let pos = color::spectrum::rate(value, ceiling);
+            f64::from((pos + step / 2.0) / (step * bands))
+        };
+        let mut value = ceiling / 32.0;
+        while value < ceiling {
+            let console = rate_frac(Some(value), ceiling).expect("on the scale");
+            let ramp = frac_of(value);
+            assert!(
+                (ramp - console).abs() < 1e-4,
+                "value={value} ramp={ramp} console={console}"
+            );
+            assert!((0.0..=1.0).contains(&console));
+            value *= 1.05;
+        }
+        let at_ceiling = rate_frac(Some(ceiling), ceiling).expect("ceiling");
+        assert!((frac_of(ceiling) - at_ceiling).abs() < 1e-4);
+        assert!((at_ceiling - 1.0).abs() < 1e-12);
+
+        // Off the scale they part on purpose. Clamping the ramp to match
+        // the console would drop the blackbody tail.
+        assert_eq!(rate_frac(Some(ceiling * 2.0), ceiling), Some(1.0));
+        assert!(
+            color::spectrum::rate(ceiling * 2.0, ceiling) > color::spectrum::rate(ceiling, ceiling)
+        );
+        assert_eq!(rate_frac(Some(ceiling / 64.0), ceiling), Some(0.0));
+        assert!(
+            color::spectrum::rate(ceiling / 64.0, ceiling)
+                < color::spectrum::rate(ceiling / 32.0, ceiling)
+        );
     }
 
     #[test]

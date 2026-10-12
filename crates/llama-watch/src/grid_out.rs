@@ -24,8 +24,10 @@
 //! clone of the [`TtyModel`] in the slot instead: the model's owned
 //! strings and vectors, one frame, dropped when a newer frame replaces it.
 //! This thread then lays that model out and writes the result. Exact
-//! colours are that second layout even when the size matches, so the
-//! console tick neither computes nor stores them. The layout runs after
+//! colours are that second layout even when the size matches. The console
+//! grid stores none of them: with the file off no plane is allocated, and
+//! a painted cell returns before any index work when the plane is absent.
+//! The layout runs after
 //! the slot is taken and the lock is dropped,
 //! so however long it takes it does not delay the console write, the snapshot
 //! or the watchdog ping. Layout reads cells only. The block digits are sized
@@ -46,7 +48,7 @@ use llama_core::gridfile::{self, GridCell, GridImage, HEARTBEAT};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::palette::Palette;
 
-use crate::config::TtySize;
+use crate::config::{GridFile, TtySize};
 use crate::tty::grid::{C16, Grid};
 use crate::tty::layout::{self, TtyModel};
 
@@ -67,6 +69,9 @@ fn rgb_bg(palette: Palette, color: C16) -> Rgb {
 /// `grid` as a file image. A cell shows its `rich` scalar when that is safe
 /// as one cell (`is_showable`), else its console `ch`. An exact colour, when
 /// the cell has one, replaces the palette RGB. The format is unchanged.
+///
+/// Public for the grid tests. The writer is the production caller.
+#[doc(hidden)]
 pub fn image_of(grid: &Grid, palette: Palette, seq: u32, unix_ms: u64) -> GridImage {
     let cols = usize::from(grid.cols());
     GridImage {
@@ -378,12 +383,24 @@ impl GridTap {
     /// Start the thread with `writer`. `log` gets one line per distinct
     /// failure and one when the writes recover. `size` is `[grid] size`:
     /// `None` publishes the console frame, unless [`Self::with_exact`] is set.
+    /// Exact colours stay off: the service uses [`Self::from_config`].
     pub fn spawn<L: Sink + Send + 'static>(
         writer: GridWriter,
         log: L,
         size: Option<TtySize>,
     ) -> io::Result<Self> {
         spawn_thread(writer, log, size, Shared::bare())
+    }
+
+    /// Start the writer from `[grid]`. [`GridFile::size`] and
+    /// [`GridFile::exact_colors`] are the fields this reads. The service
+    /// calls this when the file is enabled.
+    pub fn from_config<L: Sink + Send + 'static>(
+        writer: GridWriter,
+        log: L,
+        grid: &GridFile,
+    ) -> io::Result<Self> {
+        Ok(Self::spawn(writer, log, grid.size)?.with_exact(grid.exact_colors))
     }
 
     /// `[grid] exact_colors`. Off unless this is called. On, every frame is
