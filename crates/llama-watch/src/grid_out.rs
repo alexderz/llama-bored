@@ -218,8 +218,9 @@ type Failure = (io::ErrorKind, String);
 enum Queued {
     /// The console frame, written as it stands. No second layout.
     Console(Grid),
-    /// The same data, laid out on the writer thread at this size.
-    Apart(TtyModel, u16, u16),
+    /// The same data, laid out on the writer thread at this size. Boxed so
+    /// a waiting frame is not the size of a [`TtyModel`].
+    Apart(Box<TtyModel>, u16, u16),
 }
 
 #[derive(Default)]
@@ -284,7 +285,7 @@ impl GridTap {
     pub fn offer_frame(&self, model: &TtyModel, console: &Grid) {
         let queued = match self.size {
             Some(size) if size.cols != console.cols() || size.rows != console.rows() => {
-                Queued::Apart(model.clone(), size.cols, size.rows)
+                Queued::Apart(Box::new(model.clone()), size.cols, size.rows)
             }
             _ => Queued::Console(console.clone()),
         };
