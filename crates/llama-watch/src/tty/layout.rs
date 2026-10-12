@@ -147,10 +147,15 @@ pub struct InFlight {
 pub struct SetupItem {
     /// Separator before the item; the row's first item draws none.
     pub sep: String,
-    /// Display text from a `[setup]` rule. Printable ASCII or `·`.
+    /// Display text from a `[setup]` rule. Rule text is printable ASCII or
+    /// `·`. A `text` value may also hold the spec string's own characters;
+    /// [`paint_detail_fg`] maps them when it draws.
     pub text: String,
     /// A rule's `default` (nothing was set): drawn grey.
     pub dim: bool,
+    /// A `kind = "text"` value (#114), not its dim default. Items after
+    /// this one drop before it is cut to the row.
+    pub text_value: bool,
 }
 
 /// One SETUP row: its label and items, most important first.
@@ -267,7 +272,8 @@ pub const MIN_COLS: u16 = 160;
 /// the RECENT rule; then the health rule, the health line and the blank
 /// last row: 26. Each SLOTS row past the first pushes RECENT down a row,
 /// and it shows fewer requests. From [`FULL_ROWS`] SETUP takes up to two
-/// more rows.
+/// more rows, and from 60 rows one more than that so a label row does not
+/// push the last row out (#114).
 pub const MIN_ROWS: u16 = 26;
 /// From this height the text-on layout keeps IN/OUT: the chart shrinks or
 /// hides first. Below it panels drop in order: IN/OUT, then FANS, then the
@@ -672,9 +678,11 @@ fn draw_rule(grid: &mut Grid, row: u16, cols: u16) {
     }
 }
 
-/// SETUP rows (title included) on a screen under 60 rows, and from 60.
+/// SETUP rows (title included) on a screen under 60 rows.
 const SETUP_ROWS: u16 = 6;
-const SETUP_ROWS_TALL: u16 = 8;
+/// From 60 rows: one more than the eight the block had, so a label row
+/// does not push the last row out (#114).
+const SETUP_ROWS_TALL: u16 = 9;
 /// SETUP row labels start here; their items at [`SETUP_VALUE_X`].
 const SETUP_LABEL_X: u16 = 4;
 const SETUP_VALUE_X: u16 = 13;
@@ -753,7 +761,9 @@ fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
     }
 }
 
-/// `  label    item · item`: the items that fit whole, else the first cut.
+/// `  label    item · item`. Trailing items drop until the row fits, then
+/// the last one is cut. A `text` value stays: items after it drop first,
+/// and the value is cut to the room rather than dropped (#114).
 fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     let label: String = setup.label.chars().take(8).collect();
     paint_detail(
@@ -765,10 +775,7 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     );
     let x = usize::from(SETUP_VALUE_X);
     let room = right.saturating_add(1).saturating_sub(x);
-    let mut keep = setup.items.len();
-    while keep > 1 && setup_items_width(&setup.items[..keep]) > room {
-        keep -= 1;
-    }
+    let keep = setup_items_kept(&setup.items, room);
     let mut col = x;
     for (i, item) in setup.items[..keep].iter().enumerate() {
         if i > 0 {
@@ -788,7 +795,8 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
 /// `text`, or its first `width - 1` characters and `…`. The cut itself does
 /// not sanitise: [`paint_detail_fg`] maps every non-ASCII scalar it is
 /// handed (including the `…` this appends) when it draws the result.
-fn cut_text(text: &str, width: usize) -> String {
+/// [`crate::setup_rules`] uses the same cut for a `text` value's `max_chars`.
+pub(crate) fn cut_text(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();
     }
@@ -800,6 +808,21 @@ fn cut_text(text: &str, width: usize) -> String {
             .chain(std::iter::once('\u{2026}'))
             .collect(),
     }
+}
+
+/// Leading items to draw in `room` cells. A `text` value is the floor:
+/// items after it drop while the row is too wide, and the value itself
+/// is left to be cut. Any other row drops down to its first item.
+fn setup_items_kept(items: &[SetupItem], room: usize) -> usize {
+    let mut keep = items.len();
+    let floor = items
+        .iter()
+        .position(|item| item.text_value)
+        .map_or(1, |at| at.saturating_add(1));
+    while keep > floor && setup_items_width(&items[..keep]) > room {
+        keep -= 1;
+    }
+    keep
 }
 
 fn setup_items_width(items: &[SetupItem]) -> usize {

@@ -29,6 +29,13 @@
 //!   spec, a JSON file the poller already loaded. A missing path, null,
 //!   object or array leaves the field blank. The file itself is not opened
 //!   here.
+//! - `kind = "text"` (#114) is valid only with a `spec:` source. It shows
+//!   a JSON string: whitespace runs collapse to one space, controls are
+//!   dropped, and the value is cut to `max_chars` (default
+//!   [`DEFAULT_TEXT_CHARS`], at most [`MAX_TEXT_VALUE_CHARS`]). A number,
+//!   boolean, null, object or array shows nothing. The launch command, the
+//!   environment and the engine stay limited to numbers and short tokens,
+//!   so a path or a secret on a command line still cannot reach the screen.
 //!
 //! [`Rules::rows`] turns the extracted values plus the live engine numbers
 //! into the rows the layout draws.
@@ -71,8 +78,14 @@ pub const MAX_SPEC_SEGMENTS: usize = 8;
 /// Longest one segment of a `spec:` path.
 pub const MAX_SPEC_SEGMENT: usize = 32;
 /// Longest spec string handed to [`clean`]. A longer string yields nothing,
-/// rather than a file stem taken from the tail of an untrusted value.
+/// rather than a file stem taken from the tail of an untrusted value. A
+/// `text` label of about 130 characters is under this cap and is cut to
+/// [`MAX_TEXT_VALUE_CHARS`], not dropped.
 pub const MAX_SPEC_VALUE_CHARS: usize = 1024;
+/// Characters kept from a `text` value when the rule sets no `max_chars` (#114).
+pub const DEFAULT_TEXT_CHARS: usize = 64;
+/// Most characters a `text` rule may keep. Past this the value is cut.
+pub const MAX_TEXT_VALUE_CHARS: usize = 96;
 
 /// Separator between items on one row unless a rule names its own.
 const SEP: &str = " \u{00B7} ";
@@ -90,6 +103,8 @@ enum Kind {
     Present,
     /// A number of MiB, drawn as `16.4 GiB` (or `512 MiB` below 1 GiB).
     Mib,
+    /// A JSON string from a `spec:` source (#114), cut to `max_chars`.
+    Text,
 }
 
 /// A number the watcher already has from the engine or the launch command.
@@ -160,6 +175,8 @@ struct Rule {
     matches: Option<String>,
     source: Source,
     kind: Kind,
+    /// Characters kept from a [`Kind::Text`] value. Unused for every other kind.
+    max_chars: usize,
     label: String,
     suffix: String,
     sep: String,
@@ -176,7 +193,9 @@ struct Rule {
 pub struct Found {
     /// Index of the rule in its [`Rules`].
     pub rule: u16,
-    /// A number, a token, a quant tag or `on`. Never a path.
+    /// A number, a token, a quant tag, `on`, or a sanitised `text` string.
+    /// Never a path. A `text` string is not yet cut to `max_chars`: [`Rules::rows`]
+    /// does that after `map` has had a chance to match the whole value.
     pub value: String,
 }
 
@@ -297,7 +316,7 @@ impl Rules {
                 Source::Flag(names) => flag_value(&words[flags_from..], names, rule.kind),
                 Source::Env(name) => env_value(&words[..env_to], name),
                 Source::Json { flags, key } => json_value(cmd, &tokens[flags_from..], flags, key),
-                Source::Spec(path) => spec.and_then(|doc| spec_at(doc, path)),
+                Source::Spec(path) => spec.and_then(|doc| spec_at(doc, path, rule.kind)),
                 // Already a checked tag, not a file name to read one from.
                 Source::Name => {
                     if let Some(tag) = cmdline::name_quant(name) {
@@ -357,13 +376,17 @@ impl Rules {
                     .find(|found| usize::from(found.rule) == index)
                     .map(|found| found.value.clone()),
             };
-            let item = match value {
+            // `map` matches the sanitised value before the `max_chars` cut,
+            // so a short label still maps when a longer one would be cut.
+            // `label` and `suffix` wrap the cut value, as they do for a token.
+            let (text, dim) = match value {
                 Some(value) => match rule.map.get(&value) {
                     Some(text) => (text.clone(), false),
                     None => {
                         let shown = match rule.kind {
                             Kind::Number if is_number(&value) => number_text(&value),
                             Kind::Mib if is_number(&value) => mib_text(&value),
+                            Kind::Text => crate::tty::layout::cut_text(&value, rule.max_chars),
                             _ => value,
                         };
                         let text = if rule.label.is_empty() {
@@ -381,8 +404,10 @@ impl Rules {
             };
             rows[at].items.push(SetupItem {
                 sep: rule.sep.clone(),
-                text: item.0,
-                dim: item.1,
+                text,
+                dim,
+                // A dim default is a short configured string, not the value.
+                text_value: rule.kind == Kind::Text && !dim,
             });
             groups[at].push(group);
         }
@@ -421,6 +446,11 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
         None => None,
     };
     let source = parse_source(field.source.as_deref())?;
+    // Before the source-specific kind errors, so every non-spec source
+    // names this rule the same way.
+    if field.kind.as_deref() == Some("text") && !matches!(source, Source::Spec(_)) {
+        return Err(format!("rule {row:?}: kind text needs a spec: source"));
+    }
     let kind = match (&source, field.kind.as_deref()) {
         (Source::Fixed | Source::Live(_) | Source::Engine(_), None) => Kind::Token,
         (Source::Name, Some("quant")) => Kind::Quant,
@@ -436,9 +466,10 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
             "quant" => Kind::Quant,
             "present" => Kind::Present,
             "mib" => Kind::Mib,
+            "text" => Kind::Text,
             other => {
                 return Err(format!(
-                    "unknown kind {:?} (number, token, quant, present, mib)",
+                    "unknown kind {:?} (number, token, quant, present, mib, text)",
                     printable(other)
                 ));
             }
@@ -450,6 +481,26 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
     if matches!(source, Source::Engine(_)) && matches!(kind, Kind::Quant | Kind::Present) {
         return Err("an engine source takes kind number, token or mib".to_owned());
     }
+    if field.max_chars.is_some() && kind != Kind::Text {
+        return Err(format!(
+            "rule {row:?}: max_chars is only valid with kind text"
+        ));
+    }
+    let max_chars = if kind == Kind::Text {
+        match field.max_chars {
+            None => DEFAULT_TEXT_CHARS,
+            Some(n) => match usize::try_from(n) {
+                Ok(n) if (1..=MAX_TEXT_VALUE_CHARS).contains(&n) => n,
+                _ => {
+                    return Err(format!(
+                        "rule {row:?}: max_chars {n} is outside 1..={MAX_TEXT_VALUE_CHARS}"
+                    ));
+                }
+            },
+        }
+    } else {
+        0
+    };
     if source == Source::Fixed && field.default.is_none() {
         return Err("a field with no source needs a default".to_owned());
     }
@@ -486,6 +537,7 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
         matches,
         source,
         kind,
+        max_chars,
         label,
         suffix,
         sep,
@@ -800,10 +852,20 @@ fn json_key(object: &str, key: &str) -> Option<String> {
 /// The scalar at `path` of a spec document. An object, array, null or a
 /// missing key is nothing. A string longer than [`MAX_SPEC_VALUE_CHARS`]
 /// is nothing, so a huge path cannot become a file stem in [`clean`].
-fn spec_at(doc: &serde_json::Value, path: &[String]) -> Option<String> {
+/// A [`Kind::Text`] rule takes a string only: a number or a bool shows
+/// nothing, and the string is cut later, not dropped here.
+fn spec_at(doc: &serde_json::Value, path: &[String], kind: Kind) -> Option<String> {
     let mut cur = doc;
     for segment in path {
         cur = cur.as_object()?.get(segment)?;
+    }
+    if kind == Kind::Text {
+        return match cur {
+            serde_json::Value::String(text) if text.chars().count() <= MAX_SPEC_VALUE_CHARS => {
+                Some(text.clone())
+            }
+            _ => None,
+        };
     }
     match cur {
         serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
@@ -852,6 +914,11 @@ fn strip_quotes(text: &str) -> &str {
 
 /// The display-safe value, or `None` when `raw` does not pass for `kind`.
 fn clean(kind: Kind, raw: &str) -> Option<String> {
+    // A spec string is already decoded. Shell quotes are a command-line
+    // concern; stripping them would eat a label that starts and ends with `"`.
+    if kind == Kind::Text {
+        return clean_text(raw);
+    }
     let raw = strip_quotes(raw);
     match kind {
         Kind::Number => is_number(raw).then(|| raw.to_owned()),
@@ -870,7 +937,45 @@ fn clean(kind: Kind, raw: &str) -> Option<String> {
         Kind::Quant => cmdline::quant_tag(raw),
         Kind::Present => Some("on".to_owned()),
         Kind::Mib => (is_number(raw) && !raw.starts_with('-')).then(|| raw.to_owned()),
+        Kind::Text => None,
     }
+}
+
+/// A `text` value. Whitespace runs, including newlines and tabs, become
+/// one space; leading and trailing whitespace go. A control or a
+/// zero-width character is dropped, so an escape sequence or a newline
+/// cannot reach the console or the grid file. Everything else is kept,
+/// and the console font's mapping plus the grid file's `rich` scalar
+/// happen when the row is drawn. Empty is nothing.
+fn clean_text(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut spaced = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                spaced = true;
+            }
+            continue;
+        }
+        if text_skipped(ch) {
+            continue;
+        }
+        if spaced {
+            out.push(' ');
+            spaced = false;
+        }
+        out.push(ch);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Controls, and the zero-width characters [`crate::tty::sanitize`] gives
+/// no cell. Whitespace is not here: [`clean_text`] turns it into spaces.
+fn text_skipped(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+    ) || ch.is_control()
 }
 
 /// An engine-reported value for a rule of `kind`: a number for `number`
@@ -878,6 +983,7 @@ fn clean(kind: Kind, raw: &str) -> Option<String> {
 fn engine_value(kind: Kind, value: &str) -> Option<String> {
     let ok = match kind {
         Kind::Number | Kind::Mib => is_number(value),
+        Kind::Text => false,
         _ => is_number(value) || is_token(value),
     };
     ok.then(|| value.to_owned())
@@ -1485,5 +1591,177 @@ mod tests {
                 .extract_with("llama-server", "example", None, None)
                 .is_empty()
         );
+    }
+
+    /// #114: a `text` rule shows a spec string, cut to `max_chars`, and
+    /// nothing else. `map` matches the sanitised value before the cut;
+    /// `label` and `suffix` wrap the cut value.
+    #[test]
+    fn text_rules_show_a_sanitised_spec_string() {
+        let mut label = field("note", Some("spec:report.label"), Some("text"));
+        label.order = 10;
+        let mut capped = field("note", Some("spec:report.long"), Some("text"));
+        capped.max_chars = Some(i64::try_from(MAX_TEXT_VALUE_CHARS).unwrap());
+        capped.order = 11;
+        let mut wide = field("note", Some("spec:report.huge"), Some("text"));
+        wide.order = 12;
+        let mut over = field("note", Some("spec:report.over"), Some("text"));
+        over.order = 13;
+        let mut short = field("note", Some("spec:report.short"), Some("text"));
+        short.max_chars = Some(4);
+        short.label = Some("is".to_owned());
+        short.suffix = Some("!".to_owned());
+        short.order = 14;
+        let mut mapped = field("note", Some("spec:report.nick"), Some("text"));
+        mapped.map.insert("hi there".to_owned(), "hello".to_owned());
+        mapped.label = Some("ignored".to_owned());
+        mapped.max_chars = Some(4);
+        mapped.order = 15;
+        let mut blank = field("note", Some("spec:report.blank"), Some("text"));
+        blank.default = Some("none".to_owned());
+        blank.order = 16;
+        let scalars = ["num", "flag", "gone", "obj", "arr"];
+        let mut fields = vec![label, capped, wide, over, short, mapped, blank];
+        for (i, name) in scalars.iter().enumerate() {
+            let mut rule = field("skip", Some(&format!("spec:report.{name}")), Some("text"));
+            rule.order = 20 + u16::try_from(i).unwrap();
+            fields.push(rule);
+        }
+        let rules = only(fields);
+
+        let long = "x".repeat(130);
+        let exactly = "y".repeat(MAX_SPEC_VALUE_CHARS);
+        let too_long = "z".repeat(MAX_SPEC_VALUE_CHARS + 1);
+        let hostile = "  a\u{1b}]9;SPEC\u{7}b\nb\tc \u{202e}x\u{200d}y  ";
+        let doc = serde_json::json!({
+            "report": {
+                "label": hostile,
+                "long": long,
+                "huge": exactly,
+                "over": too_long,
+                "short": "hello",
+                "nick": "  hi \n there  ",
+                "blank": " \n\t ",
+                "num": 35,
+                "flag": true,
+                "gone": null,
+                "obj": {"a": 1},
+                "arr": [1],
+            }
+        });
+        let found = rules.extract_with("", "example", None, Some(&doc));
+        let values: Vec<&str> = found.iter().map(|item| item.value.as_str()).collect();
+        // Controls and the escape are gone; whitespace has collapsed.
+        // The bidi mark stays for the row painter, which draws the placeholder.
+        assert!(values.contains(&"a]9;SPECb b c \u{202e}xy"), "{values:?}");
+        assert!(
+            values
+                .iter()
+                .all(|value| !value.chars().any(char::is_control)),
+            "{values:?}"
+        );
+        // 130 and 1024 survive loading. 1025 is dropped, not cut.
+        assert!(values.contains(&long.as_str()), "{values:?}");
+        assert!(values.contains(&exactly.as_str()), "{values:?}");
+        assert!(
+            !values.iter().any(|value| value.contains('z')),
+            "{values:?}"
+        );
+        assert_eq!(
+            values.len(),
+            5,
+            "non-strings and the blank show nothing: {values:?}"
+        );
+
+        let live = LiveCtx {
+            backend: Backend::LlamaCpp,
+            detail: None,
+            info: None,
+            engine: None,
+        };
+        let rows = rules.rows(&found, &live);
+        let note = rows.iter().find(|row| row.label == "note").expect("note");
+        let texts: Vec<&str> = note.items.iter().map(|item| item.text.as_str()).collect();
+        let cut96: String = "x"
+            .repeat(MAX_TEXT_VALUE_CHARS - 1)
+            .chars()
+            .chain(['\u{2026}'])
+            .collect();
+        let cut64: String = "y"
+            .repeat(DEFAULT_TEXT_CHARS - 1)
+            .chars()
+            .chain(['\u{2026}'])
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "a]9;SPECb b c \u{202e}xy",
+                cut96.as_str(),
+                cut64.as_str(),
+                "is hel\u{2026}!",
+                "hello",
+                "none",
+            ]
+        );
+        assert!(note.items[5].dim, "the default is dim");
+        assert!(!note.items[5].text_value, "a default is not the text value");
+        assert!(note.items[0].text_value);
+        assert!(note.items[3].text_value);
+        assert!(
+            note.items[4].text_value,
+            "a mapped text value still keeps the row"
+        );
+        assert!(rows.iter().all(|row| row.label != "skip"), "{rows:?}");
+    }
+
+    #[test]
+    fn text_kind_and_max_chars_are_load_errors() {
+        let text_on = |source: &str| field("ctx", Some(source), Some("text"));
+        for source in [
+            "flag:-c",
+            "env:SPEC",
+            "json:--speculative-config:method",
+            "live:ctx",
+            "engine:kv",
+            "name",
+        ] {
+            let reason = only_err(text_on(source));
+            assert!(
+                reason.contains("rule \"ctx\"")
+                    && reason.contains("kind text needs a spec: source"),
+                "{source}: {reason}"
+            );
+        }
+        let mut no_source = field("ctx", None, Some("text"));
+        no_source.default = Some("x".to_owned());
+        let reason = only_err(no_source);
+        assert!(reason.contains("rule \"ctx\""), "{reason}");
+        assert!(reason.contains("spec:"), "{reason}");
+
+        let mut numbered = field("ctx", Some("flag:-c"), Some("number"));
+        numbered.max_chars = Some(64);
+        let reason = only_err(numbered);
+        assert!(
+            reason.contains("rule \"ctx\"") && reason.contains("max_chars is only valid"),
+            "{reason}"
+        );
+
+        for bad in [0, 97, -1, 10_000] {
+            let mut rule = field("note", Some("spec:report.label"), Some("text"));
+            rule.max_chars = Some(bad);
+            let reason = only_err(rule);
+            assert!(
+                reason.contains("rule \"note\"") && reason.contains("outside 1..=96"),
+                "{bad}: {reason}"
+            );
+        }
+        let mut edge = field("note", Some("spec:report.label"), Some("text"));
+        edge.max_chars = Some(1);
+        assert_eq!(only(vec![edge]).rules[0].max_chars, 1);
+        let mut top = field("note", Some("spec:report.label"), Some("text"));
+        top.max_chars = Some(i64::try_from(MAX_TEXT_VALUE_CHARS).unwrap());
+        assert_eq!(only(vec![top]).rules[0].max_chars, MAX_TEXT_VALUE_CHARS);
+        let plain = field("note", Some("spec:report.label"), Some("text"));
+        assert_eq!(only(vec![plain]).rules[0].max_chars, DEFAULT_TEXT_CHARS);
     }
 }
