@@ -13,7 +13,7 @@ use llama_core::color::Rgb;
 use llama_core::gridfile::{GridCell, GridImage, encode};
 use llama_view::{
     CliError, Color, ColorMode, ColorSettings, Fit, Options, Palette, Renderer, Session, SgrTable,
-    SourceKind, nearest_xterm256, now_unix_ms, parse_args, screen_of, source_kind,
+    SourceKind, nearest_xterm256, now_unix_ms, parse_args, place, screen_of, source_kind,
 };
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -428,4 +428,94 @@ fn a_grid_file_is_shown_at_its_own_size() {
     session(ColorMode::Truecolor).frame_grid((80, 24), &narrow, &mut small);
     let text = String::from_utf8_lossy(&small);
     assert!(text.contains("tty11 is 160x49, this pane 80x24"), "{text}");
+}
+
+fn session_fit(fit: Fit) -> Session {
+    let mut opts = Options::default();
+    opts.fit = fit;
+    let colors = ColorSettings {
+        mode: ColorMode::Truecolor,
+        palette: Palette::Llama,
+    };
+    Session::new(&opts, colors, "box", false, false)
+}
+
+/// #115: `--fit center` uses the file's own size too. A wider file shows its
+/// middle, and a narrower file is centred in the pane.
+#[test]
+fn a_grid_file_centres_when_fit_is_center() {
+    let edge = GridCell {
+        ch: '\u{00b6}',
+        fg: ORANGE,
+        bg: TEAL,
+    };
+    let inner = GridCell {
+        ch: '\u{2020}',
+        fg: ORANGE,
+        bg: TEAL,
+    };
+    let blank = GridCell {
+        ch: ' ',
+        fg: ORANGE,
+        bg: TEAL,
+    };
+    let mut wide_cells = vec![blank; 213 * 60];
+    wide_cells[0] = edge;
+    wide_cells[10] = inner;
+    let wide = GridImage {
+        seq: 1,
+        unix_ms: 0,
+        cols: 213,
+        rows: 60,
+        cells: wide_cells,
+    };
+    let centred = place(&screen_of(&wide), 192, 60, 0, 0, Fit::Center, 11);
+    assert_eq!(
+        centred.cells[0].ch, '\u{2020}',
+        "column 10 of the file is the pane's first column"
+    );
+    assert!(
+        centred.cells.iter().all(|cell| cell.ch != '\u{00b6}'),
+        "the file's first column is outside a centred 192-wide pane"
+    );
+    let hint: String = centred.cells[centred.cells.len() - 192..]
+        .iter()
+        .map(|cell| cell.ch)
+        .collect();
+    assert!(hint.contains("tty11 is 213x60, this pane 192x60"), "{hint}");
+    assert!(hint.contains("middle shown"), "{hint}");
+
+    let mut out = Vec::new();
+    session_fit(Fit::Center).frame_grid((192, 60), &wide, &mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("middle shown"), "{text}");
+    assert!(text.contains('\u{2020}'), "{text}");
+    assert!(!text.contains('\u{00b6}'), "{text}");
+
+    let mut narrow_cells = vec![blank; 160 * 49];
+    narrow_cells[0] = edge;
+    let narrow = GridImage {
+        seq: 1,
+        unix_ms: 0,
+        cols: 160,
+        rows: 49,
+        cells: narrow_cells,
+    };
+    let centred = place(&screen_of(&narrow), 192, 60, 0, 0, Fit::Center, 11);
+    assert_eq!(
+        centred.cells.len(),
+        192 * 60,
+        "a larger pane has no hint row"
+    );
+    assert_ne!(centred.cells[0].ch, '\u{00b6}');
+    assert_eq!(centred.cells[5 * 192 + 16].ch, '\u{00b6}');
+
+    let mut pane = Vec::new();
+    session_fit(Fit::Center).frame_grid((192, 60), &narrow, &mut pane);
+    let text = String::from_utf8_lossy(&pane);
+    assert!(text.contains('\u{00b6}'), "{text}");
+    assert!(
+        !text.contains("tty11 is"),
+        "a larger pane draws the file: {text}"
+    );
 }
