@@ -837,14 +837,15 @@ fn busy_frame() -> TtyModel {
 
 /// Report the CPU of a second layout. It prints; it does not pass or fail
 /// on the numbers. Ignored so `cargo test` does not spend a release build
-/// on it.
+/// on it. The report names the profile from `debug_assertions`. A debug
+/// build says the numbers are not the release profile.
 ///
 /// Run it on the shipped release profile (fat LTO, one codegen unit):
 ///
 /// ```sh
 /// cargo test -p llama-watch --locked --release --test grid_file -- --ignored measure_second_layout_cost --exact --nocapture
 /// ```
-#[ignore = "prints a release-profile timing report; run it by name with --release"]
+#[ignore = "prints a timing report; run it by name, with --release for the shipped profile"]
 #[test]
 fn measure_second_layout_cost() {
     fn clk_tck() -> f64 {
@@ -923,7 +924,14 @@ fn measure_second_layout_cost() {
 
     let hz = clk_tck();
     eprintln!("measure_second_layout_cost");
-    eprintln!("profile: release, if this binary was built with --release");
+    eprintln!(
+        "profile: {}",
+        if cfg!(debug_assertions) {
+            "debug build. debug_assertions is on, so these numbers are not the release profile"
+        } else {
+            "release build. debug_assertions is off"
+        }
+    );
     eprintln!("CLK_TCK {hz}");
     eprintln!("frames: no IN/OUT text; 8192 characters of IN; IN and OUT at 32768");
     eprintln!("each figure is the median of three one-second runs, from utime+stime");
