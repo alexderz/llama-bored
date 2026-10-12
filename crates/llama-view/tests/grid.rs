@@ -360,3 +360,72 @@ fn kiosk_calls_an_old_file_stale_and_shows_a_fresh_one() {
     assert!(!out.contains("waiting"), "{out:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #115: llama-view takes the size from the file. A 213x60 grid shown in a
+/// 192x60 pane says so, and a 160x49 grid is not treated as a 192-wide console.
+#[test]
+fn a_grid_file_is_shown_at_its_own_size() {
+    let mark = GridCell {
+        ch: '\u{00b6}',
+        fg: ORANGE,
+        bg: TEAL,
+    };
+    let blank = GridCell {
+        ch: ' ',
+        fg: ORANGE,
+        bg: TEAL,
+    };
+    let mut wide_cells = vec![blank; 213 * 60];
+    wide_cells[200] = mark;
+    let wide = GridImage {
+        seq: 1,
+        unix_ms: 0,
+        cols: 213,
+        rows: 60,
+        cells: wide_cells,
+    };
+    let screen = screen_of(&wide);
+    assert_eq!((screen.cols, screen.rows), (213, 60));
+
+    let mut out = Vec::new();
+    session(ColorMode::Truecolor).frame_grid((213, 60), &wide, &mut out);
+    assert!(
+        contains(&out, "\u{00b6}".as_bytes()),
+        "the mark is on a pane of the file's own size"
+    );
+
+    let mut cropped = Vec::new();
+    session(ColorMode::Truecolor).frame_grid((192, 60), &wide, &mut cropped);
+    let text = String::from_utf8_lossy(&cropped);
+    assert!(text.contains("tty11 is 213x60, this pane 192x60"), "{text}");
+    assert!(
+        !text.contains('\u{00b6}'),
+        "column 200 is past a 192-column pane"
+    );
+
+    let mut narrow_cells = vec![blank; 160 * 49];
+    narrow_cells[159] = mark;
+    let narrow = GridImage {
+        seq: 1,
+        unix_ms: 0,
+        cols: 160,
+        rows: 49,
+        cells: narrow_cells,
+    };
+    let mut pane = Vec::new();
+    session(ColorMode::Truecolor).frame_grid((192, 60), &narrow, &mut pane);
+    let text = String::from_utf8_lossy(&pane);
+    assert!(
+        text.contains('\u{00b6}'),
+        "the file's last column is drawn; the pane is wider than the file"
+    );
+    assert!(
+        !text.contains("tty11 is"),
+        "a larger pane does not rename the file: {text}"
+    );
+
+    let mut small = Vec::new();
+    session(ColorMode::Truecolor).frame_grid((80, 24), &narrow, &mut small);
+    let text = String::from_utf8_lossy(&small);
+    assert!(text.contains("tty11 is 160x49, this pane 80x24"), "{text}");
+}
