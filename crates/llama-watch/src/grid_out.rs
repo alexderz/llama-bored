@@ -16,6 +16,18 @@
 //! and returns, so a slow or failing disk never delays the console, the
 //! snapshot or the watchdog ping. A failed write is logged once per distinct
 //! error and retried at most once per heartbeat; the dashboard carries on.
+//!
+//! `[grid] size` (#115) is optional. Unset, or equal to the console frame,
+//! the slot holds that frame and this thread writes it. A different size
+//! puts a clone of the [`TtyModel`] in the slot instead: the model's owned
+//! strings and vectors, one frame, dropped when a newer frame replaces it.
+//! This thread then lays that model out at the file's size and writes the
+//! result. The layout runs after the slot is taken and the lock is dropped,
+//! so however long it takes it does not delay the console write, the snapshot
+//! or the watchdog ping. Layout reads cells only. The block digits are sized
+//! from the column budget (`fit_pixel`), and eighths versus halves come from
+//! `chart_glyphs` on the model, not from the console font or from a cell's
+//! size in pixels. The second size needs no font of its own.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -30,7 +42,9 @@ use llama_core::gridfile::{self, GridCell, GridImage, HEARTBEAT};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::palette::Palette;
 
+use crate::config::TtySize;
 use crate::tty::grid::{C16, Grid};
+use crate::tty::layout::{self, TtyModel};
 
 /// Mode of the grid file: owner and group read. The unit's group (`llama-view`)
 /// comes from the directory's setgid bit, not from here.
@@ -200,9 +214,17 @@ fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> io::Result<()> {
 
 type Failure = (io::ErrorKind, String);
 
+/// One waiting frame. The newest replaces whatever is still here.
+enum Queued {
+    /// The console frame, written as it stands. No second layout.
+    Console(Grid),
+    /// The same data, laid out on the writer thread at this size.
+    Apart(TtyModel, u16, u16),
+}
+
 #[derive(Default)]
 struct State {
-    pending: Option<Grid>,
+    pending: Option<Queued>,
     closed: bool,
 }
 
@@ -221,12 +243,19 @@ impl Shared {
 /// file stays (it goes stale, which is the reader's cue).
 pub struct GridTap {
     shared: Arc<Shared>,
+    /// `[grid] size`. `None` publishes every console frame as it stands.
+    size: Option<TtySize>,
 }
 
 impl GridTap {
     /// Start the thread with `writer`. `log` gets one line per distinct
-    /// failure and one when the writes recover.
-    pub fn spawn<L: Sink + Send + 'static>(writer: GridWriter, log: L) -> io::Result<Self> {
+    /// failure and one when the writes recover. `size` is `[grid] size`:
+    /// `None` publishes the console frame.
+    pub fn spawn<L: Sink + Send + 'static>(
+        writer: GridWriter,
+        log: L,
+        size: Option<TtySize>,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -236,13 +265,34 @@ impl GridTap {
         std::thread::Builder::new()
             .name("grid-writer".to_owned())
             .spawn(move || writer_loop(writer, log, &theirs))?;
-        Ok(Self { shared })
+        Ok(Self { shared, size })
     }
 
-    /// Hand over the newest frame and return at once. A frame still waiting
-    /// is replaced.
+    /// Publish `grid` as it stands and return at once. A frame still waiting
+    /// is replaced. This does not look at [`Self`]'s size: a caller that
+    /// already chose the console frame uses it, and so do the writer tests.
     pub fn offer(&self, grid: &Grid) {
-        let old = self.shared.lock().pending.replace(grid.clone());
+        self.enqueue(Queued::Console(grid.clone()));
+    }
+
+    /// Publish the console frame, or a second layout when `[grid] size`
+    /// differs from it. Returns once the frame is in the slot.
+    ///
+    /// The copy is the console grid when the size is unset or equal, and a
+    /// clone of `model` otherwise. The layout of that model happens on the
+    /// writer thread, not here.
+    pub fn offer_frame(&self, model: &TtyModel, console: &Grid) {
+        let queued = match self.size {
+            Some(size) if size.cols != console.cols() || size.rows != console.rows() => {
+                Queued::Apart(model.clone(), size.cols, size.rows)
+            }
+            _ => Queued::Console(console.clone()),
+        };
+        self.enqueue(queued);
+    }
+
+    fn enqueue(&self, queued: Queued) {
+        let old = self.shared.lock().pending.replace(queued);
         drop(old);
         self.shared.wake.notify_one();
     }
@@ -273,8 +323,8 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
                 if st.closed {
                     return;
                 }
-                if let Some(grid) = st.pending.take() {
-                    break Some(grid);
+                if let Some(queued) = st.pending.take() {
+                    break Some(queued);
                 }
                 match writer.heartbeat_in(Instant::now()) {
                     Some(left) if left.is_zero() => break None,
@@ -292,8 +342,17 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
             }
         };
         let now = Instant::now();
-        let result = match &frame {
-            Some(grid) => writer.offer(grid, now, unix_ms()),
+        // Layout, when there is one, runs without the slot lock held.
+        let result = match frame {
+            Some(Queued::Console(grid)) => writer.offer(&grid, now, unix_ms()),
+            Some(Queued::Apart(model, cols, rows)) => {
+                // Cells only: `fit_pixel` sizes the block digits from the
+                // column budget, and eighths versus halves come from
+                // `model.chart_glyphs`. The console font's pixel size is
+                // not an input.
+                let grid = layout::layout(&model, cols, rows);
+                writer.offer(&grid, now, unix_ms())
+            }
             None => writer.heartbeat(now, unix_ms()),
         };
         match result {

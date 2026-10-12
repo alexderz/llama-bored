@@ -318,6 +318,21 @@ pub enum InvalidWatchConfig {
         /// Requested rows.
         rows: u16,
     },
+    /// `grid.size` is below the layout floor or above the console bound.
+    /// Same limits as [`Self::TtySize`].
+    #[error(
+        "grid.size {cols}x{rows} is outside {min_cols}x{min_rows}..={max_cols}x{max_rows}",
+        min_cols = crate::tty::layout::MIN_COLS,
+        min_rows = crate::tty::layout::MIN_ROWS,
+        max_cols = TTY_SIZE_MAX_COLS,
+        max_rows = TTY_SIZE_MAX_ROWS
+    )]
+    GridSize {
+        /// Requested columns.
+        cols: u16,
+        /// Requested rows.
+        rows: u16,
+    },
     /// `grid.path` is not an absolute path to a file.
     #[error("grid.path {path:?}: {reason}")]
     GridPath {
@@ -567,6 +582,25 @@ impl TtySize {
             rows: dimension(rows)?,
         })
     }
+
+    /// Inside the layout floor and the console bound. `[tty] size` and
+    /// `[grid] size` both use this.
+    #[must_use]
+    fn allowed(self) -> bool {
+        (crate::tty::layout::MIN_COLS..=TTY_SIZE_MAX_COLS).contains(&self.cols)
+            && (crate::tty::layout::MIN_ROWS..=TTY_SIZE_MAX_ROWS).contains(&self.rows)
+    }
+}
+
+/// `[grid] size`. Missing means unset. A present value uses [`TtySize::parse`].
+fn deserialize_grid_size<'de, D>(deserializer: D) -> Result<Option<TtySize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    TtySize::parse(&text).map(Some).ok_or_else(|| {
+        serde::de::Error::custom("grid.size must be \"COLSxROWS\", such as \"160x49\"")
+    })
 }
 
 fn dimension(text: &str) -> Option<u16> {
@@ -965,17 +999,25 @@ pub const MAX_GRID_PATH_BYTES: usize = 4096;
 
 /// `[grid]`: publish each laid-out frame as a file (`llama_core::gridfile`)
 /// so llama-view can show the dashboard with the original characters and
-/// exact RGB (#107). The file holds the same text tty11 shows.
+/// exact RGB (#107). Unset [`GridFile::size`] publishes the console frame.
+/// A different size is a second layout of the same frame (#115); the console
+/// stays as it is.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GridFile {
-    /// Write the file. Off by default: with it off nothing is written.
+    /// Write the file. Off by default: with it off nothing is written and
+    /// nothing is built for the file.
     #[serde(default)]
     pub enabled: bool,
     /// The file. Absolute; its directory has to exist and be writable by the
     /// watcher (tmpfiles does that for the default).
     #[serde(default = "defaults::grid_path")]
     pub path: PathBuf,
+    /// `"COLSxROWS"`, parsed like [`Tty::size`] and bounded the same way.
+    /// Unset, or equal to the console's actual size, publishes that frame.
+    /// Otherwise the file is laid out again at this size.
+    #[serde(default, deserialize_with = "deserialize_grid_size")]
+    pub size: Option<TtySize>,
 }
 
 impl Default for GridFile {
@@ -983,6 +1025,7 @@ impl Default for GridFile {
         Self {
             enabled: false,
             path: defaults::grid_path(),
+            size: None,
         }
     }
 }
@@ -1467,11 +1510,21 @@ impl Config {
                 blank_min,
             });
         }
-        if let Some(TtySize { cols, rows }) = self.tty.size
-            && !((crate::tty::layout::MIN_COLS..=TTY_SIZE_MAX_COLS).contains(&cols)
-                && (crate::tty::layout::MIN_ROWS..=TTY_SIZE_MAX_ROWS).contains(&rows))
+        if let Some(size) = self.tty.size
+            && !size.allowed()
         {
-            return Err(InvalidWatchConfig::TtySize { cols, rows });
+            return Err(InvalidWatchConfig::TtySize {
+                cols: size.cols,
+                rows: size.rows,
+            });
+        }
+        if let Some(size) = self.grid.size
+            && !size.allowed()
+        {
+            return Err(InvalidWatchConfig::GridSize {
+                cols: size.cols,
+                rows: size.rows,
+            });
         }
         let smooth_s = self.load.smooth_s;
         if !smooth_s.is_finite() || !(0.0..=5.0).contains(&smooth_s) {

@@ -143,8 +143,11 @@ impl<L: Sink> PublishStep for Publisher<L> {
 impl<W: Write> RenderStep for Term<W> {
     fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()> {
         let grid = layout::layout(model, self.cols(), self.rows());
+        // The tap copies this grid, or the model when `[grid] size` differs.
+        // Either copy returns at once. A second layout runs on the tap's
+        // thread, so it cannot delay this write.
         if let Some(tap) = self.grid_tap() {
-            tap.offer(&grid);
+            tap.offer_frame(model, &grid);
         }
         self.render(&grid, now)
     }
@@ -933,7 +936,7 @@ fn with_grid_file<W: Write>(term: Term<W>, config: &Config) -> Term<W> {
         return term;
     }
     let writer = GridWriter::new(&config.grid.path, config.tty.palette);
-    match GridTap::spawn(writer, log::Stderr) {
+    match GridTap::spawn(writer, log::Stderr, config.grid.size) {
         Ok(tap) => term.with_grid_tap(tap),
         Err(err) => {
             log::emit(
@@ -4095,6 +4098,30 @@ mod tests {
 
     impl llama_core::log::Sink for QuietLog {
         fn write_line(&mut self, _line: &str) {}
+    }
+
+    /// #115: `[grid] enabled = false` starts no writer, even when a size is
+    /// set, so a frame builds nothing for the file.
+    #[test]
+    fn grid_disabled_does_not_start_a_writer() {
+        let config =
+            Config::from_toml("[grid]\nenabled = false\nsize = \"213x60\"\n").expect("parse");
+        assert!(config.validate(8).is_ok());
+        let now = Instant::now();
+        let term = crate::tty::term::Term::new(
+            Vec::new(),
+            || {
+                Ok(crate::tty::term::Size {
+                    cols: 192,
+                    rows: 60,
+                })
+            },
+            Duration::from_secs(30),
+            now,
+        )
+        .expect("term");
+        let term = super::with_grid_file(term, &config);
+        assert!(term.grid_tap().is_none());
     }
 
     fn grid_text(grid: &crate::tty::grid::Grid) -> String {

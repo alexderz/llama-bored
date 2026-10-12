@@ -131,7 +131,8 @@ pub struct Term<W> {
     /// [`Self::restore_console`].
     modes: Option<SavedModes>,
     /// `[grid] enabled` (#107): where each laid-out frame is also offered.
-    /// Never written to the console.
+    /// A `[grid] size` other than this console's is laid out on the tap's
+    /// thread (#115), not here. Never written to the console.
     grid_tap: Option<crate::grid_out::GridTap>,
 }
 

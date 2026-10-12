@@ -6,11 +6,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use llama_core::gridfile::{self, HEARTBEAT};
+use llama_core::gridfile::{self, GridImage, HEARTBEAT};
 use llama_core::log::Sink;
 use llama_core::palette::Palette;
-use llama_watch::config::{Config, DEFAULT_GRID_PATH};
+use llama_watch::collector::LoadSource;
+use llama_watch::config::{ChartGlyphs, Config, DEFAULT_GRID_PATH, TtySize};
 use llama_watch::grid_out::{GridTap, GridWriter};
+use llama_watch::service::RenderStep;
+use llama_watch::tty::chart::ChartBucket;
+use llama_watch::tty::ctx_history::CtxPoint;
+use llama_watch::tty::layout::{
+    self, Activity, HealthSeg, HealthStatus, SetupItem, SetupRow, SetupView, Slot, TtyModel,
+    WatchState,
+};
 use llama_watch::tty::sanitize::sanitize;
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 use llama_watch::tty::{C16, Cell, Grid};
@@ -250,7 +258,12 @@ fn seq_of(path: &Path) -> Option<u32> {
 fn the_tap_writes_changes_and_heartbeats_and_never_blocks() {
     let dir = scratch("tap");
     let path = dir.join("grid");
-    let tap = GridTap::spawn(GridWriter::new(&path, Palette::Llama), Capture::default()).unwrap();
+    let tap = GridTap::spawn(
+        GridWriter::new(&path, Palette::Llama),
+        Capture::default(),
+        None,
+    )
+    .unwrap();
     tap.offer(&frame("one"));
     wait_for("the first file", || seq_of(&path) == Some(1));
     // Unchanged frames at tick rate: the file stays as it is, for a while.
@@ -291,7 +304,7 @@ fn an_unwritable_directory_is_logged_once_and_frames_keep_flowing() {
     let path = dir.join("grid");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let log = Capture::default();
-    let tap = GridTap::spawn(GridWriter::new(&path, Palette::Llama), log.clone()).unwrap();
+    let tap = GridTap::spawn(GridWriter::new(&path, Palette::Llama), log.clone(), None).unwrap();
     let started = Instant::now();
     for i in 0..30 {
         tap.offer(&frame(&format!("f{i}")));
@@ -361,6 +374,7 @@ fn the_console_output_does_not_depend_on_rich_or_the_tap() {
     let tap = GridTap::spawn(
         GridWriter::new(&dir.join("grid"), Palette::Llama),
         Capture::default(),
+        None,
     )
     .unwrap();
     let with = console_bytes(&grids, Some(tap));
@@ -376,6 +390,7 @@ fn grid_config_defaults_parse_and_validate() {
     let config = Config::from_toml("").expect("empty");
     assert!(!config.grid.enabled);
     assert_eq!(config.grid.path, Path::new(DEFAULT_GRID_PATH));
+    assert_eq!(config.grid.size, None);
     assert_eq!(DEFAULT_GRID_PATH, "/run/llama-watch-grid/grid");
     assert!(config.validate(8).is_ok());
 
@@ -392,4 +407,393 @@ fn grid_config_defaults_parse_and_validate() {
         assert!(config.validate(8).is_err(), "{bad:?}");
     }
     assert!(Config::from_toml("[grid]\nbogus = 1\n").is_err());
+}
+
+/// #115: `[grid] size` parses with [`TtySize`] and fails in the same words.
+#[test]
+fn grid_size_uses_the_tty_size_wording_and_bounds() {
+    let ok = Config::from_toml("[grid]\nsize = \"213x60\"\n").expect("parse");
+    assert_eq!(
+        ok.grid.size,
+        Some(TtySize {
+            cols: 213,
+            rows: 60
+        })
+    );
+    assert!(ok.validate(8).is_ok());
+
+    for bad in [
+        "\"213X60\"",
+        "\"213x\"",
+        "\"x60\"",
+        "\"0213x60\"",
+        "\"213 x 60\"",
+        "\"\"",
+    ] {
+        let err = Config::from_toml(&format!("[grid]\nsize = {bad}\n")).expect_err(bad);
+        assert!(
+            err.to_string()
+                .contains("grid.size must be \"COLSxROWS\", such as \"160x49\""),
+            "{bad}: {err}"
+        );
+    }
+    let err = Config::from_toml("[grid]\nsize = \"159x60\"\n")
+        .expect("parses")
+        .validate(8)
+        .expect_err("below the floor");
+    assert_eq!(
+        err.to_string(),
+        "grid.size 159x60 is outside 160x26..=1024x512"
+    );
+    // `enabled = false` does not skip the check. Nothing is built either way
+    // until the file is turned on; a bad size is still a load error.
+    let err = Config::from_toml("[grid]\nenabled = false\nsize = \"213x25\"\n")
+        .expect("parses")
+        .validate(8)
+        .expect_err("below the floor");
+    assert_eq!(
+        err.to_string(),
+        "grid.size 213x25 is outside 160x26..=1024x512"
+    );
+}
+
+fn encoded(dir: &Path, grid: &Grid) -> GridImage {
+    let path = dir.join("direct");
+    let mut writer = GridWriter::new(&path, Palette::Llama);
+    writer
+        .offer(grid, Instant::now(), 7)
+        .expect("encode the console frame");
+    read(&path)
+}
+
+fn read_ok(path: &Path) -> Option<GridImage> {
+    gridfile::decode(&std::fs::read(path).ok()?).ok()
+}
+
+fn wait_cells(path: &Path, want: &GridImage) {
+    wait_for("the published cells", || {
+        read_ok(path).is_some_and(|got| {
+            got.cols == want.cols && got.rows == want.rows && got.cells == want.cells
+        })
+    });
+}
+
+fn first_diff(a: &Grid, b: &Grid) -> Option<(u16, u16)> {
+    if a.cols() != b.cols() || a.rows() != b.rows() {
+        return Some((0, 0));
+    }
+    for row in 0..a.rows() {
+        for col in 0..a.cols() {
+            if a.get(col, row) != b.get(col, row) {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+/// Top-left copy: a pad when `src` is smaller, a crop when it is larger.
+fn placed_like(src: &Grid, cols: u16, rows: u16) -> Grid {
+    let mut out = Grid::blank(cols, rows);
+    for row in 0..rows.min(src.rows()) {
+        for col in 0..cols.min(src.cols()) {
+            if let Some(cell) = src.get(col, row) {
+                out.put(col, row, cell);
+            }
+        }
+    }
+    out
+}
+
+/// #115: unset, and a size equal to the console, publish that frame and
+/// do not lay it out again. A poisoned cell would not survive a second layout.
+#[test]
+fn an_unset_or_matching_size_publishes_the_console_frame() {
+    let model = busy_frame();
+    let fresh = layout::layout(&model, 192, 60);
+    let mut console = fresh.clone();
+    let mark = Cell::with_rich('Z', '\u{017d}', C16::BrightMagenta, C16::BrightGreen);
+    assert_ne!(
+        fresh.get(4, 4),
+        Some(mark),
+        "the mark must not be a layout cell"
+    );
+    console.put(4, 4, mark);
+
+    for (name, size) in [
+        ("unset", None),
+        (
+            "equal",
+            Some(TtySize {
+                cols: 192,
+                rows: 60,
+            }),
+        ),
+    ] {
+        let dir = scratch(name);
+        let path = dir.join("grid");
+        let want = encoded(&dir, &console);
+        let tap = GridTap::spawn(
+            GridWriter::new(&path, Palette::Llama),
+            Capture::default(),
+            size,
+        )
+        .expect("tap");
+        tap.offer_frame(&model, &console);
+        wait_cells(&path, &want);
+        let got = read(&path);
+        assert_eq!((got.cols, got.rows), (192, 60), "{name}");
+        assert_ne!(
+            encoded(&dir, &fresh).cells,
+            got.cells,
+            "{name}: a second layout would have dropped the marked cell"
+        );
+        drop(tap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #115: a wider file and a narrower one are real layouts at that size.
+/// The console bytes stay the console's.
+#[test]
+fn a_wider_and_a_narrower_grid_are_laid_out_and_the_console_is_unchanged() {
+    let model = busy_frame();
+    let console = layout::layout(&model, 192, 60);
+    assert_eq!((console.cols(), console.rows()), (192, 60));
+    let plain = console_draw(&model, None);
+
+    for (cols, rows) in [(213u16, 60u16), (160, 49)] {
+        let laid = layout::layout(&model, cols, rows);
+        assert!(
+            first_diff(&laid, &placed_like(&console, cols, rows)).is_some(),
+            "{cols}x{rows} is a pad or a crop of the console"
+        );
+        let dir = scratch(&format!("{cols}x{rows}"));
+        let path = dir.join("grid");
+        let want = encoded(&dir, &laid);
+        let tap = GridTap::spawn(
+            GridWriter::new(&path, Palette::Llama),
+            Capture::default(),
+            Some(TtySize { cols, rows }),
+        )
+        .expect("tap");
+        tap.offer_frame(&model, &console);
+        wait_cells(&path, &want);
+        assert_eq!(console_draw(&model, Some(TtySize { cols, rows })), plain);
+        drop(tap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The newest model is the one that lands. An older one still waiting is not
+/// laid out once a newer frame has replaced it.
+#[test]
+fn the_newest_model_wins_the_second_layout() {
+    let console = layout::layout(&busy_frame(), 192, 60);
+    let mut first = busy_frame();
+    first.host = "aaa".to_owned();
+    let mut second = busy_frame();
+    second.host = "bbb".to_owned();
+    let dir = scratch("newest");
+    let path = dir.join("grid");
+    let tap = GridTap::spawn(
+        GridWriter::new(&path, Palette::Llama),
+        Capture::default(),
+        Some(TtySize {
+            cols: 213,
+            rows: 60,
+        }),
+    )
+    .expect("tap");
+    tap.offer_frame(&first, &console);
+    tap.offer_frame(&second, &console);
+    let want = encoded(&dir, &layout::layout(&second, 213, 60));
+    wait_cells(&path, &want);
+    drop(tap);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn console_draw(model: &TtyModel, size: Option<TtySize>) -> Vec<u8> {
+    let label = match size {
+        None => "draw-unset".to_owned(),
+        Some(size) => format!("draw-{}x{}", size.cols, size.rows),
+    };
+    let dir = scratch(&label);
+    let now = Instant::now();
+    let mut term = Term::new(
+        Vec::new(),
+        || {
+            Ok(Size {
+                cols: 192,
+                rows: 60,
+            })
+        },
+        Duration::from_secs(30),
+        now,
+    )
+    .expect("term");
+    if let Some(size) = size {
+        let tap = GridTap::spawn(
+            GridWriter::new(&dir.join("grid"), Palette::Llama),
+            Capture::default(),
+            Some(size),
+        )
+        .expect("tap");
+        term = term.with_grid_tap(tap);
+    }
+    RenderStep::draw(&mut term, model, now).expect("draw");
+    let bytes = term.out().to_vec();
+    drop(term);
+    let _ = std::fs::remove_dir_all(&dir);
+    bytes
+}
+
+fn busy_frame() -> TtyModel {
+    let prose = |tag: &str| {
+        let line = format!(
+            "{tag} the model writes a full line of ordinary prose about tokens and context. "
+        );
+        let mut text = String::new();
+        for _ in 0..12 {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text.push_str("caf\u{e9} \u{2192} next");
+        text
+    };
+    let slot = |id: u32, generating: bool| Slot {
+        id,
+        generating,
+        done: 12_000 + u64::from(id) * 1_000,
+        cached: 8_000,
+        total: 20_000,
+        open: false,
+        done_known: true,
+        decoded: 400 + u64::from(id),
+        ctx_prompt: Some(20_000),
+        n_ctx: Some(262_144),
+        ctx_history: (0u32..24)
+            .map(|i| CtxPoint {
+                ms: 10_000,
+                max: Some(10_000 + u64::from(i) * 500),
+                reset: i == 3,
+                reasons: 0,
+            })
+            .collect(),
+    };
+    let row = |id: u32, live: bool| Activity {
+        live,
+        id,
+        time: format!("18:4{}:0{}", id % 6, id % 10),
+        source: "local".to_owned(),
+        model: "Model".to_owned(),
+        input_tok: 20_000 + u64::from(id) * 100,
+        cached_tok: 8_000,
+        output_tok: 400 + u64::from(id),
+        prompt_tps: Some(900.0 + f64::from(id)),
+        gen_tps: Some(40.0 + f64::from(id)),
+        dur: format!("{id}.2s"),
+        n_ctx: Some(262_144),
+        ..Activity::default()
+    };
+    TtyModel {
+        state: WatchState::Generating,
+        host: "box".to_owned(),
+        model_name: "Model".to_owned(),
+        model_detail: "llama.cpp".to_owned(),
+        model_stuck: false,
+        slots_line: "2/3 busy".to_owned(),
+        swap_line: "none".to_owned(),
+        cool_c: Some(34),
+        cpu_c: Some(61),
+        gpu_c: Some(72),
+        clock: "2026-10-11 12:00:00".to_owned(),
+        cpu_pct: Some(41.0),
+        cpu_cores: Some(16),
+        gpu_pct: Some(88.0),
+        vram_used_gb: Some(20.5),
+        vram_total_gb: Some(24.0),
+        mem_used_gb: Some(40.0),
+        mem_total_gb: Some(64.0),
+        power_w: Some(280.0),
+        power_limit_w: Some(350.0),
+        load_pct: Some(70.0),
+        activity_pct: Some(82.0),
+        activity_src: Some(LoadSource::Gpu),
+        activity_w: Some(280.0),
+        gen_tps: Some(54.2),
+        prompt_tps: Some(1200.0),
+        prompt_last: Some(4096),
+        gen_ceiling: 250.0,
+        prompt_ceiling: 1500.0,
+        slots: vec![slot(0, true), slot(1, true), slot(2, false)],
+        backend_lines: vec!["engine running".to_owned()],
+        text_note: String::new(),
+        requests: (0u32..8).map(|id| row(id, id == 0)).collect(),
+        in_title: "IN  slot 0".to_owned(),
+        out_title: "OUT slot 0".to_owned(),
+        in_lines: vec![prose("IN")],
+        out_lines: vec![prose("OUT")],
+        out_shown: 0,
+        replay_frame: None,
+        show_text: true,
+        down_since: String::new(),
+        health: vec![
+            HealthSeg {
+                name: "llama-swap".to_owned(),
+                status: HealthStatus::Ok,
+                note: "3ms".to_owned(),
+            },
+            HealthSeg {
+                name: "slots".to_owned(),
+                status: HealthStatus::Ok,
+                note: "14ms".to_owned(),
+            },
+            HealthSeg {
+                name: "nvml".to_owned(),
+                status: HealthStatus::Ok,
+                note: String::new(),
+            },
+        ],
+        snapshot: Some(48_213),
+        snapshot_age: "0.1s".to_owned(),
+        errors: 0,
+        uptime: "3d04h".to_owned(),
+        chart: (0u32..160)
+            .map(|i| ChartBucket {
+                gen_tps: Some(20.0 + f64::from(i % 17)),
+                prompt_tps: Some(if i % 5 == 0 { 400.0 } else { 0.0 }),
+            })
+            .collect(),
+        chart_bucket_s: 2,
+        chart_glyphs: ChartGlyphs::Eighths,
+        fans: None,
+        temps: None,
+        ctx_history_h: 6,
+        setup: Some(SetupView {
+            id: "model".to_owned(),
+            name: "Model".to_owned(),
+            more: 1,
+            rows: vec![
+                SetupRow {
+                    label: "ctx".to_owned(),
+                    items: vec![SetupItem {
+                        sep: String::new(),
+                        text: "262144".to_owned(),
+                        dim: false,
+                        text_value: false,
+                    }],
+                },
+                SetupRow {
+                    label: "kv".to_owned(),
+                    items: vec![SetupItem {
+                        sep: " · ".to_owned(),
+                        text: "q8_0".to_owned(),
+                        dim: false,
+                        text_value: false,
+                    }],
+                },
+            ],
+        }),
+    }
 }

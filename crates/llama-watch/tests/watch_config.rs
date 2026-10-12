@@ -319,6 +319,7 @@ enum Rule {
     Setup,
     SpecsDir,
     TtySize,
+    GridSize,
     GridPath,
 }
 
@@ -356,6 +357,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::Setup { .. }) => Rule::Setup,
         Err(InvalidWatchConfig::SpecsDir { .. }) => Rule::SpecsDir,
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
+        Err(InvalidWatchConfig::GridSize { .. }) => Rule::GridSize,
         Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
     }
 }
@@ -1207,6 +1209,78 @@ fn cases() -> &'static [Case] {
                 })
             },
             expect: Rule::TtySize,
+        },
+        Case {
+            name: "grid size unset",
+            nproc: 32,
+            mutate: |cfg| cfg.grid.size = None,
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "grid size at the layout floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 160,
+                    rows: 26,
+                })
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "grid size at the upper bound",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 1024,
+                    rows: 512,
+                })
+            },
+            expect: Rule::Ok,
+        },
+        Case {
+            name: "grid size one column short of the floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 159,
+                    rows: 60,
+                })
+            },
+            expect: Rule::GridSize,
+        },
+        Case {
+            name: "grid size one row short of the floor",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 213,
+                    rows: 25,
+                })
+            },
+            expect: Rule::GridSize,
+        },
+        Case {
+            name: "grid size too wide",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 1025,
+                    rows: 60,
+                })
+            },
+            expect: Rule::GridSize,
+        },
+        Case {
+            name: "grid size too tall",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 213,
+                    rows: 513,
+                })
+            },
+            expect: Rule::GridSize,
         },
         Case {
             name: "blank_min 60 leaves no room for sleep",
