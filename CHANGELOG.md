@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- llama-watch SETUP rules gain kind `text` (#114), valid only with a `spec:` source. The value must be a JSON string: whitespace runs collapse to one space, a control or an escape sequence is dropped, and characters the console font lacks are transliterated the same way as the rest of the dashboard (the grid file keeps the original character when it is showable). It is cut to `max_chars` (default 64, at most 96) and then to the room on the row; items after it on that row drop before that cut. `map` matches the sanitised value before the cut and replaces the whole item; `label` and `suffix` wrap the cut value. A number, boolean, null, object or array shows nothing. From 60 rows the block may take nine rows, title included. Launch-command, environment and engine values stay limited to numbers and short tokens, and the text does not enter the snapshot, the LCD or the metrics.
+
 ## 0.5.4 — 2026-10-11
 
 A full-Unicode grid source for llama-view, llama-cast picks the H.264 encoder the local ffmpeg offers, and SETUP rules can read per-model spec files.

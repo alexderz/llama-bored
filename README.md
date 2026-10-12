@@ -334,9 +334,10 @@ speculative acceptance `acc 3.6/step · 65 %`). A Strata model reads:
 ```
 A value nothing set is grey (`kv f16`, `full GPU`, `spec none`). Which
 settings show is configuration: see **SETUP rules** under Configuration.
-The block has six rows (title included) up to 59 rows and eight from 60;
+The block has six rows (title included) up to 59 rows and nine from 60;
 rows that do not fit drop from the bottom, and items that do not fit drop
-from the end of their row. Under 48 rows it uses only the rows beside
+from the end of their row. On a row that holds a text value, items after
+it drop before the text is cut. Under 48 rows it uses only the rows beside
 SLOTS, so the short-screen panel order is unchanged. With nothing loaded,
 or llama-swap down, it is gone.
 
@@ -910,6 +911,7 @@ engines = ["vllm"]        # llamacpp, sglang, vllm, strata, openai; absent: any
 match = "hyperqwen"       # only commands containing this (case ignored)
 source = "env:SPEC"       # where the value comes from, below
 kind = "token"            # how it is read, below
+# max_chars = 64          # kind "text" only (default 64, at most 96)
 label = "method"          # text before the value: "method mtp"
 suffix = ""               # text after it: " layers in RAM"
 sep = " · "               # separator before this item (default " · ")
@@ -938,8 +940,12 @@ field that only shows its `default`. Kinds: `number` (drawn with thousands
 separators), `token` (at most 16 characters of `A-Z a-z 0-9 _ . + -`; a
 path-like value gives only its file stem), `quant` (the GGUF quant tag of
 a model file name, `UD-Q4_K_M`), `present` (the flag is there: `on`),
-`mib` (a number of MiB drawn as `16.4 GiB`, or `512 MiB` below 1 GiB).
-An `engine:` source takes `number`, `token` or `mib` (default: as
+`mib` (a number of MiB drawn as `16.4 GiB`, or `512 MiB` below 1 GiB),
+`text` (#114, a `spec:` source only: a JSON string, whitespace runs
+collapsed to one space, controls dropped, cut to `max_chars`).
+`max_chars` defaults to 64 and is at most 96; it is an error on any other
+kind, and outside 1..=96. `text` on a source other than `spec:` is an
+error. An `engine:` source takes `number`, `token` or `mib` (default: as
 reported). `present` needs a flag source.
 
 `spec:<dotted.path>` reads `<specs_dir>/<model-id>.json`, the entry spec
@@ -950,8 +956,14 @@ dot-separated segments of letters, digits and _`. A missing key, null, or
 a value that is an object or an array leaves the field blank. A number,
 boolean or string is read like a `json:` value, and an integral float such
 as `20.0` is shown as `20`. A string longer than 1024 characters is dropped
-before it is cleaned, so a long path cannot become a file stem. Only
-numbers and short tokens are drawn: a sentence in the file shows nothing.
+before it is cleaned, so a long path cannot become a file stem. Kinds
+other than `text` still draw only a number or a short token, so a sentence
+shows nothing. Kind `text` draws the string, cut to `max_chars` and then
+to the room on the row; items after it drop before that cut. `map` matches
+the sanitised string before the cut and replaces the whole item; `label`
+and `suffix` wrap the cut value. A number, boolean, null, object or array
+under a `text` rule shows nothing. From 60 rows the block may take nine
+rows, title included, so a label row does not push the last row out.
 
 `[setup] specs_dir` is the absolute directory of those files. Leave it
 unset and the watcher opens no spec file; `spec:` fields stay blank and
