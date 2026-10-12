@@ -4486,10 +4486,10 @@ fn spec_example_rules() -> Rules {
     Rules::compile(&config.setup).expect("compile")
 }
 
-/// #92, #114: the example rules over `fixtures/llama/example-spec.json`. A
-/// tall screen shows every row; 160x49 keeps the first five and drops serve
-/// and sample. `report.label` is a text value, so the joined engine row
-/// keeps the later items and the 160-column row shows the label alone.
+/// #92, #114: the example rules over `fixtures/llama/example-spec.json`.
+/// `report.label` is its own row, drawn first. The engine row keeps the
+/// engine, quant and parameters. A tall screen shows every row. 160x49
+/// keeps the first five data rows and drops think, serve and sample.
 /// The file's paths stay off the grid.
 #[test]
 fn spec_example_rules_draw_the_fixture() {
@@ -4529,8 +4529,12 @@ fn spec_example_rules_draw_the_fixture() {
         drawn,
         [
             (
+                "label".to_owned(),
+                "Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k".to_owned()
+            ),
+            (
                 "engine".to_owned(),
-                "Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k \u{00b7} llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe".to_owned()
+                "llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe".to_owned()
             ),
             ("ctx".to_owned(), "131,072 · kv f16".to_owned()),
             (
@@ -4559,13 +4563,15 @@ fn spec_example_rules_draw_the_fixture() {
         rows,
     });
     let tall = draw(&model, 160, 60);
-    let shown = left_rows(&tall, 10, 9);
+    // Blank, title, and eight data rows: the tall cap is nine, title included.
+    let shown = left_rows(&tall, 10, 10);
     assert_eq!(shown[0], "", "a blank row under ACTIVITY");
     assert_eq!(shown[1], "  SETUP  example-35b-q6 · Example 35B");
     assert_eq!(
         shown[2..],
         [
-            "    engine   Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
+            "    label    Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
+            "    engine   llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe",
             "    ctx      131,072 · kv f16",
             "    experts  18 layers in RAM · gpu 999 · mmap off",
             "    spec     none",
@@ -4580,15 +4586,16 @@ fn spec_example_rules_draw_the_fixture() {
     assert_eq!(
         shown[2..],
         [
-            "    engine   Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
+            "    label    Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
+            "    engine   llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe",
             "    ctx      131,072 · kv f16",
             "    experts  18 layers in RAM · gpu 999 · mmap off",
             "    spec     none",
-            "    think    on · budget 24,000",
         ]
     );
     let short_text = whole(&short);
     assert!(!short_text.contains("multi-agent"), "{short_text}");
+    assert!(!short_text.contains("budget 24,000"), "{short_text}");
     assert!(!short_text.contains("temp 0.6"), "{short_text}");
     for grid in [&tall, &short] {
         let all = whole(grid);

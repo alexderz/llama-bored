@@ -965,6 +965,11 @@ and `suffix` wrap the cut value. A number, boolean, null, object or array
 under a `text` rule shows nothing. From 60 rows the block may take nine
 rows, title included, so a label row does not push the last row out.
 
+The commented spec block in `packaging/watch.example.toml` puts
+`report.label` on a row named `label`, drawn first, and leaves the
+engine, quant and parameters on `engine`. At 160 columns that label
+fills its row.
+
 `[setup] specs_dir` is the absolute directory of those files. Leave it
 unset and the watcher opens no spec file; `spec:` fields stay blank and
 the other sources still work. The path is checked when the config loads
