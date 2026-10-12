@@ -1283,6 +1283,17 @@ fn cases() -> &'static [Case] {
             expect: Rule::GridSize,
         },
         Case {
+            name: "grid size one row past the ceiling",
+            nproc: 32,
+            mutate: |cfg| {
+                cfg.grid.size = Some(TtySize {
+                    cols: 1024,
+                    rows: 513,
+                })
+            },
+            expect: Rule::GridSize,
+        },
+        Case {
             name: "blank_min 60 leaves no room for sleep",
             nproc: 32,
             mutate: |cfg| {
