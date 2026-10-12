@@ -213,6 +213,12 @@ impl SgrTable {
         out.extend_from_slice(text.as_bytes());
     }
 
+    /// Whether a full block is painted on its own colour (#120): in every
+    /// mode but 16 colours, where a background has only eight.
+    pub fn fills_blocks(&self) -> bool {
+        !matches!(self.mode, ColorMode::Ansi16)
+    }
+
     fn slot(&self, color: Color) -> u8 {
         if let Color::Rgb(r, g, b) = color {
             nearest_slot(self.palette, Rgb { r, g, b })

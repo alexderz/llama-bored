@@ -1053,6 +1053,13 @@ the terminal's colour theme does not repaint the dashboard:
 - `--palette llama|vga`: match `[tty] palette` in `watch.toml` (default
   `llama`).
 
+In truecolor and 256 colours a full block (`█`) is sent with its
+background set to its own colour (#120). A terminal that draws the glyph
+from an anti-aliased font can leave a pixel row of the cell short of the
+colour, which shows as thin lines between stacked blocks; the background
+always fills the cell. `--colors 16` sends the cell as it is, because a
+background there has eight colours.
+
 `LLAMA_VIEW_COLORS` and `LLAMA_VIEW_PALETTE` set the same from the
 environment, for saved SSH sessions that cannot pass flags; a flag wins.
 

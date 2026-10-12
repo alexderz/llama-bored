@@ -266,14 +266,32 @@ fn emit_diff(
     }
 }
 
+/// `█`, the one block glyph that is meant to cover its whole cell.
+const FULL_BLOCK: char = '\u{2588}';
+
+/// The background `cell` is painted on. A full block goes on its own colour
+/// where the mode has one for it (#120): a terminal that draws the glyph
+/// from an anti-aliased font can leave a pixel row of the cell short of the
+/// colour, which shows as a thin line between stacked blocks, and the
+/// background always fills the cell. Partial blocks keep their background:
+/// their edge is the edge of a shape.
+fn painted_bg(cell: Cell, sgr: &SgrTable) -> Color {
+    if cell.ch == FULL_BLOCK && sgr.fills_blocks() {
+        cell.fg
+    } else {
+        cell.bg
+    }
+}
+
 fn emit_sgr(out: &mut Vec<u8>, cell: Cell, pen: &mut Pen<'_>) {
     if *pen.fg != Some(cell.fg) {
         pen.sgr.push_fg(out, cell.fg);
         *pen.fg = Some(cell.fg);
     }
-    if *pen.bg != Some(cell.bg) {
-        pen.sgr.push_bg(out, cell.bg);
-        *pen.bg = Some(cell.bg);
+    let bg = painted_bg(cell, pen.sgr);
+    if *pen.bg != Some(bg) {
+        pen.sgr.push_bg(out, bg);
+        *pen.bg = Some(bg);
     }
 }
 
@@ -397,6 +415,76 @@ mod tests {
             RESTORE.windows(8).any(|w| w == b"\x1b[?1004l"),
             "focus off on restore"
         );
+    }
+
+    /// #120: stacked full blocks, a letter and a half block, as the grid
+    /// source gives them.
+    fn blocks(fg: Color) -> Vec<Cell> {
+        vec![
+            Cell::new('█', fg, Color::Black),
+            Cell::new('█', fg, Color::Black),
+            Cell::new('A', Color::White, Color::Black),
+            Cell::new('▄', fg, Color::Black),
+        ]
+    }
+
+    #[test]
+    fn truecolor_paints_a_full_block_on_its_own_colour() {
+        let violet = Color::Rgb(147, 30, 221);
+        let mut renderer = Renderer::with_colors(ColorMode::Truecolor, Palette::Llama);
+        let first = renderer.render(4, 1, &blocks(violet)).to_vec();
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            "\x1b[0m\x1b[2J\x1b[H\x1b[1;1H\
+             \x1b[38;2;147;30;221m\x1b[48;2;147;30;221m██\
+             \x1b[38;2;200;200;200m\x1b[48;2;0;0;0mA\
+             \x1b[38;2;147;30;221m▄"
+        );
+        // A block that changes colour takes its background with it.
+        let mut next = blocks(violet);
+        next[0].fg = Color::Rgb(56, 30, 239);
+        let diff = renderer.render(4, 1, &next).to_vec();
+        assert_eq!(
+            String::from_utf8(diff).unwrap(),
+            "\x1b[1;1H\x1b[38;2;56;30;239m\x1b[48;2;56;30;239m█"
+        );
+    }
+
+    #[test]
+    fn xterm256_paints_a_full_block_on_its_own_colour() {
+        let mut renderer = Renderer::with_colors(ColorMode::Xterm256, Palette::Llama);
+        let out = renderer
+            .render(4, 1, &blocks(Color::Rgb(147, 30, 221)))
+            .to_vec();
+        let text = String::from_utf8(out).unwrap();
+        let before = text.split('█').next().unwrap();
+        let index = |lead: &str| {
+            let rest = before.split(lead).nth(1).expect(lead);
+            rest.split('m').next().unwrap().to_owned()
+        };
+        assert_eq!(index("\x1b[38;5;"), index("\x1b[48;5;"));
+        // The letter after the blocks is back on the cell's own background.
+        let after = text.rsplit('█').next().unwrap();
+        assert!(after.contains("\x1b[48;5;"), "{after:?}");
+        assert!(after.ends_with('▄'));
+    }
+
+    #[test]
+    fn sixteen_colours_send_a_full_block_as_it_is() {
+        // A 16-colour background has eight colours, so nothing is added.
+        let mut renderer = Renderer::new();
+        let out = renderer.render(4, 1, &blocks(Color::BrightRed)).to_vec();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[0m\x1b[2J\x1b[H\x1b[1;1H\x1b[91m\x1b[40m██\x1b[37mA\x1b[91m▄"
+        );
+        let mut renderer = Renderer::new();
+        let exact = renderer
+            .render(4, 1, &blocks(Color::Rgb(147, 30, 221)))
+            .to_vec();
+        let text = String::from_utf8(exact).unwrap();
+        assert_eq!(text.matches("\x1b[4").count(), 1, "{text:?}");
+        assert!(text.contains("\x1b[40m██"), "{text:?}");
     }
 
     #[test]

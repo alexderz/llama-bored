@@ -12,6 +12,10 @@ All notable changes to llama-bored. Versions follow
 - `[grid] size` (`"COLSxROWS"`, the same bounds as `[tty] size`) publishes the grid file at that size when it differs from the console (#115). Unset, or equal to the console's actual size, the file is still the console frame when exact colours are off. The second layout runs on the grid thread, so the console, the snapshot and the watchdog do not wait on it.
 - The grid file writes an exact ramp colour beside the palette colour on spectrum bars (the meters, fans, slot context bars and the two rate scales), the big digits, the rate charts and temperature readings that have warn and crit thresholds (#116). `[grid] exact_colors` defaults to true when the file is enabled; `false` writes today's palette RGB and, when the size matches the console, reuses that frame. The console's bytes do not change. No exact colour is stored per cell while the file is off. The cost is in `packaging/watch.example.toml`.
 
+### Fixed
+
+- llama-view sends a full block (`█`) with its background set to its foreground colour in truecolor and 256 colours (#120). A terminal that draws the glyph from an anti-aliased font could leave the top pixel row of each cell short of the colour, a thin line between stacked blocks in the big digits and the charts. `--colors 16` is unchanged. One full first render of a busy 192x60 frame grows from 26439 to 28103 bytes with palette colours and from 32755 to 35057 with exact colours.
+
 ## 0.5.4 — 2026-10-11
 
 A full-Unicode grid source for llama-view, llama-cast picks the H.264 encoder the local ffmpeg offers, and SETUP rules can read per-model spec files.
