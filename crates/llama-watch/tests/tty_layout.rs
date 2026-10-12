@@ -11,7 +11,8 @@ use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
-    Activity, HealthSeg, HealthStatus, SetupView, Slot, TtyModel, WatchState, layout, replay_shown,
+    Activity, HealthSeg, HealthStatus, SetupItem, SetupRow, SetupView, Slot, TtyModel, WatchState,
+    layout, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -4403,9 +4404,10 @@ fn single_spaced_meters_use_a_short_block_in_whole_cells() {
     assert_eq!(grid.get(28, cpu + 1).unwrap().ch, '▓');
 }
 
-/// #52: a wide screen from 60 rows shows up to eight SETUP rows; a short
-/// one keeps the 160x26 floor (title and three rows beside SLOTS); with
-/// nothing loaded the block is gone and RECENT moves back up.
+/// #52: a wide screen from 60 rows shows up to nine SETUP rows (#114, one
+/// more than the eight the block had); a short one keeps the 160x26 floor
+/// (title and three rows beside SLOTS); with nothing loaded the block is
+/// gone and RECENT moves back up.
 #[test]
 fn setup_block_height_follows_the_screen() {
     let grid = draw(&setup_model(), 240, 67);
@@ -4598,6 +4600,211 @@ fn spec_example_rules_draw_the_fixture() {
         ] {
             assert!(!all.contains(leak), "{leak} in {all}");
         }
+    }
+}
+
+fn setup_item(text: &str, text_value: bool) -> SetupItem {
+    SetupItem {
+        sep: " \u{00b7} ".to_owned(),
+        text: text.to_owned(),
+        dim: false,
+        text_value,
+    }
+}
+
+/// One SETUP row on the generating sample, so the block sits where it
+/// always does under the meters.
+fn with_setup_rows(rows: Vec<SetupRow>) -> TtyModel {
+    let mut model = setup_model();
+    let setup = model.setup.as_mut().expect("setup");
+    setup.rows = rows;
+    setup.more = 0;
+    model
+}
+
+/// #114: the value is cut to the row after `max_chars`, and items after a
+/// text value drop before that cut. An item before the value stays.
+#[test]
+fn setup_text_is_cut_to_the_row_and_later_items_drop() {
+    let long = "a".repeat(80);
+    let model = with_setup_rows(vec![SetupRow {
+        label: "note".to_owned(),
+        items: vec![setup_item(&long, true)],
+    }]);
+    let grid = draw(&model, 160, 49);
+    let row = &left_rows(&grid, 12, 1)[0];
+    // Value column is 13; the left half ends at column 77, 65 cells.
+    assert!(
+        row.ends_with('\u{2026}') && row.chars().count() == 78,
+        "{row}"
+    );
+    assert_eq!(row.chars().filter(|ch| *ch == 'a').count(), 64);
+    assert!(!row.contains("TAIL"));
+
+    let kept = "b".repeat(60);
+    let model = with_setup_rows(vec![SetupRow {
+        label: "note".to_owned(),
+        items: vec![setup_item(&kept, true), setup_item("TAIL", false)],
+    }]);
+    let grid = draw(&model, 160, 49);
+    let row = &left_rows(&grid, 12, 1)[0];
+    assert!(row.contains(&kept) && !row.contains("TAIL"), "{row}");
+    assert!(
+        !row.contains('\u{2026}'),
+        "the value fits, so it is not cut: {row}"
+    );
+
+    let model = with_setup_rows(vec![SetupRow {
+        label: "note".to_owned(),
+        items: vec![setup_item("head", false), setup_item(&long, true)],
+    }]);
+    let grid = draw(&model, 160, 49);
+    let row = &left_rows(&grid, 12, 1)[0];
+    assert!(row.contains("head"), "{row}");
+    assert!(
+        row.ends_with('\u{2026}'),
+        "the text is cut, not dropped: {row}"
+    );
+    assert!(row.matches('a').count() > 0 || row.contains('a'), "{row}");
+}
+
+/// #114: a spec string is drawn like other dashboard text. `·` stays `·`.
+/// The console cell is the #90 transliteration; the grid file's `rich`
+/// scalar keeps the original character when it is showable. Controls and
+/// the escape sequence are already gone before the row is drawn.
+#[test]
+fn setup_text_keeps_the_original_character_and_drops_controls() {
+    let rules = Rules::compile(&llama_watch::config::Setup {
+        defaults: false,
+        field: vec![llama_watch::config::SetupField {
+            row: "note".to_owned(),
+            source: Some("spec:report.label".to_owned()),
+            kind: Some("text".to_owned()),
+            order: 10,
+            ..llama_watch::config::SetupField::default()
+        }],
+        ..llama_watch::config::Setup::default()
+    })
+    .expect("rule");
+    let doc = serde_json::json!({
+        "report": {
+            "label": "Q4 \u{00b7} caf\u{e9} \u{2192} \u{4e2d} \u{1b}]9;SPEC\u{7}\nline"
+        }
+    });
+    let found = rules.extract_with("", "example", None, Some(&doc));
+    let live = LiveCtx {
+        backend: llama_core::backend::Backend::LlamaCpp,
+        detail: None,
+        info: None,
+        engine: None,
+    };
+    let mut model = with_setup_rows(rules.rows(&found, &live));
+    model.setup.as_mut().expect("setup").id = "example".to_owned();
+    model.setup.as_mut().expect("setup").name.clear();
+    let grid = draw(&model, 160, 49);
+    let row = 12u16;
+    let console: String = (0..grid.cols())
+        .map(|col| grid.get(col, row).unwrap().ch)
+        .collect();
+    let rich: String = (0..grid.cols())
+        .map(|col| grid.get(col, row).unwrap().rich)
+        .collect();
+    assert!(console.contains("Q4 \u{00b7} cafe > \u{fffd}"), "{console}");
+    assert!(
+        rich.contains("Q4 \u{00b7} caf\u{e9} \u{2192} \u{fffd}"),
+        "{rich}"
+    );
+    assert!(!console.contains('\u{4e2d}') && !rich.contains('\u{4e2d}'));
+    assert!(
+        console.contains("]9;SPEC line")
+            || console.contains("]9;SPECline")
+            || console.contains("]9;SPEC"),
+        "{console}"
+    );
+    // The newline collapsed, so the next row is not a second line of the label.
+    let next = row_string(&grid, row + 1);
+    assert!(!next.contains("line") || next.contains("]9;SPEC"), "{next}");
+    for cell in grid.cells() {
+        assert!(!cell.ch.is_control(), "console cell {:?}", cell.ch);
+        assert!(!cell.rich.is_control(), "grid cell {:?}", cell.rich);
+    }
+    let mut term = Term::new(
+        Vec::new(),
+        || {
+            Ok(Size {
+                cols: 160,
+                rows: 49,
+            })
+        },
+        Duration::from_secs(60),
+        Instant::now(),
+    )
+    .expect("term");
+    term.render(&grid, Instant::now()).expect("render");
+    let bytes = term.out();
+    assert!(
+        !bytes.windows(8).any(|window| window == b"\x1b]9;SPEC"),
+        "the spec's OSC reached the console writer"
+    );
+    assert!(
+        !bytes.contains(&0x07),
+        "BEL from the spec reached the writer"
+    );
+    assert!(
+        !bytes.contains(&b'\n'),
+        "a newline from the spec reached the writer"
+    );
+}
+
+/// #114: at 60 rows the block may take one more row (nine, title included).
+/// The row under the block, RECENT and the health line stay put at every
+/// size the dashboard draws.
+#[test]
+fn setup_gains_one_row_at_60_without_pushing_the_panels_out() {
+    let rows: Vec<SetupRow> = (1..=8)
+        .map(|n| SetupRow {
+            label: format!("u{n}"),
+            items: vec![setup_item(&format!("kept-{n}"), n == 1)],
+        })
+        .collect();
+    let model = with_setup_rows(rows);
+    let sizes = [
+        (160u16, 26u16),
+        (160, 48),
+        (160, 59),
+        (160, 60),
+        (192, 60),
+        (240, 67),
+        (286, 60),
+        (320, 90),
+        (480, 135),
+    ];
+    for (cols, rows) in sizes {
+        let grid = draw(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        assert_dashboard(&grid, &at);
+        let setup_at = row_with(&grid, "SETUP");
+        let recent = row_with(&grid, "RECENT");
+        let health = grid.rows() - 2;
+        assert!(setup_at < recent, "{at}: SETUP overlaps RECENT");
+        assert!(recent < health, "{at}: RECENT overlaps the health line");
+        assert!(
+            req_rule_row(&grid) < grid.rows() - 3,
+            "{at}: RECENT's rule meets the health rule"
+        );
+        assert!(recent_rows_shown(&grid) >= 4, "{at}: RECENT lost its floor");
+        let shown: Vec<bool> = (1..=8)
+            .map(|n| whole(&grid).contains(&format!("kept-{n}")))
+            .collect();
+        if rows >= 60 {
+            assert_eq!(shown, vec![true; 8], "{at}: a label row pushed one out");
+            let last = row_with(&grid, "kept-8");
+            assert!(last < recent, "{at}: the extra row overlaps RECENT");
+            assert!(!row_string(&grid, health).contains("kept-"), "{at}");
+        } else {
+            assert!(!shown[7], "{at}: the ninth row is only from 60");
+        }
+        assert_blank_edges(&grid);
     }
 }
 

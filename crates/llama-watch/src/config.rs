@@ -1059,11 +1059,16 @@ pub struct SetupField {
     /// field only ever shows its `default`.
     #[serde(default)]
     pub source: Option<String>,
-    /// `number`, `token`, `quant`, `present` or `mib`. Required for `flag`,
-    /// `env`, `json` and `spec` sources, `quant` for `name`; optional for
-    /// `engine`; not allowed with `live`.
+    /// `number`, `token`, `quant`, `present`, `mib` or `text`. Required for
+    /// `flag`, `env`, `json` and `spec` sources, `quant` for `name`; optional
+    /// for `engine`; not allowed with `live`. `text` is only valid with
+    /// `spec:` (#114).
     #[serde(default)]
     pub kind: Option<String>,
+    /// Characters kept from a `text` value. Default 64, at most 96. An
+    /// error on any other kind, and outside 1..=96.
+    #[serde(default)]
+    pub max_chars: Option<i64>,
     /// Text before the value: `kv` draws `kv q8_0`.
     #[serde(default)]
     pub label: Option<String>,

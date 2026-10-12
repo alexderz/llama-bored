@@ -587,6 +587,22 @@ fn bad_rules_fail_validation_with_the_field_index() {
             "[[setup.field]]\nrow = \"ctx\"\nsource = \"argv:3\"\nkind = \"number\"\n",
             "setup.field[0]: source",
         ),
+        (
+            "[[setup.field]]\nrow = \"ctx\"\nsource = \"flag:-c\"\nkind = \"text\"\n",
+            "setup.field[0]: rule \"ctx\": kind text needs a spec: source",
+        ),
+        (
+            "[[setup.field]]\nrow = \"ctx\"\nsource = \"env:SPEC\"\nkind = \"text\"\n",
+            "setup.field[0]: rule \"ctx\": kind text needs a spec: source",
+        ),
+        (
+            "[[setup.field]]\nrow = \"ctx\"\nsource = \"flag:-c\"\nkind = \"number\"\nmax_chars = 32\n",
+            "setup.field[0]: rule \"ctx\": max_chars is only valid with kind text",
+        ),
+        (
+            "[[setup.field]]\nrow = \"note\"\nsource = \"spec:report.label\"\nkind = \"text\"\nmax_chars = 97\n",
+            "setup.field[0]: rule \"note\": max_chars 97 is outside 1..=96",
+        ),
     ] {
         let config = Config::from_toml(toml).expect("parses");
         let error = config.validate(8).expect_err("invalid").to_string();
