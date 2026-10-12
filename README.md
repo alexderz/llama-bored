@@ -1119,7 +1119,16 @@ terminal. In `watch.toml` (off by default; with it off nothing is written):
 [grid]
 enabled = true
 path = "/run/llama-watch-grid/grid"   # default
+# size = "213x60"   # COLSxROWS, 160x26..=1024x512; unset keeps the console size
 ```
+
+`size` is optional. Leave it unset, or set it equal to the console's actual
+size, and the file is that console frame. A different size is a second layout
+of the same data, done on the grid thread, and that layout is what the file
+carries; the console keeps its own size. The limits are the same as
+`[tty] size` (160x26 through 1024x512). On one machine a busy frame (several
+slots, IN/OUT text, a full RECENT list) laid out again at 213x60, with the
+console at 192x60, measured 0.06% of one core at 10 frames a second.
 
 The file is rewritten atomically (temp file and rename) when the frame
 changes and at least once a second, so a reader can tell a live writer from a
