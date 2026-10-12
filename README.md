@@ -1120,28 +1120,49 @@ terminal. In `watch.toml` (off by default; with it off nothing is written):
 enabled = true
 path = "/run/llama-watch-grid/grid"   # default
 # size = "213x60"   # COLSxROWS, 160x26..=1024x512; unset keeps the console size
+# exact_colors = true   # default when the file is on; false writes palette RGB
 ```
 
 `size` is optional. Leave it unset, or set it equal to the console's actual
-size, and the file is that console frame. A different size is a second layout
-of the same data, done on the grid thread, and that layout is what the file
-carries; the console keeps its own size. The limits are the same as
-`[tty] size` (160x26 through 1024x512). The cost grows with the IN and OUT
-text. On one machine, a release build measured the model clone, the 213x60
-layout beside a 192x60 console, and the grid compare: CPU time (`utime` +
-`stime`), the median of three runs. With no IN/OUT text the layout was
-36.7 µs per frame, 0.0367% of one core at 10 frames a second. With IN and
-OUT at their 32768-character maximums it was 640.2 µs, 0.6402% of one core.
-An 8192-character IN was 68.6 µs, 0.0686% of one core. The clone was 1.4 µs
-and the compare 9.6 µs on the light frame, and 2.7 µs and 11.0 µs on the
-full frame. The ignored test `measure_second_layout_cost` prints the same
-report.
+size, and with `exact_colors = false` the file is that console frame. A
+different size, or exact colours left on, is a second layout of the same
+data on the grid thread, and that layout is what the file carries; the
+console keeps its own size and its palette colours. The limits are the same
+as `[tty] size` (160x26 through 1024x512). The cost grows with the IN and
+OUT text. On one machine, a release build measured the model clone, the
+213x60 layout beside a 192x60 console, and the grid compare: CPU time
+(`utime` + `stime`), the median of three runs. With no IN/OUT text the
+layout was 36.7 µs per frame, 0.0367% of one core at 10 frames a second.
+With IN and OUT at their 32768-character maximums it was 640.2 µs, 0.6402%
+of one core. An 8192-character IN was 68.6 µs, 0.0686% of one core. The
+clone was 1.4 µs and the compare 9.6 µs on the light frame, and 2.7 µs and
+11.0 µs on the full frame. The ignored test `measure_second_layout_cost`
+prints the same report.
+
+`exact_colors` defaults to true when the file is enabled (#116). Filled
+cells of the spectrum bars (CPU, GPU, POWER, LOAD, ACTIVITY, the fans, the
+slot context bars and the two rate scales) take the activity ramp at that
+cell's position. The big digits take the ramp of their value, shaded by
+row. Each filled chart cell takes the ramp of the level its row stands for.
+A temperature reading with warn and crit thresholds takes a ramp anchored
+to those marks. Capacity bars, the RECENT bars, labels, the empty bar track
+and other text stay on the palette. The console draws the palette step
+either way. `false` writes each cell's palette RGB, and when the size
+matches it reuses the console frame, so the file is today's. The exact
+plane is eight bytes a cell and is not allocated when the file is off or
+exact colours are off: 92160 bytes at 192x60 when it is on. On the same
+machine, the same report's 192x60 exact layout was 51.1 µs per frame with
+no IN/OUT text (0.0511% of one core at 10 frames a second), 157.8 µs with
+an 8192-character IN (0.1578%), and 565.6 µs with IN and OUT at their
+32768-character maximums (0.5656%). The palette layout of that same 192x60
+frame in that run was 39.1 µs, 71.6 µs and 508.5 µs.
 
 The file is rewritten atomically (temp file and rename) when the frame
 changes and at least once a second, so a reader can tell a live writer from a
 stale file; writing happens on a thread of its own and a failure is logged
-once and never stops the dashboard. Each cell is one Unicode scalar and the
-RGB of its palette slot (`[tty] palette`). A character is shown when a
+once and never stops the dashboard. Each cell is one Unicode scalar and an
+RGB: the ramp when that cell has one and exact colours are on, otherwise
+the palette slot (`[tty] palette`). A character is shown when a
 terminal draws it as exactly one cell (ASCII, Latin, Greek, Cyrillic,
 punctuation, arrows, maths, box drawing); CJK, emoji, bidi controls, zero-width
 and combining characters fall back to the console's glyph. The format is in
@@ -1156,6 +1177,10 @@ llama-view --grid /path/to/grid --colors truecolor
 environment form. `--colors`, `--palette`, `--fit`, `--offset-x/y`, `--once`
 and the title work as with the console; in 256 and 16 colours an RGB equal
 to a palette slot gives exactly what the console path gives for that slot.
+On one busy 192x60 frame (activity past 100, generation past its ceiling),
+`--colors truecolor` wrote 26439 bytes and 13 colours from the palette and
+32755 bytes and 158 colours with the ramps. Each distinct colour is its own
+SGR sequence.
 llama-view reads the file as untrusted data: a bad magic, a size over
 1024x512 or a length that does not match is refused, and a scalar that is
 not safe as one cell is drawn as U+FFFD. Without `--kiosk` a missing or bad
