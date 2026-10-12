@@ -214,14 +214,17 @@ enabled = true
 # palette colour. The plane is eight bytes a cell (92160 at 192x60) and is
 # not stored per cell when the file is off or this is false. The console
 # layout still runs: a painted cell checks for the plane and returns at
-# once when it is absent. On that machine the same report's 192x60 exact
-# layout was 55.9 µs per frame with no IN/OUT text (0.0559% of one core at
-# 10 frames a second), 156.9 µs with an 8192-character IN (0.1569%), and
-# 618.0 µs with IN and OUT at 32768 characters each (0.6180%). The console
-# layout of that frame in the same run was 44.6 µs, 71.1 µs and 525.2 µs.
-# The same console layout on the commit before this change was 41.1 µs,
-# 80.2 µs and 538.5 µs. In 256 and 16 colours an RGB equal to a palette
-# slot matches the console path. A ramped cell is not a slot, so those
+# once when it is absent. On that machine, in a later run of that report
+# than the figures above, the 192x60 exact layout was 55.9 µs per frame
+# with no IN/OUT text (0.0559% of one core at 10 frames a second),
+# 156.9 µs with an 8192-character IN (0.1569%), and 618.0 µs with IN and
+# OUT at 32768 characters each (0.6180%). The console layout of that frame
+# in the same run was 44.6 µs, 71.1 µs and 525.2 µs. The same console
+# layout on the commit before this change was 41.1 µs, 80.2 µs and
+# 538.5 µs. Two reports of the same build taken at different times differ
+# by about a tenth on that machine, so the console layout costs the same
+# within that noise. In 256 and 16 colours an RGB equal to a palette slot
+# matches the console path. A ramped cell is not a slot, so those
 # viewers show the nearest colour; exact_colors = false gives them the
 # console's colours. llama-view --colors truecolor, one full first render
 # of one busy 192x60 frame (activity past 100, generation past its

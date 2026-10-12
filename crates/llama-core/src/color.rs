@@ -206,12 +206,13 @@ pub mod temp {
     pub const NORMAL: Rgb = WHITE;
     /// The last [`super::BB_STOPS`] colour, [`WARM_SPAN`] degrees under the warning.
     pub const WARM: Rgb = super::BB_STOPS[super::BB_STOPS.len() - 1].1;
-    /// The blackbody stop at 120, the warning threshold. The console's warn
-    /// yellow is this same colour.
+    /// The blackbody stop at 120, the warning threshold. The llama palette's
+    /// warn yellow is this same colour.
     pub const WARN: Rgb = super::BB_STOPS[3].1;
     /// The activity ramp's 100 stop, at the critical threshold and above.
-    /// The console's critical level stays BrightRed (`#F21E5A`, the stop at
-    /// 80). That difference is intended: the file follows this ramp.
+    /// The console's critical level stays BrightRed (`#F21E5A` in the llama
+    /// palette, the stop at 80). That difference is intended: the file
+    /// follows this ramp.
     pub const CRIT: Rgb = super::ACT_STOPS[super::ACT_STOPS.len() - 1].1;
 
     /// Degrees under the warning where the colour is [`NORMAL`].
@@ -388,9 +389,11 @@ mod tests {
         assert_ne!(mid, temp::WARN);
         assert_ne!(mid, temp::CRIT);
         assert_eq!(temp::NORMAL, WHITE);
-        assert_eq!(temp::WARM, BB_STOPS[BB_STOPS.len() - 1].1);
-        assert_eq!(temp::WARN, BB_STOPS[3].1);
-        assert_eq!(temp::CRIT, ACT_STOPS[ACT_STOPS.len() - 1].1);
+        // The values themselves, so moving a stop cannot move an anchor
+        // unseen.
+        assert_eq!(temp::WARM, hex(0xFFD050));
+        assert_eq!(temp::WARN, hex(0xFFB030));
+        assert_eq!(temp::CRIT, hex(0xFF2A14));
         assert_eq!(temp::WARN, Palette::Llama.rgb(role::WARN));
         assert!(temp::color(70.0, 90.0, 80.0).is_none());
         assert!(temp::color(f32::NAN, warn, crit).is_none());
