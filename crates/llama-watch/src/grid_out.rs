@@ -233,10 +233,12 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
-    /// Test builds only. Production has no gate and the writer loop does
-    /// not look at one: a held thread is how the tests prove an offer
-    /// returns before the layout, and that a frame replaced while the
-    /// thread is held is never laid out.
+    /// Test builds only. Production has no gate. When held, the writer
+    /// parks after it has taken a second-layout frame and before it lays
+    /// that frame out. The tests show that offers made while it is parked
+    /// return, that the newest of those offers is the one left waiting,
+    /// and that a frame replaced while it is parked is never laid out.
+    /// The frame already taken is laid out when the gate opens.
     #[cfg(test)]
     gate: TestGate,
 }
@@ -265,8 +267,8 @@ impl Shared {
     }
 }
 
-/// Pauses the writer thread before it takes a frame. Absent from a
-/// production build.
+/// Pauses the writer after a second-layout frame has been taken and
+/// before that frame is laid out. Absent from a production build.
 #[cfg(test)]
 struct TestGate {
     paused: Mutex<bool>,
@@ -297,8 +299,8 @@ impl TestGate {
         }
     }
 
-    /// Block while held. The slot lock is not taken here, so an offer can
-    /// replace the waiting frame for as long as this waits.
+    /// Park until [`GridTap::release`]. The caller has already dropped the
+    /// slot lock: this waits on the gate, not on the slot.
     fn wait_if_paused(&self) {
         let mut paused = self.paused.lock().unwrap_or_else(PoisonError::into_inner);
         if !*paused {
@@ -316,6 +318,7 @@ impl TestGate {
                 .wait(paused)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+        *self.parked.lock().unwrap_or_else(PoisonError::into_inner) = false;
     }
 
     fn note(&self, host: &str) {
@@ -385,7 +388,8 @@ impl GridTap {
 
 #[cfg(test)]
 impl GridTap {
-    /// Start held, before the thread takes a frame. [`Self::release`] lets
+    /// Start with the gate held. The thread parks once it has taken a
+    /// second-layout frame, before laying it out. [`Self::release`] lets
     /// it continue. Dropping the tap releases the hold too, so the thread
     /// can see that it was closed.
     fn spawn_paused<L: Sink + Send + 'static>(
@@ -443,6 +447,16 @@ impl GridTap {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Host of the second-layout frame waiting in the slot, if that is
+    /// what is waiting.
+    fn pending_host(&self) -> Option<String> {
+        let st = self.shared.lock();
+        match &st.pending {
+            Some(Queued::Apart(model, _, _)) => Some(model.host.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl Drop for GridTap {
@@ -466,10 +480,6 @@ fn unix_ms() -> u64 {
 fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
     let mut failing: Option<Failure> = None;
     loop {
-        // Test builds can hold the thread here, before the slot is taken
-        // and without the slot lock. A production build has no gate.
-        #[cfg(test)]
-        shared.gate.wait_if_paused();
         let frame = {
             let mut st = shared.lock();
             loop {
@@ -499,6 +509,11 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
         let result = match frame {
             Some(Queued::Console(grid)) => writer.offer(&grid, now, unix_ms()),
             Some(Queued::Apart(model, cols, rows)) => {
+                // Test builds park here: the frame is already out of the
+                // slot, and the slot lock is not held. A production build
+                // has no gate.
+                #[cfg(test)]
+                shared.gate.wait_if_paused();
                 // Cells only: `fit_pixel` sizes the block digits from the
                 // column budget, and eighths versus halves come from
                 // `model.chart_glyphs`. The console font's pixel size is
@@ -539,6 +554,7 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use llama_core::gridfile;
@@ -634,16 +650,18 @@ mod tests {
         .expect("tap")
     }
 
-    /// #115: while the writer is held, three offers leave only the last
-    /// model in the slot. The middle one is never laid out and never written.
+    /// #115: a second layout is paused after its frame has been taken.
+    /// Two further offers replace the slot. The middle model is never
+    /// laid out. The frame already taken is laid out when the gate opens,
+    /// and then the newest one waiting.
     #[test]
     fn the_newest_model_wins_the_second_layout() {
         let dir = scratch("newest");
         let path = dir.join("grid");
         let tap = paused_tap(&dir);
-        tap.wait_until_parked();
         let console = Grid::blank(192, 60);
         tap.offer_frame(&host_model("aaa"), &console);
+        tap.wait_until_parked();
         tap.offer_frame(&host_model("bbb"), &console);
         let last = host_model("ccc");
         tap.offer_frame(&last, &console);
@@ -652,47 +670,89 @@ mod tests {
             tap.laid_out().is_empty(),
             "a frame was laid out while the thread was held"
         );
+        assert_eq!(tap.pending_host().as_deref(), Some("ccc"));
         tap.release();
-        let got = wait_image(&path);
-        assert_eq!(tap.laid_out(), vec!["ccc".to_owned()]);
-        assert_eq!(got.seq, 1, "an older frame was written before the newest");
         let want = super::image_of(&layout::layout(&last, 213, 60), Palette::Llama, 1, 0);
+        let got = wait_seq(&path, 2);
+        assert_eq!(
+            tap.laid_out(),
+            vec!["aaa".to_owned(), "ccc".to_owned()],
+            "the middle model was laid out"
+        );
+        assert_eq!(
+            got.seq, 2,
+            "the frame already taken is written, then the newest"
+        );
         assert_eq!((got.cols, got.rows), (want.cols, want.rows));
         assert_eq!(got.cells, want.cells);
         drop(tap);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// #115: an offer does not wait for a second layout that has not
-    /// finished. The thread is parked, and it stays parked across the offers.
+    /// #115: offers made while a second layout has been taken, and has not
+    /// run, return. The newest of them is the frame left waiting. The
+    /// deadline is a deadlock bound: a slot lock held across that layout
+    /// stops the offers until the gate opens.
     #[test]
     fn an_offer_returns_while_the_second_layout_is_held() {
         let dir = scratch("held");
-        let tap = paused_tap(&dir);
-        tap.wait_until_parked();
+        let tap = Arc::new(paused_tap(&dir));
         let console = Grid::blank(192, 60);
-        // The thread waits before it takes a frame and does not hold the
-        // slot lock. If an offer waited for that layout, it would wait
-        // until `release`, which is after these calls.
-        tap.offer_frame(&host_model("one"), &console);
-        tap.offer_frame(&host_model("two"), &console);
-        tap.offer_frame(&host_model("three"), &console);
-        assert!(tap.is_parked());
+        tap.offer_frame(&host_model("held"), &console);
+        tap.wait_until_parked();
+        assert!(
+            tap.laid_out().is_empty(),
+            "layout ran before the thread parked"
+        );
+        // The offers below are what must return. This thread does not take
+        // the slot lock again until they have: a layout that still held it
+        // would block them, and the deadline below would fire.
+
+        let offers = Arc::clone(&tap);
+        let console = console.clone();
+        let handle = std::thread::spawn(move || {
+            offers.offer_frame(&host_model("one"), &console);
+            offers.offer_frame(&host_model("two"), &console);
+            offers.offer_frame(&host_model("three"), &console);
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let returned = handle.is_finished();
+        if !returned {
+            // The offers are blocked on the slot lock. Open the gate so
+            // they can finish and this process can unwind.
+            tap.release();
+            let _ = handle.join();
+        } else {
+            handle.join().expect("offer thread");
+        }
+        assert!(
+            returned,
+            "offers blocked while a second layout was in progress"
+        );
+        assert!(
+            tap.is_parked(),
+            "the second layout finished during the offers"
+        );
         assert!(tap.laid_out().is_empty());
+        assert_eq!(tap.pending_host().as_deref(), Some("three"));
         drop(tap);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn wait_image(path: &std::path::Path) -> gridfile::GridImage {
+    fn wait_seq(path: &std::path::Path, seq: u32) -> gridfile::GridImage {
         let until = Instant::now() + Duration::from_secs(5);
         while Instant::now() < until {
             if let Ok(bytes) = std::fs::read(path)
                 && let Ok(image) = gridfile::decode(&bytes)
+                && image.seq >= seq
             {
                 return image;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for {}", path.display());
+        panic!("timed out waiting for seq {seq} at {}", path.display());
     }
 }
