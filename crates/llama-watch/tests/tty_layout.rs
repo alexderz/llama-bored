@@ -12,7 +12,7 @@ use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
     Activity, HealthSeg, HealthStatus, SetupItem, SetupRow, SetupView, Slot, TtyModel, WatchState,
-    layout, replay_shown,
+    layout, layout_exact, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -164,6 +164,26 @@ fn assert_frame(name: &str, fix: &Fix, model: &TtyModel) {
         "{name} differs in {mismatch_count} cells:\n{}",
         mismatches.join("\n")
     );
+    // Exact colours do not change the bytes tty11 writes, including a
+    // frame that differs only in those colours.
+    let exact = layout_exact(model, grid.cols(), grid.rows());
+    assert_eq!(console_bytes(&grid), console_bytes(&exact), "{name}");
+    let mut term = sized(grid.cols(), grid.rows());
+    let now = Instant::now();
+    term.render(&grid, now).expect("plain");
+    term.out_mut().clear();
+    term.render(&exact, now).expect("exact");
+    assert!(
+        term.out().is_empty(),
+        "{name}: an exact-only change wrote {} bytes",
+        term.out().len()
+    );
+}
+
+fn console_bytes(grid: &llama_watch::tty::grid::Grid) -> Vec<u8> {
+    let mut term = sized(grid.cols(), grid.rows());
+    term.render(grid, Instant::now()).expect("render");
+    term.out().to_vec()
 }
 
 fn counts(model: &TtyModel, cols: u16, rows: u16) -> (usize, usize) {
@@ -4945,10 +4965,16 @@ fn print_setup_corner() {
 use llama_watch::sources::temps::{Level, TempGroup, TempItem, TempPanel};
 
 fn temp_item(label: &str, c: i32, level: Level) -> TempItem {
+    // 80/90 °C, the anchors a reading without chip limits uses.
+    temp_marked(label, c, level, Some((800, 900)))
+}
+
+fn temp_marked(label: &str, c: i32, level: Level, thresholds: Option<(i32, i32)>) -> TempItem {
     TempItem {
         label: label.to_string(),
         tenths: c * 10,
         level,
+        thresholds,
     }
 }
 
@@ -4971,7 +4997,10 @@ fn ref_temps() -> TempPanel {
                 ],
             ),
             group("GPU", vec![temp_item("", 71, Normal)]),
-            group("coolant", vec![temp_item("", 40, Normal)]),
+            group(
+                "coolant",
+                vec![temp_marked("", 40, Normal, Some((450, 550)))],
+            ),
             group(
                 "NVMe0",
                 vec![
@@ -5028,6 +5057,154 @@ fn temps_goldens_match_character_and_colour() {
         let fix = load(name);
         assert_frame(name, &fix, &temps_model());
     }
+}
+
+/// #116: the grid file at 192x60 with exact colours, from the synthetic
+/// temps frame and a hot one (activity past 100, generation past its ceiling).
+type GridGolden = fn() -> TtyModel;
+
+const GRID_EXACT_GOLDENS: [(&str, GridGolden); 2] =
+    [("temps-192.json", temps_model), ("hot-192.json", hot_model)];
+
+fn hot_model() -> TtyModel {
+    let mut model = temps_model();
+    model.activity_pct = Some(118.0);
+    let ceiling = model.gen_ceiling;
+    model.gen_tps = Some(ceiling * 2.0);
+    for bucket in &mut model.chart {
+        if bucket.gen_tps.is_some() {
+            bucket.gen_tps = Some(ceiling * 2.0);
+        }
+    }
+    model
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+struct GridFix {
+    w: u16,
+    h: u16,
+    runs: Vec<GridRun>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+struct GridRun {
+    n: u32,
+    ch: char,
+    fg: u32,
+    bg: u32,
+}
+
+fn grid_fix_of(model: &TtyModel) -> GridFix {
+    let grid = layout_exact(model, 192, 60);
+    let image = llama_watch::grid_out::image_of(&grid, llama_core::palette::Palette::Llama, 1, 0);
+    let mut runs: Vec<GridRun> = Vec::new();
+    for cell in &image.cells {
+        let fg = rgb_word(cell.fg);
+        let bg = rgb_word(cell.bg);
+        if let Some(run) = runs.last_mut()
+            && run.ch == cell.ch
+            && run.fg == fg
+            && run.bg == bg
+        {
+            run.n += 1;
+        } else {
+            runs.push(GridRun {
+                n: 1,
+                ch: cell.ch,
+                fg,
+                bg,
+            });
+        }
+    }
+    let cells: u32 = runs.iter().map(|run| run.n).sum();
+    assert_eq!(cells, 192 * 60);
+    GridFix {
+        w: 192,
+        h: 60,
+        runs,
+    }
+}
+
+fn rgb_word(rgb: llama_core::color::Rgb) -> u32 {
+    (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+}
+
+fn grid_fix_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/grid")
+}
+
+#[test]
+fn grid_exact_goldens_match() {
+    for (name, model) in GRID_EXACT_GOLDENS {
+        let path = grid_fix_dir().join(name);
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {name}: {err}"));
+        let fix: GridFix =
+            serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let got = grid_fix_of(&model());
+        assert_eq!(got.w, fix.w, "{name}");
+        assert_eq!(got.h, fix.h, "{name}");
+        assert_eq!(got.runs, fix.runs, "{name}");
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #116 grid goldens"]
+fn dump_grid_exact_goldens() {
+    let dir = grid_fix_dir();
+    std::fs::create_dir_all(&dir).expect("fixtures/grid");
+    for (name, model) in GRID_EXACT_GOLDENS {
+        let fix = grid_fix_of(&model());
+        let text = serde_json::to_string_pretty(&fix).expect("json");
+        std::fs::write(dir.join(name), text + "\n").expect("write");
+    }
+}
+
+/// What `llama-view --source grid --colors truecolor` writes for one busy
+/// frame, palette RGB against the ramp. The counts are printed; the ramp
+/// has to cost more bytes, because a run of distinct colours is a run of
+/// SGR sequences.
+#[test]
+fn truecolor_view_writes_more_for_the_ramps() {
+    let model = hot_model();
+    let plain = llama_watch::grid_out::image_of(
+        &layout(&model, 192, 60),
+        llama_core::palette::Palette::Llama,
+        1,
+        0,
+    );
+    let ramp = llama_watch::grid_out::image_of(
+        &layout_exact(&model, 192, 60),
+        llama_core::palette::Palette::Llama,
+        1,
+        0,
+    );
+    let (plain_bytes, plain_colours) = truecolor_frame(&plain);
+    let (ramp_bytes, ramp_colours) = truecolor_frame(&ramp);
+    eprintln!(
+        "llama-view truecolor 192x60 busy frame: palette {plain_bytes} bytes, {plain_colours} colours; exact {ramp_bytes} bytes, {ramp_colours} colours"
+    );
+    assert!(ramp_bytes > plain_bytes);
+    assert!(ramp_colours > plain_colours);
+}
+
+fn truecolor_frame(image: &llama_core::gridfile::GridImage) -> (usize, usize) {
+    let screen = llama_view::screen_of(image);
+    let mut renderer = llama_view::Renderer::with_colors(
+        llama_view::ColorMode::Truecolor,
+        llama_view::Palette::Llama,
+    )
+    .synchronized(true);
+    let bytes = renderer
+        .render(screen.cols, screen.rows, &screen.cells)
+        .len();
+    let mut colours = std::collections::BTreeSet::new();
+    for cell in &image.cells {
+        colours.insert((
+            cell.fg.r, cell.fg.g, cell.fg.b, cell.bg.r, cell.bg.g, cell.bg.b,
+        ));
+    }
+    (bytes, colours.len())
 }
 
 #[test]

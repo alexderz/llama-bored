@@ -436,6 +436,7 @@ fn the_console_output_does_not_depend_on_rich_or_the_tap() {
 fn grid_config_defaults_parse_and_validate() {
     let config = Config::from_toml("").expect("empty");
     assert!(!config.grid.enabled);
+    assert!(config.grid.exact_colors);
     assert_eq!(config.grid.path, Path::new(DEFAULT_GRID_PATH));
     assert_eq!(config.grid.size, None);
     assert_eq!(DEFAULT_GRID_PATH, "/run/llama-watch-grid/grid");
@@ -443,8 +444,13 @@ fn grid_config_defaults_parse_and_validate() {
 
     let on = Config::from_toml("[grid]\nenabled = true\npath = \"/run/x/grid\"\n").expect("on");
     assert!(on.grid.enabled);
+    assert!(on.grid.exact_colors);
     assert_eq!(on.grid.path, Path::new("/run/x/grid"));
     assert!(on.validate(8).is_ok());
+
+    let off = Config::from_toml("[grid]\nexact_colors = false\n").expect("exact off");
+    assert!(!off.grid.exact_colors);
+    assert!(off.validate(8).is_ok());
 
     for bad in ["grid", "/", "", "/run/x/\u{0}grid"] {
         let text = format!("[grid]\nenabled = true\npath = {bad:?}\n");
@@ -454,6 +460,75 @@ fn grid_config_defaults_parse_and_validate() {
         assert!(config.validate(8).is_err(), "{bad:?}");
     }
     assert!(Config::from_toml("[grid]\nbogus = 1\n").is_err());
+}
+
+/// #116: exact colours off, the file is the palette frame. On, it is the
+/// ramp frame of the same model, and it is not the palette frame.
+#[test]
+fn exact_off_matches_the_palette_file_and_exact_on_matches_the_ramp() {
+    let model = busy_frame();
+    let console = layout::layout(&model, 192, 60);
+    let palette = palette_cells(&console);
+
+    let dir = scratch("exact-off");
+    let path = dir.join("grid");
+    let tap = GridTap::spawn(
+        GridWriter::new(&path, Palette::Llama),
+        Capture::default(),
+        None,
+    )
+    .unwrap()
+    .with_exact(false);
+    tap.offer_frame(&model, &console);
+    wait_for("the palette file", || seq_of(&path) == Some(1));
+    let got = read(&path);
+    assert_eq!((got.cols, got.rows), (192, 60));
+    assert_eq!(got.cells, palette);
+    let via_image = llama_watch::grid_out::image_of(&console, Palette::Llama, got.seq, got.unix_ms);
+    assert_eq!(got.cells, via_image.cells);
+    drop(tap);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dir = scratch("exact-on");
+    let path = dir.join("grid");
+    let tap = GridTap::spawn(
+        GridWriter::new(&path, Palette::Llama),
+        Capture::default(),
+        None,
+    )
+    .unwrap()
+    .with_exact(true);
+    tap.offer_frame(&model, &console);
+    wait_for("the ramp file", || seq_of(&path) == Some(1));
+    let got = read(&path);
+    let ramp = layout::layout_exact(&model, 192, 60);
+    let want = llama_watch::grid_out::image_of(&ramp, Palette::Llama, got.seq, got.unix_ms);
+    assert_eq!(got.cells, want.cells);
+    assert_ne!(got.cells, palette);
+    let mut encoded = Vec::new();
+    gridfile::encode(&want, &mut encoded).expect("encode");
+    assert_eq!(std::fs::read(&path).expect("file"), encoded);
+    drop(tap);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Today's palette RGB, built without [`image_of`], so an exact colour
+/// cannot sneak into the "off" comparison.
+fn palette_cells(grid: &Grid) -> Vec<llama_core::gridfile::GridCell> {
+    use llama_core::glyph::is_showable;
+    use llama_core::gridfile::GridCell;
+    grid.cells()
+        .iter()
+        .map(|cell| GridCell {
+            ch: if is_showable(cell.rich) {
+                cell.rich
+            } else {
+                cell.ch
+            },
+            fg: Palette::Llama.rgb(cell.fg.index()),
+            bg: Palette::Llama.rgb(cell.bg.index() & 7),
+        })
+        .collect()
 }
 
 /// #115: `[grid] size` parses with [`TtySize`] and fails in the same words.
@@ -958,6 +1033,10 @@ fn measure_second_layout_cost() {
             std::hint::black_box(layout::layout(std::hint::black_box(&model), 192, 60));
         });
         report("  layout 192x60", cpu, wall);
+        let (cpu, wall) = median(hz, || {
+            std::hint::black_box(layout::layout_exact(std::hint::black_box(&model), 192, 60));
+        });
+        report("  layout_exact 192x60", cpu, wall);
         let (cpu, wall) = median(hz, || {
             std::hint::black_box(layout::layout(std::hint::black_box(&model), 213, 60));
         });

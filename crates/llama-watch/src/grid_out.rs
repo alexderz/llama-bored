@@ -19,11 +19,14 @@
 //! carries on.
 //!
 //! `[grid] size` (#115) is optional. Unset, or equal to the console frame,
-//! the slot holds that frame and this thread writes it. A different size
-//! puts a clone of the [`TtyModel`] in the slot instead: the model's owned
+//! and with exact colours off, the slot holds that frame and this thread
+//! writes it. A different size, or `[grid] exact_colors` (#116), puts a
+//! clone of the [`TtyModel`] in the slot instead: the model's owned
 //! strings and vectors, one frame, dropped when a newer frame replaces it.
-//! This thread then lays that model out at the file's size and writes the
-//! result. The layout runs after the slot is taken and the lock is dropped,
+//! This thread then lays that model out and writes the result. Exact
+//! colours are that second layout even when the size matches, so the
+//! console tick neither computes nor stores them. The layout runs after
+//! the slot is taken and the lock is dropped,
 //! so however long it takes it does not delay the console write, the snapshot
 //! or the watchdog ping. Layout reads cells only. The block digits are sized
 //! from the column budget (`fit_pixel`), and eighths versus halves come from
@@ -62,8 +65,10 @@ fn rgb_bg(palette: Palette, color: C16) -> Rgb {
 }
 
 /// `grid` as a file image. A cell shows its `rich` scalar when that is safe
-/// as one cell (`is_showable`), else its console `ch`.
-fn image_of(grid: &Grid, palette: Palette, seq: u32, unix_ms: u64) -> GridImage {
+/// as one cell (`is_showable`), else its console `ch`. An exact colour, when
+/// the cell has one, replaces the palette RGB. The format is unchanged.
+pub fn image_of(grid: &Grid, palette: Palette, seq: u32, unix_ms: u64) -> GridImage {
+    let cols = usize::from(grid.cols());
     GridImage {
         seq,
         unix_ms,
@@ -72,14 +77,23 @@ fn image_of(grid: &Grid, palette: Palette, seq: u32, unix_ms: u64) -> GridImage 
         cells: grid
             .cells()
             .iter()
-            .map(|cell| GridCell {
-                ch: if is_showable(cell.rich) {
-                    cell.rich
-                } else {
-                    cell.ch
-                },
-                fg: rgb_fg(palette, cell.fg),
-                bg: rgb_bg(palette, cell.bg),
+            .enumerate()
+            .map(|(i, cell)| {
+                let col = u16::try_from(i % cols.max(1)).unwrap_or(0);
+                let row = u16::try_from(i / cols.max(1)).unwrap_or(0);
+                GridCell {
+                    ch: if is_showable(cell.rich) {
+                        cell.rich
+                    } else {
+                        cell.ch
+                    },
+                    fg: grid
+                        .exact_fg(col, row)
+                        .unwrap_or_else(|| rgb_fg(palette, cell.fg)),
+                    bg: grid
+                        .exact_bg(col, row)
+                        .unwrap_or_else(|| rgb_bg(palette, cell.bg)),
+                }
             })
             .collect(),
     }
@@ -219,9 +233,10 @@ type Failure = (io::ErrorKind, String);
 enum Queued {
     /// The console frame, written as it stands. No second layout.
     Console(Grid),
-    /// The same data, laid out on the writer thread at this size. Boxed so
+    /// The same data, laid out on the writer thread at this size. The bool
+    /// is `[grid] exact_colors`: the layout then records the ramp. Boxed so
     /// a waiting frame is not the size of a [`TtyModel`].
-    Apart(Box<TtyModel>, u16, u16),
+    Apart(Box<TtyModel>, u16, u16, bool),
 }
 
 #[derive(Default)]
@@ -340,21 +355,29 @@ fn spawn_thread<L: Sink + Send + 'static>(
     std::thread::Builder::new()
         .name("grid-writer".to_owned())
         .spawn(move || writer_loop(writer, log, &theirs))?;
-    Ok(GridTap { shared, size })
+    Ok(GridTap {
+        shared,
+        size,
+        exact: false,
+    })
 }
 
 /// Handle to the grid writer thread. Dropping it stops the thread; the last
 /// file stays (it goes stale, which is the reader's cue).
 pub struct GridTap {
     shared: Arc<Shared>,
-    /// `[grid] size`. `None` publishes every console frame as it stands.
+    /// `[grid] size`. `None` publishes every console frame as it stands,
+    /// unless [`Self::exact`] is set.
     size: Option<TtySize>,
+    /// `[grid] exact_colors`. The console frame stays palette-only; the
+    /// writer thread lays the model out again so the file can carry the ramp.
+    exact: bool,
 }
 
 impl GridTap {
     /// Start the thread with `writer`. `log` gets one line per distinct
     /// failure and one when the writes recover. `size` is `[grid] size`:
-    /// `None` publishes the console frame.
+    /// `None` publishes the console frame, unless [`Self::with_exact`] is set.
     pub fn spawn<L: Sink + Send + 'static>(
         writer: GridWriter,
         log: L,
@@ -363,18 +386,33 @@ impl GridTap {
         spawn_thread(writer, log, size, Shared::bare())
     }
 
+    /// `[grid] exact_colors`. Off unless this is called. On, every frame is
+    /// a second layout on the writer thread, even when the size matches.
+    #[must_use]
+    pub fn with_exact(mut self, exact: bool) -> Self {
+        self.exact = exact;
+        self
+    }
+
     /// Publish the console frame, or a second layout when `[grid] size`
-    /// differs from it. Returns once the frame is in the slot.
+    /// differs from it or exact colours are on. Returns once the frame is
+    /// in the slot.
     ///
-    /// The copy is the console grid when the size is unset or equal, and a
-    /// clone of `model` otherwise. The layout of that model happens on the
-    /// writer thread, not here.
+    /// The copy is the console grid when the size is unset or equal and
+    /// exact colours are off, and a clone of `model` otherwise. The layout
+    /// of that model happens on the writer thread, not here.
     pub fn offer_frame(&self, model: &TtyModel, console: &Grid) {
-        let queued = match self.size {
+        let (cols, rows) = match self.size {
             Some(size) if size.cols != console.cols() || size.rows != console.rows() => {
-                Queued::Apart(Box::new(model.clone()), size.cols, size.rows)
+                (size.cols, size.rows)
             }
-            _ => Queued::Console(console.clone()),
+            _ => (console.cols(), console.rows()),
+        };
+        let apart = self.exact || cols != console.cols() || rows != console.rows();
+        let queued = if apart {
+            Queued::Apart(Box::new(model.clone()), cols, rows, self.exact)
+        } else {
+            Queued::Console(console.clone())
         };
         self.enqueue(queued);
     }
@@ -453,7 +491,7 @@ impl GridTap {
     fn pending_host(&self) -> Option<String> {
         let st = self.shared.lock();
         match &st.pending {
-            Some(Queued::Apart(model, _, _)) => Some(model.host.clone()),
+            Some(Queued::Apart(model, _, _, _)) => Some(model.host.clone()),
             _ => None,
         }
     }
@@ -508,7 +546,7 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
         // Layout, when there is one, runs without the slot lock held.
         let result = match frame {
             Some(Queued::Console(grid)) => writer.offer(&grid, now, unix_ms()),
-            Some(Queued::Apart(model, cols, rows)) => {
+            Some(Queued::Apart(model, cols, rows, exact)) => {
                 // Test builds park here: the frame is already out of the
                 // slot, and the slot lock is not held. A production build
                 // has no gate.
@@ -517,10 +555,15 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
                 // Cells only: `fit_pixel` sizes the block digits from the
                 // column budget, and eighths versus halves come from
                 // `model.chart_glyphs`. The console font's pixel size is
-                // not an input.
+                // not an input. Exact colours are the same layout with the
+                // ramp plane; the console frame never carries it.
                 #[cfg(test)]
                 shared.gate.note(&model.host);
-                let grid = layout::layout(&model, cols, rows);
+                let grid = if exact {
+                    layout::layout_exact(&model, cols, rows)
+                } else {
+                    layout::layout(&model, cols, rows)
+                };
                 writer.offer(&grid, now, unix_ms())
             }
             None => writer.heartbeat(now, unix_ms()),
@@ -648,6 +691,24 @@ mod tests {
             }),
         )
         .expect("tap")
+    }
+
+    #[test]
+    fn the_console_layout_stores_no_exact_plane() {
+        let mut model = host_model("box");
+        model.cpu_pct = Some(50.0);
+        model.gen_tps = Some(40.0);
+        let plain = layout::layout(&model, 192, 60);
+        let exact = layout::layout_exact(&model, 192, 60);
+        assert!(!plain.records_exact());
+        assert!(exact.records_exact());
+        assert!(plain.same_console(&exact));
+        let palette = super::image_of(&plain, Palette::Llama, 1, 0);
+        let ramped = super::image_of(&exact, Palette::Llama, 1, 0);
+        assert_ne!(
+            palette.cells, ramped.cells,
+            "a filled meter should carry a ramp"
+        );
     }
 
     /// #115: a second layout is paused after its frame has been taken.

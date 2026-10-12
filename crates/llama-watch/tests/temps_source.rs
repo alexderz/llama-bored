@@ -465,7 +465,12 @@ fn colours_come_from_config_then_the_chip_then_defaults() {
             .into_iter()
             .filter(|r| r.chip == chip && r.sensor == sensor)
             .collect();
-        temps::panel(&one, &look).groups[0].items[0].level
+        let item = temps::panel(&one, &look).groups[0].items[0].clone();
+        assert!(
+            item.thresholds.is_some_and(|(warn, crit)| crit > warn),
+            "{chip}:{sensor}"
+        );
+        item.level
     };
     let d = Temps::default();
     assert_eq!(level(&d, "k10temp", "Tctl"), Level::Crit);

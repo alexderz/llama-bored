@@ -421,6 +421,10 @@ pub struct TempItem {
     pub tenths: i32,
     /// Colour step.
     pub level: Level,
+    /// Warning and critical thresholds, in tenths, when critical is above
+    /// the warning. The grid file anchors its exact colour to the pair.
+    /// `None` keeps the palette colour. The console still uses [`Self::level`].
+    pub thresholds: Option<(i32, i32)>,
 }
 
 /// One TEMPS row: a chip's shown inputs.
@@ -485,7 +489,7 @@ impl TempLook {
             .map(String::as_str)
     }
 
-    fn level(&self, reading: &TempReading) -> Level {
+    fn level(&self, reading: &TempReading) -> (Level, Option<(i32, i32)>) {
         let names = [reading.sensor.as_str(), reading.input.as_str()];
         let find = |list: &[(Pattern, i32)]| {
             list.iter()
@@ -499,13 +503,17 @@ impl TempLook {
         let warn = find(&self.warn)
             .or(reading.max_tenths.filter(|max| *max < crit))
             .unwrap_or(if coolant { 450 } else { 800 });
-        if reading.tenths >= crit {
+        let level = if reading.tenths >= crit {
             Level::Crit
         } else if reading.tenths >= warn {
             Level::Warn
         } else {
             Level::Normal
-        }
+        };
+        // A pair that does not rise has no ramp. The palette level above
+        // still stands.
+        let thresholds = (crit > warn).then_some((warn, crit));
+        (level, thresholds)
     }
 }
 
@@ -544,6 +552,7 @@ pub fn panel(readings: &[TempReading], look: &TempLook) -> TempPanel {
                         .renamed(&format!("{}:{}", r.chip, r.sensor))
                         .or_else(|| look.renamed(&format!("{}:{}", r.chip, r.input)))
                         .map_or_else(|| short_label(r, single), str::to_owned);
+                    let (level, thresholds) = look.level(r);
                     TempItem {
                         label: if label.eq_ignore_ascii_case(&name) {
                             String::new()
@@ -551,7 +560,8 @@ pub fn panel(readings: &[TempReading], look: &TempLook) -> TempPanel {
                             label
                         },
                         tenths: r.tenths,
-                        level: look.level(r),
+                        level,
+                        thresholds,
                     }
                 })
                 .collect();

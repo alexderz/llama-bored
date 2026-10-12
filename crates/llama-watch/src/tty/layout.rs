@@ -4,6 +4,8 @@
 //! [`Term::rows`](super::term::Term::rows). The last row and the last column
 //! stay blank so the console cannot scroll.
 
+use llama_core::color::{self, Rgb, act_color};
+
 use super::chart::{self, ChartBucket, Ink};
 use super::ctx_history::{self, CtxPoint};
 use super::grid::{C16, Cell, Grid};
@@ -12,7 +14,7 @@ use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
 use crate::sources::fans::{FanPanel, FanReading, mode_word};
-use crate::sources::temps::{Level, TempGroup, TempPanel};
+use crate::sources::temps::{Level, TempGroup, TempItem, TempPanel};
 
 /// How many of `new_chars` are visible on frame `frame` of a 10-frame second.
 ///
@@ -281,9 +283,24 @@ pub const MIN_ROWS: u16 = 26;
 pub const FULL_ROWS: u16 = 48;
 
 /// Draw one frame. Below [`MIN_COLS`]×[`MIN_ROWS`] the grid is the single
-/// "tty too small" line.
+/// "tty too small" line. Palette colours only: the console grid does not
+/// record exact colours.
 pub fn layout(model: &TtyModel, cols: u16, rows: u16) -> Grid {
-    let mut grid = Grid::new(cols, rows);
+    layout_with(model, cols, rows, false)
+}
+
+/// [`layout`] plus the exact-colour plane (#116). The grid file's writer
+/// calls this; the console tick does not.
+pub fn layout_exact(model: &TtyModel, cols: u16, rows: u16) -> Grid {
+    layout_with(model, cols, rows, true)
+}
+
+fn layout_with(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid {
+    let mut grid = if exact {
+        Grid::with_exact(cols, rows)
+    } else {
+        Grid::new(cols, rows)
+    };
     if cols < MIN_COLS || rows < MIN_ROWS {
         let msg = format!("llama-watch: tty too small ({cols}x{rows}, need {MIN_COLS}x{MIN_ROWS})");
         paint_str(&mut grid, 0, 0, &msg, C16::White, C16::Black);
@@ -1130,6 +1147,27 @@ fn draw_h_bar(grid: &mut Grid, bar: HBar) {
         if bar.rows > 1 {
             paint(grid, col, bar.row + 1, bot_ch, fg_bot, C16::Black);
         }
+        // Filled spectrum cells take the ramp at their own centre. The
+        // empty track and a fixed-ink bar (capacity, a stalled fan) stay
+        // on the palette. A hot bar's last fifth is the same cells the
+        // console paints white-hot; only that top row continues into the
+        // blackbody tail.
+        if grid.records_exact()
+            && ch != '░'
+            && let BarInk::Spectrum { hot } = bar.ink
+        {
+            let pos = color::spectrum::place(i, width);
+            let step = fifth(i, width);
+            let top = if hot && step == STEPS.len() - 1 {
+                color::spectrum::hot_top(i, width)
+            } else {
+                pos
+            };
+            grid.set_exact_fg(col, bar.row, act_color(top));
+            if bar.rows > 1 {
+                grid.set_exact_fg(col, bar.row + 1, act_color(pos));
+            }
+        }
     }
 }
 
@@ -1359,13 +1397,18 @@ fn draw_digits(
     if pw == 0 {
         return;
     }
-    let (text, top, body) = match value {
-        None => ("--".to_string(), C16::BrightBlack, C16::BrightBlack),
-        Some(v) if v <= 0.0 => ("0".to_string(), C16::BrightBlack, C16::BrightBlack),
+    let (text, top, body, pos) = match value {
+        None => ("--".to_string(), C16::BrightBlack, C16::BrightBlack, None),
+        Some(v) if v <= 0.0 => ("0".to_string(), C16::BrightBlack, C16::BrightBlack, None),
         Some(v) => {
             let step = rate_step(v, ceiling);
             let (top, body) = digit_colours(step);
-            ((v.round() as i64).to_string(), top, body)
+            // Dim values (above) stay on the palette. A live value takes
+            // the ramp position of the same scale that picked `step`.
+            let pos = grid
+                .records_exact()
+                .then(|| color::spectrum::rate(v, ceiling));
+            ((v.round() as i64).to_string(), top, body, pos)
         }
     };
     let mut cx = x;
@@ -1385,14 +1428,19 @@ fn draw_digits(
                 }
                 for dy in 0..ph {
                     for dx in 0..pw {
-                        paint(
-                            grid,
-                            cx + px as u16 * pw + dx,
-                            row + py as u16 * ph + dy,
-                            '█',
-                            colour,
-                            C16::Black,
-                        );
+                        let y = row + py as u16 * ph + dy;
+                        paint(grid, cx + px as u16 * pw + dx, y, '█', colour, C16::Black);
+                        // The top console row of the whole digit is 14 ramp
+                        // points above the value, the bottom row 14 below.
+                        if let Some(pos) = pos {
+                            let rows = 5 * usize::from(ph);
+                            let at = py * usize::from(ph) + usize::from(dy);
+                            grid.set_exact_fg(
+                                cx + px as u16 * pw + dx,
+                                y,
+                                act_color(color::spectrum::shade(pos, at, rows)),
+                            );
+                        }
                     }
                 }
             }
@@ -3352,8 +3400,18 @@ fn draw_chart_col(
                     chart::rise_eighths(level, half)
                 }
             };
+            let rows_n = usize::from(half);
             for (i, ink) in cells.into_iter().enumerate() {
-                paint_ink(grid, col, axis - half + i as u16, ink, colour);
+                // Index 0 is the far row. The baseline is the cool end.
+                let from_axis = rows_n - 1 - i;
+                paint_ink(
+                    grid,
+                    col,
+                    axis - half + i as u16,
+                    ink,
+                    colour,
+                    chart_exact(grid, ink, from_axis, rows_n),
+                );
             }
         }
     }
@@ -3375,11 +3433,29 @@ fn draw_chart_col(
                     chart::fall_eighths(level, half)
                 }
             };
+            let rows_n = usize::from(half);
             for (i, ink) in cells.into_iter().enumerate() {
-                paint_ink(grid, col, axis + 1 + i as u16, ink, colour);
+                // Index 0 is the row nearest the axis, the cool end.
+                paint_ink(
+                    grid,
+                    col,
+                    axis + 1 + i as u16,
+                    ink,
+                    colour,
+                    chart_exact(grid, ink, i, rows_n),
+                );
             }
         }
     }
+}
+
+/// The ramp colour of the level this row stands for, or `None` for an
+/// empty cell and for a grid that does not record exact colours.
+fn chart_exact(grid: &Grid, ink: Ink, from_axis: usize, rows: usize) -> Option<Rgb> {
+    if matches!(ink, Ink::Empty) || !grid.records_exact() {
+        return None;
+    }
+    Some(act_color(color::spectrum::place(from_axis, rows)))
 }
 
 fn half_inks(glyphs: Vec<char>) -> Vec<Ink> {
@@ -3389,11 +3465,23 @@ fn half_inks(glyphs: Vec<char>) -> Vec<Ink> {
         .collect()
 }
 
-fn paint_ink(grid: &mut Grid, col: u16, row: u16, ink: Ink, colour: C16) {
+fn paint_ink(grid: &mut Grid, col: u16, row: u16, ink: Ink, colour: C16, exact: Option<Rgb>) {
     match ink {
         Ink::Empty => {}
-        Ink::Fg(ch) => paint(grid, col, row, ch, colour, C16::Black),
-        Ink::Inverse(ch) => paint(grid, col, row, ch, C16::Black, colour),
+        Ink::Fg(ch) => {
+            paint(grid, col, row, ch, colour, C16::Black);
+            if let Some(rgb) = exact {
+                grid.set_exact_fg(col, row, rgb);
+            }
+        }
+        // The falling tip draws black on the bar colour, so the ramp is
+        // the background: that is the colour the cell shows.
+        Ink::Inverse(ch) => {
+            paint(grid, col, row, ch, C16::Black, colour);
+            if let Some(rgb) = exact {
+                grid.set_exact_bg(col, row, rgb);
+            }
+        }
     }
 }
 
@@ -3729,15 +3817,15 @@ fn draw_temps(grid: &mut Grid, panel: &TempPanel, left: u16, right: u16, top: u1
 fn draw_temp_group(grid: &mut Grid, group: &TempGroup, left: u16, right: u16, row: u16) {
     let name_w = usize::from(TEMP_NAME_W).min(usize::from(right - left) + 1);
     paint_fit(grid, left, row, &group.name, C16::White, C16::Black, name_w);
-    let items: Vec<Vec<(String, C16)>> = group
+    let items: Vec<Vec<InkText>> = group
         .items
         .iter()
         .map(|item| {
             let mut parts = Vec::new();
             if !item.label.is_empty() {
-                parts.push((format!("{} ", item.label), C16::BrightBlack));
+                parts.push(InkText::plain(format!("{} ", item.label), C16::BrightBlack));
             }
-            parts.push((celsius(item.tenths), level_fg(item.level)));
+            parts.push(temp_value(grid, item));
             parts
         })
         .collect();
@@ -3755,28 +3843,68 @@ fn draw_temps_line(grid: &mut Grid, panel: &TempPanel, left: u16, right: u16, ro
 }
 
 fn paint_summary(grid: &mut Grid, groups: &[TempGroup], left: u16, right: u16, row: u16) {
-    let items: Vec<Vec<(String, C16)>> = groups
+    let items: Vec<Vec<InkText>> = groups
         .iter()
         .filter_map(|group| {
             let hot = group.hottest()?;
             Some(vec![
-                (format!("{} ", group.name), C16::BrightBlack),
-                (celsius(hot.tenths), level_fg(hot.level)),
+                InkText::plain(format!("{} ", group.name), C16::BrightBlack),
+                temp_value(grid, hot),
             ])
         })
         .collect();
     paint_items(grid, &items, left, right, row);
 }
 
+/// One run of TEMPS text. `exact` is the value's ramp colour when this
+/// grid records it. Labels leave it empty.
+struct InkText {
+    text: String,
+    fg: C16,
+    exact: Option<Rgb>,
+}
+
+impl InkText {
+    fn plain(text: String, fg: C16) -> Self {
+        Self {
+            text,
+            fg,
+            exact: None,
+        }
+    }
+}
+
+/// A TEMPS value: the palette level, and the threshold ramp when this
+/// grid records exact colours and the reading has a usable pair.
+fn temp_value(grid: &Grid, item: &TempItem) -> InkText {
+    InkText {
+        text: celsius(item.tenths),
+        fg: level_fg(item.level),
+        exact: temp_exact(grid, item),
+    }
+}
+
+fn temp_exact(grid: &Grid, item: &TempItem) -> Option<Rgb> {
+    if !grid.records_exact() {
+        return None;
+    }
+    let (warn, crit) = item.thresholds?;
+    color::temp::color(
+        item.tenths as f32 / 10.0,
+        warn as f32 / 10.0,
+        crit as f32 / 10.0,
+    )
+}
+
 /// Items with ` · ` between, from `left` up to `right`; an item that does
 /// not fit whole ends the row with `…`.
-fn paint_items(grid: &mut Grid, items: &[Vec<(String, C16)>], left: u16, right: u16, row: u16) {
+fn paint_items(grid: &mut Grid, items: &[Vec<InkText>], left: u16, right: u16, row: u16) {
     const SEP: &str = " \u{00B7} ";
     let end = usize::from(right) + 1;
     let mut col = usize::from(left);
     for (i, parts) in items.iter().enumerate() {
         let sep = if i == 0 { 0 } else { SEP.chars().count() };
-        let len: usize = parts.iter().map(|(t, _)| t.chars().count()).sum();
+        let len: usize = parts.iter().map(|part| part.text.chars().count()).sum();
         if col + sep + len > end {
             if col + 2 <= end && i > 0 {
                 paint_at(
@@ -3802,9 +3930,15 @@ fn paint_items(grid: &mut Grid, items: &[Vec<(String, C16)>], left: u16, right: 
             );
             col += sep;
         }
-        for (text, fg) in parts {
-            paint_str(grid, col_u16(col), row, text, *fg, C16::Black);
-            col += text.chars().count();
+        for part in parts {
+            let start = col;
+            paint_str(grid, col_u16(col), row, &part.text, part.fg, C16::Black);
+            if let Some(rgb) = part.exact {
+                for dx in 0..part.text.chars().count() {
+                    grid.set_exact_fg(col_u16(start + dx), row, rgb);
+                }
+            }
+            col += part.text.chars().count();
         }
     }
 }
@@ -4342,6 +4476,7 @@ fn paint_rich(grid: &mut Grid, col: u16, row: u16, (ch, rich): Glyph, fg: C16, b
         return;
     }
     grid.put(col, row, Cell::with_rich(ch, rich, fg, bg));
+    grid.clear_exact(col, row);
 }
 
 pub(crate) fn commas(n: u64) -> String {
@@ -4387,6 +4522,277 @@ mod tests {
         assert!(reds.windows(2).all(|w| w[0] <= w[1]), "{reds:?}");
     }
     use super::*;
+
+    use llama_core::color::{self, act_color};
+    use llama_core::palette::Palette;
+
+    fn close(got: llama_core::color::Rgb, slot: llama_core::color::Rgb) {
+        for (a, b) in [(got.r, slot.r), (got.g, slot.g), (got.b, slot.b)] {
+            assert!(a.abs_diff(b) <= 12, "channel {a} vs {b}: {got:?} {slot:?}");
+        }
+    }
+
+    fn spectrum_bar(grid: &mut Grid, width: u16, rows: u16, frac: f64, hot: bool) {
+        draw_h_bar(
+            grid,
+            HBar {
+                x: 0,
+                row: 0,
+                width,
+                frac: Some(frac),
+                ink: BarInk::Spectrum { hot },
+                rows,
+                cells: Some('█'),
+            },
+        );
+    }
+
+    #[test]
+    fn a_spectrum_bars_centres_match_the_palette_steps() {
+        let mut grid = Grid::with_exact(8, 4);
+        spectrum_bar(&mut grid, 5, 2, 1.0, false);
+        for i in 0..5u16 {
+            let cell = grid.get(i, 0).unwrap();
+            let slot = Palette::Llama.rgb(cell.fg.index());
+            let exact = grid.exact_fg(i, 0).expect("top");
+            assert_eq!(exact, slot, "cell {i} {:?}", cell.fg);
+            assert_eq!(exact, act_color(color::spectrum::place(usize::from(i), 5)));
+            assert_eq!(grid.get(i, 1).unwrap().fg, cell.fg);
+            assert_eq!(grid.exact_fg(i, 1), Some(exact));
+        }
+        // A wide bar: the centre cell of each palette run is close to that
+        // run's colour. The test does not list RGB values.
+        let width = 67u16;
+        let mut wide = Grid::with_exact(width + 2, 3);
+        spectrum_bar(&mut wide, width, 1, 1.0, false);
+        let mut run_fg = wide.get(0, 0).unwrap().fg;
+        let mut run_start = 0u16;
+        let mut bands = 0;
+        for i in 0..=width {
+            let fg = if i == width {
+                C16::Black
+            } else {
+                wide.get(i, 0).unwrap().fg
+            };
+            if fg != run_fg {
+                let mid = run_start + (i - run_start) / 2;
+                let cell = wide.get(mid, 0).unwrap();
+                assert_ne!(cell.ch, '░');
+                close(
+                    wide.exact_fg(mid, 0).expect("exact"),
+                    Palette::Llama.rgb(cell.fg.index()),
+                );
+                bands += 1;
+                run_fg = fg;
+                run_start = i;
+            }
+        }
+        assert_eq!(bands, 5, "five spectrum steps");
+    }
+
+    #[test]
+    fn a_hot_bars_last_fifth_continues_into_the_blackbody_tail() {
+        let mut grid = Grid::with_exact(8, 4);
+        spectrum_bar(&mut grid, 5, 2, 1.0, true);
+        assert_eq!(grid.get(4, 0).unwrap().fg, C16::BrightWhite);
+        assert_eq!(grid.get(4, 1).unwrap().fg, C16::BrightRed);
+        let top = grid.exact_fg(4, 0).expect("hot top");
+        let pos = color::spectrum::hot_top(4, 5);
+        assert!(pos > 100.0);
+        assert_eq!(top, act_color(pos));
+        assert_ne!(top, Palette::Llama.rgb(C16::BrightWhite.index()));
+        let bot = grid.exact_fg(4, 1).expect("hot bottom");
+        assert_eq!(bot, act_color(color::spectrum::place(4, 5)));
+        assert_eq!(bot, Palette::Llama.rgb(C16::BrightRed.index()));
+        // The earlier fifths are not pulled onto the tail.
+        assert_eq!(
+            grid.exact_fg(0, 0).unwrap(),
+            act_color(color::spectrum::place(0, 5))
+        );
+    }
+
+    #[test]
+    fn an_empty_track_and_a_fixed_bar_carry_no_exact_colour() {
+        let mut grid = Grid::with_exact(8, 3);
+        spectrum_bar(&mut grid, 5, 1, 0.4, false);
+        assert!(grid.exact_fg(0, 0).is_some());
+        assert_eq!(grid.get(4, 0).unwrap().ch, '░');
+        assert!(grid.exact_fg(4, 0).is_none());
+        draw_h_bar(
+            &mut grid,
+            HBar {
+                x: 0,
+                row: 0,
+                width: 5,
+                frac: Some(1.0),
+                ink: BarInk::Fixed(C16::Green, C16::Green),
+                rows: 1,
+                cells: Some('█'),
+            },
+        );
+        assert_eq!(grid.get(0, 0).unwrap().fg, C16::Green);
+        assert!(
+            grid.exact_fg(0, 0).is_none(),
+            "a fixed bar overwrites the ramp"
+        );
+        let mut plain = Grid::new(8, 3);
+        spectrum_bar(&mut plain, 5, 1, 1.0, true);
+        assert!(!plain.records_exact());
+        assert!(plain.exact_fg(4, 0).is_none());
+    }
+
+    #[test]
+    fn digits_shade_around_the_value_and_a_dim_value_stays_plain() {
+        let ceiling = 250.0;
+        let value = ceiling * 2.0_f64.powf(-2.5);
+        let mut grid = Grid::with_exact(24, 8);
+        draw_digits(&mut grid, 0, 0, Some(value), ceiling, 1, 1);
+        let pos = color::spectrum::rate(value, ceiling);
+        // Column 2 of '4' is a lit pixel on every glyph row.
+        for row in 0..5u16 {
+            let cell = grid.get(2, row).unwrap();
+            assert_eq!(cell.ch, '█', "row {row}");
+            assert_eq!(cell.fg, C16::Magenta, "row {row}");
+            assert_eq!(
+                grid.exact_fg(2, row).unwrap(),
+                act_color(color::spectrum::shade(pos, usize::from(row), 5))
+            );
+        }
+        let mid = grid.exact_fg(2, 2).unwrap();
+        assert_eq!(mid, Palette::Llama.rgb(C16::Magenta.index()));
+        let mut dim = Grid::with_exact(8, 8);
+        draw_digits(&mut dim, 0, 0, Some(0.0), ceiling, 1, 1);
+        assert_eq!(dim.get(0, 0).unwrap().fg, C16::BrightBlack);
+        assert!(dim.exact_fg(0, 0).is_none());
+        draw_digits(&mut dim, 0, 0, None, ceiling, 1, 1);
+        assert!(dim.exact_fg(0, 0).is_none());
+    }
+
+    #[test]
+    fn a_chart_column_is_coloured_by_its_row_not_its_value() {
+        let mut grid = Grid::with_exact(4, 14);
+        let half = 5u16;
+        let axis = 6u16;
+        draw_chart_col(
+            &mut grid,
+            1,
+            axis,
+            half,
+            ChartBucket {
+                gen_tps: Some(250.0),
+                prompt_tps: None,
+            },
+            250.0,
+            250.0,
+            ChartGlyphs::Eighths,
+        );
+        let rows = usize::from(half);
+        for i in 0..rows {
+            let row = axis - half + i as u16;
+            let cell = grid.get(1, row).unwrap();
+            assert_eq!(cell.fg, C16::BrightRed, "column colour, row {row}");
+            let from_axis = rows - 1 - i;
+            let exact = grid.exact_fg(1, row).expect("row");
+            assert_eq!(exact, act_color(color::spectrum::place(from_axis, rows)));
+            if from_axis < 5 {
+                let slot = Palette::Llama.rgb(llama_core::palette::role::SPECTRUM[from_axis]);
+                assert_eq!(exact, slot, "band {from_axis}");
+            }
+        }
+        // The row nearest the axis is cool, not the column's red.
+        assert_ne!(
+            grid.exact_fg(1, axis - 1).unwrap(),
+            Palette::Llama.rgb(C16::BrightRed.index())
+        );
+        // A measured zero is the dim dot, with no ramp.
+        draw_chart_col(
+            &mut grid,
+            1,
+            axis,
+            half,
+            ChartBucket {
+                gen_tps: Some(0.0),
+                prompt_tps: None,
+            },
+            250.0,
+            250.0,
+            ChartGlyphs::Eighths,
+        );
+        assert_eq!(grid.get(1, axis).unwrap().ch, '·');
+        assert!(grid.exact_fg(1, axis).is_none());
+
+        let v = 250.0 * 2.0_f64.powf(-4.875);
+        assert_eq!(
+            chart::eighths(rate_frac(Some(v), 250.0).unwrap_or(0.0), half),
+            1
+        );
+        draw_chart_col(
+            &mut grid,
+            1,
+            axis,
+            half,
+            ChartBucket {
+                gen_tps: None,
+                prompt_tps: Some(v),
+            },
+            250.0,
+            250.0,
+            ChartGlyphs::Eighths,
+        );
+        let tip = axis + 1;
+        assert_eq!(grid.get(1, tip).unwrap().fg, C16::Black);
+        assert_eq!(grid.get(1, tip).unwrap().bg, C16::Blue);
+        assert!(grid.exact_fg(1, tip).is_none());
+        assert_eq!(
+            grid.exact_bg(1, tip).unwrap(),
+            act_color(color::spectrum::place(0, rows))
+        );
+        assert_eq!(
+            grid.exact_bg(1, tip).unwrap(),
+            Palette::Llama.rgb(C16::Blue.index())
+        );
+    }
+
+    #[test]
+    fn temperatures_follow_the_threshold_ramp() {
+        let marks = Some((800, 900));
+        let item = |c: i32, level: Level, thresholds: Option<(i32, i32)>| TempItem {
+            label: String::new(),
+            tenths: c * 10,
+            level,
+            thresholds,
+        };
+        let panel = TempPanel {
+            groups: vec![TempGroup {
+                name: "CPU".to_owned(),
+                items: vec![
+                    item(45, Level::Normal, marks),
+                    item(80, Level::Warn, marks),
+                    item(90, Level::Crit, marks),
+                    item(70, Level::Normal, None),
+                ],
+            }],
+        };
+        let mut grid = Grid::with_exact(48, 4);
+        draw_temps(&mut grid, &panel, 0, 46, 0, 3);
+        let row = 1u16;
+        // Name takes TEMP_NAME_W, then a gap, then the values.
+        let at = |col: u16| grid.exact_fg(col, row);
+        let fg = |col: u16| grid.get(col, row).unwrap().fg;
+        assert_eq!(grid.get(9, row).unwrap().ch, '4');
+        assert_eq!(fg(9), C16::BrightWhite);
+        assert_eq!(at(9), Some(color::temp::NORMAL));
+        assert_eq!(grid.get(14, row).unwrap().ch, '8');
+        assert_eq!(fg(14), C16::Yellow);
+        assert_eq!(at(14), Some(color::temp::WARN));
+        assert_eq!(at(14).unwrap(), Palette::Llama.rgb(C16::Yellow.index()));
+        assert_eq!(grid.get(19, row).unwrap().ch, '9');
+        assert_eq!(fg(19), C16::BrightRed);
+        assert_eq!(at(19), Some(color::temp::CRIT));
+        assert_eq!(grid.get(24, row).unwrap().ch, '7');
+        assert_eq!(fg(24), C16::BrightWhite);
+        assert!(at(24).is_none(), "no thresholds, no ramp");
+    }
 
     #[test]
     fn cut_text_drops_the_space_before_the_ellipsis() {
