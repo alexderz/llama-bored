@@ -285,6 +285,50 @@ fn the_tap_writes_changes_and_heartbeats_and_never_blocks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #115: the same model, offered again because `[grid] size` differs from
+/// the console, is written once and then only on the heartbeat.
+#[test]
+fn an_unchanged_second_layout_waits_for_the_heartbeat() {
+    let dir = scratch("idle-size");
+    let path = dir.join("grid");
+    let tap = GridTap::spawn(
+        GridWriter::new(&path, Palette::Llama),
+        Capture::default(),
+        Some(TtySize {
+            cols: 213,
+            rows: 60,
+        }),
+    )
+    .unwrap();
+    let model = busy_frame();
+    let console = frame("idle");
+    tap.offer_frame(&model, &console);
+    wait_for("the first second layout", || seq_of(&path) == Some(1));
+    let first = read(&path);
+    assert_eq!((first.cols, first.rows), (213, 60));
+    let started = Instant::now();
+    for _ in 0..20 {
+        tap.offer_frame(&model, &console);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(started.elapsed() < HEARTBEAT, "test pacing");
+    assert_eq!(
+        seq_of(&path),
+        Some(1),
+        "an unchanged second layout wrote again"
+    );
+    wait_for("the heartbeat", || seq_of(&path).is_some_and(|s| s >= 2));
+    let again = read(&path);
+    assert_eq!(
+        again.seq, 2,
+        "the file was written more than once per heartbeat"
+    );
+    assert_eq!((again.cols, again.rows), (213, 60));
+    assert_eq!(again.cells, first.cells);
+    drop(tap);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn euid_is_root() -> bool {
     std::process::Command::new("id")
         .arg("-u")
