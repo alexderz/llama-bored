@@ -143,9 +143,10 @@ impl<L: Sink> PublishStep for Publisher<L> {
 impl<W: Write> RenderStep for Term<W> {
     fn draw(&mut self, model: &TtyModel, now: Instant) -> io::Result<()> {
         let grid = layout::layout(model, self.cols(), self.rows());
-        // The tap copies this grid, or the model when `[grid] size` differs.
-        // Either copy returns at once. A second layout runs on the tap's
-        // thread, so it cannot delay this write.
+        // The tap copies this grid when the file is the console frame.
+        // Exact colours, or a different `[grid] size`, clone the model
+        // instead and lay it out on the tap's thread, so this write does
+        // not compute the ramp and does not wait.
         if let Some(tap) = self.grid_tap() {
             tap.offer_frame(model, &grid);
         }
@@ -937,7 +938,7 @@ fn with_grid_file<W: Write>(term: Term<W>, config: &Config) -> Term<W> {
     }
     let writer = GridWriter::new(&config.grid.path, config.tty.palette);
     match GridTap::spawn(writer, log::Stderr, config.grid.size) {
-        Ok(tap) => term.with_grid_tap(tap),
+        Ok(tap) => term.with_grid_tap(tap.with_exact(config.grid.exact_colors)),
         Err(err) => {
             log::emit(
                 &mut log::Stderr,

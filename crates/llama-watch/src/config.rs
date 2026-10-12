@@ -999,9 +999,11 @@ pub const MAX_GRID_PATH_BYTES: usize = 4096;
 
 /// `[grid]`: publish each laid-out frame as a file (`llama_core::gridfile`)
 /// so llama-view can show the dashboard with the original characters and
-/// exact RGB (#107). Unset [`GridFile::size`] publishes the console frame.
-/// A different size is a second layout of the same frame (#115); the console
-/// stays as it is.
+/// exact RGB (#107). Unset [`GridFile::size`] publishes the console frame's
+/// cells. A different size is a second layout of the same frame (#115).
+/// [`GridFile::exact_colors`] writes a ramp on the cells that have one
+/// (#116); it defaults on, and `false` restores the palette RGB. The
+/// console stays as it is either way.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GridFile {
@@ -1014,10 +1016,16 @@ pub struct GridFile {
     #[serde(default = "defaults::grid_path")]
     pub path: PathBuf,
     /// `"COLSxROWS"`, parsed like [`Tty::size`] and bounded the same way.
-    /// Unset, or equal to the console's actual size, publishes that frame.
-    /// Otherwise the file is laid out again at this size.
+    /// Unset, or equal to the console's actual size, publishes that frame
+    /// when exact colours are off. Otherwise the file is laid out again,
+    /// at this size or at the console size when only the ramp differs.
     #[serde(default, deserialize_with = "deserialize_grid_size")]
     pub size: Option<TtySize>,
+    /// Ramp colours in the file (#116). On when the file is enabled.
+    /// `false` writes each cell's palette colour. The console is the
+    /// palette either way.
+    #[serde(default = "defaults::enabled")]
+    pub exact_colors: bool,
 }
 
 impl Default for GridFile {
@@ -1026,6 +1034,7 @@ impl Default for GridFile {
             enabled: false,
             path: defaults::grid_path(),
             size: None,
+            exact_colors: true,
         }
     }
 }
