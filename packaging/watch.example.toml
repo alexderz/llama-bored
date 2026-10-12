@@ -228,10 +228,12 @@ enabled = true
 # viewers show the nearest colour; exact_colors = false gives them the
 # console's colours. llama-view --colors truecolor, one full first render
 # of one busy 192x60 frame (activity past 100, generation past its
-# ceiling), wrote 26439 bytes and 13 colour pairs from the palette and
-# 32755 bytes and 158 colour pairs with the ramps. That is the first
+# ceiling), wrote 28103 bytes and 13 colour pairs from the palette and
+# 35057 bytes and 158 colour pairs with the ramps. That is the first
 # render, not the steady-state diff. Each distinct colour pair is its own
-# SGR sequence.
+# SGR sequence. Both byte counts include the background llama-view sends
+# with a full block in truecolor and 256 colours (#120); before that they
+# were 26439 and 32755.
 #[grid]
 #enabled = true
 #path = "/run/llama-watch-grid/grid"
