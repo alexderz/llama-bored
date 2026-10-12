@@ -4486,9 +4486,11 @@ fn spec_example_rules() -> Rules {
     Rules::compile(&config.setup).expect("compile")
 }
 
-/// #92: the example rules over `fixtures/llama/example-spec.json`. A tall
-/// screen shows every row; 160x49 keeps the first five and drops serve
-/// and sample. The long report label and the file's paths stay off the grid.
+/// #92, #114: the example rules over `fixtures/llama/example-spec.json`. A
+/// tall screen shows every row; 160x49 keeps the first five and drops serve
+/// and sample. `report.label` is a text value, so the joined engine row
+/// keeps the later items and the 160-column row shows the label alone.
+/// The file's paths stay off the grid.
 #[test]
 fn spec_example_rules_draw_the_fixture() {
     let rules = spec_example_rules();
@@ -4528,7 +4530,7 @@ fn spec_example_rules_draw_the_fixture() {
         [
             (
                 "engine".to_owned(),
-                "llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe".to_owned()
+                "Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k \u{00b7} llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe".to_owned()
             ),
             ("ctx".to_owned(), "131,072 · kv f16".to_owned()),
             (
@@ -4563,7 +4565,7 @@ fn spec_example_rules_draw_the_fixture() {
     assert_eq!(
         shown[2..],
         [
-            "    engine   llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe",
+            "    engine   Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
             "    ctx      131,072 · kv f16",
             "    experts  18 layers in RAM · gpu 999 · mmap off",
             "    spec     none",
@@ -4578,7 +4580,7 @@ fn spec_example_rules_draw_the_fixture() {
     assert_eq!(
         shown[2..],
         [
-            "    engine   llama.cpp 0.6 · Q6_K_XL · params 35B / 3B · moe",
+            "    engine   Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
             "    ctx      131,072 · kv f16",
             "    experts  18 layers in RAM · gpu 999 · mmap off",
             "    spec     none",
@@ -4590,14 +4592,7 @@ fn spec_example_rules_draw_the_fixture() {
     assert!(!short_text.contains("temp 0.6"), "{short_text}");
     for grid in [&tall, &short] {
         let all = whole(grid);
-        for leak in [
-            "Example-35B",
-            "/models",
-            "sha256",
-            "d77d5bc",
-            "retry wave",
-            "8096",
-        ] {
+        for leak in ["/models", "sha256", "d77d5bc", "retry wave", "8096"] {
             assert!(!all.contains(leak), "{leak} in {all}");
         }
     }
