@@ -1068,10 +1068,12 @@ fn percent_of(used: Option<f64>, total: Option<f64>) -> Option<f64> {
     }
 }
 
-/// Spectrum ink for a level meter. Past 100 % the top step is white-hot.
+/// Spectrum ink for a level meter. Past 100 % the top step is white-hot,
+/// and the exact ramp is stretched to end at the level.
 fn level_ink(pct: Option<f64>) -> BarInk {
     BarInk::Spectrum {
         hot: pct.is_some_and(|p| p > 100.0),
+        top: pct.map_or(color::spectrum::FULL, color::spectrum::top_of),
     }
 }
 
@@ -1109,7 +1111,9 @@ enum BarInk {
     /// Each lit cell takes the step of its own position (its fifth of full
     /// scale), so a bar starts blue and a full bar shows every step. `hot` is
     /// a value past full scale: the top step turns white-hot (97 on 91).
-    Spectrum { hot: bool },
+    /// `top` is the ramp position of the bar's right edge for the exact
+    /// colours: [`color::spectrum::FULL`], or the level itself past 100 %.
+    Spectrum { hot: bool, top: f32 },
 }
 
 struct HBar {
@@ -1139,7 +1143,7 @@ fn draw_h_bar(grid: &mut Grid, bar: HBar) {
         let (fg_top, fg_bot) = match bar.ink {
             _ if ch == '░' => (C16::BrightBlack, C16::BrightBlack),
             BarInk::Fixed(top, bot) => (top, bot),
-            BarInk::Spectrum { hot } => spectrum_colours(i, width, hot),
+            BarInk::Spectrum { hot, .. } => spectrum_colours(i, width, hot),
         };
         let bot_ch = match ch {
             '█' => '▓',
@@ -1150,25 +1154,18 @@ fn draw_h_bar(grid: &mut Grid, bar: HBar) {
         if bar.rows > 1 {
             paint(grid, col, bar.row + 1, bot_ch, fg_bot, C16::Black);
         }
-        // Filled spectrum cells take the ramp at their own centre. The
+        // Filled spectrum cells take the ramp at their own centre, on one
+        // scale from the bar's left edge to `top` at its right (#123). The
         // empty track and a fixed-ink bar (capacity, a stalled fan) stay
-        // on the palette. A hot bar's last fifth is the same cells the
-        // console paints white-hot; only that top row continues into the
-        // blackbody tail.
+        // on the palette. Both rows of a tall bar are that colour.
         if grid.records_exact()
             && ch != '░'
-            && let BarInk::Spectrum { hot } = bar.ink
+            && let BarInk::Spectrum { top, .. } = bar.ink
         {
-            let pos = color::spectrum::place(i, width);
-            let step = fifth(i, width);
-            let top = if hot && step == STEPS.len() - 1 {
-                color::spectrum::hot_top(i, width)
-            } else {
-                pos
-            };
-            grid.set_exact_fg(col, bar.row, act_color(top));
+            let exact = act_color(color::spectrum::place_to(i, width, top));
+            grid.set_exact_fg(col, bar.row, exact);
             if bar.rows > 1 {
-                grid.set_exact_fg(col, bar.row + 1, act_color(pos));
+                grid.set_exact_fg(col, bar.row + 1, exact);
             }
         }
     }
@@ -1318,7 +1315,10 @@ fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64
             row,
             width,
             frac,
-            ink: BarInk::Spectrum { hot },
+            ink: BarInk::Spectrum {
+                hot,
+                top: color::spectrum::FULL,
+            },
             rows,
             // #95: GENERATION and PROMPT each draw one isolated bar (the
             // tick row sits right below, no other bar directly above or
@@ -1774,7 +1774,10 @@ fn paint_slot_spark(
                 row,
                 width: CTX_METER_W,
                 frac: Some(frac),
-                ink: BarInk::Spectrum { hot: false },
+                ink: BarInk::Spectrum {
+                    hot: false,
+                    top: color::spectrum::FULL,
+                },
                 rows: 1,
                 // #95: one ctx meter per slot row, stacked with no blank
                 // row between, so it needs #52's whole-cell glyph too.
@@ -1960,7 +1963,10 @@ fn paint_slot_ctx(
                 row,
                 width: col_u16(meter_w),
                 frac: Some(frac),
-                ink: BarInk::Spectrum { hot: false },
+                ink: BarInk::Spectrum {
+                    hot: false,
+                    top: color::spectrum::FULL,
+                },
                 rows: 1,
                 // #95: stacks with the slot rows above and below it.
                 cells: Some(meter_glyph(glyphs)),
@@ -4066,7 +4072,10 @@ fn draw_fan_row(
                 ink: if stalled {
                     BarInk::Fixed(C16::Red, C16::Red)
                 } else {
-                    BarInk::Spectrum { hot: false }
+                    BarInk::Spectrum {
+                        hot: false,
+                        top: color::spectrum::FULL,
+                    }
                 },
                 rows: 1,
                 // #95: one fan per row, stacked with no blank row between.
@@ -4535,7 +4544,9 @@ mod tests {
         }
     }
 
-    fn spectrum_bar(grid: &mut Grid, width: u16, rows: u16, frac: f64, hot: bool) {
+    /// A spectrum bar at `pct` percent of full scale, inked like a level meter.
+    fn spectrum_bar(grid: &mut Grid, width: u16, rows: u16, pct: f64) {
+        let frac = (pct / 100.0).min(1.0);
         draw_h_bar(
             grid,
             HBar {
@@ -4543,81 +4554,96 @@ mod tests {
                 row: 0,
                 width,
                 frac: Some(frac),
-                ink: BarInk::Spectrum { hot },
+                ink: level_ink(Some(pct)),
                 rows,
                 cells: Some('█'),
             },
         );
     }
 
-    #[test]
-    fn a_spectrum_bars_centres_match_the_palette_steps() {
-        let mut grid = Grid::with_exact(8, 4);
-        spectrum_bar(&mut grid, 5, 2, 1.0, false);
-        for i in 0..5u16 {
-            let cell = grid.get(i, 0).unwrap();
-            let slot = Palette::Llama.rgb(cell.fg.index());
-            let exact = grid.exact_fg(i, 0).expect("top");
-            assert_eq!(exact, slot, "cell {i} {:?}", cell.fg);
-            assert_eq!(exact, act_color(color::spectrum::place(usize::from(i), 5)));
-            assert_eq!(grid.get(i, 1).unwrap().fg, cell.fg);
-            assert_eq!(grid.exact_fg(i, 1), Some(exact));
-        }
-        // A wide bar: the centre cell of each palette run is close to that
-        // run's colour. The test does not list RGB values.
-        let width = 67u16;
-        let mut wide = Grid::with_exact(width + 2, 3);
-        spectrum_bar(&mut wide, width, 1, 1.0, false);
-        let mut run_fg = wide.get(0, 0).unwrap().fg;
-        let mut run_start = 0u16;
-        let mut bands = 0;
-        for i in 0..=width {
-            let fg = if i == width {
-                C16::Black
-            } else {
-                wide.get(i, 0).unwrap().fg
-            };
-            if fg != run_fg {
-                let mid = run_start + (i - run_start) / 2;
-                let cell = wide.get(mid, 0).unwrap();
-                assert_ne!(cell.ch, '░');
-                close(
-                    wide.exact_fg(mid, 0).expect("exact"),
-                    Palette::Llama.rgb(cell.fg.index()),
-                );
-                bands += 1;
-                run_fg = fg;
-                run_start = i;
-            }
-        }
-        assert_eq!(bands, 5, "five spectrum steps");
+    /// Largest channel difference between two colours.
+    fn gap(a: llama_core::color::Rgb, b: llama_core::color::Rgb) -> u8 {
+        a.r.abs_diff(b.r)
+            .max(a.g.abs_diff(b.g))
+            .max(a.b.abs_diff(b.b))
     }
 
     #[test]
-    fn a_hot_bars_last_fifth_continues_into_the_blackbody_tail() {
+    fn a_spectrum_bar_is_one_ramp_from_the_first_stop_to_the_last() {
         let mut grid = Grid::with_exact(8, 4);
-        spectrum_bar(&mut grid, 5, 2, 1.0, true);
+        spectrum_bar(&mut grid, 5, 2, 100.0);
+        for i in 0..5u16 {
+            let exact = grid.exact_fg(i, 0).expect("top");
+            assert_eq!(exact, act_color(color::spectrum::place(usize::from(i), 5)));
+            assert_eq!(grid.get(i, 1).unwrap().fg, grid.get(i, 0).unwrap().fg);
+            assert_eq!(grid.exact_fg(i, 1), Some(exact));
+        }
+        // A wide bar starts on the first stop, ends on the last and has no
+        // seam. The console still paints its five steps under it.
+        let width = 67u16;
+        let mut wide = Grid::with_exact(width + 2, 3);
+        spectrum_bar(&mut wide, width, 1, 100.0);
+        close(wide.exact_fg(0, 0).expect("first"), color::ACT_STOPS[0].1);
+        close(
+            wide.exact_fg(width - 1, 0).expect("last"),
+            color::ACT_STOPS[color::ACT_STOPS.len() - 1].1,
+        );
+        let mut steps = vec![wide.get(0, 0).unwrap().fg];
+        for i in 1..width {
+            let here = wide.exact_fg(i, 0).expect("exact");
+            let before = wide.exact_fg(i - 1, 0).expect("exact");
+            assert!(gap(here, before) <= 16, "a seam at cell {i}");
+            let fg = wide.get(i, 0).unwrap().fg;
+            if steps.last() != Some(&fg) {
+                steps.push(fg);
+            }
+        }
+        assert_eq!(steps.len(), 5, "five spectrum steps on the console");
+    }
+
+    #[test]
+    fn a_hot_bar_stretches_into_the_blackbody_tail_without_a_seam() {
+        let mut grid = Grid::with_exact(8, 4);
+        spectrum_bar(&mut grid, 5, 2, 125.0);
+        // The console is as before: the last step white-hot over red.
         assert_eq!(grid.get(4, 0).unwrap().fg, C16::BrightWhite);
         assert_eq!(grid.get(4, 1).unwrap().fg, C16::BrightRed);
-        let top = grid.exact_fg(4, 0).expect("hot top");
-        let pos = color::spectrum::hot_top(4, 5);
-        assert!(pos > 100.0);
-        assert_eq!(top, act_color(pos));
-        assert_ne!(top, Palette::Llama.rgb(C16::BrightWhite.index()));
-        let bot = grid.exact_fg(4, 1).expect("hot bottom");
-        assert_eq!(bot, act_color(color::spectrum::place(4, 5)));
-        assert_eq!(bot, Palette::Llama.rgb(C16::BrightRed.index()));
-        // The earlier fifths are not pulled onto the tail.
-        assert_eq!(
-            grid.exact_fg(0, 0).unwrap(),
-            act_color(color::spectrum::place(0, 5))
-        );
+        for i in 0..5u16 {
+            let pos = color::spectrum::place_to(usize::from(i), 5, 125.0);
+            assert_eq!(grid.exact_fg(i, 0), Some(act_color(pos)));
+            assert_eq!(grid.exact_fg(i, 1), Some(act_color(pos)));
+        }
+        assert!(color::spectrum::place_to(4, 5, 125.0) > color::spectrum::FULL);
+
+        let width = 67u16;
+        let bar = |pct: f64| {
+            let mut grid = Grid::with_exact(width + 2, 3);
+            spectrum_bar(&mut grid, width, 1, pct);
+            (0..width)
+                .map(|i| grid.exact_fg(i, 0).expect("exact"))
+                .collect::<Vec<_>>()
+        };
+        for pct in [101.0, 110.0, 118.0, 125.0, 300.0] {
+            let cells = bar(pct);
+            for pair in cells.windows(2) {
+                assert!(gap(pair[0], pair[1]) <= 16, "{pct} %: a seam");
+            }
+        }
+        // Crossing 100 % moves no cell by more than a shade.
+        let full = bar(100.0);
+        let above = bar(100.5);
+        for (a, b) in full.iter().zip(&above) {
+            assert!(gap(*a, *b) <= 4);
+        }
+        // Past the tail's end the bar stops changing.
+        assert_eq!(bar(125.0), bar(300.0));
+        assert_ne!(bar(125.0), full);
     }
 
     #[test]
     fn an_empty_track_and_a_fixed_bar_carry_no_exact_colour() {
         let mut grid = Grid::with_exact(8, 3);
-        spectrum_bar(&mut grid, 5, 1, 0.4, false);
+        spectrum_bar(&mut grid, 5, 1, 40.0);
         assert!(grid.exact_fg(0, 0).is_some());
         assert_eq!(grid.get(4, 0).unwrap().ch, '░');
         assert!(grid.exact_fg(4, 0).is_none());
@@ -4639,7 +4665,7 @@ mod tests {
             "a fixed bar overwrites the ramp"
         );
         let mut plain = Grid::new(8, 3);
-        spectrum_bar(&mut plain, 5, 1, 1.0, true);
+        spectrum_bar(&mut plain, 5, 1, 125.0);
         assert!(!plain.records_exact());
         assert!(plain.exact_fg(4, 0).is_none());
     }
@@ -4661,8 +4687,10 @@ mod tests {
                 act_color(color::spectrum::shade(pos, usize::from(row), 5))
             );
         }
-        let mid = grid.exact_fg(2, 2).unwrap();
-        assert_eq!(mid, Palette::Llama.rgb(C16::Magenta.index()));
+        // The middle row is the value itself: the middle of the third band,
+        // half a band above the step the console paints.
+        assert_eq!(grid.exact_fg(2, 2).unwrap(), act_color(pos));
+        assert!((pos - 50.0).abs() < 1.0e-3, "{pos}");
         let mut dim = Grid::with_exact(8, 8);
         draw_digits(&mut dim, 0, 0, Some(0.0), ceiling, 1, 1);
         assert_eq!(dim.get(0, 0).unwrap().fg, C16::BrightBlack);
@@ -4697,10 +4725,6 @@ mod tests {
             let from_axis = rows - 1 - i;
             let exact = grid.exact_fg(1, row).expect("row");
             assert_eq!(exact, act_color(color::spectrum::place(from_axis, rows)));
-            if from_axis < 5 {
-                let slot = Palette::Llama.rgb(llama_core::palette::role::SPECTRUM[from_axis]);
-                assert_eq!(exact, slot, "band {from_axis}");
-            }
         }
         // The row nearest the axis is cool, not the column's red.
         assert_ne!(
@@ -4746,13 +4770,10 @@ mod tests {
         assert_eq!(grid.get(1, tip).unwrap().fg, C16::Black);
         assert_eq!(grid.get(1, tip).unwrap().bg, C16::Blue);
         assert!(grid.exact_fg(1, tip).is_none());
+        // The row at the axis: the cool end of the ramp, half a row in.
         assert_eq!(
             grid.exact_bg(1, tip).unwrap(),
             act_color(color::spectrum::place(0, rows))
-        );
-        assert_eq!(
-            grid.exact_bg(1, tip).unwrap(),
-            Palette::Llama.rgb(C16::Blue.index())
         );
     }
 
@@ -4808,11 +4829,9 @@ mod tests {
     #[test]
     fn the_rate_fraction_matches_the_ramp_across_the_scale() {
         let ceiling = 250.0;
-        let step = color::ACT_STOPS[1].0 - color::ACT_STOPS[0].0;
-        let bands = (color::ACT_STOPS.len() - 1) as f32;
         let frac_of = |value: f64| {
             let pos = color::spectrum::rate(value, ceiling);
-            f64::from((pos + step / 2.0) / (step * bands))
+            f64::from(pos / color::spectrum::FULL)
         };
         let mut value = ceiling / 32.0;
         while value < ceiling {
