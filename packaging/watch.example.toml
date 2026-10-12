@@ -259,13 +259,15 @@ enabled = true
 # this file, and it does not follow a symlink. `defaults = false` keeps only
 # these rules. `report.label` is kind `text` (#114): a sentence from the
 # file, kept up to `max_chars` (default 64, at most 96) and then to the
-# row. Copy the block below, without the leading "#", into watch.toml.
+# row. It has its own row, `label`, drawn first. Engine, quant and
+# parameters stay on `engine`. At 160 columns the label fills its row.
+# Copy the block below, without the leading "#", into watch.toml.
 # >>> spec example
 #specs_dir = "/etc/llama-bored/specs"
 #defaults = false
 #
 #[[setup.field]]
-#row = "engine"
+#row = "label"
 #source = "spec:report.label"
 #kind = "text"
 #order = 10
