@@ -224,14 +224,18 @@ impl Grid {
 
     /// Drop any exact colour at `col`, `row`. A painter calls this when it
     /// overwrites a cell, so a later blank does not keep a stale ramp.
+    /// No plane: return before the index. The console layout paints every
+    /// cell through here and has no plane.
     pub(crate) fn clear_exact(&mut self, col: u16, row: u16) {
+        if self.exact.is_none() {
+            return;
+        }
         let Some(i) = self.checked_index(col, row) else {
             return;
         };
-        let Some(plane) = self.exact.as_mut() else {
-            return;
-        };
-        plane[i] = Exact::default();
+        if let Some(plane) = self.exact.as_mut() {
+            plane[i] = Exact::default();
+        }
     }
 
     fn exact_at(&self, col: u16, row: u16) -> Option<Exact> {

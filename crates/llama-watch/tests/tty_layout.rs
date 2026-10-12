@@ -5079,54 +5079,81 @@ fn hot_model() -> TtyModel {
     model
 }
 
+/// One screen row per line. A run is `"n,RRGGBB,RRGGBB,ch"`: the repeat
+/// count, foreground, background, then the character (a comma in the
+/// character stays with it).
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
 struct GridFix {
     w: u16,
     h: u16,
-    runs: Vec<GridRun>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-struct GridRun {
-    n: u32,
-    ch: char,
-    fg: u32,
-    bg: u32,
+    rows: Vec<Vec<String>>,
 }
 
 fn grid_fix_of(model: &TtyModel) -> GridFix {
     let grid = layout_exact(model, 192, 60);
     let image = llama_watch::grid_out::image_of(&grid, llama_core::palette::Palette::Llama, 1, 0);
-    let mut runs: Vec<GridRun> = Vec::new();
-    for cell in &image.cells {
-        let fg = rgb_word(cell.fg);
-        let bg = rgb_word(cell.bg);
-        if let Some(run) = runs.last_mut()
-            && run.ch == cell.ch
-            && run.fg == fg
-            && run.bg == bg
-        {
-            run.n += 1;
-        } else {
-            runs.push(GridRun {
-                n: 1,
-                ch: cell.ch,
-                fg,
-                bg,
-            });
+    let width = usize::from(image.cols);
+    assert_eq!((image.cols, image.rows), (192, 60));
+    let mut rows = Vec::with_capacity(usize::from(image.rows));
+    for cells in image.cells.chunks(width) {
+        let mut runs = Vec::new();
+        let mut n = 0u32;
+        let mut ch = ' ';
+        let mut fg = String::new();
+        let mut bg = String::new();
+        for cell in cells {
+            let cell_fg = hex6(cell.fg);
+            let cell_bg = hex6(cell.bg);
+            if n > 0 && cell.ch == ch && cell_fg == fg && cell_bg == bg {
+                n += 1;
+            } else {
+                if n > 0 {
+                    runs.push(format!("{n},{fg},{bg},{ch}"));
+                }
+                n = 1;
+                ch = cell.ch;
+                fg = cell_fg;
+                bg = cell_bg;
+            }
         }
+        if n > 0 {
+            runs.push(format!("{n},{fg},{bg},{ch}"));
+        }
+        let covered: u32 = runs.iter().map(|run| run_count(run)).sum();
+        assert_eq!(covered, u32::from(image.cols));
+        rows.push(runs);
     }
-    let cells: u32 = runs.iter().map(|run| run.n).sum();
-    assert_eq!(cells, 192 * 60);
+    assert_eq!(rows.len(), usize::from(image.rows));
     GridFix {
-        w: 192,
-        h: 60,
-        runs,
+        w: image.cols,
+        h: image.rows,
+        rows,
     }
 }
 
-fn rgb_word(rgb: llama_core::color::Rgb) -> u32 {
-    (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+fn hex6(rgb: llama_core::color::Rgb) -> String {
+    format!("{:02X}{:02X}{:02X}", rgb.r, rgb.g, rgb.b)
+}
+
+fn run_count(run: &str) -> u32 {
+    run.split_once(',')
+        .expect("n,fg,bg,ch")
+        .0
+        .parse()
+        .expect("n")
+}
+
+/// Compact JSON: `{"w":N,"h":N,"rows":[` then one JSON array per screen row.
+fn grid_fix_text(fix: &GridFix) -> String {
+    let mut out = format!("{{\"w\":{},\"h\":{},\"rows\":[\n", fix.w, fix.h);
+    for (i, row) in fix.rows.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&serde_json::to_string(row).expect("row"));
+    }
+    out.push_str("\n]}\n");
+    out
 }
 
 fn grid_fix_dir() -> PathBuf {
@@ -5142,9 +5169,8 @@ fn grid_exact_goldens_match() {
         let fix: GridFix =
             serde_json::from_str(&text).unwrap_or_else(|err| panic!("{name}: {err}"));
         let got = grid_fix_of(&model());
-        assert_eq!(got.w, fix.w, "{name}");
-        assert_eq!(got.h, fix.h, "{name}");
-        assert_eq!(got.runs, fix.runs, "{name}");
+        assert_eq!(got, fix, "{name}");
+        assert_eq!(text, grid_fix_text(&got), "{name}: compact form");
     }
 }
 
@@ -5154,9 +5180,8 @@ fn dump_grid_exact_goldens() {
     let dir = grid_fix_dir();
     std::fs::create_dir_all(&dir).expect("fixtures/grid");
     for (name, model) in GRID_EXACT_GOLDENS {
-        let fix = grid_fix_of(&model());
-        let text = serde_json::to_string_pretty(&fix).expect("json");
-        std::fs::write(dir.join(name), text + "\n").expect("write");
+        let text = grid_fix_text(&grid_fix_of(&model()));
+        std::fs::write(dir.join(name), text).expect("write");
     }
 }
 
@@ -5182,7 +5207,7 @@ fn truecolor_view_writes_more_for_the_ramps() {
     let (plain_bytes, plain_colours) = truecolor_frame(&plain);
     let (ramp_bytes, ramp_colours) = truecolor_frame(&ramp);
     eprintln!(
-        "llama-view truecolor 192x60 busy frame: palette {plain_bytes} bytes, {plain_colours} colours; exact {ramp_bytes} bytes, {ramp_colours} colours"
+        "llama-view truecolor 192x60 busy frame, one full first render: palette {plain_bytes} bytes, {plain_colours} colour pairs; exact {ramp_bytes} bytes, {ramp_colours} colour pairs"
     );
     assert!(ramp_bytes > plain_bytes);
     assert!(ramp_colours > plain_colours);

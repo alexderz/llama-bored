@@ -10,7 +10,7 @@ use llama_core::gridfile::{self, GridImage, HEARTBEAT};
 use llama_core::log::Sink;
 use llama_core::palette::Palette;
 use llama_watch::collector::LoadSource;
-use llama_watch::config::{ChartGlyphs, Config, DEFAULT_GRID_PATH, TtySize};
+use llama_watch::config::{ChartGlyphs, Config, DEFAULT_GRID_PATH, GridFile, TtySize};
 use llama_watch::grid_out::{GridTap, GridWriter};
 use llama_watch::service::RenderStep;
 use llama_watch::tty::chart::ChartBucket;
@@ -510,6 +510,56 @@ fn exact_off_matches_the_palette_file_and_exact_on_matches_the_ramp() {
     assert_eq!(std::fs::read(&path).expect("file"), encoded);
     drop(tap);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #116: `[grid]` is what the tap writes. [`GridTap::spawn`] leaves exact
+/// colours off, and the service does not call [`GridTap::with_exact`]
+/// itself: it calls [`GridTap::from_config`]. The default config (exact
+/// colours on) writes the ramp frame; `exact_colors = false` writes the
+/// palette frame.
+#[test]
+fn the_grid_config_is_what_the_tap_writes() {
+    let model = busy_frame();
+    let console = layout::layout(&model, 192, 60);
+    let palette = palette_cells(&console);
+    let ramp = layout::layout_exact(&model, 192, 60);
+
+    let offer = |name: &str, grid: &GridFile| {
+        let dir = scratch(name);
+        let path = dir.join("grid");
+        let tap = GridTap::from_config(
+            GridWriter::new(&path, Palette::Llama),
+            Capture::default(),
+            grid,
+        )
+        .expect("tap");
+        tap.offer_frame(&model, &console);
+        wait_for(name, || seq_of(&path) == Some(1));
+        let got = read(&path);
+        drop(tap);
+        let _ = std::fs::remove_dir_all(&dir);
+        got
+    };
+
+    let got = offer("config-default", &GridFile::default());
+    let want = llama_watch::grid_out::image_of(&ramp, Palette::Llama, got.seq, got.unix_ms);
+    assert_eq!(got.cells, want.cells, "default config writes the ramp");
+    assert_ne!(
+        got.cells, palette,
+        "default config is not the palette frame"
+    );
+
+    let off = GridFile {
+        exact_colors: false,
+        ..GridFile::default()
+    };
+    let got = offer("config-exact-off", &off);
+    assert_eq!(
+        got.cells, palette,
+        "exact_colors = false writes the palette"
+    );
+    let via = llama_watch::grid_out::image_of(&console, Palette::Llama, got.seq, got.unix_ms);
+    assert_eq!(got.cells, via.cells);
 }
 
 /// Today's palette RGB, built without [`image_of`], so an exact colour

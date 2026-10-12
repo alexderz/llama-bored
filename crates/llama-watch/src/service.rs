@@ -937,8 +937,8 @@ fn with_grid_file<W: Write>(term: Term<W>, config: &Config) -> Term<W> {
         return term;
     }
     let writer = GridWriter::new(&config.grid.path, config.tty.palette);
-    match GridTap::spawn(writer, log::Stderr, config.grid.size) {
-        Ok(tap) => term.with_grid_tap(tap.with_exact(config.grid.exact_colors)),
+    match GridTap::from_config(writer, log::Stderr, &config.grid) {
+        Ok(tap) => term.with_grid_tap(tap),
         Err(err) => {
             log::emit(
                 &mut log::Stderr,
