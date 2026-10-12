@@ -197,8 +197,9 @@ enabled = true
 # outside it has to exist and be writable by the llama-watch account.
 # size (#115) is "COLSxROWS", the same limits as [tty] size (160x26 through
 # 1024x512). Unset, or equal to the console's actual size, the file is that
-# frame. A different size is a second layout of the same data on the grid
-# thread; the console keeps its size. The cost grows with the IN and OUT
+# frame when exact_colors is false. A different size, or exact colours left
+# on, is a second layout of the same data on the grid thread; the console
+# keeps its size and its palette colours. The cost grows with the IN and OUT
 # text. On one machine, a release build measured the model clone, that
 # 213x60 layout beside a 192x60 console, and the grid compare (CPU time,
 # the median of three runs). The layout was 36.7 µs per frame with no
@@ -207,10 +208,21 @@ enabled = true
 # 8192-character IN was 68.6 µs (0.0686%). The clone was 1.4 µs and the
 # compare 9.6 µs on the light frame, and 2.7 µs and 11.0 µs on the full
 # frame.
+# exact_colors (#116) defaults to true when the file is enabled. Spectrum
+# bars, the big digits, the rate charts and temperature readings that have
+# warn and crit thresholds then carry a ramp; false writes each cell's
+# palette colour. The plane is eight bytes a cell (92160 at 192x60) and is
+# not allocated when the file is off or this is false. On that machine the
+# 192x60 exact layout was 51.1 µs per frame with no IN/OUT text (0.0511%
+# of one core at 10 frames a second), 157.8 µs with an 8192-character IN
+# (0.1578%), and 565.6 µs with IN and OUT at 32768 characters each
+# (0.5656%). The palette layout of that frame in the same run was 39.1 µs,
+# 71.6 µs and 508.5 µs.
 #[grid]
 #enabled = true
 #path = "/run/llama-watch-grid/grid"
 #size = "213x60"
+#exact_colors = true
 
 # >>> setup example
 #[[setup.field]]
