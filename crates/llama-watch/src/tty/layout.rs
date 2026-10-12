@@ -763,7 +763,9 @@ fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
 
 /// `  label    item · item`. Trailing items drop until the row fits, then
 /// the last one is cut. A `text` value stays: items after it drop first,
-/// and the value is cut to the room rather than dropped (#114).
+/// and the value is cut to the room rather than dropped (#114). A text
+/// value that is not the row's first item, with fewer than two cells left,
+/// drops with its separator: a bare ` · ` or a lone `…` is not drawn.
 fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     let label: String = setup.label.chars().take(8).collect();
     paint_detail(
@@ -778,8 +780,14 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     let keep = setup_items_kept(&setup.items, room);
     let mut col = x;
     for (i, item) in setup.items[..keep].iter().enumerate() {
+        let used = col - x;
         if i > 0 {
-            col += paint_detail(grid, col, usize::from(row), &item.sep, room - (col - x));
+            let sep_room = room.saturating_sub(used);
+            let sep_w = detail_width(&item.sep).min(sep_room);
+            if item.text_value && sep_room.saturating_sub(sep_w) < 2 {
+                break;
+            }
+            col += paint_detail(grid, col, usize::from(row), &item.sep, sep_room);
         }
         let left = room.saturating_sub(col - x);
         let text = cut_text(&item.text, left);
@@ -792,37 +800,52 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
     }
 }
 
-/// `text`, or its first `width - 1` characters and `…`. The cut itself does
-/// not sanitise: [`paint_detail_fg`] maps every non-ASCII scalar it is
-/// handed (including the `…` this appends) when it draws the result.
-/// [`crate::setup_rules`] uses the same cut for a `text` value's `max_chars`.
+/// `text`, or its first `width - 1` characters and `…`. Trailing spaces of
+/// that prefix are dropped, so the cut is `hello…` rather than `hello …`.
+/// The cut itself does not sanitise: [`paint_detail_fg`] maps every
+/// non-ASCII scalar it is handed (including the `…` this appends) when it
+/// draws the result. [`crate::setup_rules`] uses the same cut for a `text`
+/// value's `max_chars`.
 pub(crate) fn cut_text(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text.to_owned();
     }
-    match width {
-        0 => String::new(),
-        n => text
-            .chars()
-            .take(n - 1)
-            .chain(std::iter::once('\u{2026}'))
-            .collect(),
+    if width == 0 {
+        return String::new();
     }
+    let mut out: String = text.chars().take(width - 1).collect();
+    let end = out.trim_end_matches(' ').len();
+    out.truncate(end);
+    out.push('\u{2026}');
+    out
 }
 
 /// Leading items to draw in `room` cells. A `text` value is the floor:
 /// items after it drop while the row is too wide, and the value itself
-/// is left to be cut. Any other row drops down to its first item.
+/// is left to be cut. A text value that is not first, with fewer than two
+/// cells left after its separator, drops with that separator. Any other
+/// row drops down to its first item.
 fn setup_items_kept(items: &[SetupItem], room: usize) -> usize {
     let mut keep = items.len();
-    let floor = items
-        .iter()
-        .position(|item| item.text_value)
-        .map_or(1, |at| at.saturating_add(1));
+    let text_at = items.iter().position(|item| item.text_value);
+    let floor = text_at.map_or(1, |at| at.saturating_add(1));
     while keep > floor && setup_items_width(&items[..keep]) > room {
         keep -= 1;
     }
+    if let Some(at) = text_at
+        && at > 0
+        && keep > at
+        && text_item_room(items, at, room) < 2
+    {
+        keep = at;
+    }
     keep
+}
+
+/// Cells left for `items[at]` after the items before it and its separator.
+fn text_item_room(items: &[SetupItem], at: usize, room: usize) -> usize {
+    let sep = detail_width(&items[at].sep);
+    room.saturating_sub(setup_items_width(&items[..at]).saturating_add(sep))
 }
 
 fn setup_items_width(items: &[SetupItem]) -> usize {
@@ -4364,6 +4387,15 @@ mod tests {
         assert!(reds.windows(2).all(|w| w[0] <= w[1]), "{reds:?}");
     }
     use super::*;
+
+    #[test]
+    fn cut_text_drops_the_space_before_the_ellipsis() {
+        assert_eq!(cut_text("hello world", 7), "hello\u{2026}");
+        assert_eq!(cut_text("hello  world", 8), "hello\u{2026}");
+        assert_eq!(cut_text("hello world", 6), "hello\u{2026}");
+        assert_eq!(cut_text("hello world", 11), "hello world");
+        assert_eq!(cut_text("hello", 0), "");
+    }
 
     #[test]
     fn segment_key_is_fixed_colour_and_shortens_below_17_cells() {

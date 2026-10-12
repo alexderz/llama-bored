@@ -4621,20 +4621,19 @@ fn with_setup_rows(rows: Vec<SetupRow>) -> TtyModel {
 /// text value drop before that cut. An item before the value stays.
 #[test]
 fn setup_text_is_cut_to_the_row_and_later_items_drop() {
+    // Value column is 13; the left half ends at column 77, 65 cells.
+    // `left_rows` keeps columns 0..78, so a full cut ends on that column.
     let long = "a".repeat(80);
     let model = with_setup_rows(vec![SetupRow {
         label: "note".to_owned(),
-        items: vec![setup_item(&long, true)],
+        items: vec![setup_item(&long, true), setup_item("TAIL", false)],
     }]);
     let grid = draw(&model, 160, 49);
     let row = &left_rows(&grid, 12, 1)[0];
-    // Value column is 13; the left half ends at column 77, 65 cells.
-    assert!(
-        row.ends_with('\u{2026}') && row.chars().count() == 78,
-        "{row}"
-    );
+    assert!(!row.contains("TAIL"), "{row}");
+    assert!(row.ends_with('\u{2026}'), "{row}");
+    assert_eq!(row.chars().count(), 78, "{row}");
     assert_eq!(row.chars().filter(|ch| *ch == 'a').count(), 64);
-    assert!(!row.contains("TAIL"));
 
     let kept = "b".repeat(60);
     let model = with_setup_rows(vec![SetupRow {
@@ -4660,13 +4659,90 @@ fn setup_text_is_cut_to_the_row_and_later_items_drop() {
         row.ends_with('\u{2026}'),
         "the text is cut, not dropped: {row}"
     );
-    assert!(row.matches('a').count() > 0 || row.contains('a'), "{row}");
+    assert_eq!(row.chars().count(), 78, "{row}");
+}
+
+/// #114: a head that leaves fewer than two cells drops the text value and
+/// its separator. 61, 62 and 63 characters at 160 columns (65 cells) leave
+/// 1, 0 and 0 after the ` · `.
+#[test]
+fn a_text_item_with_no_room_drops_with_its_separator() {
+    for n in [61, 62, 63] {
+        let head = "h".repeat(n);
+        let model = with_setup_rows(vec![SetupRow {
+            label: "note".to_owned(),
+            items: vec![setup_item(&head, false), setup_item("LABEL", true)],
+        }]);
+        let grid = draw(&model, 160, 49);
+        let row = &left_rows(&grid, 12, 1)[0];
+        assert_eq!(row, &format!("    note     {head}"), "{n}: {row}");
+        assert!(!row.contains('\u{2026}'), "{n}: {row}");
+    }
+}
+
+/// #114: a row cut that lands on a space does not draw ` …`.
+#[test]
+fn setup_text_cut_drops_the_space_before_the_ellipsis() {
+    let text = format!("{} zzzz", "a".repeat(63));
+    let model = with_setup_rows(vec![SetupRow {
+        label: "note".to_owned(),
+        items: vec![setup_item(&text, true)],
+    }]);
+    let grid = draw(&model, 160, 49);
+    let row = &left_rows(&grid, 12, 1)[0];
+    assert!(row.ends_with(&format!("a{}", '\u{2026}')), "{row}");
+    assert!(!row.contains(" \u{2026}"), "{row}");
+    assert!(!row.contains('z'), "{row}");
+}
+
+/// Cell text of one terminal frame: the writer's own sequences (ESC % G
+/// and CSI) are skipped. Anything else, including OSC, is left in place
+/// so a control from the spec fails the check below.
+fn term_cell_text(bytes: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            assert!(i < bytes.len(), "dangling ESC");
+            match bytes[i] {
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        assert!(
+                            (0x20..=0x3f).contains(&bytes[i]),
+                            "CSI param {:02x}",
+                            bytes[i]
+                        );
+                        i += 1;
+                    }
+                    assert!(i < bytes.len(), "truncated CSI");
+                    i += 1;
+                }
+                b'%' => {
+                    i += 1;
+                    assert!(i < bytes.len() && bytes[i] == b'G', "not ESC % G");
+                    i += 1;
+                }
+                other => {
+                    out.push(0x1b);
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("cell text is utf-8")
 }
 
 /// #114: a spec string is drawn like other dashboard text. `·` stays `·`.
 /// The console cell is the #90 transliteration; the grid file's `rich`
-/// scalar keeps the original character when it is showable. Controls and
-/// the escape sequence are already gone before the row is drawn.
+/// scalar keeps the original character when it is showable. NUL, DEL, CR,
+/// C1, the escape, zero-width characters and the newline never become a
+/// cell. A bidi override and a combining mark become the placeholder.
 #[test]
 fn setup_text_keeps_the_original_character_and_drops_controls() {
     let rules = Rules::compile(&llama_watch::config::Setup {
@@ -4683,10 +4759,17 @@ fn setup_text_keeps_the_original_character_and_drops_controls() {
     .expect("rule");
     let doc = serde_json::json!({
         "report": {
-            "label": "Q4 \u{00b7} caf\u{e9} \u{2192} \u{4e2d} \u{1b}]9;SPEC\u{7}\nline"
+            "label": "Q4 \u{00b7} caf\u{e9} \u{2192} \u{4e2d} \u{0}\u{7f}\r\u{85}\u{9b}\u{9c}\u{9d}\u{1b}]9;SPEC\u{7}\n\u{202e}\u{200b}\u{200d}line\u{301}"
         }
     });
     let found = rules.extract_with("", "example", None, Some(&doc));
+    assert_eq!(
+        found
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        ["Q4 \u{00b7} caf\u{e9} \u{2192} \u{4e2d} ]9;SPEC \u{202e}line\u{301}"]
+    );
     let live = LiveCtx {
         backend: llama_core::backend::Backend::LlamaCpp,
         detail: None,
@@ -4698,31 +4781,51 @@ fn setup_text_keeps_the_original_character_and_drops_controls() {
     model.setup.as_mut().expect("setup").name.clear();
     let grid = draw(&model, 160, 49);
     let row = 12u16;
-    let console: String = (0..grid.cols())
-        .map(|col| grid.get(col, row).unwrap().ch)
-        .collect();
-    let rich: String = (0..grid.cols())
-        .map(|col| grid.get(col, row).unwrap().rich)
-        .collect();
-    assert!(console.contains("Q4 \u{00b7} cafe > \u{fffd}"), "{console}");
-    assert!(
-        rich.contains("Q4 \u{00b7} caf\u{e9} \u{2192} \u{fffd}"),
-        "{rich}"
+    // The row shares its line with SLOTS. The text under test is the left half.
+    let end = grid.cols() / 2 - 2;
+    let console = left_rows(&grid, row, 1).pop().expect("row");
+    let rich: String = (0..end)
+        .map(|col| grid.get(col, row).expect("cell").rich)
+        .collect::<String>()
+        .trim_end()
+        .to_owned();
+    assert_eq!(
+        console,
+        "    note     Q4 \u{00b7} cafe > \u{fffd} ]9;SPEC \u{fffd}line\u{fffd}"
     );
-    assert!(!console.contains('\u{4e2d}') && !rich.contains('\u{4e2d}'));
-    assert!(
-        console.contains("]9;SPEC line")
-            || console.contains("]9;SPECline")
-            || console.contains("]9;SPEC"),
-        "{console}"
+    assert_eq!(
+        rich,
+        "    note     Q4 \u{00b7} caf\u{e9} \u{2192} \u{fffd} ]9;SPEC \u{fffd}line\u{fffd}"
     );
-    // The newline collapsed, so the next row is not a second line of the label.
-    let next = row_string(&grid, row + 1);
-    assert!(!next.contains("line") || next.contains("]9;SPEC"), "{next}");
+    assert!(!row_string(&grid, row + 1).contains("line"));
     for cell in grid.cells() {
         assert!(!cell.ch.is_control(), "console cell {:?}", cell.ch);
         assert!(!cell.rich.is_control(), "grid cell {:?}", cell.rich);
     }
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("setup-text-{}-hostile", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("grid");
+    let mut writer =
+        llama_watch::grid_out::GridWriter::new(&path, llama_core::palette::Palette::Llama);
+    assert!(writer.offer(&grid, Instant::now(), 1_000).expect("write"));
+    let image = llama_core::gridfile::decode(&std::fs::read(&path).expect("read")).expect("decode");
+    assert_eq!((image.cols, image.rows), (grid.cols(), grid.rows()));
+    let cols = usize::from(image.cols);
+    let at = usize::from(row) * cols;
+    let file_row: String = image.cells[at..at + usize::from(end)]
+        .iter()
+        .map(|cell| cell.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_owned();
+    assert_eq!(file_row, rich);
+    for cell in &image.cells {
+        assert!(!cell.ch.is_control(), "grid file cell {:?}", cell.ch);
+    }
+
     let mut term = Term::new(
         Vec::new(),
         || {
@@ -4736,18 +4839,14 @@ fn setup_text_keeps_the_original_character_and_drops_controls() {
     )
     .expect("term");
     term.render(&grid, Instant::now()).expect("render");
-    let bytes = term.out();
+    let text = term_cell_text(term.out());
     assert!(
-        !bytes.windows(8).any(|window| window == b"\x1b]9;SPEC"),
-        "the spec's OSC reached the console writer"
+        text.contains("Q4 \u{00b7} cafe > \u{fffd} ]9;SPEC \u{fffd}line\u{fffd}"),
+        "{text}"
     );
     assert!(
-        !bytes.contains(&0x07),
-        "BEL from the spec reached the writer"
-    );
-    assert!(
-        !bytes.contains(&b'\n'),
-        "a newline from the spec reached the writer"
+        text.chars().all(|ch| !ch.is_control()),
+        "a control from the spec reached the writer: {text:?}"
     );
 }
 
