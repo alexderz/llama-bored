@@ -202,7 +202,7 @@ pub mod spectrum {
 ///
 /// The console still paints its palette level. The grid file writes this
 /// ramp: the bright value colour at `warn - COOL_SPAN` and below, [`WARM`]
-/// ten degrees under the warning, [`WARN`] at the warning, and [`CRIT`] at
+/// at `warn - WARM_SPAN`, [`WARN`] at the warning, and [`CRIT`] at
 /// the critical point and above.
 pub mod temp {
     use super::{Rgb, WHITE, ramp};
@@ -223,9 +223,12 @@ pub mod temp {
     pub const CRIT: Rgb = super::ACT_STOPS[super::ACT_STOPS.len() - 1].1;
 
     /// Degrees under the warning where the colour is [`NORMAL`].
-    pub const COOL_SPAN: f32 = 35.0;
+    ///
+    /// The span is short on purpose (#125): a sensor whose normal range sits
+    /// close under its warning, coolant for one, must still read as normal.
+    pub const COOL_SPAN: f32 = 10.0;
     /// Degrees under the warning where the colour is [`WARM`].
-    pub const WARM_SPAN: f32 = 10.0;
+    pub const WARM_SPAN: f32 = 4.0;
 
     /// Colour of `celsius` on the warning/critical anchors. `None` when any
     /// input is non-finite or `crit` is not above `warn`: a reading without
@@ -417,6 +420,14 @@ mod tests {
         assert_eq!(temp::WARN, hex(0xFFB030));
         assert_eq!(temp::CRIT, hex(0xFF2A14));
         assert_eq!(temp::WARN, Palette::Llama.rgb(role::WARN));
+        // #125: a low warning does not tint a normal reading. Coolant that
+        // warns at 45 is the normal colour at 31 and at 35.
+        let coolant = |c| temp::color(c, 45.0, 55.0).expect("thresholds");
+        assert_eq!(coolant(31.0), temp::NORMAL);
+        assert_eq!(coolant(35.0), temp::NORMAL);
+        assert_ne!(coolant(38.0), temp::NORMAL);
+        assert_eq!(coolant(41.0), temp::WARM);
+        assert_eq!(coolant(45.0), temp::WARN);
         assert!(temp::color(70.0, 90.0, 80.0).is_none());
         assert!(temp::color(f32::NAN, warn, crit).is_none());
         assert!(temp::color(70.0, f32::NAN, crit).is_none());

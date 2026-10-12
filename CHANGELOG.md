@@ -9,6 +9,7 @@ All notable changes to llama-bored. Versions follow
 ### Fixed
 
 - The exact colours along a bar are one continuous ramp (#123). A spectrum bar, a rate scale and the chart rows run from the first stop at the low end to the last stop at full scale; before, they stopped short of the last stop and the first half-fifth was flat. Past 100 % a level meter stretches that ramp to end at its value, up to the end of the blackbody tail, instead of replacing its last fifth with the whole tail: no cell jumps when the value crosses 100 and the bar has no seam. A rate at its ceiling is the last stop, for the big digits and for the scale under them, and past the ceiling that scale stretches to the same position the digits take. The console and `exact_colors = false` are unchanged.
+- A temperature's exact colour stays the normal text colour until the reading is within 10 degrees of its warning threshold, then ramps to `#FFD050` 4 degrees under it and to the warn colour at it (#125). Before, the tint began 35 degrees under the threshold, so a sensor whose normal range sits close under its warning (coolant that warns at 45 °C) read gold at idle. The console is unchanged.
 
 ## 0.5.5 — 2026-10-12
 
