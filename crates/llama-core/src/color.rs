@@ -112,9 +112,12 @@ pub const fn hex(value: u32) -> Rgb {
 ///
 /// The console paints the nearest palette step. These functions return the
 /// ramp position of the same reading, and [`act_color`] turns that into the
-/// colour the grid file writes. The five spectrum bands are the five gaps
-/// between [`ACT_STOPS`]: a cell at the centre of band `k` sits on stop
-/// `k`. Above 100 the position continues into [`BB_STOPS`].
+/// colour the grid file writes. A bar or a rate scale runs the whole ramp:
+/// the first stop at its low end, the last [`ACT_STOPS`] stop at full
+/// scale (#123). The console's five steps are the five gaps between the
+/// stops, so the middle of a band is half a band above the step the
+/// console paints there. Above 100 the position continues into
+/// [`BB_STOPS`].
 pub mod spectrum {
     use super::{ACT_STOPS, BB_STOPS};
 
@@ -125,24 +128,53 @@ pub mod spectrum {
     /// Five bands, one per gap in [`ACT_STOPS`].
     const BANDS: usize = ACT_STOPS.len() - 1;
 
+    /// The ramp position of full scale: the last [`ACT_STOPS`] stop. A bar's
+    /// right edge and a rate at its ceiling are here.
+    pub const FULL: f32 = ACT_STOPS[BANDS].0;
+
     /// Ramp position of the cell at `index` in a run of `len`, measured at
-    /// the cell's centre. Band centres land on the stops 0/20/40/60/80. The
-    /// right edge sits between L5 and L6. An empty run is the first stop.
+    /// the cell's centre: the first stop at the run's left edge, [`FULL`] at
+    /// its right edge (#123). An empty run is the first stop.
     #[must_use]
     pub fn place(index: usize, len: usize) -> f32 {
+        place_to(index, len, FULL)
+    }
+
+    /// [`place`] on a scale that ends at `top` instead of [`FULL`]: a bar
+    /// past full scale is the same ramp stretched to its value, so no cell
+    /// jumps when the value crosses 100 and the bar has no seam. `top` is
+    /// held between [`FULL`] and the end of the blackbody tail.
+    #[must_use]
+    pub fn place_to(index: usize, len: usize, top: f32) -> f32 {
         if len == 0 {
             return ACT_STOPS[0].0;
         }
+        let top = if top.is_finite() {
+            top.clamp(FULL, BB_STOPS[BB_STOPS.len() - 1].0)
+        } else {
+            FULL
+        };
         let frac = (index as f32 + 0.5) / len as f32;
-        from_frac(frac)
+        ACT_STOPS[0].0 + frac * (top - ACT_STOPS[0].0)
+    }
+
+    /// The `top` of a level meter at `percent` of full scale, for
+    /// [`place_to`]: [`FULL`] up to 100 %, the level itself above that, at
+    /// most the end of the blackbody tail. Not a number is [`FULL`].
+    #[must_use]
+    pub fn top_of(percent: f64) -> f32 {
+        if percent.is_finite() {
+            (percent as f32).clamp(FULL, BB_STOPS[BB_STOPS.len() - 1].0)
+        } else {
+            FULL
+        }
     }
 
     /// Ramp position of `value` on the logarithmic rate scale whose top is
-    /// `ceiling` (the same scale that picks the console's step). The centre
-    /// of each of the five steps lands on stops 0/20/40/60/80. At `ceiling`
-    /// the position is between L5 and L6; above it the position climbs into
-    /// the blackbody tail. A non-finite, non-positive value or ceiling is
-    /// the first stop.
+    /// `ceiling` (the same scale that picks the console's step): the first
+    /// stop at the bottom of the scale, [`FULL`] at `ceiling`. Above it the
+    /// position climbs into the blackbody tail. A non-finite, non-positive
+    /// value or ceiling is the first stop.
     #[must_use]
     pub fn rate(value: f64, ceiling: f64) -> f32 {
         if !value.is_finite() || !ceiling.is_finite() || value <= 0.0 || ceiling <= 0.0 {
@@ -150,7 +182,7 @@ pub mod spectrum {
         }
         let bands = BANDS as f64;
         let frac = ((value / ceiling).log2() + bands) / bands;
-        from_frac(frac as f32)
+        ACT_STOPS[0].0 + frac as f32 * (FULL - ACT_STOPS[0].0)
     }
 
     /// `pos` shaded across `rows`: row 0 is [`SHADE`] points above `pos`,
@@ -163,31 +195,6 @@ pub mod spectrum {
         }
         let t = row as f32 / (rows - 1) as f32;
         pos + SHADE * (1.0 - 2.0 * t)
-    }
-
-    /// Ramp position of a hot bar's top row in the last fifth. That fifth
-    /// runs from the first [`BB_STOPS`] position to the last, so the
-    /// white-hot console cell continues into the blackbody tail. An empty
-    /// run is the start of the tail.
-    #[must_use]
-    pub fn hot_top(index: usize, len: usize) -> f32 {
-        let start = BB_STOPS[0].0;
-        let end = BB_STOPS[BB_STOPS.len() - 1].0;
-        if len == 0 {
-            return start;
-        }
-        let frac = (index as f32 + 0.5) / len as f32;
-        let fifth = (BANDS - 1) as f32 / BANDS as f32;
-        let along = ((frac - fifth) / (1.0 - fifth)).clamp(0.0, 1.0);
-        start + along * (end - start)
-    }
-
-    /// `frac` 0 is half a band below the first stop; `frac` 1 is half a
-    /// band above the last of the five. That is what puts a band's centre
-    /// on its stop.
-    fn from_frac(frac: f32) -> f32 {
-        let step = ACT_STOPS[1].0 - ACT_STOPS[0].0;
-        frac * step * BANDS as f32 - step / 2.0
     }
 }
 
@@ -247,77 +254,115 @@ mod tests {
         ACT_STOPS[1].0 - ACT_STOPS[0].0
     }
 
+    /// From the first stop to full scale.
+    const FULL_SPAN: f32 = spectrum::FULL - ACT_STOPS[0].0;
+
     fn near(got: f32, want: f32) {
         assert!((got - want).abs() < 1.0e-3, "{got} vs {want}");
     }
 
-    #[test]
-    fn fifth_centres_sit_on_the_stops() {
-        let bands = ACT_STOPS.len() - 1;
-        for (k, stop) in ACT_STOPS.iter().enumerate().take(bands) {
-            let pos = spectrum::place(k, bands);
-            near(pos, stop.0);
-            assert_eq!(act_color(pos), stop.1);
-            assert_eq!(
-                act_color(pos),
-                Palette::Llama.rgb(role::SPECTRUM[k]),
-                "band {k}"
-            );
-        }
-        // The right-hand edge is halfway from L5 to L6, not on a stop. The
-        // last cell of a wide bar is half a cell short of that edge.
-        let edge = ACT_STOPS[bands - 1].0 + step() / 2.0;
-        let wide = 1000;
-        let short = step() * bands as f32 / (2.0 * wide as f32);
-        near(spectrum::place(wide - 1, wide), edge - short);
-        assert_eq!(spectrum::place(0, 0), ACT_STOPS[0].0);
+    /// Largest channel difference between two colours.
+    fn gap(a: Rgb, b: Rgb) -> u8 {
+        a.r.abs_diff(b.r)
+            .max(a.g.abs_diff(b.g))
+            .max(a.b.abs_diff(b.b))
     }
 
     #[test]
-    fn a_wide_bar_is_close_at_each_band_centre() {
-        let len = 67;
+    fn a_bar_runs_from_the_first_stop_to_the_last() {
+        let wide = 1000;
+        let half = FULL_SPAN / (2.0 * wide as f32);
+        near(spectrum::place(0, wide), ACT_STOPS[0].0 + half);
+        near(spectrum::place(wide - 1, wide), spectrum::FULL - half);
+        assert_eq!(spectrum::place(0, 0), ACT_STOPS[0].0);
+        assert!(gap(act_color(spectrum::place(0, wide)), ACT_STOPS[0].1) <= 1);
+        assert!(
+            gap(
+                act_color(spectrum::place(wide - 1, wide)),
+                ACT_STOPS[ACT_STOPS.len() - 1].1
+            ) <= 1
+        );
+        // A band's centre is half a band above the console's step for that
+        // band: the console paints the band's first stop, the ramp its middle.
         let bands = ACT_STOPS.len() - 1;
-        for k in 0..bands {
-            let centre = ((k as f32 + 0.5) / bands as f32) * len as f32 - 0.5;
-            let index = centre.round() as usize;
-            let pos = spectrum::place(index, len);
-            let want = k as f32 * step();
-            assert!(
-                (pos - want).abs() < step() / 10.0,
-                "band {k}: cell {index} at {pos}, stop {want}"
-            );
-            let exact = act_color(pos);
-            let slot = Palette::Llama.rgb(role::SPECTRUM[k]);
-            for (got, want_c) in [(exact.r, slot.r), (exact.g, slot.g), (exact.b, slot.b)] {
+        for (k, stop) in ACT_STOPS.iter().enumerate().take(bands) {
+            near(spectrum::place(k, bands), stop.0 + step() / 2.0);
+            assert_eq!(stop.1, Palette::Llama.rgb(role::SPECTRUM[k]), "band {k}");
+        }
+    }
+
+    #[test]
+    fn a_bar_changes_by_small_steps_at_any_top() {
+        let len = 67;
+        for top in [spectrum::FULL, 100.5, 110.0, 118.0, 125.0] {
+            let mut last = spectrum::place_to(0, len, top);
+            for index in 1..len {
+                let pos = spectrum::place_to(index, len, top);
+                assert!(pos > last, "top {top}: cell {index} goes back");
                 assert!(
-                    got.abs_diff(want_c) <= 12,
-                    "band {k} channel {got} vs {want_c}"
+                    gap(act_color(pos), act_color(last)) <= 16,
+                    "top {top}: a seam at cell {index}"
                 );
+                last = pos;
             }
         }
     }
 
     #[test]
-    fn rate_centres_sit_on_the_same_stops() {
+    fn past_full_scale_the_bar_stretches_to_the_value() {
+        let end = BB_STOPS[BB_STOPS.len() - 1].0;
+        assert_eq!(spectrum::top_of(0.0), spectrum::FULL);
+        assert_eq!(spectrum::top_of(100.0), spectrum::FULL);
+        near(spectrum::top_of(118.0), 118.0);
+        assert_eq!(spectrum::top_of(500.0), end);
+        assert_eq!(spectrum::top_of(f64::NAN), spectrum::FULL);
+        assert_eq!(spectrum::top_of(f64::INFINITY), spectrum::FULL);
+
+        let len = 67;
+        // No jump when the value crosses 100: just above it every cell is
+        // where it was.
+        for index in 0..len {
+            let at = spectrum::place(index, len);
+            let above = spectrum::place_to(index, len, spectrum::top_of(100.5));
+            assert!((above - at).abs() <= 0.5, "cell {index}");
+            assert!(gap(act_color(above), act_color(at)) <= 4, "cell {index}");
+        }
+        // At the end of the tail the last cell is half a cell short of it,
+        // and the first cell has hardly moved.
+        let half = (end - ACT_STOPS[0].0) / (2.0 * len as f32);
+        near(spectrum::place_to(len - 1, len, end), end - half);
+        assert!(spectrum::place_to(0, len, end) < 2.0);
+        // A top outside the tail is held to it.
+        assert_eq!(
+            spectrum::place_to(3, len, 1000.0),
+            spectrum::place_to(3, len, end)
+        );
+        assert_eq!(spectrum::place_to(3, len, 10.0), spectrum::place(3, len));
+        assert_eq!(
+            spectrum::place_to(3, len, f32::NAN),
+            spectrum::place(3, len)
+        );
+        assert_eq!(spectrum::place_to(0, 0, end), ACT_STOPS[0].0);
+    }
+
+    #[test]
+    fn a_rate_at_its_ceiling_is_full_scale() {
         let ceiling = 250.0;
         let bands = ACT_STOPS.len() - 1;
-        for (k, stop) in ACT_STOPS.iter().enumerate().take(bands) {
-            // Geometric centre of step k: halfway between ceiling/32 and
-            // ceiling on a log scale, one band at a time.
+        near(spectrum::rate(ceiling, ceiling), spectrum::FULL);
+        near(spectrum::rate(ceiling / 32.0, ceiling), ACT_STOPS[0].0);
+        for k in 0..bands {
+            // Geometric centre of step k: half a band above its first stop.
             let log = k as f64 - (bands as f64 - 0.5);
             let value = ceiling * 2.0_f64.powf(log);
-            let pos = spectrum::rate(value, ceiling);
-            near(pos, stop.0);
-            assert_eq!(act_color(pos), stop.1, "step {k}");
-            assert_eq!(act_color(pos), Palette::Llama.rgb(role::SPECTRUM[k]));
+            near(
+                spectrum::rate(value, ceiling),
+                ACT_STOPS[k].0 + step() / 2.0,
+            );
         }
-        near(
-            spectrum::rate(ceiling, ceiling),
-            ACT_STOPS[bands].0 - step() / 2.0,
-        );
         // Past the ceiling the position keeps climbing, and it reaches the
         // end of the blackbody tail.
-        assert!(spectrum::rate(ceiling * 2.0, ceiling) > ACT_STOPS[bands].0);
+        assert!(spectrum::rate(ceiling * 2.0, ceiling) > spectrum::FULL);
         let tail = BB_STOPS[BB_STOPS.len() - 1].0;
         let mut high = ceiling;
         while spectrum::rate(high, ceiling) < tail {
@@ -349,28 +394,6 @@ mod tests {
             act_color(spectrum::shade(BB_STOPS[BB_STOPS.len() - 1].0, 0, 5)),
             BB_STOPS[BB_STOPS.len() - 1].1
         );
-    }
-
-    #[test]
-    fn hot_top_runs_the_blackbody_tail_across_the_last_fifth() {
-        let len = 5;
-        let last = len - 1;
-        let pos = spectrum::hot_top(last, len);
-        assert!(pos > BB_STOPS[0].0 && pos < BB_STOPS[BB_STOPS.len() - 1].0);
-        // A cell whose centre is on the left of the last fifth is the start
-        // of the tail. The last cell is half a cell short of the right edge.
-        let len = 100;
-        let bands = ACT_STOPS.len() - 1;
-        let left = ((bands - 1) as f32 / bands as f32) * len as f32 - 0.5;
-        near(spectrum::hot_top(left.floor() as usize, len), BB_STOPS[0].0);
-        let end = BB_STOPS[BB_STOPS.len() - 1].0;
-        let tail = end - BB_STOPS[0].0;
-        let short = (0.5 / len as f32) / (1.0 / bands as f32) * tail;
-        near(spectrum::hot_top(len - 1, len), end - short);
-        assert_eq!(spectrum::hot_top(0, 0), BB_STOPS[0].0);
-        let colour = act_color(pos);
-        assert_ne!(colour, WHITE);
-        assert_eq!(colour, ramp(&BB_STOPS, pos));
     }
 
     #[test]
