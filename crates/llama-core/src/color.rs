@@ -204,12 +204,15 @@ pub mod temp {
     /// below. That is the bright value colour the console uses for a normal
     /// reading.
     pub const NORMAL: Rgb = WHITE;
-    /// `#FFD050`, [`WARM_SPAN`] degrees under the warning.
-    pub const WARM: Rgb = super::hex(0xFFD050);
-    /// `#FFB030`, the warning threshold.
-    pub const WARN: Rgb = super::hex(0xFFB030);
-    /// `#FF2A14`, the critical threshold and above.
-    pub const CRIT: Rgb = super::hex(0xFF2A14);
+    /// The last [`super::BB_STOPS`] colour, [`WARM_SPAN`] degrees under the warning.
+    pub const WARM: Rgb = super::BB_STOPS[super::BB_STOPS.len() - 1].1;
+    /// The blackbody stop at 120, the warning threshold. The console's warn
+    /// yellow is this same colour.
+    pub const WARN: Rgb = super::BB_STOPS[3].1;
+    /// The activity ramp's 100 stop, at the critical threshold and above.
+    /// The console's critical level stays BrightRed (`#F21E5A`, the stop at
+    /// 80). That difference is intended: the file follows this ramp.
+    pub const CRIT: Rgb = super::ACT_STOPS[super::ACT_STOPS.len() - 1].1;
 
     /// Degrees under the warning where the colour is [`NORMAL`].
     pub const COOL_SPAN: f32 = 35.0;
