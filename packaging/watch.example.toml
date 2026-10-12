@@ -195,9 +195,16 @@ enabled = true
 # shows, readable by group llama-view only. The directory below is created by
 # /etc/tmpfiles.d/llama-bored.conf (2750 llama-watch:llama-view); a path
 # outside it has to exist and be writable by the llama-watch account.
+# size (#115) is "COLSxROWS", the same limits as [tty] size (160x26 through
+# 1024x512). Unset, or equal to the console's actual size, the file is that
+# frame. A different size is a second layout of the same data on the grid
+# thread; the console keeps its size. On one machine a busy frame laid out
+# again at 213x60, beside a 192x60 console, at 10 frames a second, measured
+# 0.06% of one core.
 #[grid]
 #enabled = true
 #path = "/run/llama-watch-grid/grid"
+#size = "213x60"
 
 # >>> setup example
 #[[setup.field]]
