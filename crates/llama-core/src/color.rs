@@ -163,10 +163,10 @@ pub mod spectrum {
     /// most the end of the blackbody tail. Not a number is [`FULL`].
     #[must_use]
     pub fn top_of(percent: f64) -> f32 {
-        if percent.is_finite() {
-            (percent as f32).clamp(FULL, BB_STOPS[BB_STOPS.len() - 1].0)
-        } else {
+        if percent.is_nan() {
             FULL
+        } else {
+            (percent as f32).clamp(FULL, BB_STOPS[BB_STOPS.len() - 1].0)
         }
     }
 
@@ -316,7 +316,9 @@ mod tests {
         near(spectrum::top_of(118.0), 118.0);
         assert_eq!(spectrum::top_of(500.0), end);
         assert_eq!(spectrum::top_of(f64::NAN), spectrum::FULL);
-        assert_eq!(spectrum::top_of(f64::INFINITY), spectrum::FULL);
+        assert_eq!(spectrum::top_of(f64::INFINITY), end);
+        assert_eq!(spectrum::top_of(f64::NEG_INFINITY), spectrum::FULL);
+        assert_eq!(spectrum::top_of(-5.0), spectrum::FULL);
 
         let len = 67;
         // No jump when the value crosses 100: just above it every cell is
