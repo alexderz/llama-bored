@@ -1632,7 +1632,10 @@ mod tests {
         let long = "x".repeat(130);
         let exactly = "y".repeat(MAX_SPEC_VALUE_CHARS);
         let too_long = "z".repeat(MAX_SPEC_VALUE_CHARS + 1);
-        let hostile = "  a\u{1b}]9;SPEC\u{7}b\nb\tc \u{202e}x\u{200d}y  ";
+        // NUL, DEL, CR, C1 (U+0085 is also a line break), bidi, zero-width
+        // and a combining mark. Controls and zero-width characters go;
+        // CR and U+0085 collapse with the space already there.
+        let hostile = "  a\u{0}\u{1b}]9;SPEC\u{7}\u{7f}b\nb\tc \r\u{85}\u{9b}\u{9c}\u{9d}\u{202e}x\u{200b}\u{200c}\u{200d}\u{feff}\u{ad}y\u{301}  ";
         let doc = serde_json::json!({
             "report": {
                 "label": hostile,
@@ -1652,14 +1655,24 @@ mod tests {
         let found = rules.extract_with("", "example", None, Some(&doc));
         let values: Vec<&str> = found.iter().map(|item| item.value.as_str()).collect();
         // Controls and the escape are gone; whitespace has collapsed.
-        // The bidi mark stays for the row painter, which draws the placeholder.
-        assert!(values.contains(&"a]9;SPECb b c \u{202e}xy"), "{values:?}");
+        // The bidi mark and the combining mark stay for the row painter.
+        let cleaned = "a]9;SPECb b c \u{202e}xy\u{301}";
+        assert!(values.contains(&cleaned), "{values:?}");
         assert!(
             values
                 .iter()
                 .all(|value| !value.chars().any(char::is_control)),
             "{values:?}"
         );
+        for ch in [
+            '\0', '\u{1b}', '\u{7}', '\u{7f}', '\r', '\u{85}', '\u{9b}', '\u{9c}', '\u{9d}',
+            '\u{200b}', '\u{200c}', '\u{200d}', '\u{feff}', '\u{ad}',
+        ] {
+            assert!(
+                values.iter().all(|value| !value.contains(ch)),
+                "{ch:?} in {values:?}"
+            );
+        }
         // 130 and 1024 survive loading. 1025 is dropped, not cut.
         assert!(values.contains(&long.as_str()), "{values:?}");
         assert!(values.contains(&exactly.as_str()), "{values:?}");
@@ -1695,7 +1708,7 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "a]9;SPECb b c \u{202e}xy",
+                "a]9;SPECb b c \u{202e}xy\u{301}",
                 cut96.as_str(),
                 cut64.as_str(),
                 "is hel\u{2026}!",
@@ -1763,5 +1776,24 @@ mod tests {
         assert_eq!(only(vec![top]).rules[0].max_chars, MAX_TEXT_VALUE_CHARS);
         let plain = field("note", Some("spec:report.label"), Some("text"));
         assert_eq!(only(vec![plain]).rules[0].max_chars, DEFAULT_TEXT_CHARS);
+    }
+
+    /// #114: `max_chars` uses the same cut as the row, so a space at the
+    /// cut does not stay in front of `…`.
+    #[test]
+    fn text_max_chars_drops_the_space_before_the_ellipsis() {
+        let mut rule = field("note", Some("spec:report.label"), Some("text"));
+        rule.max_chars = Some(7);
+        let rules = only(vec![rule]);
+        let doc = serde_json::json!({ "report": { "label": "hello world" } });
+        let found = rules.extract_with("", "example", None, Some(&doc));
+        let live = LiveCtx {
+            backend: Backend::LlamaCpp,
+            detail: None,
+            info: None,
+            engine: None,
+        };
+        let rows = rules.rows(&found, &live);
+        assert_eq!(rows[0].items[0].text, "hello\u{2026}");
     }
 }
