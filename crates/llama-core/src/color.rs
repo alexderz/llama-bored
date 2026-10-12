@@ -351,14 +351,11 @@ mod tests {
         let bands = ACT_STOPS.len() - 1;
         near(spectrum::rate(ceiling, ceiling), spectrum::FULL);
         near(spectrum::rate(ceiling / 32.0, ceiling), ACT_STOPS[0].0);
-        for k in 0..bands {
+        for (k, stop) in ACT_STOPS.iter().enumerate().take(bands) {
             // Geometric centre of step k: half a band above its first stop.
             let log = k as f64 - (bands as f64 - 0.5);
             let value = ceiling * 2.0_f64.powf(log);
-            near(
-                spectrum::rate(value, ceiling),
-                ACT_STOPS[k].0 + step() / 2.0,
-            );
+            near(spectrum::rate(value, ceiling), stop.0 + step() / 2.0);
         }
         // Past the ceiling the position keeps climbing, and it reaches the
         // end of the blackbody tail.
