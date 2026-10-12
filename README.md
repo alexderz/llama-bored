@@ -1126,9 +1126,16 @@ path = "/run/llama-watch-grid/grid"   # default
 size, and the file is that console frame. A different size is a second layout
 of the same data, done on the grid thread, and that layout is what the file
 carries; the console keeps its own size. The limits are the same as
-`[tty] size` (160x26 through 1024x512). On one machine a busy frame (several
-slots, IN/OUT text, a full RECENT list) laid out again at 213x60, with the
-console at 192x60, measured 0.06% of one core at 10 frames a second.
+`[tty] size` (160x26 through 1024x512). The cost grows with the IN and OUT
+text. On one machine, a release build measured the model clone, the 213x60
+layout beside a 192x60 console, and the grid compare: CPU time (`utime` +
+`stime`), the median of three runs. With no IN/OUT text the layout was
+36.7 µs per frame, 0.0367% of one core at 10 frames a second. With IN and
+OUT at their 32768-character maximums it was 640.2 µs, 0.6402% of one core.
+An 8192-character IN was 68.6 µs, 0.0686% of one core. The clone was 1.4 µs
+and the compare 9.6 µs on the light frame, and 2.7 µs and 11.0 µs on the
+full frame. The ignored test `measure_second_layout_cost` prints the same
+report.
 
 The file is rewritten atomically (temp file and rename) when the frame
 changes and at least once a second, so a reader can tell a live writer from a

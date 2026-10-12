@@ -198,9 +198,15 @@ enabled = true
 # size (#115) is "COLSxROWS", the same limits as [tty] size (160x26 through
 # 1024x512). Unset, or equal to the console's actual size, the file is that
 # frame. A different size is a second layout of the same data on the grid
-# thread; the console keeps its size. On one machine a busy frame laid out
-# again at 213x60, beside a 192x60 console, at 10 frames a second, measured
-# 0.06% of one core.
+# thread; the console keeps its size. The cost grows with the IN and OUT
+# text. On one machine, a release build measured the model clone, that
+# 213x60 layout beside a 192x60 console, and the grid compare (CPU time,
+# the median of three runs). The layout was 36.7 µs per frame with no
+# IN/OUT text (0.0367% of one core at 10 frames a second) and 640.2 µs
+# with IN and OUT at their 32768-character maximums (0.6402%). An
+# 8192-character IN was 68.6 µs (0.0686%). The clone was 1.4 µs and the
+# compare 9.6 µs on the light frame, and 2.7 µs and 11.0 µs on the full
+# frame.
 #[grid]
 #enabled = true
 #path = "/run/llama-watch-grid/grid"
