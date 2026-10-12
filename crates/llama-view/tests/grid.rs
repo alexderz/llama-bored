@@ -431,8 +431,10 @@ fn a_grid_file_is_shown_at_its_own_size() {
 }
 
 fn session_fit(fit: Fit) -> Session {
-    let mut opts = Options::default();
-    opts.fit = fit;
+    let opts = Options {
+        fit,
+        ..Options::default()
+    };
     let colors = ColorSettings {
         mode: ColorMode::Truecolor,
         palette: Palette::Llama,
