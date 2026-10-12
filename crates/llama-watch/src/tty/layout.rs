@@ -1261,8 +1261,20 @@ fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     let bar_row = digit_row + if g.tall { 10 } else { 5 } + 1;
     let gen_frac = rate_frac(model.gen_tps, model.gen_ceiling);
     let prompt_frac = rate_frac(model.prompt_tps, model.prompt_ceiling);
-    draw_rate_bar(grid, g.right, bar_row, g.half, gen_frac, g.bar_rows);
-    draw_rate_bar(grid, g.prompt_x(), bar_row, g.half, prompt_frac, g.bar_rows);
+    let gen_top = rate_top(model.gen_tps, model.gen_ceiling);
+    let prompt_top = rate_top(model.prompt_tps, model.prompt_ceiling);
+    draw_rate_bar(
+        grid, g.right, bar_row, g.half, gen_frac, g.bar_rows, gen_top,
+    );
+    draw_rate_bar(
+        grid,
+        g.prompt_x(),
+        bar_row,
+        g.half,
+        prompt_frac,
+        g.bar_rows,
+        prompt_top,
+    );
     let tick_row = bar_row + g.bar_rows;
     draw_ticks(grid, g.right, tick_row, g.half, model.gen_ceiling);
     draw_ticks(grid, g.prompt_x(), tick_row, g.half, model.prompt_ceiling);
@@ -1306,7 +1318,22 @@ fn digit_len(value: Option<f64>) -> usize {
     }
 }
 
-fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64>, rows: u16) {
+/// Ramp position of a rate bar's right edge for the exact colours: full
+/// scale up to the ceiling, and past it the value's own position, the one
+/// the digits above the bar take (#123).
+fn rate_top(value: Option<f64>, ceiling: f64) -> f32 {
+    value.map_or(color::spectrum::FULL, |v| color::spectrum::rate(v, ceiling))
+}
+
+fn draw_rate_bar(
+    grid: &mut Grid,
+    x: u16,
+    row: u16,
+    width: u16,
+    frac: Option<f64>,
+    rows: u16,
+    top: f32,
+) {
     let hot = frac.is_some_and(|frac| frac >= 1.0);
     draw_h_bar(
         grid,
@@ -1315,10 +1342,7 @@ fn draw_rate_bar(grid: &mut Grid, x: u16, row: u16, width: u16, frac: Option<f64
             row,
             width,
             frac,
-            ink: BarInk::Spectrum {
-                hot,
-                top: color::spectrum::FULL,
-            },
+            ink: BarInk::Spectrum { hot, top },
             rows,
             // #95: GENERATION and PROMPT each draw one isolated bar (the
             // tick row sits right below, no other bar directly above or
@@ -4638,6 +4662,49 @@ mod tests {
         // Past the tail's end the bar stops changing.
         assert_eq!(bar(125.0), bar(300.0));
         assert_ne!(bar(125.0), full);
+    }
+
+    #[test]
+    fn a_rate_bar_past_its_ceiling_stretches_like_its_digits() {
+        let ceiling = 250.0;
+        let width = 20u16;
+        let bar = |value: f64| {
+            let mut grid = Grid::with_exact(width + 2, 3);
+            draw_rate_bar(
+                &mut grid,
+                0,
+                0,
+                width,
+                rate_frac(Some(value), ceiling),
+                1,
+                rate_top(Some(value), ceiling),
+            );
+            (0..width).map(|i| grid.exact_fg(i, 0)).collect::<Vec<_>>()
+        };
+        // At the ceiling the bar is full and ends at full scale.
+        let full = bar(ceiling);
+        let last = usize::from(width) - 1;
+        assert_eq!(
+            full[last],
+            Some(act_color(color::spectrum::place(last, usize::from(width))))
+        );
+        // Past it the right edge is where the digits are: in the tail.
+        let over = bar(ceiling * 2.0);
+        let top = color::spectrum::rate(ceiling * 2.0, ceiling);
+        assert!(top > color::spectrum::FULL);
+        assert_eq!(
+            over[last],
+            Some(act_color(color::spectrum::place_to(
+                last,
+                usize::from(width),
+                top
+            )))
+        );
+        assert_ne!(over[last], full[last]);
+        // Below the ceiling the lit cells are the full-scale ramp.
+        let low = bar(ceiling / 4.0);
+        assert_eq!(low[0], full[0]);
+        assert_eq!(rate_top(None, ceiling), color::spectrum::FULL);
     }
 
     #[test]
