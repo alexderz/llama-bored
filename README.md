@@ -1148,14 +1148,10 @@ A temperature reading with warn and crit thresholds takes a ramp anchored
 to those marks. Capacity bars, the RECENT bars, labels, the empty bar track
 and other text stay on the palette. The console draws the palette step
 either way. `false` writes each cell's palette RGB, and when the size
-matches it reuses the console frame, so the file is today's. The exact
-plane is eight bytes a cell and is not allocated when the file is off or
-exact colours are off: 92160 bytes at 192x60 when it is on. On the same
-machine, the same report's 192x60 exact layout was 51.1 µs per frame with
-no IN/OUT text (0.0511% of one core at 10 frames a second), 157.8 µs with
-an 8192-character IN (0.1578%), and 565.6 µs with IN and OUT at their
-32768-character maximums (0.5656%). The palette layout of that same 192x60
-frame in that run was 39.1 µs, 71.6 µs and 508.5 µs.
+matches it reuses the console frame, so the file is today's. No exact
+colour is stored per cell while the file is off. What the second layout
+costs, and what the console layout costs against the build before it, is
+in `packaging/watch.example.toml`.
 
 The file is rewritten atomically (temp file and rename) when the frame
 changes and at least once a second, so a reader can tell a live writer from a
@@ -1175,12 +1171,12 @@ llama-view --grid /path/to/grid --colors truecolor
 
 `--grid PATH` implies `--source grid`; `LLAMA_VIEW_SOURCE=grid` is the
 environment form. `--colors`, `--palette`, `--fit`, `--offset-x/y`, `--once`
-and the title work as with the console; in 256 and 16 colours an RGB equal
+and the title work as with the console. In 256 and 16 colours an RGB equal
 to a palette slot gives exactly what the console path gives for that slot.
-On one busy 192x60 frame (activity past 100, generation past its ceiling),
-`--colors truecolor` wrote 26439 bytes and 13 colours from the palette and
-32755 bytes and 158 colours with the ramps. Each distinct colour is its own
-SGR sequence.
+With exact colours on, a ramped cell is not a palette slot, so those
+viewers show the nearest colour. `exact_colors = false` gives them the
+console's colours.
+
 llama-view reads the file as untrusted data: a bad magic, a size over
 1024x512 or a length that does not match is refused, and a scalar that is
 not safe as one cell is drawn as U+FFFD. Without `--kiosk` a missing or bad
