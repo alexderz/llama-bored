@@ -1198,10 +1198,11 @@ fn draw_h_bar(grid: &mut Grid, bar: HBar) {
         if bar.rows > 1 {
             paint(grid, col, bar.row + 1, bot_ch, fg_bot, C16::Black);
         }
-        // Filled spectrum cells take the ramp at their own centre, on one
-        // scale from the bar's left edge to `top` at its right (#123). The
-        // empty track and a fixed-ink bar (capacity, a stalled fan) stay
-        // on the palette. Both rows of a tall bar are that colour.
+        // Filled spectrum cells take the ramp sampled at the ends: the
+        // first cell is the first stop and the last cell of a full bar is
+        // `top` (#130). The empty track and a fixed-ink bar (capacity, a
+        // stalled fan) stay on the palette. Both rows of a tall bar are
+        // that colour.
         if grid.records_exact()
             && ch != '░'
             && let BarInk::Spectrum { top, .. } = bar.ink
@@ -1470,7 +1471,11 @@ fn draw_digits(
     }
     let (text, top, body, pos) = match value {
         None => ("--".to_string(), C16::BrightBlack, C16::BrightBlack, None),
-        Some(v) if v <= 0.0 => ("0".to_string(), C16::BrightBlack, C16::BrightBlack, None),
+        // NaN is not a rate: the same dim zero as a non-positive value.
+        // Positive infinity stays live, at the end of the tail (#130).
+        Some(v) if v.is_nan() || v <= 0.0 => {
+            ("0".to_string(), C16::BrightBlack, C16::BrightBlack, None)
+        }
         Some(v) => {
             let step = rate_step(v, ceiling);
             let (top, body) = digit_colours(step);
@@ -5667,12 +5672,6 @@ mod tests {
     use llama_core::color::{self, act_color};
     use llama_core::palette::Palette;
 
-    fn close(got: llama_core::color::Rgb, slot: llama_core::color::Rgb) {
-        for (a, b) in [(got.r, slot.r), (got.g, slot.g), (got.b, slot.b)] {
-            assert!(a.abs_diff(b) <= 12, "channel {a} vs {b}: {got:?} {slot:?}");
-        }
-    }
-
     /// A spectrum bar at `pct` percent of full scale, inked like a level meter.
     fn spectrum_bar(grid: &mut Grid, width: u16, rows: u16, pct: f64) {
         let frac = (pct / 100.0).min(1.0);
@@ -5699,24 +5698,24 @@ mod tests {
 
     #[test]
     fn a_spectrum_bar_is_one_ramp_from_the_first_stop_to_the_last() {
-        let mut grid = Grid::with_exact(8, 4);
-        spectrum_bar(&mut grid, 5, 2, 100.0);
-        for i in 0..5u16 {
-            let exact = grid.exact_fg(i, 0).expect("top");
-            assert_eq!(exact, act_color(color::spectrum::place(usize::from(i), 5)));
-            assert_eq!(grid.get(i, 1).unwrap().fg, grid.get(i, 0).unwrap().fg);
-            assert_eq!(grid.exact_fg(i, 1), Some(exact));
+        let first = color::ACT_STOPS[0].1;
+        let last = color::ACT_STOPS[color::ACT_STOPS.len() - 1].1;
+        // Width 2 and 5 are short enough that centre sampling misses both
+        // stops. The ends are the stops at every width.
+        for width in [2u16, 5, 20, 67] {
+            let mut grid = Grid::with_exact(width + 2, 4);
+            spectrum_bar(&mut grid, width, 2, 100.0);
+            assert_eq!(grid.exact_fg(0, 0), Some(first), "width {width} start");
+            assert_eq!(grid.exact_fg(width - 1, 0), Some(last), "width {width} end");
+            for i in 0..width {
+                assert_eq!(grid.exact_fg(i, 1), grid.exact_fg(i, 0), "row {i}");
+                assert_eq!(grid.get(i, 1).unwrap().fg, grid.get(i, 0).unwrap().fg);
+            }
         }
-        // A wide bar starts on the first stop, ends on the last and has no
-        // seam. The console still paints its five steps under it.
+        // A wide bar has no seam. The console still paints its five steps.
         let width = 67u16;
         let mut wide = Grid::with_exact(width + 2, 3);
         spectrum_bar(&mut wide, width, 1, 100.0);
-        close(wide.exact_fg(0, 0).expect("first"), color::ACT_STOPS[0].1);
-        close(
-            wide.exact_fg(width - 1, 0).expect("last"),
-            color::ACT_STOPS[color::ACT_STOPS.len() - 1].1,
-        );
         let mut steps = vec![wide.get(0, 0).unwrap().fg];
         for i in 1..width {
             let here = wide.exact_fg(i, 0).expect("exact");
@@ -5737,6 +5736,12 @@ mod tests {
         // The console is as before: the last step white-hot over red.
         assert_eq!(grid.get(4, 0).unwrap().fg, C16::BrightWhite);
         assert_eq!(grid.get(4, 1).unwrap().fg, C16::BrightRed);
+        // A five-cell bar at the end of the tail: first stop, last stop.
+        assert_eq!(grid.exact_fg(0, 0), Some(color::ACT_STOPS[0].1));
+        assert_eq!(
+            grid.exact_fg(4, 0),
+            Some(color::BB_STOPS[color::BB_STOPS.len() - 1].1)
+        );
         for i in 0..5u16 {
             let pos = color::spectrum::place_to(usize::from(i), 5, 125.0);
             assert_eq!(grid.exact_fg(i, 0), Some(act_color(pos)));
@@ -5772,43 +5777,70 @@ mod tests {
     #[test]
     fn a_rate_bar_past_its_ceiling_stretches_like_its_digits() {
         let ceiling = 250.0;
-        let width = 20u16;
-        let bar = |value: f64| {
-            let mut grid = Grid::with_exact(width + 2, 3);
-            draw_rate_bar(
-                &mut grid,
-                0,
-                0,
-                width,
-                rate_frac(Some(value), ceiling),
-                1,
-                rate_top(Some(value), ceiling),
-            );
-            (0..width).map(|i| grid.exact_fg(i, 0)).collect::<Vec<_>>()
+        let tail = color::BB_STOPS[color::BB_STOPS.len() - 1].0;
+        let mut at_tail = ceiling;
+        while color::spectrum::rate(at_tail, ceiling) < tail {
+            at_tail *= 2.0;
+            assert!(at_tail < ceiling * 64.0, "the tail stays reachable");
+        }
+        // The stop the digits take at each of the three values.
+        let stop_of = |value: f64| {
+            if value == ceiling {
+                color::ACT_STOPS[color::ACT_STOPS.len() - 1].1
+            } else if value == ceiling * 2.0 {
+                color::BB_STOPS[3].1
+            } else {
+                color::BB_STOPS[color::BB_STOPS.len() - 1].1
+            }
         };
-        // At the ceiling the bar is full and ends at full scale.
-        let full = bar(ceiling);
-        let last = usize::from(width) - 1;
-        assert_eq!(
-            full[last],
-            Some(act_color(color::spectrum::place(last, usize::from(width))))
-        );
-        // Past it the right edge is where the digits are: in the tail.
-        let over = bar(ceiling * 2.0);
-        let top = color::spectrum::rate(ceiling * 2.0, ceiling);
-        assert!(top > color::spectrum::FULL);
-        assert_eq!(
-            over[last],
-            Some(act_color(color::spectrum::place_to(
-                last,
-                usize::from(width),
-                top
-            )))
-        );
-        assert_ne!(over[last], full[last]);
-        // Below the ceiling the lit cells are the full-scale ramp.
-        let low = bar(ceiling / 4.0);
-        assert_eq!(low[0], full[0]);
+        // Widths `Geom` gives the rate bars at 192 and 213 columns.
+        for cols in [192u16, 213] {
+            let g = Geom::new(cols, 60);
+            let digit_row = if g.tall { 5 } else { 4 };
+            let ph = if g.tall { 2u16 } else { 1 };
+            let base = if g.tall { 4u16 } else { 2 };
+            let bar_row = digit_row + if g.tall { 10 } else { 5 } + 1;
+            assert_eq!(ph, 1, "60 rows draw the short digits");
+            let draw = |value: f64| {
+                let mut grid = Grid::with_exact(g.cols, 60);
+                let pw = fit_pixel(base, digit_len(Some(value)), g.half);
+                draw_digits(&mut grid, g.right, digit_row, Some(value), ceiling, pw, ph);
+                draw_rate_bar(
+                    &mut grid,
+                    g.right,
+                    bar_row,
+                    g.half,
+                    rate_frac(Some(value), ceiling),
+                    g.bar_rows,
+                    rate_top(Some(value), ceiling),
+                );
+                grid
+            };
+            let mut full_first = None;
+            for value in [ceiling, ceiling * 2.0, at_tail] {
+                let grid = draw(value);
+                let last = grid
+                    .exact_fg(g.right + g.half - 1, bar_row)
+                    .expect("last cell of a full scale");
+                let mut digit = None;
+                // The middle glyph row is the value, unshaded.
+                for col in g.right..g.right + g.half {
+                    if let Some(colour) = grid.exact_fg(col, digit_row + 2) {
+                        digit = Some(colour);
+                        break;
+                    }
+                }
+                let digit = digit.expect("digit colour");
+                assert_eq!(last, digit, "{cols} cols at {value}");
+                assert_eq!(digit, stop_of(value), "{cols} cols at {value}");
+                if value == ceiling {
+                    full_first = grid.exact_fg(g.right, bar_row);
+                }
+            }
+            // Below the ceiling the lit cells are the full-scale ramp.
+            let low = draw(ceiling / 4.0);
+            assert_eq!(low.exact_fg(g.right, bar_row), full_first, "{cols}");
+        }
         assert_eq!(rate_top(None, ceiling), color::spectrum::FULL);
     }
 
@@ -5869,41 +5901,78 @@ mod tests {
         assert!(dim.exact_fg(0, 0).is_none());
         draw_digits(&mut dim, 0, 0, None, ceiling, 1, 1);
         assert!(dim.exact_fg(0, 0).is_none());
+        // NaN is the dim zero, not a live value on the first stop.
+        let mut nan = Grid::with_exact(8, 8);
+        draw_digits(&mut nan, 0, 0, Some(f64::NAN), ceiling, 1, 1);
+        assert_eq!(nan.get(0, 0).unwrap().ch, '█');
+        assert_eq!(nan.get(0, 0).unwrap().fg, C16::BrightBlack);
+        assert!(nan.exact_fg(0, 0).is_none());
     }
 
     #[test]
     fn a_chart_column_is_coloured_by_its_row_not_its_value() {
-        let mut grid = Grid::with_exact(4, 14);
-        let half = 5u16;
-        let axis = 6u16;
-        draw_chart_col(
-            &mut grid,
-            1,
-            axis,
-            half,
-            ChartBucket {
-                gen_tps: Some(250.0),
-                prompt_tps: None,
-            },
-            250.0,
-            250.0,
-            ChartGlyphs::Eighths,
-        );
-        let rows = usize::from(half);
-        for i in 0..rows {
-            let row = axis - half + i as u16;
-            let cell = grid.get(1, row).unwrap();
-            assert_eq!(cell.fg, C16::BrightRed, "column colour, row {row}");
-            let from_axis = rows - 1 - i;
-            let exact = grid.exact_fg(1, row).expect("row");
-            assert_eq!(exact, act_color(color::spectrum::place(from_axis, rows)));
+        // `chart_height` draws 2, 3 or 4 rows a side. Five never happens.
+        let mut halves = Vec::new();
+        for rows in MIN_ROWS..=512 {
+            for req in 0..rows {
+                let height = chart_height(req, rows);
+                if height == 0 {
+                    continue;
+                }
+                let half = (height - 1) / 2;
+                if !halves.contains(&half) {
+                    halves.push(half);
+                }
+            }
         }
-        // The row nearest the axis is cool, not the column's red.
-        assert_ne!(
-            grid.exact_fg(1, axis - 1).unwrap(),
-            Palette::Llama.rgb(C16::BrightRed.index())
-        );
-        // A measured zero is the dim dot, with no ramp.
+        halves.sort_unstable();
+        assert_eq!(halves, vec![2, 3, 4], "rows a side chart_height produces");
+        let first = color::ACT_STOPS[0].1;
+        let last = color::ACT_STOPS[color::ACT_STOPS.len() - 1].1;
+        let ceiling = 250.0;
+        for half in halves {
+            for above in [true, false] {
+                let mut grid = Grid::with_exact(4, half * 2 + 4);
+                let axis = half + 1;
+                draw_chart_col(
+                    &mut grid,
+                    1,
+                    axis,
+                    half,
+                    ChartBucket {
+                        gen_tps: above.then_some(ceiling),
+                        prompt_tps: (!above).then_some(ceiling),
+                    },
+                    ceiling,
+                    ceiling,
+                    ChartGlyphs::Eighths,
+                );
+                // The row at the axis is the first stop; the far row the last.
+                let (near, far) = if above {
+                    (axis - 1, axis - half)
+                } else {
+                    (axis + 1, axis + half)
+                };
+                assert_eq!(
+                    grid.exact_fg(1, near),
+                    Some(first),
+                    "half {half} above {above}: axis"
+                );
+                assert_eq!(
+                    grid.exact_fg(1, far),
+                    Some(last),
+                    "half {half} above {above}: far"
+                );
+                // The console colour is the column's value, on every row.
+                assert_eq!(grid.get(1, near).unwrap().fg, C16::BrightRed);
+                assert_eq!(grid.get(1, far).unwrap().fg, C16::BrightRed);
+                assert_ne!(first, Palette::Llama.rgb(C16::BrightRed.index()));
+            }
+        }
+        // A measured zero is the dim dot, with no ramp. The usual height.
+        let half = 4u16;
+        let axis = half + 1;
+        let mut grid = Grid::with_exact(4, half * 2 + 4);
         draw_chart_col(
             &mut grid,
             1,
@@ -5913,18 +5982,24 @@ mod tests {
                 gen_tps: Some(0.0),
                 prompt_tps: None,
             },
-            250.0,
-            250.0,
+            ceiling,
+            ceiling,
             ChartGlyphs::Eighths,
         );
         assert_eq!(grid.get(1, axis).unwrap().ch, '·');
         assert!(grid.exact_fg(1, axis).is_none());
 
-        let v = 250.0 * 2.0_f64.powf(-4.875);
-        assert_eq!(
-            chart::eighths(rate_frac(Some(v), 250.0).unwrap_or(0.0), half),
-            1
-        );
+        // One eighth: the tip is the row at the axis, the first stop.
+        let mut value = ceiling / 32.0;
+        let mut level = 0u32;
+        while value < ceiling {
+            level = chart::eighths(rate_frac(Some(value), ceiling).unwrap_or(0.0), half);
+            if level == 1 {
+                break;
+            }
+            value *= 1.05;
+        }
+        assert_eq!(level, 1, "a one-eighth column at {value}");
         draw_chart_col(
             &mut grid,
             1,
@@ -5932,21 +6007,17 @@ mod tests {
             half,
             ChartBucket {
                 gen_tps: None,
-                prompt_tps: Some(v),
+                prompt_tps: Some(value),
             },
-            250.0,
-            250.0,
+            ceiling,
+            ceiling,
             ChartGlyphs::Eighths,
         );
         let tip = axis + 1;
         assert_eq!(grid.get(1, tip).unwrap().fg, C16::Black);
         assert_eq!(grid.get(1, tip).unwrap().bg, C16::Blue);
         assert!(grid.exact_fg(1, tip).is_none());
-        // The row at the axis: the cool end of the ramp, half a row in.
-        assert_eq!(
-            grid.exact_bg(1, tip).unwrap(),
-            act_color(color::spectrum::place(0, rows))
-        );
+        assert_eq!(grid.exact_bg(1, tip).unwrap(), first);
     }
 
     #[test]
