@@ -2863,27 +2863,30 @@ sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n",
     .into_bytes()
 }
 
-/// One activity row. `cache`, `prompt` and `gen` are llama-swap's numbers;
-/// `-1` is its "not reported".
-fn sglang_activity(rows: &[(i64, i64, i64, f64, f64)]) -> Vec<u8> {
+/// One activity row. `cache`, `prompt` and `gen_rate` are llama-swap's
+/// numbers; `-1` is its "not reported". `output` and `duration_ms` have to
+/// match the window or the row is not that request.
+fn sglang_activity(rows: &[(i64, i64, i64, i64, f64, f64, u64)]) -> Vec<u8> {
     let data: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(id, input, cache, prompt, gen_rate)| {
-            serde_json::json!({
-                "id": id,
-                "timestamp": format!("2026-10-13T10:00:{id:02}Z"),
-                "model": "flash",
-                "tokens": {
-                    "input_tokens": input,
-                    "output_tokens": 401,
-                    "cache_tokens": cache,
-                    "prompt_per_second": prompt,
-                    "tokens_per_second": gen_rate
-                },
-                "duration_ms": 10_000,
-                "resp_status_code": 200
-            })
-        })
+        .map(
+            |(id, input, output, cache, prompt, gen_rate, duration_ms)| {
+                serde_json::json!({
+                    "id": id,
+                    "timestamp": format!("2026-10-13T10:00:{id:02}Z"),
+                    "model": "flash",
+                    "tokens": {
+                        "input_tokens": input,
+                        "output_tokens": output,
+                        "cache_tokens": cache,
+                        "prompt_per_second": prompt,
+                        "tokens_per_second": gen_rate
+                    },
+                    "duration_ms": duration_ms,
+                    "resp_status_code": 200
+                })
+            },
+        )
         .collect();
     serde_json::to_vec(&serde_json::json!({ "data": data })).expect("json")
 }
@@ -2916,7 +2919,7 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             "flash".to_owned(),
             sglang_window((1, 0), 1_000, (400, 200), 401, (10.0, 1.0), (2.0, 1.0), 0),
         );
-        world.activity = sglang_activity(&[(1, 1_000, -1, -1.0, -1.0)]);
+        world.activity = sglang_activity(&[(1, 1_000, 401, -1, -1.0, -1.0, 10_000)]);
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
         detail
@@ -2933,13 +2936,17 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     thread::sleep(Duration::from_millis(500));
     // A second request whose row already has a cached count and a prompt
     // rate. The window is clean (prompt 500, cached 300, TTFT 2 s, 100
-    // generated, e2e 4 s) and must not replace those values.
+    // generated, e2e 4 s). Those reported values stay. The generation
+    // rate was not reported, so it is filled: (100 − 1) / (4 − 2) = 49.5.
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
             sglang_window((2, 0), 1_500, (700, 200), 501, (14.0, 2.0), (4.0, 2.0), 0),
         );
-        world.activity = sglang_activity(&[(2, 500, 0, 12.5, -1.0), (1, 1_000, -1, -1.0, -1.0)]);
+        world.activity = sglang_activity(&[
+            (2, 500, 100, 0, 12.5, -1.0, 4_000),
+            (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
+        ]);
     });
     wait_msg(&rx, Duration::from_secs(3), |_, detail| {
         detail.activity.iter().any(|row| row.id == 2)
@@ -2950,14 +2957,38 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     assert_eq!(reported.cached_tokens, Some(0));
     assert_eq!(reported.prompt_tps, Some(12.5));
     assert_eq!(reported.gen_tps, None);
-    assert_eq!(
-        (reported.engine_prompt_tps, reported.engine_gen_tps),
-        (None, None)
-    );
+    assert_eq!(reported.engine_prompt_tps, None);
+    assert!((reported.engine_gen_tps.expect("unreported gen") - 49.5).abs() < 1e-6);
     let kept = detail.activity.iter().find(|row| row.id == 1).expect("row");
     assert_eq!(kept.cached_tokens, Some(600));
     assert!((kept.engine_prompt_tps.expect("kept") - 200.0).abs() < 1e-6);
     assert!((kept.engine_gen_tps.expect("kept") - 50.0).abs() < 1e-6);
+
+    thread::sleep(Duration::from_millis(500));
+    // A rate was reported and the cached count was not. The count is
+    // filled (100); the prompt rate stays 8.
+    server.update(|world| {
+        world.metrics.insert(
+            "flash".to_owned(),
+            sglang_window((3, 0), 2_500, (800, 200), 902, (24.0, 3.0), (6.0, 3.0), 0),
+        );
+        world.activity = sglang_activity(&[
+            (3, 1_000, 401, -1, 8.0, -1.0, 10_000),
+            (2, 500, 100, 0, 12.5, -1.0, 4_000),
+            (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
+        ]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 3 && row.cached_tokens.is_some())
+    });
+    let partial = detail.activity.iter().find(|row| row.id == 3).expect("row");
+    assert_eq!(partial.cached_tokens, Some(100));
+    assert_eq!(partial.prompt_tps, Some(8.0));
+    assert_eq!(partial.engine_prompt_tps, None);
+    assert!((partial.engine_gen_tps.expect("gen") - 50.0).abs() < 1e-6);
 }
 
 // ---- #46: engine and counter state across restarts and engine changes ------

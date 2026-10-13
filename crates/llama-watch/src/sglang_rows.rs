@@ -7,15 +7,22 @@
 //! produced, which can be several scrapes earlier. `num_running_reqs` is
 //! how many requests the engine is running.
 //!
-//! A window runs from one finish to the next. It is clean when, across
-//! every scrape in it, exactly one request finished, exactly one
-//! first-token observation happened, nothing ran beside it, no counter
-//! went backwards, and no scrape was missed for longer than
-//! [`crate::speeds::PENDING_FOR`]. The matched llama-swap row is the one
-//! of that model whose `input_tokens` equals the prompt increase and whose
-//! time falls in the same span [`crate::speeds::SpeedBook`] uses. No
-//! match, or more than one, fills nothing. A value llama-swap already
-//! reported is never replaced.
+//! A fill needs one streaming request alone in the engine. The window from
+//! one finish to the next is clean when exactly one request finished,
+//! exactly one first token was observed, the first-token count equals the
+//! finished count at both ends (nothing is already past its first token),
+//! nothing else ran, no counter went backwards, and no scrape was missed
+//! for longer than [`crate::speeds::PENDING_FOR`]. The llama-swap row is
+//! that request only when its prompt, output and duration match the
+//! window (duration within the larger of one second and five percent).
+//! No match, or more than one, fills nothing.
+//!
+//! A non-streaming finish (`is_streaming="false"` on `num_requests_total`)
+//! fills the cached count only: its time to first token is the whole
+//! request, so neither rate is a measurement. Queue time over five percent
+//! of the time to the first token leaves the prompt rate unset; the cached
+//! count and the generation rate stay. A value llama-swap already reported
+//! is never replaced. A missing cached count is still filled.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -37,6 +44,9 @@ const FINISH_FOR: Duration = Duration::from_secs(30);
 pub struct Totals {
     /// `sglang:num_requests_total`, both streaming series summed.
     pub requests: u64,
+    /// `sglang:num_requests_total` with `is_streaming="false"` only.
+    /// Absent on the sample counts as zero.
+    pub batch: u64,
     /// `sglang:prompt_tokens_total`.
     pub prompt: u64,
     /// `sglang:cached_tokens_total`, every `cache_source` summed.
@@ -51,25 +61,45 @@ pub struct Totals {
     pub ttft_sum: f64,
     /// `sglang:time_to_first_token_seconds_count`.
     pub ttft_count: f64,
+    /// `sglang:queue_time_seconds_sum`. Absent on the sample counts as zero.
+    pub queue_sum: f64,
+    /// `sglang:queue_time_seconds_count`.
+    pub queue_count: f64,
     /// `sglang:num_running_reqs`.
     pub running: f64,
 }
 
 impl Totals {
     /// The counters a scrape must have before it can attribute a row.
+    ///
+    /// An engine without a `cached_tokens_total` series fills nothing:
+    /// this returns `None`, and the scrape is a hole.
     #[must_use]
     pub fn from_sample(sample: &MetricsSample) -> Option<Self> {
         let e2e = sample.e2e?;
         let ttft = sample.ttft?;
         let running = sample.requests_processing?;
-        if ![e2e.sum, e2e.count, ttft.sum, ttft.count, running]
-            .into_iter()
-            .all(f64::is_finite)
+        let (queue_sum, queue_count) = match sample.queue_time {
+            Some(hist) => (hist.sum, hist.count),
+            None => (0.0, 0.0),
+        };
+        if ![
+            e2e.sum,
+            e2e.count,
+            ttft.sum,
+            ttft.count,
+            running,
+            queue_sum,
+            queue_count,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
         {
             return None;
         }
         Some(Self {
             requests: sample.requests_total?,
+            batch: sample.requests_batch.unwrap_or(0),
             prompt: sample.prompt_total?,
             cached: sample.cached_total?,
             generated: sample.n_decode_total?,
@@ -77,6 +107,8 @@ impl Totals {
             e2e_count: e2e.count,
             ttft_sum: ttft.sum,
             ttft_count: ttft.count,
+            queue_sum,
+            queue_count,
             running,
         })
     }
@@ -103,15 +135,21 @@ pub struct Claim {
     pub model: String,
     /// The row's `input_tokens`. SGLang's count includes the cached part.
     pub input: u64,
-    /// llama-swap already reported a cached count or a rate. The window
-    /// is consumed and nothing is stored.
-    pub reported: bool,
+    /// The row's `output_tokens`. `None` cannot match a finish.
+    pub output: Option<u64>,
+    /// The row's `duration_ms`. `None` cannot match a finish.
+    pub duration_ms: Option<u64>,
+    /// llama-swap reported a prompt rate. A reported rate is never replaced.
+    pub prompt_known: bool,
+    /// llama-swap reported a generation rate.
+    pub gen_known: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Snap {
     at: Instant,
     requests: u64,
+    batch: u64,
     prompt: u64,
     cached: u64,
     generated: u64,
@@ -119,6 +157,8 @@ struct Snap {
     e2e_count: f64,
     ttft_sum: f64,
     ttft_count: f64,
+    queue_sum: f64,
+    queue_count: f64,
     running: f64,
 }
 
@@ -127,6 +167,7 @@ impl Snap {
         Self {
             at,
             requests: totals.requests,
+            batch: totals.batch,
             prompt: totals.prompt,
             cached: totals.cached,
             generated: totals.generated,
@@ -134,6 +175,8 @@ impl Snap {
             e2e_count: totals.e2e_count,
             ttft_sum: totals.ttft_sum,
             ttft_count: totals.ttft_count,
+            queue_sum: totals.queue_sum,
+            queue_count: totals.queue_count,
             running: totals.running,
         }
     }
@@ -143,7 +186,11 @@ impl Snap {
 struct Finish {
     at: Instant,
     prompt: u64,
+    /// Generation-token increase over the window.
+    generated: u64,
     cached: u64,
+    /// End-to-end seconds over the window.
+    e2e_s: f64,
     prompt_tps: Option<f64>,
     gen_tps: Option<f64>,
     taken: bool,
@@ -165,7 +212,10 @@ struct Pending {
     seq: u64,
     model: String,
     input: u64,
-    reported: bool,
+    output: Option<u64>,
+    duration_ms: Option<u64>,
+    prompt_known: bool,
+    gen_known: bool,
     after: Instant,
     seen: Instant,
 }
@@ -214,7 +264,10 @@ impl SglangBook {
                         seq: row.seq,
                         model: row.model.clone(),
                         input: row.input,
-                        reported: row.reported,
+                        output: row.output,
+                        duration_ms: row.duration_ms,
+                        prompt_known: row.prompt_known,
+                        gen_known: row.gen_known,
                         after,
                         seen: at,
                     });
@@ -283,6 +336,10 @@ impl SglangBook {
                         && finish.at > *base_at
                         && finish.at <= *end_at
                         && finish.prompt == wait.input
+                        && wait.output == Some(finish.generated)
+                        && wait
+                            .duration_ms
+                            .is_some_and(|ms| duration_agrees(ms, finish.e2e_s))
                 })
                 .map(|(index, _)| index)
                 .collect();
@@ -296,18 +353,23 @@ impl SglangBook {
             let unique =
                 hits.len() == 1 && claims.get(&(wait.model.clone(), hits[0])).copied() == Some(1);
             if unique
-                && !wait.reported
                 && let Some(finish) = self
                     .models
                     .get(&wait.model)
                     .and_then(|model| model.finishes.get(hits[0]))
             {
+                // A reported value is never stored over the row. A missing
+                // cached count is; so is a rate the row did not report.
                 stored.push((
                     wait.seq,
                     Fill {
                         cached: finish.cached,
-                        prompt_tps: finish.prompt_tps,
-                        gen_tps: finish.gen_tps,
+                        prompt_tps: if wait.prompt_known {
+                            None
+                        } else {
+                            finish.prompt_tps
+                        },
+                        gen_tps: if wait.gen_known { None } else { finish.gen_tps },
                     },
                 ));
             }
@@ -373,7 +435,7 @@ impl Model {
             self.close(snap);
             return;
         }
-        self.open(base, prev, snap);
+        self.open(prev, snap);
     }
 
     fn idle(&self, base: Snap, snap: &Snap) -> bool {
@@ -386,10 +448,11 @@ impl Model {
     }
 
     fn window_clean(&self, base: &Snap, snap: &Snap) -> bool {
-        if self.dirty || base.running > 1.0 || snap.running > 1.0 {
-            return false;
-        }
-        if self.since.iter().any(|old| old.running > 1.0) {
+        // `running > 1` is already `dirty`: `note` sets it on the scrape
+        // that showed the overlap, and the baseline keeps it until a close
+        // at `running <= 1`. An idle rebase will not clear it while the
+        // baseline or any scrape since still overlapped.
+        if self.dirty {
             return false;
         }
         if snap.requests != base.requests + 1 {
@@ -398,7 +461,18 @@ impl Model {
         if whole_delta(base.e2e_count, snap.e2e_count) != Some(1) {
             return false;
         }
+        // The first token of this finish, not one left over from the
+        // previous window and not one that arrived for a request still running.
         if whole_delta(base.ttft_count, snap.ttft_count) != Some(1) {
+            return false;
+        }
+        if !settled(base) || !settled(snap) {
+            return false;
+        }
+        let batch = snap.batch.saturating_sub(base.batch);
+        let streaming = streaming_of(snap).saturating_sub(streaming_of(base));
+        // Both series stepped: the token counters are two requests.
+        if batch > 0 && streaming > 0 {
             return false;
         }
         let prompt = snap.prompt.saturating_sub(base.prompt);
@@ -415,11 +489,22 @@ impl Model {
         let generated = snap.generated - base.generated;
         let ttft_s = snap.ttft_sum - base.ttft_sum;
         let e2e_s = snap.e2e_sum - base.e2e_sum;
-        let (prompt_tps, gen_tps) = rates(prompt, cached, generated, ttft_s, e2e_s);
+        let queue_s = snap.queue_sum - base.queue_sum;
+        let (mut prompt_tps, mut gen_tps) = rates(prompt, cached, generated, ttft_s, e2e_s);
+        let batch = snap.batch.saturating_sub(base.batch);
+        if batch > 0 {
+            // Non-streaming: time to first token is the whole request.
+            prompt_tps = None;
+            gen_tps = None;
+        } else if !queue_within(queue_s, ttft_s) {
+            prompt_tps = None;
+        }
         self.finishes.push_back(Finish {
             at: snap.at,
             prompt,
+            generated,
             cached,
+            e2e_s,
             prompt_tps,
             gen_tps,
             taken: false,
@@ -429,20 +514,19 @@ impl Model {
         }
     }
 
-    fn open(&mut self, base: Snap, prev: Snap, snap: Snap) {
+    fn open(&mut self, prev: Snap, snap: Snap) {
         let step = whole_delta(prev.ttft_count, snap.ttft_count).unwrap_or(-1);
-        let from_base = whole_delta(base.ttft_count, snap.ttft_count).unwrap_or(2);
+        // Tokens or a finished-request counter moved with no finish. The
+        // first-token count from the baseline is not a separate flag: the
+        // window already requires that count to grow by exactly one.
         let moved = snap.requests != prev.requests
+            || snap.batch != prev.batch
             || snap.prompt != prev.prompt
             || snap.cached != prev.cached
             || snap.generated != prev.generated
             || !near(snap.e2e_sum, prev.e2e_sum)
             || !near(snap.e2e_count, prev.e2e_count);
-        if moved
-            || (step != 0 && step != 1)
-            || from_base > 1
-            || snap.ttft_sum + 1e-6 < prev.ttft_sum
-        {
+        if moved || (step != 0 && step != 1) || snap.ttft_sum + 1e-6 < prev.ttft_sum {
             self.dirty = true;
         }
         self.since.push(snap);
@@ -486,6 +570,7 @@ impl Model {
 
 fn same_counters(left: &Snap, right: &Snap) -> bool {
     left.requests == right.requests
+        && left.batch == right.batch
         && left.prompt == right.prompt
         && left.cached == right.cached
         && left.generated == right.generated
@@ -493,6 +578,8 @@ fn same_counters(left: &Snap, right: &Snap) -> bool {
         && near(left.e2e_count, right.e2e_count)
         && near(left.ttft_sum, right.ttft_sum)
         && near(left.ttft_count, right.ttft_count)
+        && near(left.queue_sum, right.queue_sum)
+        && near(left.queue_count, right.queue_count)
 }
 
 fn near(left: f64, right: f64) -> bool {
@@ -501,6 +588,7 @@ fn near(left: f64, right: f64) -> bool {
 
 fn went_back(prev: &Snap, snap: &Snap) -> bool {
     snap.requests < prev.requests
+        || snap.batch < prev.batch
         || snap.prompt < prev.prompt
         || snap.cached < prev.cached
         || snap.generated < prev.generated
@@ -508,6 +596,34 @@ fn went_back(prev: &Snap, snap: &Snap) -> bool {
         || snap.e2e_count + 1e-6 < prev.e2e_count
         || snap.ttft_sum + 1e-6 < prev.ttft_sum
         || snap.ttft_count + 1e-6 < prev.ttft_count
+        || snap.queue_sum + 1e-6 < prev.queue_sum
+        || snap.queue_count + 1e-6 < prev.queue_count
+}
+
+/// The first-token count equals the finished count: nothing is past its
+/// first token and still running.
+fn settled(snap: &Snap) -> bool {
+    whole_delta(snap.requests as f64, snap.ttft_count) == Some(0)
+}
+
+fn streaming_of(snap: &Snap) -> u64 {
+    snap.requests.saturating_sub(snap.batch)
+}
+
+/// Queue time at most five percent of the time to the first token.
+fn queue_within(queue_s: f64, ttft_s: f64) -> bool {
+    queue_s <= ttft_s * 0.05
+}
+
+/// `duration_ms` agrees with the window's end-to-end seconds. The slack
+/// is the larger of one second and five percent (36_468 ms against 36.47 s).
+fn duration_agrees(duration_ms: u64, e2e_s: f64) -> bool {
+    if !e2e_s.is_finite() || e2e_s < 0.0 {
+        return false;
+    }
+    let row_s = duration_ms as f64 / 1000.0;
+    let tol = (e2e_s * 0.05).max(1.0);
+    (row_s - e2e_s).abs() <= tol
 }
 
 fn whole_delta(before: f64, now: f64) -> Option<i64> {
@@ -571,6 +687,7 @@ mod tests {
     ) -> Totals {
         Totals {
             requests,
+            batch: 0,
             prompt,
             cached,
             generated,
@@ -578,16 +695,27 @@ mod tests {
             e2e_count: e2e.1,
             ttft_sum: ttft.0,
             ttft_count: ttft.1,
+            queue_sum: 0.0,
+            queue_count: 0.0,
             running,
         }
     }
 
-    fn claim(seq: u64, input: u64, reported: bool) -> Claim {
+    /// A streaming row whose output and duration match the usual window:
+    /// 401 generated tokens, 10 s end to end.
+    fn claim(seq: u64, input: u64) -> Claim {
+        measured(seq, input, 401, 10_000)
+    }
+
+    fn measured(seq: u64, input: u64, output: u64, duration_ms: u64) -> Claim {
         Claim {
             seq,
             model: "flash".to_owned(),
             input,
-            reported,
+            output: Some(output),
+            duration_ms: Some(duration_ms),
+            prompt_known: false,
+            gen_known: false,
         }
     }
 
@@ -620,7 +748,7 @@ mod tests {
             clock.at(4_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(4_500), &[claim(seq, 1_000, false)]);
+        book.activity(clock.at(4_500), &[claim(seq, 1_000)]);
         book.observe(
             "flash",
             clock.at(5_000),
@@ -656,7 +784,7 @@ mod tests {
             clock.at(8_000),
             Some(totals(2, 1_800, 800, 502, (13.0, 2.0), (3.0, 2.0), 0.0)),
         );
-        book.activity(clock.at(8_500), &[claim(2, 800, false)]);
+        book.activity(clock.at(8_500), &[measured(2, 800, 101, 3_000)]);
         book.observe(
             "flash",
             clock.at(9_000),
@@ -684,7 +812,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 500, 500, 11, (4.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 500, false)]);
+        book.activity(clock.at(1_500), &[measured(1, 500, 11, 4_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -711,10 +839,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(2, 2_000, 1_000, 800, (20.0, 2.0), (4.0, 2.0), 0.0)),
         );
-        book.activity(
-            clock.at(1_500),
-            &[claim(1, 1_000, false), claim(2, 1_000, false)],
-        );
+        book.activity(clock.at(1_500), &[claim(1, 1_000), claim(2, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -732,7 +857,7 @@ mod tests {
             clock.at(4_000),
             Some(totals(3, 3_000, 1_600, 1_201, (30.0, 3.0), (6.0, 3.0), 0.0)),
         );
-        book.activity(clock.at(4_500), &[claim(3, 1_000, false)]);
+        book.activity(clock.at(4_500), &[claim(3, 1_000)]);
         book.observe(
             "flash",
             clock.at(5_000),
@@ -764,7 +889,7 @@ mod tests {
             clock.at(2_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(2_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(2_500), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             clock.at(3_000),
@@ -793,7 +918,7 @@ mod tests {
             clock.at(2_000),
             Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
         );
-        book.activity(clock.at(2_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(2_500), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             clock.at(3_000),
@@ -814,7 +939,7 @@ mod tests {
             clock.at(5_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(5_500), &[claim(2, 1_000, false)]);
+        book.activity(clock.at(5_500), &[claim(2, 1_000)]);
         book.observe(
             "flash",
             clock.at(6_000),
@@ -843,7 +968,7 @@ mod tests {
             late,
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(late + Duration::from_millis(100), &[claim(1, 1_000, false)]);
+        book.activity(late + Duration::from_millis(100), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             late + Duration::from_millis(200),
@@ -866,7 +991,7 @@ mod tests {
             edge,
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(edge + Duration::from_millis(50), &[claim(7, 1_000, false)]);
+        book.activity(edge + Duration::from_millis(50), &[claim(7, 1_000)]);
         book.observe(
             "flash",
             edge + Duration::from_millis(100),
@@ -893,10 +1018,7 @@ mod tests {
             idle + Duration::from_millis(1_000),
             Some(totals(1, 1_000, 0, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(
-            idle + Duration::from_millis(1_100),
-            &[claim(8, 1_000, false)],
-        );
+        book.activity(idle + Duration::from_millis(1_100), &[claim(8, 1_000)]);
         book.observe(
             "flash",
             idle + Duration::from_millis(1_200),
@@ -924,10 +1046,7 @@ mod tests {
         );
         // The unmatched row and the row it did match share this read, so
         // the miss must not take the finish away from the match.
-        book.activity(
-            clock.at(1_500),
-            &[claim(1, 999, false), claim(2, 1_000, false)],
-        );
+        book.activity(clock.at(1_500), &[claim(1, 999), claim(2, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -949,10 +1068,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(
-            clock.at(1_500),
-            &[claim(3, 1_000, false), claim(4, 1_000, false)],
-        );
+        book.activity(clock.at(1_500), &[claim(3, 1_000), claim(4, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -984,7 +1100,7 @@ mod tests {
         );
         book.activity(
             clock.at(2_500),
-            &[claim(1, 1_000, false), claim(2, 500, false)],
+            &[claim(1, 1_000), measured(2, 500, 1, 2_000)],
         );
         book.observe(
             "flash",
@@ -1001,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_row_consumes_the_window_and_stores_nothing() {
+    fn a_reported_rate_keeps_the_rate_and_still_fills_a_missing_cached_count() {
         let clock = Clock(Instant::now());
         let mut book = SglangBook::default();
         book.observe(
@@ -1015,24 +1131,25 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 1_000, true)]);
+        let mut row = claim(1, 1_000);
+        row.prompt_known = true;
+        book.activity(clock.at(1_500), &[row]);
         book.observe(
             "flash",
             clock.at(2_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        assert_eq!(book.fill(1), None);
-        book.activity(clock.at(2_500), &[claim(2, 1_000, false)]);
+        let fill = book.fill(1).expect("the missing cached count is filled");
+        assert_eq!(fill.cached, 600);
+        assert_eq!(fill.prompt_tps, None, "a reported rate is not replaced");
+        assert_eq!(fill.gen_tps, Some(50.0), "a rate the row did not report");
+        book.activity(clock.at(2_500), &[claim(2, 1_000)]);
         book.observe(
             "flash",
             clock.at(3_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        assert_eq!(
-            book.fill(2),
-            None,
-            "the reported row already took the finish"
-        );
+        assert_eq!(book.fill(2), None, "the row already took the finish");
     }
 
     #[test]
@@ -1050,7 +1167,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 400, 1, (5.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(1_500), &[measured(1, 1_000, 1, 5_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -1077,7 +1194,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 100, 150, 10, (4.0, 1.0), (1.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 100, false)]);
+        book.activity(clock.at(1_500), &[claim(1, 100)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -1101,7 +1218,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 0.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -1135,7 +1252,7 @@ mod tests {
             clock.at(3_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (4.0, 2.0), 0.0)),
         );
-        book.activity(clock.at(3_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(3_500), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             clock.at(4_000),
@@ -1160,7 +1277,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -1181,7 +1298,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 0, 401, (10.0, 1.0), (0.0005, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(4, 1_000, false)]);
+        book.activity(clock.at(1_500), &[claim(4, 1_000)]);
         book.observe(
             "flash",
             clock.at(2_000),
@@ -1208,7 +1325,7 @@ mod tests {
             clock.at(1_000),
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        book.activity(clock.at(1_500), &[claim(1, 1_000, false)]);
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
         book.activity(clock.at(1_500) + Duration::from_secs(11), &[]);
         assert_eq!(book.fill(1), None);
         book.observe(
@@ -1217,6 +1334,591 @@ mod tests {
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
         assert_eq!(book.fill(1), None);
+    }
+
+    /// B's first token fell in a window that was rejected. Between the next
+    /// two scrapes C starts, produces its first token and B finishes, and
+    /// `num_running_reqs` never shows 2. The window sees one first token
+    /// and one finish; B must not take C's time to first token.
+    #[test]
+    fn a_first_token_from_an_earlier_window_is_not_this_finish() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 2.0)),
+        );
+        // B's first token, while the overlap is still visible.
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (1.5, 1.0), 2.0)),
+        );
+        // The other request finishes (its first token too). B is still in
+        // flight, so the first-token count is ahead of the finished count.
+        // This window is rejected; its snap is the next window's start.
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(totals(1, 400, 0, 50, (5.0, 1.0), (3.0, 2.0), 1.0)),
+        );
+        // C's first token and B's finish both land between these scrapes.
+        book.observe(
+            "flash",
+            clock.at(4_000),
+            Some(totals(2, 1_400, 600, 451, (15.0, 2.0), (3.4, 3.0), 1.0)),
+        );
+        book.activity(clock.at(4_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(5_000),
+            Some(totals(2, 1_400, 600, 451, (15.0, 2.0), (3.4, 3.0), 1.0)),
+        );
+        assert_eq!(
+            book.fill(1),
+            None,
+            "B's row must not show C's time to first token"
+        );
+    }
+
+    /// The first token was already counted before this window, so the
+    /// finish scrape adds none. Nothing is filled.
+    #[test]
+    fn a_first_token_increase_of_zero_fills_nothing() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (1.5, 1.0), 1.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (1.5, 1.0), 0.0)),
+        );
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (1.5, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None);
+    }
+
+    #[test]
+    fn a_non_streaming_request_fills_the_cached_count_and_no_rate() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        // The false series' time to first token is the whole request,
+        // 5e-6 s short of the end-to-end sum.
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(1, 1_000, 600, 401, (10.0, 1.0), (10.0 - 5e-6, 1.0), 0.0)
+            }),
+        );
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(1, 1_000, 600, 401, (10.0, 1.0), (10.0 - 5e-6, 1.0), 0.0)
+            }),
+        );
+        let fill = book.fill(1).expect("cached count");
+        assert_eq!(fill.cached, 600);
+        assert_eq!(fill.prompt_tps, None);
+        assert_eq!(fill.gen_tps, None);
+    }
+
+    #[test]
+    fn a_non_streaming_request_after_a_streaming_one_fills_cached_only() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        let streaming = one(&mut book, &clock, 1);
+        assert_eq!(streaming.prompt_tps, Some(200.0));
+        assert_eq!(streaming.gen_tps, Some(50.0));
+        book.observe(
+            "flash",
+            clock.at(6_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(
+                    2,
+                    1_800,
+                    800,
+                    502,
+                    (13.0, 2.0),
+                    (2.0 + 3.0 - 5e-6, 2.0),
+                    0.0,
+                )
+            }),
+        );
+        book.activity(clock.at(6_500), &[measured(2, 800, 101, 3_000)]);
+        book.observe(
+            "flash",
+            clock.at(7_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(
+                    2,
+                    1_800,
+                    800,
+                    502,
+                    (13.0, 2.0),
+                    (2.0 + 3.0 - 5e-6, 2.0),
+                    0.0,
+                )
+            }),
+        );
+        let fill = book.fill(2).expect("cached count");
+        assert_eq!(fill.cached, 200);
+        assert_eq!(fill.prompt_tps, None);
+        assert_eq!(fill.gen_tps, None);
+        assert_eq!(book.fill(1).expect("kept").prompt_tps, Some(200.0));
+    }
+
+    #[test]
+    fn a_mixed_window_fills_nothing_and_the_next_streaming_request_does() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        // One streaming finish and one non-streaming finish, one scrape.
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(2, 2_000, 1_000, 800, (20.0, 2.0), (4.0, 2.0), 0.0)
+            }),
+        );
+        book.activity(clock.at(1_500), &[claim(1, 1_000), claim(2, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(2, 2_000, 1_000, 800, (20.0, 2.0), (4.0, 2.0), 0.0)
+            }),
+        );
+        assert_eq!(book.fill(1), None);
+        assert_eq!(book.fill(2), None);
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(2, 2_000, 1_000, 800, (20.0, 2.0), (4.0, 2.0), 1.0)
+            }),
+        );
+        book.observe(
+            "flash",
+            clock.at(4_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(3, 3_000, 1_600, 1_201, (30.0, 3.0), (6.0, 3.0), 0.0)
+            }),
+        );
+        book.activity(clock.at(4_500), &[claim(3, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(5_000),
+            Some(Totals {
+                batch: 1,
+                ..totals(3, 3_000, 1_600, 1_201, (30.0, 3.0), (6.0, 3.0), 0.0)
+            }),
+        );
+        let fill = book.fill(3).expect("the later streaming request");
+        assert_eq!(fill.cached, 600);
+        assert_eq!(fill.prompt_tps, Some(200.0));
+        assert_eq!(fill.gen_tps, Some(50.0));
+    }
+
+    #[test]
+    fn one_row_does_not_take_the_first_of_two_matching_finishes() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(2, 2_000, 1_200, 802, (20.0, 2.0), (4.0, 2.0), 0.0)),
+        );
+        book.activity(clock.at(2_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(totals(2, 2_000, 1_200, 802, (20.0, 2.0), (4.0, 2.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None, "two finishes match this one row");
+    }
+
+    #[test]
+    fn a_later_row_cannot_fill_from_a_finish_already_taken() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.activity(clock.at(80), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1).expect("the first row").cached, 600);
+        book.activity(clock.at(1_100), &[claim(2, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(1_200),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(2), None, "one finish fills one row");
+    }
+
+    #[test]
+    fn output_and_duration_must_match_the_window() {
+        let clock = Clock(Instant::now());
+        let mut different_output = SglangBook::default();
+        different_output.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        different_output.activity(clock.at(50), &[]);
+        different_output.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        different_output.activity(clock.at(1_500), &[measured(1, 1_000, 400, 10_000)]);
+        different_output.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(
+            different_output.fill(1),
+            None,
+            "equal input, different output"
+        );
+
+        let mut far = SglangBook::default();
+        far.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        far.activity(clock.at(50), &[]);
+        far.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        far.activity(clock.at(1_500), &[measured(1, 1_000, 401, 20_000)]);
+        far.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(far.fill(1), None, "duration 20 s against 10 s");
+
+        // Exactly one second off still agrees: the floor is one second.
+        let mut edge = SglangBook::default();
+        edge.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        edge.activity(clock.at(50), &[]);
+        edge.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        edge.activity(clock.at(1_500), &[measured(1, 1_000, 401, 11_000)]);
+        edge.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(edge.fill(1).expect("one second").cached, 600);
+
+        // 36_468 ms against 36.47 s agrees; two seconds past it does not.
+        // The row is read before the scrape that shows the finish.
+        let mut before = SglangBook::default();
+        before.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        before.activity(clock.at(50), &[]);
+        before.activity(clock.at(80), &[measured(1, 1_000, 401, 36_468)]);
+        before.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(before.fill(1).expect("read before the finish").cached, 600);
+        assert_eq!(before.fill(1).expect("rate").prompt_tps, Some(200.0));
+
+        let mut past = SglangBook::default();
+        past.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        past.activity(clock.at(50), &[]);
+        past.activity(clock.at(80), &[measured(1, 1_000, 401, 38_470)]);
+        past.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(past.fill(1), None, "36.47 s plus 2 s is past five percent");
+
+        // The same finish, read after the scrape that showed it.
+        let mut after = SglangBook::default();
+        after.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        after.activity(clock.at(50), &[]);
+        after.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
+        );
+        after.activity(clock.at(1_500), &[measured(1, 1_000, 401, 36_468)]);
+        after.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(after.fill(1).expect("read after the finish").cached, 600);
+    }
+
+    #[test]
+    fn queue_time_over_five_percent_of_ttft_drops_only_the_prompt_rate() {
+        let clock = Clock(Instant::now());
+        let run = |queue_sum: f64| {
+            let mut book = SglangBook::default();
+            book.observe(
+                "flash",
+                clock.at(0),
+                Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+            );
+            book.activity(clock.at(50), &[]);
+            let finish = Totals {
+                queue_sum,
+                queue_count: 1.0,
+                ..totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)
+            };
+            book.observe("flash", clock.at(1_000), Some(finish));
+            book.activity(clock.at(1_500), &[claim(1, 1_000)]);
+            book.observe("flash", clock.at(2_000), Some(finish));
+            book.fill(1).expect("filled")
+        };
+        // 0.10 s is five percent of a 2 s time to first token.
+        let at = run(0.10);
+        assert_eq!(at.cached, 600);
+        assert_eq!(at.prompt_tps, Some(200.0));
+        assert_eq!(at.gen_tps, Some(50.0));
+        let over = run(0.11);
+        assert_eq!(over.cached, 600);
+        assert_eq!(over.prompt_tps, None);
+        assert_eq!(over.gen_tps, Some(50.0));
+    }
+
+    #[test]
+    fn a_prompt_that_moves_before_the_finish_fills_nothing() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(0, 100, 0, 0, (0.0, 0.0), (0.0, 0.0), 1.0)),
+        );
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        book.activity(clock.at(2_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None);
+    }
+
+    #[test]
+    fn an_overlap_that_changes_no_counter_is_not_rebased_away() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 2.0)),
+        );
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        book.activity(clock.at(3_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(4_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None);
+    }
+
+    #[test]
+    fn a_finish_beside_another_request_dirties_the_next_window() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 400, 0, 11, (4.0, 1.0), (1.0, 1.0), 2.0)),
+        );
+        book.activity(clock.at(1_500), &[measured(1, 400, 11, 4_000)]);
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 400, 0, 11, (4.0, 1.0), (1.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None, "the finish itself overlapped");
+        book.observe(
+            "flash",
+            clock.at(3_000),
+            Some(totals(2, 1_400, 600, 412, (14.0, 2.0), (3.0, 2.0), 0.0)),
+        );
+        book.activity(clock.at(3_500), &[claim(2, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(4_000),
+            Some(totals(2, 1_400, 600, 412, (14.0, 2.0), (3.0, 2.0), 0.0)),
+        );
+        assert_eq!(
+            book.fill(2),
+            None,
+            "the next window still started overlapped"
+        );
+    }
+
+    #[test]
+    fn the_first_scrape_already_overlapping_fills_nothing() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        book.observe(
+            "flash",
+            clock.at(0),
+            Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 2.0)),
+        );
+        book.activity(clock.at(50), &[]);
+        book.observe(
+            "flash",
+            clock.at(1_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        book.activity(clock.at(1_500), &[claim(1, 1_000)]);
+        book.observe(
+            "flash",
+            clock.at(2_000),
+            Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
+        );
+        assert_eq!(book.fill(1), None);
+    }
+
+    #[test]
+    fn a_scrape_without_cached_tokens_total_fills_nothing() {
+        use llama_core::backend::Backend;
+
+        use crate::metrics::parse_metrics_for;
+        let body = "\
+sglang:num_requests_total{model_name=\"flash\",is_streaming=\"true\"} 3.0
+sglang:num_requests_total{model_name=\"flash\",is_streaming=\"false\"} 4.0
+sglang:prompt_tokens_total{model_name=\"flash\"} 1000.0
+sglang:generation_tokens_total{model_name=\"flash\"} 401.0
+sglang:e2e_request_latency_seconds_sum{model_name=\"flash\"} 10.0
+sglang:e2e_request_latency_seconds_count{model_name=\"flash\"} 1.0
+sglang:time_to_first_token_seconds_sum{model_name=\"flash\"} 2.0
+sglang:time_to_first_token_seconds_count{model_name=\"flash\"} 1.0
+sglang:num_running_reqs{model_name=\"flash\"} 0.0
+";
+        let sample = parse_metrics_for(Backend::SgLang, body);
+        assert_eq!(Totals::from_sample(&sample), None);
+        let with_cached =
+            format!("{body}sglang:cached_tokens_total{{model_name=\"flash\"}} 600.0\n");
+        let totals = Totals::from_sample(&parse_metrics_for(Backend::SgLang, &with_cached))
+            .expect("the series is present");
+        assert_eq!(totals.requests, 7);
+        assert_eq!(totals.batch, 4);
+        assert_eq!(totals.cached, 600);
     }
 
     #[test]
@@ -1232,7 +1934,7 @@ mod tests {
             clock.at(9_000),
             Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
         );
-        book.activity(clock.at(9_100), &[claim(2, 0, false)]);
+        book.activity(clock.at(9_100), &[claim(2, 0)]);
         book.observe(
             "flash",
             clock.at(9_200),
