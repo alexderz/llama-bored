@@ -513,6 +513,8 @@ fn ellipsis_chars(text: &str, max_chars: usize) -> String {
         return String::new();
     }
     let mut out: String = text.chars().take(max_chars - 1).collect();
+    let end = out.trim_end_matches(' ').len();
+    out.truncate(end);
     out.push('\u{2026}');
     out
 }
@@ -1345,6 +1347,33 @@ mod tests {
         assert_eq!(list[0].holder, "eval-runner");
         assert_eq!(list[1].holder, "chat-ui");
         assert_eq!(list[0].model, list[1].model);
+    }
+
+    /// A holder cut at 24 characters does not leave a space before `…`.
+    #[test]
+    fn a_holder_cut_does_not_end_in_a_space_before_the_ellipsis() {
+        let mut claims = Claims::default();
+        // 22 characters, a space, then more: take(23) ends on that space.
+        let raw = format!("{} extra", "1234567890123456789012");
+        assert_eq!(raw.chars().nth(22), Some(' '));
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", &raw, false, true, None, None, None)],
+            }),
+        );
+        let holder = &claims.view().0[0].holder;
+        // take(23) ends on the space, then the trim drops it: 22 digits + `…`.
+        assert_eq!(holder.chars().count(), 23);
+        assert!(holder.ends_with('\u{2026}'));
+        assert!(
+            !holder.contains(" \u{2026}"),
+            "space before ellipsis: {holder:?}"
+        );
+        assert_eq!(
+            holder,
+            &format!("{}{}", "1234567890123456789012", '\u{2026}')
+        );
     }
 
     /// Byte caps: a 128-byte model id is kept (then sanitised), a holder

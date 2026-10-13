@@ -895,7 +895,12 @@ fn fit_reason(reason: &str, leftover: usize) -> Option<String> {
     if room < 3 {
         return None;
     }
-    Some(cut_text(reason, room))
+    let cut = cut_text(reason, room);
+    let head = cut.strip_suffix('\u{2026}').unwrap_or(cut.as_str());
+    if head.chars().filter(|c| *c != ' ').count() < 2 {
+        return None;
+    }
+    Some(cut)
 }
 
 fn claim_status(claim: &HeaderClaim, now: SystemTime, tz_offset_s: i32) -> Option<ClaimStatus> {
@@ -6638,8 +6643,27 @@ mod tests {
         let no_label: String = no_label.trim_end().chars().collect();
         assert!(no_label.starts_with("operator"), "{no_label:?}");
         assert!(!no_label.contains("hold"), "{no_label:?}");
+        assert!(
+            !no_label.contains("overnight"),
+            "reason without label: {no_label:?}"
+        );
 
         let nothing = claim_row(&claim, now, 0, 7);
         assert!(nothing.chars().all(|c| c == ' '), "{nothing:?}");
+    }
+
+    #[test]
+    fn a_cut_reason_needs_two_non_space_characters() {
+        // leftover = SEP (3) + room. room 3 is `cut_text(_, 3)`: two chars,
+        // then a trailing space is trimmed, so `a b c` would be `a…`.
+        assert_eq!(fit_reason("a b c", 6), None);
+        // `abc` is three cells: it fits whole in room 3. A longer string
+        // is cut to two cells and `…`.
+        assert_eq!(fit_reason("abc", 6).as_deref(), Some("abc"));
+        assert_eq!(fit_reason("abcd", 6).as_deref(), Some("ab\u{2026}"));
+        assert_eq!(fit_reason("ab", 6).as_deref(), Some("ab"));
+        assert_eq!(fit_reason("a", 6).as_deref(), Some("a"));
+        assert_eq!(fit_reason("a b c d e f", 6), None);
+        assert_eq!(fit_reason("a b c d e f", 8).as_deref(), Some("a b\u{2026}"));
     }
 }
