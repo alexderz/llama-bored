@@ -415,8 +415,9 @@ fn no_inflight(detail: &LlamaDetail) -> bool {
 }
 
 /// llama.cpp-only: the events stream is connected for claims, but the
-/// snapshot has no `inflight` member before, during, or after a failed
-/// `/running` read.
+/// snapshot has no `inflight` member before a failed `/running` read and
+/// after it recovers. While `/running` is down the series list is empty,
+/// so that phase is not checked here.
 #[test]
 fn llamacpp_snapshot_has_no_inflight_when_running_fails() {
     let fake = Fake::start(World {
@@ -437,14 +438,9 @@ fn llamacpp_snapshot_has_no_inflight_when_running_fails() {
         detail.series.iter().map(|s| s.inflight).collect::<Vec<_>>()
     );
     fake.edit(|w| w.running_status = 500);
-    let (_, detail) = wait(&rx, "running down", |view, _| {
+    wait(&rx, "running down", |view, _| {
         view.ai == llama_core::sample::AiState::Down
     });
-    assert!(
-        no_inflight(&detail),
-        "during: {:?}",
-        detail.series.iter().map(|s| s.inflight).collect::<Vec<_>>()
-    );
     fake.edit(|w| w.running_status = 200);
     let (_, detail) = wait(&rx, "running up", |view, detail| {
         view.ai == llama_core::sample::AiState::Loaded && !detail.series.is_empty()
