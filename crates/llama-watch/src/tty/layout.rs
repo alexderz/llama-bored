@@ -264,6 +264,19 @@ pub struct TtyModel {
     pub ctx_history_h: u32,
     /// SETUP block under the meters (#52). `None` collapses it.
     pub setup: Option<SetupView>,
+    /// Job view replacing GENERATION, PROMPT, the charts, SLOTS and RECENT.
+    /// `None` keeps the inference layout.
+    pub job: Option<JobView>,
+    /// One-line job note in the header when the inference view is showing.
+    pub job_note: Option<String>,
+}
+
+/// The job shown in place of the inference panels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobView {
+    pub job: crate::jobs::Job,
+    /// Extra live jobs besides this one, drawn `+N` after the name.
+    pub more: usize,
 }
 
 /// Narrowest console the dashboard draws: the RECENT columns' floor.
@@ -314,26 +327,30 @@ fn layout_with(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid {
     draw_header(&mut grid, model, &g);
     draw_rule(&mut grid, 1, g.cols);
     draw_meters(&mut grid, model, &g);
-    draw_rates(&mut grid, model, &g);
-    draw_slots(&mut grid, model, &g);
-    let stats_end = g.meter_last.max(g.slot_last);
-    let mid_rule = draw_setup(&mut grid, model, &g, stats_end + 2);
-    draw_rule(&mut grid, mid_rule, g.cols);
-    let req_header = mid_rule + 1;
-    if model.show_text && (rows >= FULL_ROWS || text_fits(model, &g, req_header)) {
-        let req_rows = request_slots(rows);
-        draw_requests(&mut grid, model, &g, req_header, req_rows);
-        let req_rule = req_header + 1 + req_rows + 1;
-        draw_rule(&mut grid, req_rule, g.cols);
-        let chart_h = chart_height(req_rule, rows);
-        if chart_h >= 5 {
-            draw_chart(&mut grid, model, &g, req_rule + 1, chart_h);
-        }
-        draw_text(&mut grid, model, &g, req_rule.saturating_add(chart_h));
+    if model.job.is_some() {
+        draw_job(&mut grid, model, &g);
     } else {
-        // Text off, or a short screen without room for IN/OUT under a
-        // full chart: the IN/OUT rows go to the chart and RECENT.
-        draw_text_off(&mut grid, model, &g, req_header);
+        draw_rates(&mut grid, model, &g);
+        draw_slots(&mut grid, model, &g);
+        let stats_end = g.meter_last.max(g.slot_last);
+        let mid_rule = draw_setup(&mut grid, model, &g, stats_end + 2);
+        draw_rule(&mut grid, mid_rule, g.cols);
+        let req_header = mid_rule + 1;
+        if model.show_text && (rows >= FULL_ROWS || text_fits(model, &g, req_header)) {
+            let req_rows = request_slots(rows);
+            draw_requests(&mut grid, model, &g, req_header, req_rows);
+            let req_rule = req_header + 1 + req_rows + 1;
+            draw_rule(&mut grid, req_rule, g.cols);
+            let chart_h = chart_height(req_rule, rows);
+            if chart_h >= 5 {
+                draw_chart(&mut grid, model, &g, req_rule + 1, chart_h);
+            }
+            draw_text(&mut grid, model, &g, req_rule.saturating_add(chart_h));
+        } else {
+            // Text off, or a short screen without room for IN/OUT under a
+            // full chart: the IN/OUT rows go to the chart and RECENT.
+            draw_text_off(&mut grid, model, &g, req_header);
+        }
     }
     let health_rule = rows - 3;
     // A long SLOTS list on a short screen may reach these rows. The health
@@ -521,6 +538,14 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         limit,
     );
     let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
+    if let Some(note) = &model.job_note {
+        let room = limit.saturating_sub(usize::from(tag_at));
+        if room >= 4 {
+            let shown = cut_text(note, room);
+            let n = shown.chars().count();
+            paint_fit(grid, tag_at, 0, &shown, C16::BrightWhite, C16::Black, n);
+        }
+    }
     paint_str(grid, start, 0, &temps, fg, C16::Black);
     if !model.show_text {
         let tag_end = usize::from(tag_at).saturating_add(TEXT_OFF_TAG.chars().count());
@@ -4531,8 +4556,746 @@ pub(crate) fn comma_pair(done: u64, total: u64) -> String {
     format!("{}/{}", commas(done), commas(total))
 }
 
+/// Elapsed or remaining time for a job: `43 min`, `4 h 16 min`, `12 s`.
+pub(crate) fn job_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} s");
+    }
+    let mins = (secs + 30) / 60;
+    let hours = mins / 60;
+    let mins = mins % 60;
+    if hours > 0 {
+        if mins == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {mins} min")
+        }
+    } else {
+        format!("{mins} min")
+    }
+}
+
+/// Big-digit text: at most four characters (`16.6`, `0.25`, `1540`, `3.3`).
+pub(crate) fn job_digits(value: f64) -> String {
+    if !value.is_finite() {
+        return "--".to_owned();
+    }
+    let sign = if value < 0.0 { "-" } else { "" };
+    let abs = value.abs();
+    let body = if abs >= 9999.5 {
+        job_sci(abs)
+    } else if abs >= 100.0 {
+        format!("{:.0}", abs)
+    } else if abs >= 1.0 {
+        format!("{:.1}", abs)
+    } else if abs >= 0.01 {
+        format!("{:.2}", abs)
+    } else if abs == 0.0 {
+        "0".to_owned()
+    } else {
+        job_sci(abs)
+    };
+    format!("{sign}{body}")
+}
+
+/// Compact number for the VALUES block (`1.28e-5`, `0.8465`, `0.96`).
+pub(crate) fn job_compact(value: f64) -> String {
+    if !value.is_finite() {
+        return "--".to_owned();
+    }
+    let abs = value.abs();
+    if abs != 0.0 && (abs < 1e-3 || abs >= 1e5) {
+        let sign = if value < 0.0 { "-" } else { "" };
+        return format!("{sign}{}", job_sci(abs));
+    }
+    let mut text = format!("{value:.4}");
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    if text == "-0" { "0".to_owned() } else { text }
+}
+
+fn job_sci(abs: f64) -> String {
+    let text = format!("{abs:.2e}");
+    text.replace("e-0", "e-")
+        .replace("e+0", "e")
+        .replace("e+", "e")
+}
+
+/// Caption beside the rate digits: `s/step` becomes `SECONDS / STEP`.
+pub(crate) fn job_unit_caption(unit: &str) -> String {
+    if unit.eq_ignore_ascii_case("s/step") {
+        "SECONDS / STEP".to_owned()
+    } else {
+        unit.to_ascii_uppercase()
+    }
+}
+
+fn draw_job(grid: &mut Grid, model: &TtyModel, g: &Geom) {
+    let Some(view) = &model.job else {
+        return;
+    };
+    let job = &view.job;
+    let health_rule = g.rows.saturating_sub(3);
+    draw_job_title(grid, view, g);
+    let mut right_y = 4u16;
+    if g.rows >= MIN_ROWS {
+        draw_job_progress(grid, job, g, right_y, model.chart_glyphs);
+        right_y = right_y.saturating_add(1).saturating_add(g.bar_rows);
+    }
+    let digit_h: u16 = if g.tall { 10 } else { 5 };
+    let digits_span = 1 + digit_h;
+    let mut values_y = None;
+    if right_y.saturating_add(digits_span) < health_rule.saturating_sub(4) {
+        draw_job_digits(grid, job, g, right_y);
+        values_y = Some(right_y.saturating_add(digits_span).saturating_add(1));
+    }
+    let setup_top = g
+        .activity_row()
+        .saturating_add(g.bar_rows)
+        .saturating_add(1);
+    let mut mid = g.meter_last.max(g.slot_last).saturating_add(2);
+    if setup_top < health_rule.saturating_sub(5) {
+        let used = draw_job_setup(grid, view, setup_top, usize::from(g.left_end()));
+        mid = mid.max(setup_top.saturating_add(used));
+    }
+    let values_h = job_values_rows(job, g);
+    let without_values = mid;
+    let with_values = values_y.map_or(mid, |top| mid.max(top.saturating_add(values_h)));
+    let (fans, temps) = (model.fans.as_ref(), model.temps.as_ref());
+    let side = g.cols >= FANS_SIDE_COLS && (fans.is_some() || temps.is_some());
+    let chart_min: u16 = if job.series.is_empty() { 0 } else { 5 };
+    let lower_with = health_rule.saturating_sub(with_values.saturating_add(1));
+    let keep_values =
+        values_h > 0 && values_y.is_some() && lower_with >= chart_min.saturating_add(2);
+    if keep_values && let Some(top) = values_y {
+        let used = draw_job_values(grid, job, g, top);
+        mid = mid.max(top.saturating_add(used));
+    } else {
+        mid = without_values;
+    }
+    if mid + 1 >= health_rule {
+        return;
+    }
+    draw_rule(grid, mid, g.cols);
+    let mut y = mid + 1;
+    let spare_for_strip = health_rule.saturating_sub(y.saturating_add(6));
+    let strip = if side {
+        None
+    } else {
+        strip_plan(fans, temps, spare_for_strip)
+    };
+    let reserve = match strip {
+        Some(Strip::Block(height)) => 1 + height,
+        Some(Strip::Line) => 1,
+        None => 0,
+    };
+    let body_end = health_rule.saturating_sub(reserve);
+    let content_right = if side {
+        fans_split(g.cols).saturating_sub(2)
+    } else {
+        g.cols.saturating_sub(3)
+    };
+    let body = body_end.saturating_sub(y);
+    let mut chart_h = if body >= chart_min && chart_min > 0 {
+        body.min(if g.rows >= 60 { 16 } else { 10 })
+    } else {
+        0
+    };
+    let phase_n = u16::try_from(job.phases.len()).unwrap_or(0);
+    let phase_need = if phase_n == 0 { 0 } else { 1 + phase_n + 1 };
+    if phase_need > 0 && chart_h > 0 && y + phase_need + chart_h > body_end {
+        if body.saturating_sub(chart_min) >= 3 {
+            chart_h = chart_h.min(body.saturating_sub(3));
+        } else {
+            // Charts outrank PHASES: keep the charts.
+        }
+    }
+    let keep_phases =
+        phase_need > 0 && y + phase_need + chart_h <= body_end && body.saturating_sub(chart_h) >= 3;
+    if keep_phases {
+        let take = phase_n.min(body_end.saturating_sub(y + 1 + chart_h));
+        if take > 0 {
+            draw_job_phases(grid, job, g, y, take, content_right);
+            y = y.saturating_add(1).saturating_add(take).saturating_add(1);
+            if y < body_end {
+                draw_rule(grid, y.saturating_sub(1), g.cols);
+            }
+        }
+    }
+    if chart_h >= 5 {
+        let height = chart_h.min(body_end.saturating_sub(y));
+        if height >= 5 {
+            draw_job_charts(grid, job, g, y, height, model.chart_glyphs, content_right);
+            y = y.saturating_add(height);
+        }
+    }
+    let _ = y;
+    if side {
+        let split = fans_split(g.cols);
+        let top = mid + 1;
+        for row in top..health_rule {
+            paint(grid, split, row, '|', C16::BrightBlack, C16::Black);
+        }
+        draw_side_column(
+            grid,
+            fans,
+            temps,
+            fans_span(g),
+            top,
+            health_rule.saturating_sub(top),
+            model.chart_glyphs,
+        );
+    } else {
+        match strip {
+            Some(Strip::Block(height)) => {
+                let strip_rule = g.rows - 3 - reserve;
+                draw_rule(grid, strip_rule, g.cols);
+                draw_strip(
+                    grid,
+                    g,
+                    fans,
+                    temps,
+                    strip_rule + 1,
+                    height,
+                    model.chart_glyphs,
+                );
+            }
+            Some(Strip::Line) => {
+                if let Some(panel) = temps {
+                    draw_temps_line(grid, panel, 2, g.cols - 3, g.rows - 4);
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+fn draw_job_title(grid: &mut Grid, view: &JobView, g: &Geom) {
+    let job = &view.job;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(kind) = &job.kind {
+        parts.push(kind.to_ascii_uppercase());
+    }
+    let mut who = job.name.clone();
+    if view.more > 0 {
+        who.push_str(&format!(" +{}", view.more));
+    }
+    parts.push(who);
+    if let Some(title) = &job.title {
+        parts.push(title.clone());
+    }
+    if let Some(phase) = &job.phase {
+        let mut text = phase.label.clone();
+        if let (Some(index), Some(of)) = (phase.index, phase.of) {
+            text.push_str(&format!(", {index} of {of}"));
+        }
+        parts.push(text);
+    }
+    let line = parts.join(" \u{00B7} ");
+    let x = usize::from(g.right);
+    let end = usize::from(g.cols.saturating_sub(3));
+    let room = end.saturating_add(1).saturating_sub(x);
+    let shown = cut_text(&line, room);
+    paint_detail_fg(grid, x, 3, &shown, room, C16::BrightWhite);
+}
+
+fn draw_job_progress(
+    grid: &mut Grid,
+    job: &crate::jobs::Job,
+    g: &Geom,
+    row: u16,
+    glyphs: ChartGlyphs,
+) {
+    let mut bits: Vec<String> = Vec::new();
+    match (job.step, job.total) {
+        (Some(step), Some(total)) => {
+            bits.push(format!("STEP {} / {}", commas(step), commas(total)))
+        }
+        (Some(step), None) => bits.push(format!("STEP {}", commas(step))),
+        (None, Some(total)) => bits.push(format!("STEP -- / {}", commas(total))),
+        (None, None) => {}
+    }
+    if let (Some(step), Some(total)) = (job.step, job.total)
+        && total > 0
+    {
+        let pct = ((step as f64 / total as f64) * 100.0).round();
+        if pct.is_finite() {
+            bits.push(format!("{} %", pct as i64));
+        }
+    }
+    if let Some(eta) = job.eta_s {
+        bits.push(format!("{} left", job_duration(eta)));
+    }
+    let line = bits.join("   ");
+    let x = usize::from(g.right);
+    let end = usize::from(g.cols.saturating_sub(3));
+    let room = end.saturating_add(1).saturating_sub(x);
+    paint_str(
+        grid,
+        g.right,
+        row,
+        &cut_text(&line, room),
+        C16::White,
+        C16::Black,
+    );
+    let frac = match (job.step, job.total) {
+        (Some(step), Some(total)) if total > 0 => {
+            Some((step as f64 / total as f64).clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+    let bar_row = row + 1;
+    let width = g.cols.saturating_sub(3).saturating_sub(g.right);
+    if width == 0 {
+        return;
+    }
+    draw_h_bar(
+        grid,
+        HBar {
+            x: g.right,
+            row: bar_row,
+            width,
+            frac,
+            ink: BarInk::Spectrum {
+                hot: frac.is_some_and(|f| f >= 1.0),
+                top: color::spectrum::FULL,
+            },
+            rows: g.bar_rows,
+            cells: Some(meter_glyph(glyphs)),
+        },
+    );
+}
+
+fn draw_job_digits(grid: &mut Grid, job: &crate::jobs::Job, g: &Geom, row: u16) {
+    let ph = if g.tall { 2u16 } else { 1 };
+    let base = if g.tall { 4u16 } else { 2 };
+    if let Some(rate) = &job.rate {
+        let caption = job
+            .rate
+            .as_ref()
+            .and_then(|r| r.unit.as_deref())
+            .map(job_unit_caption)
+            .unwrap_or_else(|| "RATE".to_owned());
+        paint_str(grid, g.right, row, &caption, C16::White, C16::Black);
+        let text = job_digits(rate.value);
+        let pw = fit_pixel(base, text.chars().count().max(1), g.half);
+        draw_value_digits(grid, g.right, row + 1, &text, rate.value, pw, ph);
+    }
+    if let Some(first) = job.values.first() {
+        let x = g.prompt_x();
+        let caption = first.label.to_ascii_uppercase();
+        paint_str(grid, x, row, &caption, C16::White, C16::Black);
+        let text = job_digits(first.value);
+        let pw = fit_pixel(base, text.chars().count().max(1), g.half);
+        draw_value_digits(grid, x, row + 1, &text, first.value, pw, ph);
+    }
+}
+
+fn draw_value_digits(grid: &mut Grid, x: u16, row: u16, text: &str, value: f64, pw: u16, ph: u16) {
+    if pw == 0 {
+        return;
+    }
+    let ceiling = value_ceiling(value);
+    let step = rate_step(value.abs(), ceiling);
+    let (top, body) = digit_colours(step);
+    let pos = grid
+        .records_exact()
+        .then(|| color::spectrum::rate(value.abs(), ceiling));
+    let mut cx = x;
+    for ch in text.chars() {
+        match ch {
+            '0'..='9' => {
+                paint_digit_glyph(
+                    grid,
+                    cx,
+                    row,
+                    DIGITS[(ch as u8 - b'0') as usize],
+                    top,
+                    body,
+                    pos,
+                    pw,
+                    ph,
+                );
+                cx += 3 * pw + pw;
+            }
+            '-' => {
+                paint_digit_glyph(grid, cx, row, DIGITS[10], top, body, pos, pw, ph);
+                cx += 3 * pw + pw;
+            }
+            '.' => {
+                for dy in 0..ph {
+                    paint(grid, cx, row + 4 * ph + dy, '█', body, C16::Black);
+                    if let Some(pos) = pos {
+                        let rows = 5 * usize::from(ph);
+                        let at = 4 * usize::from(ph) + usize::from(dy);
+                        grid.set_exact_fg(
+                            cx,
+                            row + 4 * ph + dy,
+                            act_color(color::spectrum::shade(pos, at, rows)),
+                        );
+                    }
+                }
+                cx += pw + pw / 2 + 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_digit_glyph(
+    grid: &mut Grid,
+    cx: u16,
+    row: u16,
+    glyph: &[&str],
+    top: C16,
+    body: C16,
+    pos: Option<f32>,
+    pw: u16,
+    ph: u16,
+) {
+    for (py, bits) in glyph.iter().enumerate() {
+        let colour = if py < 2 { top } else { body };
+        for (px, bit) in bits.chars().enumerate() {
+            if bit != '#' {
+                continue;
+            }
+            for dy in 0..ph {
+                for dx in 0..pw {
+                    let y = row + py as u16 * ph + dy;
+                    paint(grid, cx + px as u16 * pw + dx, y, '█', colour, C16::Black);
+                    if let Some(pos) = pos {
+                        let rows = 5 * usize::from(ph);
+                        let at = py * usize::from(ph) + usize::from(dy);
+                        grid.set_exact_fg(
+                            cx + px as u16 * pw + dx,
+                            y,
+                            act_color(color::spectrum::shade(pos, at, rows)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn value_ceiling(value: f64) -> f64 {
+    let abs = value.abs();
+    if abs <= 0.0 {
+        return 1.0;
+    }
+    let exp = abs.log10().ceil();
+    if !exp.is_finite() {
+        return abs.max(1.0);
+    }
+    10_f64.powf(exp).max(1.0)
+}
+
+fn draw_job_setup(grid: &mut Grid, view: &JobView, top: u16, right: usize) -> u16 {
+    let job = &view.job;
+    paint_str(grid, 2, top, "JOB", C16::White, C16::Black);
+    let state = job.state.as_str();
+    let fg = match job.state {
+        crate::jobs::JobState::Running => C16::BrightRed,
+        crate::jobs::JobState::Done => C16::Green,
+        crate::jobs::JobState::Failed => C16::Yellow,
+    };
+    paint_str(grid, 8, top, state, fg, C16::Black);
+    let mut used = 1u16;
+    if let Some(elapsed) = job.elapsed_s {
+        paint_detail(grid, 4, usize::from(top + 1), "elapsed", 8);
+        let text = job_duration(elapsed);
+        paint_detail_fg(
+            grid,
+            13,
+            usize::from(top + 1),
+            &text,
+            right.saturating_sub(12),
+            C16::BrightWhite,
+        );
+        used += 1;
+    }
+    used
+}
+
+fn job_values_rows(job: &crate::jobs::Job, g: &Geom) -> u16 {
+    let n = job.rates.len() + job.values.len();
+    if n == 0 {
+        return 0;
+    }
+    let width = usize::from(g.cols.saturating_sub(3).saturating_sub(g.right));
+    let cols = (width / 18).max(1);
+    let rows = n.div_ceil(cols);
+    1 + u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+fn draw_job_values(grid: &mut Grid, job: &crate::jobs::Job, g: &Geom, top: u16) -> u16 {
+    paint_str(grid, g.right, top, "VALUES", C16::White, C16::Black);
+    let mut items: Vec<String> = Vec::new();
+    for n in job.rates.iter().chain(job.values.iter()) {
+        items.push(format!("{} {}", n.label, job_compact(n.value)));
+    }
+    if items.is_empty() {
+        return 1;
+    }
+    let width = usize::from(g.cols.saturating_sub(3).saturating_sub(g.right));
+    let col_w = 18usize;
+    let cols = (width / col_w).max(1);
+    let mut row = 1u16;
+    let mut col = 0usize;
+    for item in items {
+        let x = usize::from(g.right) + col * col_w;
+        paint_detail_fg(
+            grid,
+            x,
+            usize::from(top + row),
+            &item,
+            col_w.saturating_sub(1),
+            C16::BrightWhite,
+        );
+        col += 1;
+        if col >= cols {
+            col = 0;
+            row += 1;
+        }
+    }
+    if col == 0 { row } else { row + 1 }
+}
+
+fn draw_job_phases(
+    grid: &mut Grid,
+    job: &crate::jobs::Job,
+    g: &Geom,
+    header: u16,
+    take: u16,
+    right: u16,
+) {
+    paint_str(grid, 2, header, "PHASES", C16::White, C16::Black);
+    let take_n = usize::from(take).min(job.phases.len());
+    for (i, phase) in job.phases.iter().take(take_n).enumerate() {
+        let row = header + 1 + i as u16;
+        let (mark, fg) = match phase.mark {
+            Some(crate::jobs::PhaseMark::Done) => ('•', C16::Green),
+            Some(crate::jobs::PhaseMark::Running) => ('•', C16::BrightRed),
+            Some(crate::jobs::PhaseMark::Queued) => ('·', C16::BrightBlack),
+            Some(crate::jobs::PhaseMark::Failed) => ('•', C16::Yellow),
+            None => ('·', C16::BrightBlack),
+        };
+        paint(grid, 2, row, mark, fg, C16::Black);
+        let mut x = 4usize;
+        let label = cut_text(&phase.label, 16);
+        x += paint_detail_fg(grid, x, usize::from(row), &label, 16, C16::BrightWhite);
+        x = x.max(22);
+        if let Some(elapsed) = phase.elapsed_s {
+            let text = job_duration(elapsed);
+            x += paint_detail_fg(grid, x, usize::from(row), &text, 16, C16::BrightBlack);
+            x += 2;
+        }
+        if let Some(result) = &phase.result {
+            let room = usize::from(right).saturating_sub(x);
+            paint_detail_fg(grid, x, usize::from(row), result, room, C16::White);
+        }
+        let _ = g;
+    }
+}
+
+fn draw_job_charts(
+    grid: &mut Grid,
+    job: &crate::jobs::Job,
+    g: &Geom,
+    start: u16,
+    height: u16,
+    glyphs: ChartGlyphs,
+    right: u16,
+) {
+    let series: Vec<&crate::jobs::JobSeries> = job.series.iter().take(2).collect();
+    if series.is_empty() || height < 5 {
+        return;
+    }
+    let n = series.len() as u16;
+    let gap = 1u16;
+    let each = (height.saturating_sub(gap * n.saturating_sub(1))) / n;
+    if each < 3 {
+        draw_one_job_chart(grid, series[0], g, start, height, glyphs, right);
+        return;
+    }
+    let mut y = start;
+    for (i, s) in series.iter().enumerate() {
+        draw_one_job_chart(grid, s, g, y, each, glyphs, right);
+        y = y.saturating_add(each);
+        if i + 1 < series.len() {
+            y = y.saturating_add(gap);
+        }
+    }
+}
+
+fn draw_one_job_chart(
+    grid: &mut Grid,
+    series: &crate::jobs::JobSeries,
+    g: &Geom,
+    start: u16,
+    height: u16,
+    glyphs: ChartGlyphs,
+    right: u16,
+) {
+    if height < 3 {
+        return;
+    }
+    let left = 2u16;
+    let _ = g;
+    let last = series.points.last().copied();
+    let mut head = series.label.clone();
+    if let Some(v) = last {
+        head.push(' ');
+        head.push_str(&job_compact(v));
+    }
+    paint_str(grid, left, start, &head, C16::White, C16::Black);
+    let (min, max) = series_bounds(&series.points);
+    right_align(
+        grid,
+        right,
+        start,
+        &job_compact(max),
+        C16::BrightBlack,
+        C16::Black,
+    );
+    right_align(
+        grid,
+        right,
+        start + height - 1,
+        &job_compact(min),
+        C16::BrightBlack,
+        C16::Black,
+    );
+    let data_top = start + 1;
+    let data_h = height.saturating_sub(2);
+    if data_h == 0 {
+        return;
+    }
+    let data_left = left;
+    let data_right = right.saturating_sub(8);
+    if data_right <= data_left {
+        return;
+    }
+    let width = usize::from(data_right - data_left + 1);
+    let span = (max - min).abs().max(1e-12);
+    let n = series.points.len();
+    for col in 0..width {
+        let idx = if n == 0 {
+            continue;
+        } else if n == 1 {
+            0
+        } else {
+            // newest at the right
+            let t = col as f64 / (width - 1) as f64;
+            ((t * (n - 1) as f64).round() as usize).min(n - 1)
+        };
+        let v = series.points[idx];
+        if !v.is_finite() {
+            continue;
+        }
+        let frac = ((v - min) / span).clamp(0.0, 1.0);
+        let colour = digit_colours(rate_step(frac * 5.0 + 0.01, 5.0)).1;
+        let cells = match glyphs {
+            ChartGlyphs::Halves => {
+                let level = crate::tty::chart::halves(frac, data_h).max(1);
+                half_inks(crate::tty::chart::rise_glyphs(level, data_h))
+            }
+            ChartGlyphs::Eighths => {
+                let level = crate::tty::chart::eighths(frac, data_h).max(1);
+                crate::tty::chart::rise_eighths(level, data_h)
+            }
+        };
+        let rows_n = usize::from(data_h);
+        for (i, ink) in cells.into_iter().enumerate() {
+            let from_axis = rows_n.saturating_sub(1).saturating_sub(i);
+            paint_ink(
+                grid,
+                data_left + col as u16,
+                data_top + i as u16,
+                ink,
+                colour,
+                chart_exact(grid, ink, from_axis, rows_n),
+            );
+        }
+    }
+}
+
+fn series_bounds(points: &[f64]) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in points {
+        if v.is_finite() {
+            min = min.min(v);
+            max = max.max(v);
+        }
+    }
+    if !min.is_finite() {
+        (0.0, 1.0)
+    } else if (max - min).abs() < 1e-12 {
+        (min - 1.0, max + 1.0)
+    } else {
+        (min, max)
+    }
+}
+
+/// Header one-line note for a live or finished job.
+pub(crate) fn job_note_line(job: &crate::jobs::Job, more: usize, live: bool) -> String {
+    let mut out = job.name.clone();
+    if more > 0 {
+        out.push_str(&format!(" +{more}"));
+    }
+    if live {
+        match (job.step, job.total) {
+            (Some(step), Some(total)) => {
+                out.push(' ');
+                out.push_str(&comma_pair(step, total));
+            }
+            (Some(step), None) => {
+                out.push(' ');
+                out.push_str(&commas(step));
+            }
+            _ => {}
+        }
+        if let Some(eta) = job.eta_s {
+            out.push(' ');
+            out.push_str(&job_duration(eta));
+            out.push_str(" left");
+        }
+    } else {
+        out.push(' ');
+        out.push_str(job.state.as_str());
+        if let Some(elapsed) = job.elapsed_s {
+            out.push(' ');
+            out.push_str(&job_duration(elapsed));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn job_digits_fit_four_characters() {
+        assert_eq!(job_digits(16.62), "16.6");
+        assert_eq!(job_digits(0.2544), "0.25");
+        assert_eq!(job_digits(1540.0), "1540");
+        assert_eq!(job_digits(3.285), "3.3");
+        assert_eq!(job_compact(1.276e-5), "1.28e-5");
+        assert_eq!(job_compact(0.8465), "0.8465");
+        assert_eq!(job_compact(0.96), "0.96");
+        assert_eq!(job_duration(2559), "43 min");
+        assert_eq!(job_duration(15_381), "4 h 16 min");
+        assert_eq!(job_duration(10_186), "2 h 50 min");
+        assert_eq!(job_duration(12), "12 s");
+    }
 
     /// #26: the layout's colour roles sit on the slots the palette module
     /// documents, so the llama palette paints them as designed.
