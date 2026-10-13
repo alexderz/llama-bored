@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use llama_core::log::Sink;
 use llama_core::sample::{AiState, LlamaView};
@@ -2863,17 +2863,32 @@ sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n",
     .into_bytes()
 }
 
-/// One activity row. `cache`, `prompt` and `gen_rate` are llama-swap's
+/// This second, as llama-swap writes an activity timestamp.
+fn sglang_stamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    format!(
+        "{}Z",
+        llama_watch::localtime::format_local(now, llama_watch::localtime::Zone::utc())
+    )
+}
+
+/// One activity page. `cache`, `prompt` and `gen_rate` are llama-swap's
 /// numbers; `-1` is its "not reported". `output` and `duration_ms` have to
-/// match the window or the row is not that request.
-fn sglang_activity(rows: &[(i64, i64, i64, i64, f64, f64, u64)]) -> Vec<u8> {
+/// match the window or the row is not that request. `stamps` is each row's
+/// own end time, in the same order: llama-swap does not rewrite it when
+/// the page is read again, and the ring treats a new timestamp as a new row.
+fn sglang_activity(rows: &[(i64, i64, i64, i64, f64, f64, u64)], stamps: &[String]) -> Vec<u8> {
     let data: Vec<serde_json::Value> = rows
         .iter()
+        .zip(stamps)
         .map(
-            |(id, input, output, cache, prompt, gen_rate, duration_ms)| {
+            |((id, input, output, cache, prompt, gen_rate, duration_ms), stamp)| {
                 serde_json::json!({
                     "id": id,
-                    "timestamp": format!("2026-10-13T10:00:{id:02}Z"),
+                    "timestamp": stamp,
                     "model": "flash",
                     "tokens": {
                         "input_tokens": input,
@@ -2914,12 +2929,16 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     thread::sleep(Duration::from_millis(500));
 
     // Prompt 1,000 (600 cached), TTFT 2 s, 401 generated, e2e 10 s.
+    let stamp1 = sglang_stamp();
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
             sglang_window((1, 0), 1_000, (400, 200), 401, (10.0, 1.0), (2.0, 1.0), 0),
         );
-        world.activity = sglang_activity(&[(1, 1_000, 401, -1, -1.0, -1.0, 10_000)]);
+        world.activity = sglang_activity(
+            &[(1, 1_000, 401, -1, -1.0, -1.0, 10_000)],
+            &[stamp1.clone()],
+        );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
         detail
@@ -2938,15 +2957,19 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     // rate. The window is clean (prompt 500, cached 300, TTFT 2 s, 100
     // generated, e2e 4 s). Those reported values stay. The generation
     // rate was not reported, so it is filled: (100 − 1) / (4 − 2) = 49.5.
+    let stamp2 = sglang_stamp();
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
             sglang_window((2, 0), 1_500, (700, 200), 501, (14.0, 2.0), (4.0, 2.0), 0),
         );
-        world.activity = sglang_activity(&[
-            (2, 500, 100, 0, 12.5, -1.0, 4_000),
-            (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
-        ]);
+        world.activity = sglang_activity(
+            &[
+                (2, 500, 100, 0, 12.5, -1.0, 4_000),
+                (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
+            ],
+            &[stamp2.clone(), stamp1.clone()],
+        );
     });
     wait_msg(&rx, Duration::from_secs(3), |_, detail| {
         detail.activity.iter().any(|row| row.id == 2)
@@ -2972,11 +2995,14 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             "flash".to_owned(),
             sglang_window((3, 0), 2_500, (800, 200), 902, (24.0, 3.0), (6.0, 3.0), 0),
         );
-        world.activity = sglang_activity(&[
-            (3, 1_000, 401, -1, 8.0, -1.0, 10_000),
-            (2, 500, 100, 0, 12.5, -1.0, 4_000),
-            (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
-        ]);
+        world.activity = sglang_activity(
+            &[
+                (3, 1_000, 401, -1, 8.0, -1.0, 10_000),
+                (2, 500, 100, 0, 12.5, -1.0, 4_000),
+                (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
+            ],
+            &[sglang_stamp(), stamp2, stamp1],
+        );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
         detail

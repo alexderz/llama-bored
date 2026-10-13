@@ -1200,8 +1200,12 @@ impl<L: Sink> State<L> {
                 let engine = self.engines.observe(&model.id, sample);
                 self.speeds.observe(&model.id, now, sample.speeds);
                 if model.backend == Backend::SgLang {
-                    self.sglang
-                        .observe(&model.id, now, Totals::from_sample(sample));
+                    self.sglang.observe(
+                        &model.id,
+                        now,
+                        SystemTime::now(),
+                        Totals::from_sample(sample),
+                    );
                 }
                 self.gauges
                     .insert(model.id.clone(), Gauges::of(sample, engine, live, now));
@@ -1717,6 +1721,7 @@ impl<L: Sink> State<L> {
                     duration_ms: row.duration_ms,
                     prompt_known: row.prompt_tps.is_some(),
                     gen_known: row.gen_tps.is_some(),
+                    timestamp: Some(row.time.clone()),
                 });
             }
         }
