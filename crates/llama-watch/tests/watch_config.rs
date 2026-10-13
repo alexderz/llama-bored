@@ -321,6 +321,8 @@ enum Rule {
     TtySize,
     GridSize,
     GridPath,
+    JobsDir,
+    JobsStale,
 }
 
 fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
@@ -359,6 +361,8 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::TtySize { .. }) => Rule::TtySize,
         Err(InvalidWatchConfig::GridSize { .. }) => Rule::GridSize,
         Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
+        Err(InvalidWatchConfig::JobsDir { .. }) => Rule::JobsDir,
+        Err(InvalidWatchConfig::JobsStale { .. }) => Rule::JobsStale,
     }
 }
 
@@ -1926,4 +1930,38 @@ fn specs_dir_is_an_absolute_path_and_is_not_opened() {
     .expect("parses");
     assert!(cfg.setup.specs_dir.is_none());
     cfg.validate(8).expect("a spec rule with no directory");
+}
+
+/// `[jobs] dir` is an absolute path, not opened at load. `stale_s` is 10..=3600.
+#[test]
+fn jobs_dir_is_an_absolute_path_and_stale_s_is_bounded() {
+    use std::path::PathBuf;
+
+    let mut cfg = Config::default();
+    assert!(cfg.jobs.dir.is_none());
+    assert_eq!(cfg.jobs.stale_s, 180);
+    cfg.validate(8).expect("unset jobs dir");
+
+    cfg.jobs.dir = Some(PathBuf::from("jobs"));
+    let err = cfg.validate(8).expect_err("relative");
+    assert_eq!(rule_of(Err(err)), Rule::JobsDir);
+
+    let mut cfg = Config::default();
+    cfg.jobs.dir = Some(PathBuf::from("/var/lib/llama-bored/jobs"));
+    cfg.validate(8).expect("an absolute path is not opened");
+
+    let mut cfg = Config::default();
+    cfg.jobs.stale_s = 9;
+    assert_eq!(rule_of(cfg.validate(8)), Rule::JobsStale);
+    cfg.jobs.stale_s = 3601;
+    assert_eq!(rule_of(cfg.validate(8)), Rule::JobsStale);
+    cfg.jobs.stale_s = 10;
+    cfg.validate(8).expect("10 is allowed");
+    cfg.jobs.stale_s = 3600;
+    cfg.validate(8).expect("3600 is allowed");
+
+    let cfg = Config::from_toml("[jobs]\nstale_s = 60\n").expect("parses");
+    assert!(cfg.jobs.dir.is_none());
+    assert_eq!(cfg.jobs.stale_s, 60);
+    cfg.validate(8).expect("stale_s only");
 }
