@@ -1078,8 +1078,8 @@ In truecolor and 256 colours a full block (`█`) is sent with its
 background set to its own colour (#120). A terminal that draws the glyph
 from an anti-aliased font can leave a pixel row of the cell short of the
 colour, which shows as thin lines between stacked blocks; the background
-always fills the cell. `--colors 16` sends the cell as it is, because a
-background there has eight colours.
+always fills the cell. `--colors 16` is left as it is. The eight-colour
+background limit is the Linux console's.
 
 `LLAMA_VIEW_COLORS` and `LLAMA_VIEW_PALETTE` set the same from the
 environment, for saved SSH sessions that cannot pass flags; a flag wins.
@@ -1174,7 +1174,8 @@ cell's position. The big digits take the ramp of their value, shaded by
 row. Each filled chart cell takes the ramp of the level its row stands for.
 A temperature reading with warn and crit thresholds takes a ramp anchored
 to those marks: the normal colour until 10 degrees under the warning, the
-warn colour at it, the crit colour at the critical mark. Capacity bars,
+`#FFD050` stop four degrees under it, the warn colour at the warning, and
+the crit colour at the critical mark. Capacity bars,
 the RECENT bars, labels, the empty bar track and other text stay on the
 palette. The console draws the palette step
 either way. `false` writes each cell's palette RGB, and when the size
