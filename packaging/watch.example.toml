@@ -415,6 +415,14 @@ enabled = true
 #map = { "true" = "on", "false" = "off" }
 #order = 50
 #
+# Job status files for the job view. Unset `dir` (the default) opens
+# nothing; every frame is unchanged. The directory is not opened at load,
+# and a symlink is not followed. Copy the block below, without the leading
+# "#", into watch.toml. See docs/job-status.md for the file format.
+#[jobs]
+#dir = "/var/lib/llama-bored/jobs"
+#stale_s = 180                       # 10..=3600; a file older than this is not shown
+#
 #[[setup.field]]
 #row = "think"
 #source = "spec:thinking.server_budget"
