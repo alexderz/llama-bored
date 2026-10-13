@@ -2207,7 +2207,60 @@ fn format_span(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::{Job, JobState};
     use llama_core::backend::{Backend, BackendInfo};
+
+    fn job_at(name: &str, state: JobState, mtime: SystemTime) -> Job {
+        Job {
+            file: name.to_owned(),
+            name: name.to_owned(),
+            kind: Some("training".to_owned()),
+            title: None,
+            state,
+            phase: None,
+            step: None,
+            total: None,
+            elapsed_s: None,
+            eta_s: None,
+            rate: None,
+            rates: Vec::new(),
+            values: Vec::new(),
+            series: Vec::new(),
+            phases: Vec::new(),
+            mtime,
+        }
+    }
+
+    #[test]
+    fn job_and_note_serving_keeps_the_note_idle_gets_the_view() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let fresh = now - Duration::from_secs(10);
+        let running = job_at("run", JobState::Running, fresh);
+
+        let (view, note) = job_and_note(std::slice::from_ref(&running), true, 180, now);
+        assert!(view.is_none(), "serving keeps inference: {view:?}");
+        let note = note.expect("serving live job is a one-line note");
+        assert!(note.starts_with("run"), "{note}");
+
+        let (view, note) = job_and_note(std::slice::from_ref(&running), false, 180, now);
+        let view = view.expect("idle with a live job is the job view");
+        assert_eq!(view.job.name, "run");
+        assert!(note.is_none(), "idle live job has no note: {note:?}");
+
+        let done = job_at("wrap", JobState::Done, fresh);
+        let (view, note) = job_and_note(std::slice::from_ref(&done), false, 180, now);
+        assert!(view.is_none(), "done is not the job view: {view:?}");
+        let note = note.expect("done job is a one-line note");
+        assert!(note.contains("wrap"), "{note}");
+        assert!(note.contains("done"), "{note}");
+
+        let failed = job_at("boom", JobState::Failed, fresh);
+        let (view, note) = job_and_note(std::slice::from_ref(&failed), false, 180, now);
+        assert!(view.is_none(), "failed is not the job view: {view:?}");
+        let note = note.expect("failed job is a one-line note");
+        assert!(note.contains("boom"), "{note}");
+        assert!(note.contains("failed"), "{note}");
+    }
 
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
     /// none, and marks them; a llama.cpp row keeps its own.
