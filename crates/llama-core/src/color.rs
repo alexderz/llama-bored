@@ -114,8 +114,11 @@ pub const fn hex(value: u32) -> Rgb {
 /// ramp position of the same reading, and [`act_color`] turns that into the
 /// colour the grid file writes. A bar or a rate scale runs the whole ramp:
 /// the first stop at its low end, the last [`ACT_STOPS`] stop at full
-/// scale (#123). The console's five steps are the five gaps between the
-/// stops, so the middle of a band is half a band above the step the
+/// scale (#123). A run of more than one cell is sampled at its ends, so
+/// the first cell is the first stop and the last cell is the top of the
+/// scale; one cell is the middle, and an empty run is the first stop
+/// (#130). The console's five steps are the five gaps between the stops,
+/// so a value in the middle of a band sits half a band above the step the
 /// console paints there. Above 100 the position continues into
 /// [`BB_STOPS`].
 pub mod spectrum {
@@ -132,9 +135,11 @@ pub mod spectrum {
     /// right edge and a rate at its ceiling are here.
     pub const FULL: f32 = ACT_STOPS[BANDS].0;
 
-    /// Ramp position of the cell at `index` in a run of `len`, measured at
-    /// the cell's centre: the first stop at the run's left edge, [`FULL`] at
-    /// its right edge (#123). An empty run is the first stop.
+    /// Ramp position of the cell at `index` in a run of `len` (#130).
+    ///
+    /// More than one cell is sampled at the ends: index 0 is the first stop
+    /// and the last cell is [`FULL`]. One cell is the middle of that scale.
+    /// An empty run is the first stop.
     #[must_use]
     pub fn place(index: usize, len: usize) -> f32 {
         place_to(index, len, FULL)
@@ -142,8 +147,9 @@ pub mod spectrum {
 
     /// [`place`] on a scale that ends at `top` instead of [`FULL`]: a bar
     /// past full scale is the same ramp stretched to its value, so no cell
-    /// jumps when the value crosses 100 and the bar has no seam. `top` is
-    /// held between [`FULL`] and the end of the blackbody tail.
+    /// jumps when the value crosses 100 and the bar has no seam (#123).
+    /// The last cell of a longer run is `top`. `top` is held between
+    /// [`FULL`] and the end of the blackbody tail.
     #[must_use]
     pub fn place_to(index: usize, len: usize, top: f32) -> f32 {
         if len == 0 {
@@ -154,7 +160,12 @@ pub mod spectrum {
         } else {
             FULL
         };
-        let frac = (index as f32 + 0.5) / len as f32;
+        // One cell has no ends to sample, so it takes the middle.
+        let frac = if len == 1 {
+            0.5
+        } else {
+            index as f32 / (len as f32 - 1.0)
+        };
         ACT_STOPS[0].0 + frac * (top - ACT_STOPS[0].0)
     }
 
@@ -173,12 +184,17 @@ pub mod spectrum {
     /// Ramp position of `value` on the logarithmic rate scale whose top is
     /// `ceiling` (the same scale that picks the console's step): the first
     /// stop at the bottom of the scale, [`FULL`] at `ceiling`. Above it the
-    /// position climbs into the blackbody tail. A non-finite, non-positive
-    /// value or ceiling is the first stop.
+    /// position climbs into the blackbody tail. Positive infinity with a
+    /// valid ceiling is the end of that tail (#130). NaN, a non-positive
+    /// value, or a ceiling that is not a positive finite number, is the
+    /// first stop.
     #[must_use]
     pub fn rate(value: f64, ceiling: f64) -> f32 {
-        if !value.is_finite() || !ceiling.is_finite() || value <= 0.0 || ceiling <= 0.0 {
+        if !ceiling.is_finite() || ceiling <= 0.0 || value.is_nan() || value <= 0.0 {
             return ACT_STOPS[0].0;
+        }
+        if value.is_infinite() {
+            return BB_STOPS[BB_STOPS.len() - 1].0;
         }
         let bands = BANDS as f64;
         let frac = ((value / ceiling).log2() + bands) / bands;
@@ -257,9 +273,6 @@ mod tests {
         ACT_STOPS[1].0 - ACT_STOPS[0].0
     }
 
-    /// From the first stop to full scale.
-    const FULL_SPAN: f32 = spectrum::FULL - ACT_STOPS[0].0;
-
     fn near(got: f32, want: f32) {
         assert!((got - want).abs() < 1.0e-3, "{got} vs {want}");
     }
@@ -271,25 +284,49 @@ mod tests {
             .max(a.b.abs_diff(b.b))
     }
 
+    /// Channels a tenth of a degree may move on the steepest stop-to-stop
+    /// slope, plus one for rounding. Wider than that is a jump.
+    fn step_bound(warn: f32, crit: f32) -> u8 {
+        let stops = [
+            (warn - temp::COOL_SPAN, temp::NORMAL),
+            (warn - temp::WARM_SPAN, temp::WARM),
+            (warn, temp::WARN),
+            (crit, temp::CRIT),
+        ];
+        let mut per_degree = 0.0f32;
+        for pair in stops.windows(2) {
+            let span = pair[1].0 - pair[0].0;
+            for (from, to) in [
+                (pair[0].1.r, pair[1].1.r),
+                (pair[0].1.g, pair[1].1.g),
+                (pair[0].1.b, pair[1].1.b),
+            ] {
+                per_degree = per_degree.max(f32::from(from.abs_diff(to)) / span);
+            }
+        }
+        let per_tenth = per_degree * 0.1;
+        (per_tenth.floor() as u32).saturating_add(1).min(255) as u8
+    }
+
     #[test]
     fn a_bar_runs_from_the_first_stop_to_the_last() {
-        let wide = 1000;
-        let half = FULL_SPAN / (2.0 * wide as f32);
-        near(spectrum::place(0, wide), ACT_STOPS[0].0 + half);
-        near(spectrum::place(wide - 1, wide), spectrum::FULL - half);
-        assert_eq!(spectrum::place(0, 0), ACT_STOPS[0].0);
-        assert!(gap(act_color(spectrum::place(0, wide)), ACT_STOPS[0].1) <= 1);
-        assert!(
-            gap(
-                act_color(spectrum::place(wide - 1, wide)),
-                ACT_STOPS[ACT_STOPS.len() - 1].1
-            ) <= 1
+        let last = ACT_STOPS[ACT_STOPS.len() - 1].1;
+        for width in [2usize, 5, 67, 1000] {
+            assert_eq!(spectrum::place(0, width), ACT_STOPS[0].0, "width {width}");
+            near(spectrum::place(width - 1, width), spectrum::FULL);
+            assert_eq!(act_color(spectrum::place(0, width)), ACT_STOPS[0].1);
+            assert_eq!(act_color(spectrum::place(width - 1, width)), last);
+        }
+        // No ends to sample: the only cell is the middle of the scale.
+        near(
+            spectrum::place(0, 1),
+            (ACT_STOPS[0].0 + spectrum::FULL) / 2.0,
         );
-        // A band's centre is half a band above the console's step for that
-        // band: the console paints the band's first stop, the ramp its middle.
+        assert_eq!(spectrum::place(0, 0), ACT_STOPS[0].0);
+        // The console's five steps are these stops. A value in the middle
+        // of a band is what `rate` covers; a cell run is the ends.
         let bands = ACT_STOPS.len() - 1;
         for (k, stop) in ACT_STOPS.iter().enumerate().take(bands) {
-            near(spectrum::place(k, bands), stop.0 + step() / 2.0);
             assert_eq!(stop.1, Palette::Llama.rgb(role::SPECTRUM[k]), "band {k}");
         }
     }
@@ -332,11 +369,11 @@ mod tests {
             assert!((above - at).abs() <= 0.5, "cell {index}");
             assert!(gap(act_color(above), act_color(at)) <= 4, "cell {index}");
         }
-        // At the end of the tail the last cell is half a cell short of it,
-        // and the first cell has hardly moved.
-        let half = (end - ACT_STOPS[0].0) / (2.0 * len as f32);
-        near(spectrum::place_to(len - 1, len, end), end - half);
-        assert!(spectrum::place_to(0, len, end) < 2.0);
+        // At the end of the tail the last cell is the tail and the first
+        // cell is still the first stop. One cell is the middle of that scale.
+        near(spectrum::place_to(len - 1, len, end), end);
+        assert_eq!(spectrum::place_to(0, len, end), ACT_STOPS[0].0);
+        near(spectrum::place_to(0, 1, end), (ACT_STOPS[0].0 + end) / 2.0);
         // A top outside the tail is held to it.
         assert_eq!(
             spectrum::place_to(3, len, 1000.0),
@@ -378,8 +415,19 @@ mod tests {
         assert_eq!(spectrum::rate(0.0, ceiling), ACT_STOPS[0].0);
         assert_eq!(spectrum::rate(-1.0, ceiling), ACT_STOPS[0].0);
         assert_eq!(spectrum::rate(f64::NAN, ceiling), ACT_STOPS[0].0);
+        assert_eq!(spectrum::rate(f64::NEG_INFINITY, ceiling), ACT_STOPS[0].0);
         assert_eq!(spectrum::rate(1.0, 0.0), ACT_STOPS[0].0);
         assert_eq!(spectrum::rate(1.0, f64::INFINITY), ACT_STOPS[0].0);
+        // Positive infinity with a valid ceiling is the end of the tail.
+        // An unusable ceiling keeps the first stop.
+        assert_eq!(spectrum::rate(f64::INFINITY, ceiling), tail);
+        assert_eq!(
+            act_color(spectrum::rate(f64::INFINITY, ceiling)),
+            BB_STOPS[BB_STOPS.len() - 1].1
+        );
+        assert_eq!(spectrum::rate(f64::INFINITY, f64::NAN), ACT_STOPS[0].0);
+        assert_eq!(spectrum::rate(f64::INFINITY, f64::INFINITY), ACT_STOPS[0].0);
+        assert_eq!(spectrum::rate(f64::INFINITY, -1.0), ACT_STOPS[0].0);
     }
 
     #[test]
@@ -429,16 +477,31 @@ mod tests {
         assert_eq!(coolant(41.0), temp::WARM);
         assert_eq!(coolant(45.0), temp::WARN);
         // The ramp has no jump anywhere, for low and negative thresholds
-        // too, and far under the warning it is the normal colour.
-        for (warn, crit) in [(5.0_f32, 15.0_f32), (45.0, 55.0), (-5.0, 5.0), (80.0, 90.0)] {
+        // too, and far under the warning it is the normal colour. The
+        // bound is the steepest slope of these stops over a tenth of a
+        // degree, so a real jump fails it. A warning and a critical mark
+        // one tenth of a degree apart is the last pair: the whole
+        // warn-to-crit gap is then one sample, which that slope allows.
+        for (warn, crit) in [
+            (5.0_f32, 15.0_f32),
+            (45.0, 55.0),
+            (-5.0, 5.0),
+            (80.0, 90.0),
+            (80.0, 80.1),
+        ] {
             let at = |c| temp::color(c, warn, crit).expect("thresholds");
             assert_eq!(at(warn - temp::COOL_SPAN - 20.0), temp::NORMAL);
+            let bound = step_bound(warn, crit);
             let mut celsius = warn - temp::COOL_SPAN - 2.0;
             let mut last = at(celsius);
             while celsius < crit + 2.0 {
                 celsius += 0.1;
                 let here = at(celsius);
-                assert!(gap(here, last) <= 12, "warn {warn}: a jump at {celsius}");
+                assert!(
+                    gap(here, last) <= bound,
+                    "warn {warn} crit {crit}: a jump of {} at {celsius} (bound {bound})",
+                    gap(here, last)
+                );
                 last = here;
             }
             assert_eq!(last, temp::CRIT);
