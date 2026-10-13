@@ -6251,6 +6251,51 @@ fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
     assert_eq!(flying, 4);
 }
 
+/// An in-flight llama.cpp prefill that omitted `prompt_cached` keeps the
+/// done/pending split and the prefill cursor. Before #133
+/// that omitted count was drawn as cached 0, so the whole prompt is new;
+/// the bars match, and there is no blue cached run. Only the CACHED cell
+/// is `--`.
+#[test]
+fn an_inflight_prefill_without_a_cached_count_keeps_its_progress_and_cursor() {
+    let mut parent = flight_row(48_000, 0, None);
+    parent.cached_tok = 0;
+    parent.cached_unknown = false;
+    parent.prompt_tps = Some(10.0);
+    parent.gen_tps = Some(10.0);
+    parent.inflight.as_mut().expect("flight").beats = 2;
+    let mut unknown = parent.clone();
+    unknown.cached_unknown = true;
+
+    let parent_grid = draw(&bar_model(vec![parent], ChartGlyphs::Eighths), 192, 60);
+    let unknown_grid = draw(&bar_model(vec![unknown], ChartGlyphs::Eighths), 192, 60);
+    let header = row_with(&parent_grid, "RECENT");
+    let parent_bar = bar_of(&parent_grid, header + 1);
+    let unknown_bar = bar_of(&unknown_grid, header + 1);
+    assert_eq!(
+        unknown_bar, parent_bar,
+        "the bar matches the cached-0 drawing, cursor included"
+    );
+    assert!(
+        unknown_bar.iter().any(|(_, fg)| *fg == SPIN[2]),
+        "the prefill cursor is on the growing segment: {unknown_bar:?}"
+    );
+    assert!(
+        unknown_bar
+            .iter()
+            .any(|(ch, fg)| *ch == '\u{2581}' && *fg == C16::BrightCyan),
+        "the rest of the prompt stays pending: {unknown_bar:?}"
+    );
+    assert!(
+        unknown_bar.iter().all(|(_, fg)| *fg != C16::Blue),
+        "no cached split: {unknown_bar:?}"
+    );
+    let unknown_text = row_string(&unknown_grid, header + 1);
+    let parent_text = row_string(&parent_grid, header + 1);
+    assert!(unknown_text.contains("--"), "{unknown_text}");
+    assert_ne!(unknown_text, parent_text);
+}
+
 /// #78: a llama.cpp prefill whose whole prompt `/slots` does not give:
 /// IN is the held count with a `+`, the bar has no pending target.
 #[test]
