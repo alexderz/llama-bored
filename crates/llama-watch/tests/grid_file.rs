@@ -957,6 +957,8 @@ fn busy_frame() -> TtyModel {
                 },
             ],
         }),
+        job: None,
+        job_note: None,
     }
 }
 

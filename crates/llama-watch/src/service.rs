@@ -418,6 +418,7 @@ where
         show_text: input.config.tty.show_text,
         setup: Rules::compile(&input.config.setup).unwrap_or_default(),
         temps_look: crate::sources::temps::TempLook::new(&input.config.temps),
+        jobs_stale_s: input.config.jobs.stale_s,
     };
     let mut state = TickState::new(
         input.config.tty.chart_bucket_s,
@@ -501,6 +502,7 @@ impl TickState {
                 suspected_loads: Vec::new(),
                 series: Vec::new(),
                 requests: Vec::new(),
+                jobs: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -538,6 +540,8 @@ struct FrameCtx {
     setup: Rules,
     /// `[temps]` renames and thresholds, for the TEMPS panel (#74).
     temps_look: crate::sources::temps::TempLook,
+    /// `[jobs] stale_s`.
+    jobs_stale_s: u64,
 }
 
 fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
@@ -890,7 +894,14 @@ pub fn run(args: &RunArgs) -> i32 {
             return 1;
         }
     };
-    let (poller, feed) = if prepared.config.llama.enabled {
+    let (poller, feed) = if prepared.config.llama.enabled || prepared.config.jobs.dir.is_some() {
+        if !prepared.config.llama.enabled {
+            log::emit(
+                &mut log::Stderr,
+                Priority::Info,
+                "llama-swap polling is off ([llama] enabled = false)",
+            );
+        }
         match poller::spawn(&prepared.config, log::Stderr) {
             Ok((poller, rx)) => (Some(poller), SlotFeed::new(rx)),
             Err(err) => {
@@ -987,6 +998,12 @@ fn tty_model(
     };
     let mem_total = ctx.mem_total_bytes.map(gib);
     let mem_used = mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes).map(gib);
+    let job_and_note = job_and_note(
+        &tick.detail.jobs,
+        serving_models(sample),
+        ctx.jobs_stale_s,
+        wall,
+    );
     TtyModel {
         state: watch,
         host: ctx.host.clone(),
@@ -1080,6 +1097,52 @@ fn tty_model(
             .map(|readings| crate::sources::temps::panel(readings, &ctx.temps_look)),
         ctx_history_h: ctx.ctx_history_h,
         setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
+        job: job_and_note.0,
+        job_note: job_and_note.1,
+    }
+}
+
+fn serving_models(sample: &WatchSample) -> bool {
+    !sample.snapshot.models.is_empty()
+}
+
+fn job_and_note(
+    jobs: &[crate::jobs::Job],
+    serving: bool,
+    stale_s: u64,
+    now: SystemTime,
+) -> (Option<layout::JobView>, Option<String>) {
+    let fresh: Vec<&crate::jobs::Job> = jobs
+        .iter()
+        .filter(|job| !crate::jobs::is_stale(job.mtime, now, stale_s))
+        .collect();
+    let live: Vec<&crate::jobs::Job> = fresh
+        .iter()
+        .copied()
+        .filter(|job| job.state == crate::jobs::JobState::Running)
+        .collect();
+    if let Some(job) = live.first() {
+        let more = live.len().saturating_sub(1);
+        if serving {
+            (None, Some(layout::job_note_line(job, more, true)))
+        } else {
+            (
+                Some(layout::JobView {
+                    job: (*job).clone(),
+                    more,
+                }),
+                None,
+            )
+        }
+    } else if let Some(job) = fresh.iter().copied().find(|job| {
+        matches!(
+            job.state,
+            crate::jobs::JobState::Done | crate::jobs::JobState::Failed
+        )
+    }) {
+        (None, Some(layout::job_note_line(job, 0, false)))
+    } else {
+        (None, None)
     }
 }
 
@@ -2800,6 +2863,7 @@ mod tests {
                     suspected_loads: Vec::new(),
                     series: Vec::new(),
                     requests: Vec::new(),
+                    jobs: Vec::new(),
                 },
             ))
         }
@@ -2950,6 +3014,7 @@ mod tests {
                     suspected_loads: Vec::new(),
                     series: Vec::new(),
                     requests: Vec::new(),
+                    jobs: Vec::new(),
                 },
             ))
         }
@@ -3167,6 +3232,7 @@ mod tests {
             show_text: false,
             setup: Rules::builtin(),
             temps_look: crate::sources::temps::TempLook::default(),
+            jobs_stale_s: 180,
         }
     }
 

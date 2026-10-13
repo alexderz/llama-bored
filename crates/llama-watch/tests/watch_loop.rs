@@ -1330,6 +1330,7 @@ fn empty_detail() -> LlamaDetail {
         suspected_loads: Vec::new(),
         series: Vec::new(),
         requests: Vec::new(),
+        jobs: Vec::new(),
     }
 }
 
