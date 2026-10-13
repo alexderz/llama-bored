@@ -490,12 +490,23 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         C16::BrightBlack,
         C16::Black,
     );
-    let (pip_fg, word, word_fg, word_bg) = match model.state {
-        WatchState::Generating => (C16::BrightRed, "GENERATING", C16::BrightRed, C16::Black),
-        WatchState::Ready => (C16::Green, "READY", C16::Green, C16::Black),
-        WatchState::AiDown => (C16::Yellow, " AI DOWN ", C16::Black, C16::Yellow),
-        WatchState::Starting => (C16::BrightBlack, "STARTING", C16::BrightBlack, C16::Black),
-        WatchState::NoLlama => (C16::BrightBlack, "NO LLAMA", C16::BrightBlack, C16::Black),
+    let job_word = model.job.as_ref().map(|view| {
+        view.job
+            .kind
+            .as_deref()
+            .map(|kind| kind.to_ascii_uppercase())
+            .unwrap_or_else(|| "JOB".to_owned())
+    });
+    let (pip_fg, word, word_fg, word_bg) = if let Some(word) = job_word.as_deref() {
+        (C16::BrightRed, word, C16::BrightRed, C16::Black)
+    } else {
+        match model.state {
+            WatchState::Generating => (C16::BrightRed, "GENERATING", C16::BrightRed, C16::Black),
+            WatchState::Ready => (C16::Green, "READY", C16::Green, C16::Black),
+            WatchState::AiDown => (C16::Yellow, " AI DOWN ", C16::Black, C16::Yellow),
+            WatchState::Starting => (C16::BrightBlack, "STARTING", C16::BrightBlack, C16::Black),
+            WatchState::NoLlama => (C16::BrightBlack, "NO LLAMA", C16::BrightBlack, C16::Black),
+        }
     };
     paint(grid, 24, 0, '█', pip_fg, C16::Black);
     paint_str(grid, 26, 0, word, word_fg, word_bg);
@@ -538,21 +549,23 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         limit,
     );
     let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
-    if let Some(note) = &model.job_note {
-        let room = limit.saturating_sub(usize::from(tag_at));
-        if room >= 4 {
-            let shown = cut_text(note, room);
-            let n = shown.chars().count();
-            paint_fit(grid, tag_at, 0, &shown, C16::BrightWhite, C16::Black, n);
-        }
-    }
-    paint_str(grid, start, 0, &temps, fg, C16::Black);
+    let mut note_at = tag_at;
     if !model.show_text {
         let tag_end = usize::from(tag_at).saturating_add(TEXT_OFF_TAG.chars().count());
         if tag_end.saturating_add(2) <= usize::from(start) {
             paint_str(grid, tag_at, 0, TEXT_OFF_TAG, C16::BrightBlack, C16::Black);
+            note_at = col_u16(tag_end.saturating_add(2));
         }
     }
+    if let Some(note) = &model.job_note {
+        let room = limit.saturating_sub(usize::from(note_at));
+        if room >= 4 {
+            let shown = cut_text(note, room);
+            let n = shown.chars().count();
+            paint_fit(grid, note_at, 0, &shown, C16::BrightWhite, C16::Black, n);
+        }
+    }
+    paint_str(grid, start, 0, &temps, fg, C16::Black);
 }
 
 /// Header tag while `tty.show_text = false`.
@@ -590,17 +603,22 @@ fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
     let label_len = label.chars().count();
     paint_fit(grid, x, 0, label, C16::BrightBlack, C16::Black, label_len);
     let vx = usize::from(x).saturating_add(label_len).saturating_add(1);
-    let drawn = model.model_name.chars().count().min(MODEL_NAME_CAP);
+    let job_name = model.job.as_ref().map(|view| view.job.name.as_str());
+    let name = job_name.unwrap_or(model.model_name.as_str());
+    let drawn = name.chars().count().min(MODEL_NAME_CAP);
     paint_fit(
         grid,
         col_u16(vx),
         0,
-        &model.model_name,
+        name,
         name_fg(model),
         C16::Black,
         drawn,
     );
     let mut end = vx.saturating_add(drawn);
+    if job_name.is_some() {
+        return col_u16(end.saturating_add(3));
+    }
     if model.model_stuck {
         let sx = end.saturating_add(2);
         paint_str(grid, col_u16(sx), 0, STUCK_TAG, C16::Yellow, C16::Black);
@@ -4558,10 +4576,11 @@ pub(crate) fn comma_pair(done: u64, total: u64) -> String {
 
 /// Elapsed or remaining time for a job: `43 min`, `4 h 16 min`, `12 s`.
 pub(crate) fn job_duration(secs: u64) -> String {
+    let secs = secs.min(crate::jobs::MAX_DURATION_S);
     if secs < 60 {
         return format!("{secs} s");
     }
-    let mins = (secs + 30) / 60;
+    let mins = secs.saturating_add(30) / 60;
     let hours = mins / 60;
     let mins = mins % 60;
     if hours > 0 {
@@ -4575,27 +4594,101 @@ pub(crate) fn job_duration(secs: u64) -> String {
     }
 }
 
-/// Big-digit text: at most four characters (`16.6`, `0.25`, `1540`, `3.3`).
+/// Scale applied to [`job_digits`] so the caption carries k / M / `x1e-N`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DigitScale {
+    One,
+    Kilo,
+    Mega,
+    Exp(i32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DigitFmt {
+    pub text: String,
+    pub scale: DigitScale,
+}
+
+/// Big-digit text: at most four characters (`16.6`, `0.25`, `1540`, `9999`).
+/// Never contains `e`. A value of 10,000 or more uses a k/M scale in the
+/// caption; a value under 0.01 uses `x1eN` there.
+#[allow(dead_code)]
 pub(crate) fn job_digits(value: f64) -> String {
+    job_digit_fmt(value).text
+}
+
+pub(crate) fn job_digit_fmt(value: f64) -> DigitFmt {
     if !value.is_finite() {
-        return "--".to_owned();
+        return DigitFmt {
+            text: "--".to_owned(),
+            scale: DigitScale::One,
+        };
     }
     let sign = if value < 0.0 { "-" } else { "" };
     let abs = value.abs();
-    let body = if abs >= 9999.5 {
-        job_sci(abs)
+    if abs == 0.0 {
+        return DigitFmt {
+            text: "0".to_owned(),
+            scale: DigitScale::One,
+        };
+    }
+    if abs >= 1_000_000.0 {
+        return DigitFmt {
+            text: format!("{sign}{}", four_char(abs / 1_000_000.0)),
+            scale: DigitScale::Mega,
+        };
+    }
+    if abs >= 9999.5 {
+        return DigitFmt {
+            text: format!("{sign}{}", four_char(abs / 1_000.0)),
+            scale: DigitScale::Kilo,
+        };
+    }
+    if abs >= 0.01 {
+        return DigitFmt {
+            text: format!("{sign}{}", four_char(abs)),
+            scale: DigitScale::One,
+        };
+    }
+    let mut exp = abs.log10().floor() as i32;
+    let mut mantissa = abs / 10f64.powi(exp);
+    if mantissa >= 9.995 {
+        exp += 1;
+        mantissa = abs / 10f64.powi(exp);
+    }
+    DigitFmt {
+        text: format!("{sign}{mantissa:.2}"),
+        scale: DigitScale::Exp(exp),
+    }
+}
+
+/// At most four characters, no exponent. `abs` is in a range that fits.
+fn four_char(abs: f64) -> String {
+    if abs >= 1000.0 {
+        format!("{:.0}", abs.min(9999.0))
     } else if abs >= 100.0 {
         format!("{:.0}", abs)
+    } else if abs >= 10.0 {
+        let text = format!("{abs:.1}");
+        if text.len() > 4 {
+            format!("{:.0}", abs.round())
+        } else {
+            text
+        }
     } else if abs >= 1.0 {
-        format!("{:.1}", abs)
-    } else if abs >= 0.01 {
-        format!("{:.2}", abs)
-    } else if abs == 0.0 {
-        "0".to_owned()
+        format!("{abs:.1}")
     } else {
-        job_sci(abs)
-    };
-    format!("{sign}{body}")
+        format!("{abs:.2}")
+    }
+}
+
+fn scale_caption(base: &str, scale: DigitScale) -> String {
+    match scale {
+        DigitScale::One => base.to_owned(),
+        DigitScale::Kilo => format!("K {base}"),
+        DigitScale::Mega => format!("M {base}"),
+        DigitScale::Exp(exp) => format!("{base} x1e{exp}"),
+    }
 }
 
 /// Compact number for the VALUES block (`1.28e-5`, `0.8465`, `0.96`).
@@ -4702,24 +4795,13 @@ fn draw_job(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         g.cols.saturating_sub(3)
     };
     let body = body_end.saturating_sub(y);
-    let mut chart_h = if body >= chart_min && chart_min > 0 {
-        body.min(if g.rows >= 60 { 16 } else { 10 })
-    } else {
-        0
-    };
     let phase_n = u16::try_from(job.phases.len()).unwrap_or(0);
     let phase_need = if phase_n == 0 { 0 } else { 1 + phase_n + 1 };
-    if phase_need > 0 && chart_h > 0 && y + phase_need + chart_h > body_end {
-        if body.saturating_sub(chart_min) >= 3 {
-            chart_h = chart_h.min(body.saturating_sub(3));
-        } else {
-            // Charts outrank PHASES: keep the charts.
-        }
-    }
-    let keep_phases =
-        phase_need > 0 && y + phase_need + chart_h <= body_end && body.saturating_sub(chart_h) >= 3;
+    // PHASES stays when charts still get at least five rows after it.
+    // Charts outrank PHASES only when both will not fit.
+    let keep_phases = phase_need > 0 && body >= phase_need.saturating_add(chart_min);
     if keep_phases {
-        let take = phase_n.min(body_end.saturating_sub(y + 1 + chart_h));
+        let take = phase_n.min(body_end.saturating_sub(y + 1));
         if take > 0 {
             draw_job_phases(grid, job, g, y, take, content_right);
             y = y.saturating_add(1).saturating_add(take).saturating_add(1);
@@ -4728,12 +4810,10 @@ fn draw_job(grid: &mut Grid, model: &TtyModel, g: &Geom) {
             }
         }
     }
-    if chart_h >= 5 {
-        let height = chart_h.min(body_end.saturating_sub(y));
-        if height >= 5 {
-            draw_job_charts(grid, job, g, y, height, model.chart_glyphs, content_right);
-            y = y.saturating_add(height);
-        }
+    let rest = body_end.saturating_sub(y);
+    if rest >= 5 && chart_min > 0 {
+        draw_job_charts(grid, job, g, y, rest, model.chart_glyphs, content_right);
+        y = y.saturating_add(rest);
     }
     let _ = y;
     if side {
@@ -4876,24 +4956,24 @@ fn draw_job_digits(grid: &mut Grid, job: &crate::jobs::Job, g: &Geom, row: u16) 
     let ph = if g.tall { 2u16 } else { 1 };
     let base = if g.tall { 4u16 } else { 2 };
     if let Some(rate) = &job.rate {
-        let caption = job
-            .rate
-            .as_ref()
-            .and_then(|r| r.unit.as_deref())
+        let fmt = job_digit_fmt(rate.value);
+        let base_cap = rate
+            .unit
+            .as_deref()
             .map(job_unit_caption)
             .unwrap_or_else(|| "RATE".to_owned());
+        let caption = scale_caption(&base_cap, fmt.scale);
         paint_str(grid, g.right, row, &caption, C16::White, C16::Black);
-        let text = job_digits(rate.value);
-        let pw = fit_pixel(base, text.chars().count().max(1), g.half);
-        draw_value_digits(grid, g.right, row + 1, &text, rate.value, pw, ph);
+        let pw = fit_pixel(base, fmt.text.chars().count().max(1), g.half);
+        draw_value_digits(grid, g.right, row + 1, &fmt.text, rate.value, pw, ph);
     }
     if let Some(first) = job.values.first() {
         let x = g.prompt_x();
-        let caption = first.label.to_ascii_uppercase();
+        let fmt = job_digit_fmt(first.value);
+        let caption = scale_caption(&first.label.to_ascii_uppercase(), fmt.scale);
         paint_str(grid, x, row, &caption, C16::White, C16::Black);
-        let text = job_digits(first.value);
-        let pw = fit_pixel(base, text.chars().count().max(1), g.half);
-        draw_value_digits(grid, x, row + 1, &text, first.value, pw, ph);
+        let pw = fit_pixel(base, fmt.text.chars().count().max(1), g.half);
+        draw_value_digits(grid, x, row + 1, &fmt.text, first.value, pw, ph);
     }
 }
 
@@ -5082,9 +5162,9 @@ fn draw_job_phases(
         let row = header + 1 + i as u16;
         let (mark, fg) = match phase.mark {
             Some(crate::jobs::PhaseMark::Done) => ('•', C16::Green),
-            Some(crate::jobs::PhaseMark::Running) => ('•', C16::BrightRed),
+            Some(crate::jobs::PhaseMark::Running) => ('>', C16::BrightRed),
             Some(crate::jobs::PhaseMark::Queued) => ('·', C16::BrightBlack),
-            Some(crate::jobs::PhaseMark::Failed) => ('•', C16::Yellow),
+            Some(crate::jobs::PhaseMark::Failed) => ('x', C16::Yellow),
             None => ('·', C16::BrightBlack),
         };
         paint(grid, 2, row, mark, fg, C16::Black);
@@ -5105,6 +5185,11 @@ fn draw_job_phases(
     }
 }
 
+/// Narrowest chart when pairing two series side by side.
+const JOB_CHART_PAIR_W: u16 = 60;
+const JOB_CHART_H_MIN: u16 = 5;
+const JOB_CHART_H_MAX: u16 = 16;
+
 fn draw_job_charts(
     grid: &mut Grid,
     job: &crate::jobs::Job,
@@ -5114,27 +5199,91 @@ fn draw_job_charts(
     glyphs: ChartGlyphs,
     right: u16,
 ) {
-    let series: Vec<&crate::jobs::JobSeries> = job.series.iter().take(2).collect();
-    if series.is_empty() || height < 5 {
+    let series: Vec<&crate::jobs::JobSeries> = job.series.iter().take(4).collect();
+    if series.is_empty() || height < JOB_CHART_H_MIN {
         return;
     }
-    let n = series.len() as u16;
-    let gap = 1u16;
-    let each = (height.saturating_sub(gap * n.saturating_sub(1))) / n;
-    if each < 3 {
-        draw_one_job_chart(grid, series[0], g, start, height, glyphs, right);
+    let left = 2u16;
+    let width = right.saturating_sub(left).saturating_add(1);
+    let pair = series.len() >= 2 && width >= JOB_CHART_PAIR_W * 2;
+    let rows_n = if pair {
+        series.len().div_ceil(2)
+    } else {
+        series.len()
+    };
+    let heights = split_chart_heights(u16::try_from(rows_n).unwrap_or(1), height);
+    if heights.is_empty() {
         return;
     }
     let mut y = start;
-    for (i, s) in series.iter().enumerate() {
-        draw_one_job_chart(grid, s, g, y, each, glyphs, right);
-        y = y.saturating_add(each);
-        if i + 1 < series.len() {
-            y = y.saturating_add(gap);
+    if pair {
+        let gap = 2u16;
+        let inner = width.saturating_sub(gap);
+        let each_w = inner / 2;
+        let mid = left + each_w;
+        for (row_i, h) in heights.iter().enumerate() {
+            let a = row_i * 2;
+            if a >= series.len() {
+                break;
+            }
+            draw_one_job_chart(
+                grid,
+                series[a],
+                g,
+                y,
+                *h,
+                glyphs,
+                left,
+                mid.saturating_sub(1),
+            );
+            if a + 1 < series.len() {
+                draw_one_job_chart(grid, series[a + 1], g, y, *h, glyphs, mid + gap, right);
+            }
+            y = y.saturating_add(*h).saturating_add(1);
+        }
+    } else {
+        for (i, h) in heights.iter().enumerate() {
+            if i >= series.len() {
+                break;
+            }
+            draw_one_job_chart(grid, series[i], g, y, *h, glyphs, left, right);
+            y = y.saturating_add(*h).saturating_add(1);
         }
     }
 }
 
+fn split_chart_heights(count: u16, rows: u16) -> Vec<u16> {
+    if count == 0 || rows < JOB_CHART_H_MIN {
+        return Vec::new();
+    }
+    let mut fit = 0u16;
+    while fit < count {
+        let need = (fit + 1) * JOB_CHART_H_MIN + fit;
+        if need > rows {
+            break;
+        }
+        fit += 1;
+    }
+    if fit == 0 {
+        return Vec::new();
+    }
+    let gaps = fit.saturating_sub(1);
+    let usable = rows.saturating_sub(gaps);
+    let base = (usable / fit).clamp(JOB_CHART_H_MIN, JOB_CHART_H_MAX);
+    let mut heights = vec![base; usize::from(fit)];
+    let mut leftover = usable.saturating_sub(base * fit);
+    for h in &mut heights {
+        let add = leftover.min(JOB_CHART_H_MAX.saturating_sub(*h));
+        *h += add;
+        leftover -= add;
+        if leftover == 0 {
+            break;
+        }
+    }
+    heights
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_one_job_chart(
     grid: &mut Grid,
     series: &crate::jobs::JobSeries,
@@ -5142,12 +5291,12 @@ fn draw_one_job_chart(
     start: u16,
     height: u16,
     glyphs: ChartGlyphs,
+    left: u16,
     right: u16,
 ) {
     if height < 3 {
         return;
     }
-    let left = 2u16;
     let _ = g;
     let last = series.points.last().copied();
     let mut head = series.label.clone();
@@ -5185,22 +5334,15 @@ fn draw_one_job_chart(
     }
     let width = usize::from(data_right - data_left + 1);
     let span = (max - min).abs().max(1e-12);
-    let n = series.points.len();
     for col in 0..width {
-        let idx = if n == 0 {
+        let Some(v) = column_sample(&series.points, col, width) else {
             continue;
-        } else if n == 1 {
-            0
-        } else {
-            // newest at the right
-            let t = col as f64 / (width - 1) as f64;
-            ((t * (n - 1) as f64).round() as usize).min(n - 1)
         };
-        let v = series.points[idx];
-        if !v.is_finite() {
-            continue;
-        }
-        let frac = ((v - min) / span).clamp(0.0, 1.0);
+        let frac = if (max - min).abs() < 1e-12 {
+            0.5
+        } else {
+            ((v - min) / span).clamp(0.0, 1.0)
+        };
         let colour = digit_colours(rate_step(frac * 5.0 + 0.01, 5.0)).1;
         let cells = match glyphs {
             ChartGlyphs::Halves => {
@@ -5238,10 +5380,37 @@ fn series_bounds(points: &[f64]) -> (f64, f64) {
     }
     if !min.is_finite() {
         (0.0, 1.0)
-    } else if (max - min).abs() < 1e-12 {
-        (min - 1.0, max + 1.0)
     } else {
         (min, max)
+    }
+}
+
+/// Value drawn in one chart column. A long series takes the column's
+/// maximum so a loss spike is not skipped.
+fn column_sample(points: &[f64], col: usize, width: usize) -> Option<f64> {
+    let n = points.len();
+    if n == 0 || width == 0 {
+        return None;
+    }
+    if n == 1 {
+        return points[0].is_finite().then_some(points[0]);
+    }
+    if n > width {
+        let start = col * n / width;
+        let end = ((col + 1) * n / width).max(start + 1).min(n);
+        points[start..end]
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .max_by(|a, b| a.total_cmp(b))
+    } else {
+        let idx = if width <= 1 {
+            0
+        } else {
+            (col * (n - 1) + (width - 1) / 2) / (width - 1)
+        };
+        let v = points[idx.min(n - 1)];
+        v.is_finite().then_some(v)
     }
 }
 
@@ -5295,6 +5464,79 @@ mod tests {
         assert_eq!(job_duration(15_381), "4 h 16 min");
         assert_eq!(job_duration(10_186), "2 h 50 min");
         assert_eq!(job_duration(12), "12 s");
+        assert_eq!(
+            job_duration(u64::MAX),
+            job_duration(crate::jobs::MAX_DURATION_S)
+        );
+        assert_ne!(job_duration(u64::MAX), "0 min");
+    }
+
+    fn paint_digits(value: f64) -> (DigitFmt, usize) {
+        let fmt = job_digit_fmt(value);
+        let body = fmt.text.trim_start_matches('-');
+        assert!(
+            fmt.text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '-' || c == '.'),
+            "digits contain a non-paintable char: {}",
+            fmt.text
+        );
+        assert!(
+            !fmt.text.contains('e') && !fmt.text.contains('E'),
+            "{}",
+            fmt.text
+        );
+        assert!(body.chars().count() <= 4, "{}", fmt.text);
+        let mut grid = Grid::new(80, 12);
+        draw_value_digits(&mut grid, 0, 0, &fmt.text, value, 1, 1);
+        let ink = grid.cells().iter().filter(|cell| cell.ch == '█').count();
+        assert!(ink > 0, "painter drew nothing for {value} ({})", fmt.text);
+        assert!(
+            !grid
+                .cells()
+                .iter()
+                .any(|cell| cell.ch == 'e' || cell.ch == 'E'),
+            "painter kept an e for {value}"
+        );
+        (fmt, ink)
+    }
+
+    #[test]
+    fn job_digits_through_the_painter() {
+        let (fmt, _) = paint_digits(12345.0);
+        assert_eq!(fmt.text, "12.3");
+        assert_eq!(fmt.scale, DigitScale::Kilo);
+        let (fmt, _) = paint_digits(0.005);
+        assert_eq!(fmt.text, "5.00");
+        assert_eq!(fmt.scale, DigitScale::Exp(-3));
+        let (fmt, _) = paint_digits(1.276e-5);
+        assert_eq!(fmt.text, "1.28");
+        assert_eq!(fmt.scale, DigitScale::Exp(-5));
+        let (fmt, _) = paint_digits(99.96);
+        assert_eq!(fmt.text, "100");
+        assert_eq!(fmt.scale, DigitScale::One);
+        let (fmt, _) = paint_digits(-16.62);
+        assert_eq!(fmt.text, "-16.6");
+        let (fmt, _) = paint_digits(0.0);
+        assert_eq!(fmt.text, "0");
+        assert_eq!(scale_caption("ROWS / S", DigitScale::Kilo), "K ROWS / S");
+        assert_eq!(scale_caption("LR", DigitScale::Exp(-5)), "LR x1e-5");
+    }
+
+    #[test]
+    fn a_constant_series_prints_its_real_bounds() {
+        assert_eq!(series_bounds(&[5.0, 5.0, 5.0]), (5.0, 5.0));
+        assert_eq!(series_bounds(&[5.0]), (5.0, 5.0));
+        assert_eq!(series_bounds(&[1.0, 3.0, 2.0]), (1.0, 3.0));
+    }
+
+    #[test]
+    fn a_long_series_takes_each_column_maximum() {
+        let mut points = vec![1.0; 20];
+        points[3] = 9.0;
+        let v = column_sample(&points, 0, 4).unwrap();
+        assert_eq!(v, 9.0, "the spike in the first quarter is kept");
+        assert_eq!(column_sample(&[2.0, 4.0, 3.0], 0, 10), Some(2.0));
     }
 
     /// #26: the layout's colour roles sit on the slots the palette module
