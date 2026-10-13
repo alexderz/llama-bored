@@ -807,7 +807,7 @@ fn paint_claim(
     let leftover = room.saturating_sub(used);
     let shown_reason = if reason.is_empty() {
         None
-    } else if leftover >= SEP_CELLS + 1 {
+    } else if leftover > SEP_CELLS {
         Some(cut_text(reason, leftover - SEP_CELLS))
     } else {
         None
