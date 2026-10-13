@@ -7,7 +7,8 @@
 //! any other state (no swap in progress). Every upstream request must also
 //! be followed at once by a `/running` read (the self-check). The poller
 //! is one thread making one request at a time, so the order the fake sees
-//! is the order the poller acted in. The script runs models through
+//! is the order the poller acted in (`/api/events` is another thread and
+//! is ignored for the gate). The script runs models through
 //! starting, ready, stopping, gone, a failed `/running` and back, with
 //! backends that take every upstream read: the `/metrics` detection probe,
 //! vLLM and llama.cpp `/metrics`, and `/slots`.
@@ -131,38 +132,43 @@ fn serve(mut stream: TcpStream, fake: &Mutex<Fake>) {
     let (status, body) = {
         let mut fake = fake.lock().unwrap_or_else(|err| err.into_inner());
         fake.hits.push(path.clone());
-        let fresh = std::mem::replace(&mut fake.fresh, path == "/running");
-        if path == "/running" {
-            fake.ready = if fake.status == 200 {
-                ready_ids(&fake.running)
-            } else {
-                HashSet::new()
-            };
-            fake.swapping = fake.status == 200 && swapping(&fake.running);
-            (
-                fake.status,
-                serde_json::to_vec(&fake.running).expect("json"),
-            )
-        } else if let Some(rest) = path.strip_prefix("/upstream/") {
-            let (id, leaf) = rest.split_once('/').unwrap_or((rest, ""));
-            if !fresh || fake.swapping || !fake.ready.contains(id) {
-                fake.violations.push(path.clone());
-            }
-            match leaf {
-                "metrics" => (
-                    200,
-                    fake.metrics
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| b"\n".to_vec()),
-                ),
-                "slots" => (200, slots_body()),
-                _ => (404, Vec::new()),
-            }
-        } else if path == "/api/metrics/activity" {
-            (200, br#"{"data":[]}"#.to_vec())
+        if path == "/api/events" {
+            // Another thread; it does not sit in the poller's request order.
+            (200, Vec::new())
         } else {
-            (404, Vec::new())
+            let fresh = std::mem::replace(&mut fake.fresh, path == "/running");
+            if path == "/running" {
+                fake.ready = if fake.status == 200 {
+                    ready_ids(&fake.running)
+                } else {
+                    HashSet::new()
+                };
+                fake.swapping = fake.status == 200 && swapping(&fake.running);
+                (
+                    fake.status,
+                    serde_json::to_vec(&fake.running).expect("json"),
+                )
+            } else if let Some(rest) = path.strip_prefix("/upstream/") {
+                let (id, leaf) = rest.split_once('/').unwrap_or((rest, ""));
+                if !fresh || fake.swapping || !fake.ready.contains(id) {
+                    fake.violations.push(path.clone());
+                }
+                match leaf {
+                    "metrics" => (
+                        200,
+                        fake.metrics
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| b"\n".to_vec()),
+                    ),
+                    "slots" => (200, slots_body()),
+                    _ => (404, Vec::new()),
+                }
+            } else if path == "/api/metrics/activity" {
+                (200, br#"{"data":[]}"#.to_vec())
+            } else {
+                (404, Vec::new())
+            }
         }
     };
     let reason = if status == 200 { "OK" } else { "Error" };
