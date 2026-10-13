@@ -10,6 +10,10 @@ All notable changes to llama-bored. Versions follow
 
 - llama-watch shows a job view for a training run or other batch job when no model is serving (#129). `[jobs] dir` names an absolute directory of `<name>.json` status files; unset, nothing is opened and every frame is unchanged. `stale_s` (default 180) hides a file whose mtime is older.
 
+### Fixed
+
+- A short exact-colour run reaches both end stops (#130). Cells of a bar, a rate scale and a chart column are sampled at the ends, so the first cell is the first stop and the last cell of a full run is the top of its scale; before, a cell was sampled at its centre, and a chart column of two to four rows and the last cell of a rate scale stopped short of the stops. A positive-infinite rate is the end of the blackbody tail. The console and `exact_colors = false` are unchanged.
+
 ## 0.5.6 — 2026-10-12
 
 Exact colours on the grid file: one continuous ramp along a bar, and a normal temperature keeps the normal colour.
