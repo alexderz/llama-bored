@@ -1456,4 +1456,26 @@ mod tests {
         assert_eq!(holder.as_str(), "\u{10348}".repeat(16));
         assert!(!holder.contains('\u{2026}'));
     }
+
+    /// The 256-byte reason cap is applied before text sanitising, so
+    /// control bytes in the first 256 that the sanitiser drops cannot
+    /// make room for visible text after that cut.
+    #[test]
+    fn a_reason_cut_at_256_bytes_drops_visible_text_after_that() {
+        let mut raw = String::from("seen");
+        raw.push_str(&"\u{1b}".repeat(252));
+        assert_eq!(raw.len(), 256);
+        raw.push_str(" after the cap that a larger byte cut would keep");
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    "big", "operator", false, false, None,
+                    Some("2026-10-12T02:37:04Z"), Some(&raw),
+                )],
+            }),
+        );
+        assert_eq!(claims.view().0[0].hold_reason, "seen");
+    }
 }
