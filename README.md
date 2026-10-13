@@ -139,8 +139,9 @@ context or more gets a bright yellow `!` after its bar (a step brighter
 than the out run, since out is yellow too). Without a context size the
 bar is scaled to the largest such row shown and marked `~`. With
 `chart_glyphs = "halves"` the heights fall back to `▄` (and the header
-key's mark with them) and the colours carry the rest. Engines that
-report no cached count show all input as new.
+key's mark with them) and the colours carry the rest. A cached count the
+engine did not report is `--`, and the prompt is one dim run in that
+same grey, not all new. A reported 0 stays 0 and the prompt is all new.
 
 **Head spinner** (#96). An in-flight row's growing run — new while it is
 still in prefill, out once it decodes — carries a one-cell cursor at its
@@ -158,7 +159,8 @@ and any OpenAI `usage`, so llama-watch reads it per engine, in one place,
 for IN, CACHED, the bar, the per-model prompt counters, the in-flight
 handover and the reset matching. A row of a model this run never saw
 loaded reads as the OpenAI form unless its cached count is above its
-input, which only the other form can give.
+input, which only the other form can give. A cached count the row did
+not report prints `--` under CACHED. A reported 0 prints `0`.
 
 ```text
  RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ▇cached ▇new ▇out

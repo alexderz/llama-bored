@@ -84,9 +84,10 @@ pub fn input_excludes_cache(engine: Backend) -> bool {
 }
 
 /// The one place llama-swap's `input_tokens` and `cache_tokens` become a
-/// prompt (#82): RECENT's IN and CACHED, the context bar, the prompt
-/// counters fed from activity rows, the in-flight handover and the reset
-/// matching all read it.
+/// prompt (#82): the prompt counters fed from activity rows, the in-flight
+/// handover and the reset matching all read it. A missing cached count is
+/// 0 here, so those stay as they were. RECENT reads the `Option` itself
+/// and prints `--` when the engine reported none (#133).
 ///
 /// With the engine unknown (a row of a model this run never saw loaded),
 /// a cached count above the input can only mean the excluding form; any
@@ -383,7 +384,7 @@ mod tests {
             let odd = split(10, Some(50), Some(engine)).expect("split");
             assert_eq!((odd.whole, odd.cached), (10, 10));
         }
-        // No cached count: everything is new.
+        // No cached count: the split's cached number is 0. RECENT prints `--`.
         assert_eq!(
             split(64, None, Some(Backend::LlamaCpp)),
             Some(PromptSplit {

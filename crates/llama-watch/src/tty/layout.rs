@@ -91,6 +91,10 @@ pub struct Activity {
     pub model: String,
     pub input_tok: u64,
     pub cached_tok: u64,
+    /// The engine did not report a cached count (#133). [`Self::cached_tok`]
+    /// is then 0 for the counters that still read a number; RECENT prints
+    /// `--` and draws the prompt as one dim run. A reported 0 stays 0.
+    pub cached_unknown: bool,
     pub output_tok: u64,
     /// `None` when llama-swap reported no rate (a backend without timings)
     /// and the engine measured none either.
@@ -2421,6 +2425,10 @@ fn paint_segment_key(grid: &mut Grid, bar: Span, row: u16, glyphs: ChartGlyphs) 
 pub enum CtxPart {
     /// Cached input.
     Cached,
+    /// The whole prompt when the cached count was not reported (#133).
+    /// One full-height run in the dim grey of a `--` cell, not the new
+    /// colour and not the lower step.
+    Prompt,
     /// New input (input minus cached, never below 0). Drawn a step lower
     /// than the other segments (#96) so cached → new → out read as steps.
     New,
@@ -2630,6 +2638,16 @@ fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
             ];
         }
     }
+    // #133: an unreported cached count is not zero new tokens. The prompt
+    // is one run; output is unchanged. A reported 0 takes the path below.
+    if req.cached_unknown {
+        return [
+            (CtxPart::Prompt, req.input_tok),
+            (CtxPart::New, 0),
+            (CtxPart::Pending, 0),
+            (CtxPart::Out, req.output_tok),
+        ];
+    }
     let cached = req.cached_tok.min(req.input_tok);
     let new = req.input_tok - cached;
     let (done, pending) = match req.inflight {
@@ -2690,9 +2708,16 @@ fn draw_ctx_bar(
     let n_ctx = req.n_ctx.filter(|n| *n > 0);
     let scale = n_ctx.unwrap_or(relative_scale);
     let width = usize::from(span.w);
-    let spin = req.inflight.map(|flight| Spin {
-        decoding: flight.decoding,
-        beats: flight.beats,
+    // An unknown cache has no new run for a prefill cursor to sit on.
+    let spin = req.inflight.and_then(|flight| {
+        if req.cached_unknown && !flight.decoding {
+            None
+        } else {
+            Some(Spin {
+                decoding: flight.decoding,
+                beats: flight.beats,
+            })
+        }
     });
     let cells = ctx_cells(&parts, scale, width, spin);
     for (i, cell) in cells.iter().enumerate() {
@@ -2703,6 +2728,7 @@ fn draw_ctx_bar(
                 let base = match part {
                     CtxPart::Cached => C16::Blue,
                     CtxPart::New => C16::BrightCyan,
+                    CtxPart::Prompt => C16::BrightBlack,
                     _ => C16::Yellow,
                 };
                 (
@@ -3252,7 +3278,11 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         };
         let approx_in = flight.approx && !flight.no_prompt;
         paint_span_approx(grid, plan.prompt_tok, row, &input, approx_in, hot);
-        let (cached, approx) = known(flight.no_prompt, req.cached_tok);
+        let (cached, approx) = if req.cached_unknown {
+            ("--".to_owned(), false)
+        } else {
+            known(flight.no_prompt, req.cached_tok)
+        };
         paint_span_approx(grid, plan.cached, row, &cached, approx, plain);
         let (output, approx) = known(flight.no_output, req.output_tok);
         paint_span_approx(grid, plan.output, row, &output, approx, hot);

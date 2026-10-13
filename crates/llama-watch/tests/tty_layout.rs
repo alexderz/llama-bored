@@ -669,6 +669,237 @@ fn recent_numbers_stay_right_aligned_under_their_headers() {
     }
 }
 
+/// #133: an unreported cached count is `--`, right-aligned like the other
+/// `--` cells, and the prompt run is the dim full-height block. A reported
+/// 0 stays `0` and is drawn as new. A known cached count is unchanged.
+#[test]
+fn recent_unknown_cache_is_dim_and_a_reported_zero_is_new() {
+    let model = cache_rows_model();
+    let grid = draw(&model, 240, 67);
+    let header_row = row_with(&grid, "RECENT");
+    let header = full_row(&grid, header_row);
+    let label = "CACHED tokens";
+    let label_end = find_chars(&header, label).expect("cached header") + label.chars().count();
+    let prompt_label = "PROMPT tok/s";
+    let prompt_end =
+        find_chars(&header, prompt_label).expect("prompt header") + prompt_label.chars().count();
+    let gen_label = "GEN tok/s";
+    let gen_end = find_chars(&header, gen_label).expect("gen header") + gen_label.chars().count();
+    // (model, cached text, unknown bar, reported zero, filled)
+    let cases = [
+        ("lcpp-miss", "--", BarKind::Unknown),
+        ("lcpp-zero", "0", BarKind::NewOnly),
+        ("vllm-miss", "--", BarKind::Unknown),
+        ("vllm-zero", "0", BarKind::NewOnly),
+        ("sg-miss", "--", BarKind::Unknown),
+        ("sg-fill", "600", BarKind::Split),
+    ];
+    for (name, cached, kind) in cases {
+        let row = row_with(&grid, name);
+        let text = full_row(&grid, row);
+        let start = label_end - cached.chars().count();
+        let got: String = text
+            .chars()
+            .skip(start)
+            .take(cached.chars().count())
+            .collect();
+        assert_eq!(got, cached, "{name}: CACHED cell: {text}");
+        assert_eq!(
+            text.chars().nth(start - 1),
+            Some(' '),
+            "{name}: {cached} is not right-aligned in its own cell: {text}"
+        );
+        if cached == "--" {
+            let col = u16::try_from(start).expect("col");
+            assert_eq!(
+                grid.get(col, row).expect("cell").fg,
+                C16::White,
+                "{name}: CACHED `--` is the column's plain colour"
+            );
+        }
+        let bar = bar_cells(&grid, row);
+        match kind {
+            BarKind::Unknown => {
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2587}' && *fg == C16::BrightBlack),
+                    "{name}: prompt is not a dim full block: {bar:?}"
+                );
+                assert!(
+                    bar.iter()
+                        .all(|(_, fg)| *fg != C16::Blue && *fg != C16::BrightCyan),
+                    "{name}: unknown cache was painted cached or new: {bar:?}"
+                );
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2587}' && *fg == C16::Yellow),
+                    "{name}: output run changed: {bar:?}"
+                );
+            }
+            BarKind::NewOnly => {
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2584}' && *fg == C16::BrightCyan),
+                    "{name}: a reported 0 is all new: {bar:?}"
+                );
+                assert!(
+                    bar.iter().all(|(_, fg)| *fg != C16::Blue),
+                    "{name}: a reported 0 drew a cached run: {bar:?}"
+                );
+            }
+            BarKind::Split => {
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2587}' && *fg == C16::Blue),
+                    "{name}: cached run: {bar:?}"
+                );
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2584}' && *fg == C16::BrightCyan),
+                    "{name}: new run: {bar:?}"
+                );
+                assert!(
+                    bar.iter()
+                        .any(|(ch, fg)| *ch == '\u{2587}' && *fg == C16::Yellow),
+                    "{name}: output run: {bar:?}"
+                );
+                assert!(
+                    find_chars(&text, "~200").is_some_and(|at| at + 4 == prompt_end),
+                    "{name}: prompt rate: {text}"
+                );
+                assert!(
+                    find_chars(&text, "~50.0").is_some_and(|at| at + 5 == gen_end),
+                    "{name}: gen rate: {text}"
+                );
+                assert!(
+                    !text.contains("~600"),
+                    "{name}: the cached count is not marked: {text}"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BarKind {
+    Unknown,
+    NewOnly,
+    Split,
+}
+
+fn bar_cells(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<(char, C16)> {
+    let start = (0..grid.cols())
+        .find(|col| is_bar_char(grid.get(*col, row).expect("cell").ch))
+        .unwrap_or_else(|| panic!("no bar on {row}"));
+    (start..grid.cols())
+        .map(|col| grid.get(col, row).expect("cell"))
+        .take_while(|cell| is_bar_char(cell.ch) && cell.ch != '\u{2581}')
+        .map(|cell| (cell.ch, cell.fg))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cache_row(
+    id: u32,
+    model: &str,
+    input: u64,
+    cached: u64,
+    unknown: bool,
+    output: u64,
+    prompt: Option<f64>,
+    gen_rate: Option<f64>,
+    measured: bool,
+) -> Activity {
+    Activity {
+        id,
+        time: format!("18:10:{id:02}"),
+        source: "192.0.2.10".to_owned(),
+        model: model.to_owned(),
+        input_tok: input,
+        cached_tok: cached,
+        cached_unknown: unknown,
+        output_tok: output,
+        prompt_tps: prompt,
+        gen_tps: gen_rate,
+        prompt_measured: measured && prompt.is_some(),
+        gen_measured: measured && gen_rate.is_some(),
+        dur: "4.0s".to_owned(),
+        n_ctx: Some(8_192),
+        ..Activity::default()
+    }
+}
+
+/// Unknown and reported-zero rows for llama.cpp, vLLM and SGLang, plus one
+/// SGLang row filled from a single-request window (600 cached of 1,000,
+/// 200 prompt tok/s, 50 gen tok/s).
+fn cache_rows_model() -> TtyModel {
+    let mut model = sample(WatchState::Ready);
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    model.requests = vec![
+        cache_row(
+            6,
+            "lcpp-miss",
+            1_200,
+            0,
+            true,
+            300,
+            Some(400.0),
+            Some(30.0),
+            false,
+        ),
+        cache_row(
+            5,
+            "lcpp-zero",
+            1_200,
+            0,
+            false,
+            300,
+            Some(400.0),
+            Some(30.0),
+            false,
+        ),
+        cache_row(4, "vllm-miss", 1_000, 0, true, 200, None, None, false),
+        cache_row(3, "vllm-zero", 1_000, 0, false, 200, None, None, false),
+        cache_row(2, "sg-miss", 800, 0, true, 100, None, None, false),
+        cache_row(
+            1,
+            "sg-fill",
+            1_000,
+            600,
+            false,
+            401,
+            Some(200.0),
+            Some(50.0),
+            true,
+        ),
+    ];
+    model
+}
+
+#[test]
+fn recent_cache_golden_matches_character_and_colour() {
+    assert_frame(
+        "recent-cache-240.json",
+        &load("recent-cache-240.json"),
+        &cache_rows_model(),
+    );
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #133 cache goldens"]
+fn dump_recent_cache_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    let grid = draw(&cache_rows_model(), 240, 67);
+    std::fs::write(dir.join("recent-cache-240.json"), dump_grid(&grid)).expect("write tty golden");
+    let gdir = grid_fix_dir();
+    std::fs::create_dir_all(&gdir).expect("fixtures/grid");
+    std::fs::write(
+        gdir.join("recent-cache-192.json"),
+        grid_fix_text(&grid_fix_of(&cache_rows_model())),
+    )
+    .expect("write grid golden");
+}
+
 /// #8: DURATION reads with the other numbers, left of the rate bar:
 /// `... IN CACHED OUT PROMPT GEN DUR [bar] STATUS`, in both column sets and
 /// with text on or off.
@@ -5183,11 +5414,12 @@ fn temps_goldens_match_character_and_colour() {
 /// temps frame and a hot one (activity past 100, generation past its ceiling).
 type GridGolden = fn() -> TtyModel;
 
-const GRID_EXACT_GOLDENS: [(&str, GridGolden); 4] = [
+const GRID_EXACT_GOLDENS: [(&str, GridGolden); 5] = [
     ("temps-192.json", temps_model),
     ("hot-192.json", hot_model),
     ("job-192.json", job_grid_model),
     ("claims-192.json", claims_grid_model),
+    ("recent-cache-192.json", cache_rows_model),
 ];
 
 fn claims_grid_model() -> TtyModel {
