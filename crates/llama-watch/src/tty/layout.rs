@@ -4634,7 +4634,7 @@ pub(crate) fn job_digit_fmt(value: f64) -> DigitFmt {
     if abs == 0.0 {
         return zero_digits();
     }
-    if abs >= 1_000_000.0 && abs < MEGA_MAX {
+    if (1_000_000.0..MEGA_MAX).contains(&abs) {
         return scaled_digits(sign, four_char(abs / 1_000_000.0), DigitScale::Mega);
     }
     if (9999.5..1_000_000.0).contains(&abs) {
@@ -4706,9 +4706,7 @@ fn mantissa_at(abs: f64, exp: i32) -> Option<f64> {
 
 /// At most four characters, no exponent. `abs` is in a range that fits.
 fn four_char(abs: f64) -> String {
-    if abs >= 1000.0 {
-        format!("{:.0}", abs)
-    } else if abs >= 100.0 {
+    if abs >= 100.0 {
         format!("{:.0}", abs)
     } else if abs >= 10.0 {
         let text = format!("{abs:.1}");
