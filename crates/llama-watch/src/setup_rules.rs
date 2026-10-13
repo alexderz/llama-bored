@@ -912,6 +912,36 @@ fn strip_quotes(text: &str) -> &str {
     text
 }
 
+/// SETUP's `token` kind with a longer cap: the file stem of a path-like
+/// value, then `[A-Za-z0-9_.+-]`, at most `max_chars`. Used for a claim
+/// holder (#128), which is drawn at 24 characters rather than
+/// [`llama_core::detail::MAX_TOKEN_CHARS`].
+pub(crate) fn token_held(raw: &str, max_chars: usize) -> Option<String> {
+    let raw = strip_quotes(raw);
+    let value = if raw.contains('/') {
+        let file = raw.rsplit('/').next().unwrap_or(raw);
+        match file.rfind('.') {
+            Some(dot) if dot > 0 => &file[..dot],
+            _ => file,
+        }
+    } else {
+        raw
+    };
+    let value: String = value.chars().take(max_chars).collect();
+    let ok = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-'));
+    ok.then_some(value)
+}
+
+/// SETUP's `text` kind (#114), then at most `max_chars` characters. Empty
+/// after sanitising is nothing. Used for a claim's `hold_reason` (#128).
+pub(crate) fn text_held(raw: &str, max_chars: usize) -> Option<String> {
+    let text = clean_text(raw)?;
+    Some(text.chars().take(max_chars).collect())
+}
+
 /// The display-safe value, or `None` when `raw` does not pass for `kind`.
 fn clean(kind: Kind, raw: &str) -> Option<String> {
     // A spec string is already decoded. Shell quotes are a command-line
@@ -1221,6 +1251,19 @@ mod tests {
         // A path-like value is only ever its file stem.
         assert_eq!(clean(Kind::Token, "../../etc/x.conf").as_deref(), Some("x"));
         assert_eq!(clean(Kind::Token, "x;rm"), None);
+        assert_eq!(
+            token_held("eval-runner", 24).as_deref(),
+            Some("eval-runner")
+        );
+        assert_eq!(
+            token_held(&"h".repeat(40), 24).as_deref(),
+            Some(&*"h".repeat(24))
+        );
+        assert_eq!(token_held("a b", 24), None);
+        assert_eq!(
+            text_held("overnight  eval,\n\x1b[2Jdo not unload", 40).as_deref(),
+            Some("overnight eval, [2Jdo not unload")
+        );
         assert_eq!(
             clean(Kind::Quant, "/m/Qwen3-27B-UD-Q6_K_XL.gguf").as_deref(),
             Some("UD-Q6_K_XL")

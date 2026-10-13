@@ -8,12 +8,20 @@
 //! history as `logData` frames (about 100 KB); after that a frame for each
 //! change, and a `logData` frame for every log line.
 //!
-//! Only `inflight` frames are read (llama-swap's `InFlightRequestsEvent`):
+//! `inflight` frames are read (llama-swap's `InFlightRequestsEvent`):
 //! `snapshot` with `requests[]`, `upsert` with `request`, `remove` with
 //! `id`. Upserts come at most every 250 ms per request while bytes flow.
 //! Of each entry only `id`, `model`, `resp_bytes` and `elapsed_ms` are
 //! kept; `req_headers`, `resp_headers`, `remote_ip`, `metadata` and the
 //! path are skipped unread. It carries no tokens.
+//!
+//! A llama-swap build with model claims also sends `claims` frames on this
+//! same stream (#128): the whole list on connect and again after every
+//! change. Only the `claims` array is kept; `changes` and `at` are
+//! ignored. An entry without a usable `model` or `holder` is skipped, not
+//! the list. A frame whose `data` does not parse leaves the previous list
+//! in place. The list is forgotten when the stream reconnects, until the
+//! first `claims` frame of the new session.
 //!
 //! This is llama-swap's own API, like `/running`: it names no model path
 //! and cannot make llama-swap load one (#70). One long-lived connection on
@@ -41,6 +49,8 @@ use llama_core::names::sanitize;
 use serde::Deserialize;
 
 use crate::activity::model_key;
+use crate::localtime::parse_rfc3339;
+use crate::setup_rules::{text_held, token_held};
 
 /// Longest SSE line kept, bytes. A longer one (v256's log history) is read
 /// through and dropped.
@@ -52,6 +62,18 @@ pub const MAX_REQUESTS: usize = 64;
 /// Most recently ended requests remembered, for the token attribution of
 /// the poll window they ended in.
 pub const MAX_ENDED: usize = 64;
+/// Most model claims kept (first [`MAX_CLAIMS`] of a frame).
+pub const MAX_CLAIMS: usize = 16;
+/// Longest llama-swap model id kept on a claim, bytes.
+const CLAIM_MODEL_BYTES: usize = 128;
+/// Longest holder kept before token sanitising, bytes.
+const CLAIM_HOLDER_BYTES: usize = 64;
+/// Longest hold reason kept before text sanitising, bytes.
+const CLAIM_REASON_BYTES: usize = 256;
+/// Holder as drawn: SETUP's token kind, at most this many characters.
+const CLAIM_HOLDER_CHARS: usize = 24;
+/// Hold reason as drawn: SETUP's text kind, at most this many characters.
+const CLAIM_REASON_CHARS: usize = 40;
 /// How long an ended request is remembered.
 pub const ENDED_TTL: Duration = Duration::from_secs(10);
 /// One connection's longest life; it reconnects at once after.
@@ -93,6 +115,26 @@ pub struct EndedRequest {
     pub ended: Instant,
 }
 
+/// One model claim from a `claims` frame (#128).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelClaim {
+    /// [`model_key`] of the llama-swap model id.
+    pub model: String,
+    /// Holder as a short token (SETUP's `token` kind, at most 24 characters).
+    pub holder: String,
+    /// An automatic claim from use, as opposed to an explicit one.
+    pub auto: bool,
+    /// The claimed model is serving a request.
+    pub in_use: bool,
+    /// When the idle claim expires. `None` while in use, or when omitted.
+    pub expires_at: Option<SystemTime>,
+    /// When an explicit hold ends. `Some` makes the entry a hold.
+    pub hold_until: Option<SystemTime>,
+    /// Free text from a caller (SETUP's `text` kind, at most 40 characters).
+    /// Empty when there is none.
+    pub hold_reason: String,
+}
+
 /// What the stream says now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EventsView {
@@ -102,6 +144,12 @@ pub struct EventsView {
     pub requests: Vec<InflightRequest>,
     /// Requests that ended in the last [`ENDED_TTL`], oldest first.
     pub ended: Vec<EndedRequest>,
+    /// Latest model claims, first [`MAX_CLAIMS`]. Empty until this
+    /// session's first `claims` frame, and after reconnect.
+    pub claims: Vec<ModelClaim>,
+    /// A `claims` frame this session did not parse. The previous list is
+    /// kept. The poller logs this once per session.
+    pub claims_error: Option<&'static str>,
     /// Why the last connect failed, for the poller's log; `None` while a
     /// session runs.
     pub failure: Option<&'static str>,
@@ -321,9 +369,142 @@ impl Inflight {
             connected: self.synced,
             requests: if self.synced { requests } else { Vec::new() },
             ended: self.ended.iter().cloned().collect(),
+            claims: Vec::new(),
+            claims_error: None,
             failure: None,
         }
     }
+}
+
+/// The claims list one stream has built (#128).
+#[derive(Debug, Default)]
+pub struct Claims {
+    list: Vec<ModelClaim>,
+    /// A `claims` frame was read this session.
+    synced: bool,
+    /// A `claims` frame this session did not parse.
+    bad: bool,
+}
+
+#[derive(Deserialize)]
+struct ClaimsEvent {
+    #[serde(default)]
+    claims: Vec<serde_json::Value>,
+}
+
+impl Claims {
+    /// A new session: nothing is known until its first `claims` frame.
+    pub fn new_session(&mut self) {
+        self.list.clear();
+        self.synced = false;
+        self.bad = false;
+    }
+
+    /// Take one frame's data. Frames other than `claims` are ignored. A
+    /// `claims` frame whose `data` does not parse leaves the previous list
+    /// and is remembered once for the session.
+    pub fn apply(&mut self, data: &[u8]) {
+        let Ok(kind) = serde_json::from_slice::<Kind>(data) else {
+            return;
+        };
+        if kind.kind != "claims" {
+            return;
+        }
+        let Ok(envelope) = serde_json::from_slice::<Envelope>(data) else {
+            self.bad = true;
+            return;
+        };
+        let Ok(event) = serde_json::from_str::<ClaimsEvent>(&envelope.data) else {
+            self.bad = true;
+            return;
+        };
+        self.list = event
+            .claims
+            .into_iter()
+            .filter_map(keep_claim)
+            .take(MAX_CLAIMS)
+            .collect();
+        self.synced = true;
+    }
+
+    /// What is known now. Empty before this session's first `claims` frame.
+    #[must_use]
+    pub fn view(&self) -> (Vec<ModelClaim>, Option<&'static str>) {
+        (
+            if self.synced {
+                self.list.clone()
+            } else {
+                Vec::new()
+            },
+            self.bad.then_some("malformed claims frame"),
+        )
+    }
+}
+
+/// One `claims` array entry as kept. An entry without a usable model or
+/// holder is dropped; unknown members and unusable times are skipped.
+fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
+    let obj = value.as_object()?;
+    let model = obj.get("model").and_then(serde_json::Value::as_str)?;
+    let holder = obj.get("holder").and_then(serde_json::Value::as_str)?;
+    let model = claim_model(model)?;
+    let holder = token_held(take_bytes(holder, CLAIM_HOLDER_BYTES), CLAIM_HOLDER_CHARS)?;
+    let auto = obj
+        .get("auto")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let in_use = obj
+        .get("in_use")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let expires_at = obj
+        .get("expires_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(rfc3339_time);
+    let hold_until = obj
+        .get("hold_until")
+        .and_then(serde_json::Value::as_str)
+        .and_then(rfc3339_time);
+    let hold_reason = obj
+        .get("hold_reason")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| text_held(take_bytes(raw, CLAIM_REASON_BYTES), CLAIM_REASON_CHARS))
+        .unwrap_or_default();
+    Some(ModelClaim {
+        model,
+        holder,
+        auto,
+        in_use,
+        expires_at,
+        hold_until,
+        hold_reason,
+    })
+}
+
+fn claim_model(raw: &str) -> Option<String> {
+    let raw = take_bytes(raw, CLAIM_MODEL_BYTES);
+    let cleaned = sanitize(raw, 32);
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(model_key(raw))
+}
+
+fn take_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn rfc3339_time(text: &str) -> Option<SystemTime> {
+    let unix = parse_rfc3339(text)?;
+    let unix = u64::try_from(unix).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(unix))
 }
 
 /// An id as kept: printable ASCII, at most [`ID_CHARS`].
@@ -414,11 +595,21 @@ fn run(endpoint: &str, timeout: Duration, shared: &Mutex<EventsView>, stop: &Ato
     let agent = super::llamaswap::new_agent();
     let mut backoff = MIN_BACKOFF;
     let mut inflight = Inflight::default();
+    let mut claims = Claims::default();
     while !stop.load(Ordering::Relaxed) {
         let began = Instant::now();
-        let failure = session(&agent, endpoint, timeout, shared, stop, &mut inflight);
+        let failure = session(
+            &agent,
+            endpoint,
+            timeout,
+            shared,
+            stop,
+            &mut inflight,
+            &mut claims,
+        );
         inflight.new_session();
-        publish(shared, &mut inflight, failure);
+        claims.new_session();
+        publish(shared, &mut inflight, &claims, failure);
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -452,6 +643,7 @@ fn session(
     shared: &Mutex<EventsView>,
     stop: &AtomicBool,
     inflight: &mut Inflight,
+    claims: &mut Claims,
 ) -> Option<&'static str> {
     let response = agent
         .get(endpoint)
@@ -488,16 +680,25 @@ fn session(
         let mut changed = false;
         parser.feed(&buf[..read], |data| {
             inflight.apply(data, now, wall);
+            claims.apply(data);
             changed = true;
         });
         if changed {
-            publish(shared, inflight, None);
+            publish(shared, inflight, claims, None);
         }
     }
 }
 
-fn publish(shared: &Mutex<EventsView>, inflight: &mut Inflight, failure: Option<&'static str>) {
+fn publish(
+    shared: &Mutex<EventsView>,
+    inflight: &mut Inflight,
+    claims: &Claims,
+    failure: Option<&'static str>,
+) {
     let mut view = inflight.view(Instant::now());
+    let (list, claims_error) = claims.view();
+    view.claims = list;
+    view.claims_error = claims_error;
     view.failure = failure;
     *shared.lock().unwrap_or_else(|err| err.into_inner()) = view;
 }
@@ -720,5 +921,278 @@ mod tests {
             inflight.apply(junk, now, SystemTime::UNIX_EPOCH);
         }
         assert_eq!(inflight.view(now).requests.len(), MAX_REQUESTS);
+    }
+
+    fn apply_claims(claims: &mut Claims, body: serde_json::Value) {
+        let text = frame("claims", &body);
+        let mut parser = SseParser::default();
+        parser.feed(text.as_bytes(), |data| claims.apply(data));
+    }
+
+    fn claim_entry(
+        model: &str,
+        holder: &str,
+        auto: bool,
+        in_use: bool,
+        expires_at: Option<&str>,
+        hold_until: Option<&str>,
+        hold_reason: Option<&str>,
+    ) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("model".into(), serde_json::Value::String(model.into()));
+        map.insert("holder".into(), serde_json::Value::String(holder.into()));
+        map.insert("auto".into(), serde_json::Value::Bool(auto));
+        map.insert("in_use".into(), serde_json::Value::Bool(in_use));
+        map.insert(
+            "expires_at".into(),
+            expires_at.map_or(serde_json::Value::Null, |s| s.into()),
+        );
+        map.insert(
+            "hold_until".into(),
+            hold_until.map_or(serde_json::Value::Null, |s| s.into()),
+        );
+        if let Some(reason) = hold_reason {
+            map.insert("hold_reason".into(), reason.into());
+        }
+        map.insert("claimed_at".into(), "2026-10-12T02:36:04.718076818Z".into());
+        serde_json::Value::Object(map)
+    }
+
+    #[test]
+    fn claims_frames_keep_the_latest_list() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({"changes":[],"claims":[],"at":"2026-10-12T02:36:03.437371362Z"}),
+        );
+        assert!(claims.view().0.is_empty());
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"claimed","model":"big","holder":"eval-runner"}],
+                "claims":[claim_entry(
+                    "big", "eval-runner", false, false,
+                    Some("2026-10-12T02:37:04.718076818Z"), None, None,
+                )],
+                "at":"2026-10-12T02:36:04.718103348Z",
+            }),
+        );
+        let (list, err) = claims.view();
+        assert!(err.is_none());
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].model, "big");
+        assert_eq!(list[0].holder, "eval-runner");
+        assert!(!list[0].auto);
+        assert!(!list[0].in_use);
+        assert!(list[0].expires_at.is_some());
+        assert!(list[0].hold_until.is_none());
+        assert!(list[0].hold_reason.is_empty());
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"claimed","model":"big","holder":"chat-ui","by":"chat-ui"}],
+                "claims":[claim_entry(
+                    "big", "chat-ui", true, true, None, None, None,
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list[0].holder, "chat-ui");
+        assert!(list[0].auto && list[0].in_use);
+        assert!(list[0].expires_at.is_none());
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"idle","model":"big","holder":"chat-ui","by":"chat-ui"}],
+                "claims":[claim_entry(
+                    "big", "chat-ui", true, false,
+                    Some("2026-10-12T04:47:18.26725812Z"), None, None,
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert!(!list[0].in_use);
+        assert!(list[0].expires_at.is_some());
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"expired","model":"big","holder":"chat-ui"}],
+                "claims":[],
+            }),
+        );
+        assert!(claims.view().0.is_empty());
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"claimed","model":"big","holder":"eval-runner"}],
+                "claims":[claim_entry(
+                    "big", "eval-runner", false, false,
+                    Some("2026-10-12T02:37:04Z"),
+                    Some("2026-10-12T02:37:04Z"),
+                    Some("reader check"),
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert!(list[0].hold_until.is_some());
+        assert_eq!(list[0].hold_reason, "reader check");
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes":[{"action":"force-released","model":"big","holder":"eval-runner","by":"eval-runner"}],
+                "claims":[],
+            }),
+        );
+        assert!(claims.view().0.is_empty());
+    }
+
+    #[test]
+    fn two_claims_on_two_models_are_kept() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[
+                    claim_entry("big", "eval-runner", false, false, None, None, None),
+                    claim_entry("small", "chat-ui", true, true, None, None, None),
+                ],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(
+            list.iter()
+                .map(|c| (c.model.as_str(), c.holder.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("big", "eval-runner"), ("small", "chat-ui")]
+        );
+    }
+
+    #[test]
+    fn a_malformed_claims_frame_keeps_the_previous_list() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "eval-runner", false, false, None, None, None)],
+            }),
+        );
+        claims.apply(br#"{"type":"claims","data":"{not json"}"#);
+        claims.apply(br#"{"type":"claims","data":"{not json"}"#);
+        let (list, err) = claims.view();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].holder, "eval-runner");
+        assert_eq!(err, Some("malformed claims frame"));
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "chat-ui", true, true, None, None, None)],
+            }),
+        );
+        let (list, err) = claims.view();
+        assert_eq!(list[0].holder, "chat-ui");
+        assert_eq!(err, Some("malformed claims frame"));
+    }
+
+    #[test]
+    fn an_entry_missing_holder_is_skipped_not_the_list() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[
+                    {"model":"big","in_use":true},
+                    claim_entry("small", "chat-ui", false, false, None, None, None),
+                    {"holder":"eval-runner","in_use":false},
+                ],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].model, "small");
+    }
+
+    #[test]
+    fn over_long_holder_and_reason_are_capped() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    "big",
+                    &"h".repeat(80),
+                    false,
+                    false,
+                    None,
+                    Some("2026-10-12T02:37:04Z"),
+                    Some(&"r".repeat(80)),
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list[0].holder.len(), CLAIM_HOLDER_CHARS);
+        assert_eq!(list[0].hold_reason.chars().count(), CLAIM_REASON_CHARS);
+    }
+
+    #[test]
+    fn a_reason_drops_escapes_and_controls() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    "big",
+                    "operator",
+                    false,
+                    false,
+                    None,
+                    Some("2026-10-12T02:37:04Z"),
+                    Some("overnight  eval,\n\u{1b}[2Jdo not unload"),
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list[0].hold_reason, "overnight eval, [2Jdo not unload");
+        assert!(!list[0].hold_reason.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn more_than_sixteen_entries_keep_the_first_sixteen() {
+        let mut claims = Claims::default();
+        let many: Vec<_> = (0..MAX_CLAIMS + 8)
+            .map(|i| claim_entry("big", &format!("h{i}"), false, false, None, None, None))
+            .collect();
+        apply_claims(&mut claims, serde_json::json!({"claims": many}));
+        let list = claims.view().0;
+        assert_eq!(list.len(), MAX_CLAIMS);
+        assert_eq!(list[0].holder, "h0");
+        assert_eq!(list[MAX_CLAIMS - 1].holder, format!("h{}", MAX_CLAIMS - 1));
+    }
+
+    #[test]
+    fn reconnect_forgets_the_claims_list() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "eval-runner", false, false, None, None, None)],
+            }),
+        );
+        assert_eq!(claims.view().0.len(), 1);
+        claims.new_session();
+        assert!(claims.view().0.is_empty());
+        assert!(claims.view().1.is_none());
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "chat-ui", true, true, None, None, None)],
+            }),
+        );
+        assert_eq!(claims.view().0[0].holder, "chat-ui");
     }
 }
