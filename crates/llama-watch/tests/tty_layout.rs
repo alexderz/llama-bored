@@ -6720,15 +6720,39 @@ fn header_claim_sheds_in_order_from_160_to_240() {
 
 #[test]
 fn header_claim_is_not_drawn_when_swap_does_not_fit() {
-    let mut model = header_claim_model(hold_claim());
-    model.model_name = "N".repeat(48);
-    model.swap_line = "x".repeat(32);
-    let mut blank = model.clone();
-    blank.claims.clear();
-    let header = header_line(&model, 160);
-    let without = header_line(&blank, 160);
-    assert_eq!(header, without, "{header}");
-    assert!(!header.contains("operator"), "{header}");
+    let claim = HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: true,
+        ..HeaderClaim::default()
+    };
+    let mut saw_swap_dropped = 0;
+    for name_len in 1usize..=48 {
+        for cols in 100u16..=240 {
+            let mut model = header_claim_model(claim.clone());
+            model.model_name = "N".repeat(name_len);
+            model.swap_line = "x".repeat(32);
+            let header = header_line(&model, cols);
+            if header.contains("swap ") {
+                continue;
+            }
+            if cols >= 160 {
+                saw_swap_dropped += 1;
+            }
+            assert!(
+                !header.contains("eval-runner"),
+                "claim without swap at {cols} name {name_len}: {header}"
+            );
+            assert!(
+                !header.contains("claim eval-runner"),
+                "{cols} {name_len}: {header}"
+            );
+        }
+    }
+    assert!(
+        saw_swap_dropped > 0,
+        "the sweep must include a frame where swap does not fit"
+    );
 }
 
 #[test]
