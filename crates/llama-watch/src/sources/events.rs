@@ -1417,9 +1417,9 @@ mod tests {
         assert!(!kept.contains('\u{2026}'));
     }
 
-    /// The 64-byte holder cap and the 256-byte reason cap bind on their
-    /// own: ASCII longer than the later character caps, cut at the literal
-    /// byte lengths.
+    /// The 64-byte holder cap and the 256-byte reason cap cut at their
+    /// own lengths: ASCII longer than the later character caps, cut at
+    /// the literal byte lengths.
     #[test]
     fn claim_byte_caps_cut_at_64_and_256() {
         assert_eq!(CLAIM_HOLDER_BYTES, 64);
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(reason_bytes.len(), 256);
         assert_eq!(reason_bytes.chars().count(), 64);
         // 4-byte scalars: 16 fit in 64 bytes, 17 do not. The 24-character
-        // cap does not bind.
+        // cap is not the one that cuts.
         let gothic = "\u{10348}".repeat(17);
         assert_eq!(gothic.len(), 68);
         let held = take_bytes(&gothic, CLAIM_HOLDER_BYTES);
