@@ -20,7 +20,16 @@
 //! `[T, T+1)`. It fits a finish seen in `(t_prev, t_fin]` when
 //! `t_prev - 1 s < T <= t_fin + 0.5 s`: llama-swap's end is the engine's
 //! end or at most half a second later. The match has to be unique in both
-//! directions. No match, or more than one, fills nothing.
+//! directions, and no other scrape where the finished count stepped may
+//! also be that row. One such finish has to have the row's prompt and
+//! output; two or more have to have increased by at least that many
+//! tokens. A scrape after a gap, a reset or a restart, whose increases
+//! are not known, may be any row whose timestamp fits. No match, or more
+//! than one, fills nothing.
+//!
+//! A row for which the engine has no finish, that agrees with some other
+//! request's finish in prompt tokens, output tokens, duration and second,
+//! cannot be told apart and can still be filled.
 //!
 //! A non-streaming finish (`is_streaming="false"` on `num_requests_total`)
 //! fills the cached count only: its time to first token is the whole
@@ -44,8 +53,11 @@ use crate::speeds::{MAX_MODELS, MAX_PENDING, MAX_ROWS, PENDING_FOR};
 
 /// Scrapes kept per model. Past this the open window is dropped.
 const HISTORY_CAP: usize = 512;
-/// Untaken finishes older than this cannot meet a row.
+/// Untaken finishes older than this cannot meet a row. Finish scrapes
+/// that can block a fill are kept for the same time.
 const FINISH_FOR: Duration = Duration::from_secs(30);
+/// Finishes, and the finish scrapes that can block one, kept per model.
+const KEPT_FINISHES: usize = 64;
 /// Queue steps remembered since the idle anchor. Past this the order is
 /// no longer trusted.
 const QUEUE_CAP: usize = 64;
@@ -218,6 +230,26 @@ struct Finish {
     taken: bool,
 }
 
+/// Prompt and generation tokens gained on one finish scrape.
+#[derive(Clone, Copy, Debug)]
+struct SightLengths {
+    /// How many requests the finished count stepped by.
+    n: u64,
+    prompt: u64,
+    generated: u64,
+}
+
+/// A scrape where the finished count stepped. `lengths` is `None` after
+/// a gap, a reset or a restart: the increases are not known, so any row
+/// whose timestamp fits could be one of these finishes.
+#[derive(Clone, Copy, Debug)]
+struct Sight {
+    at: Instant,
+    wall_lo: SystemTime,
+    wall_hi: SystemTime,
+    lengths: Option<SightLengths>,
+}
+
 #[derive(Debug, Default)]
 struct Model {
     base: Option<Snap>,
@@ -227,6 +259,9 @@ struct Model {
     dirty: bool,
     history: VecDeque<Snap>,
     finishes: VecDeque<Finish>,
+    /// Every scrape where the finished count stepped, clean or not.
+    /// Kept for as long as [`Self::finishes`], and capped the same way.
+    sights: VecDeque<Sight>,
     /// Queue-histogram steps since [`Self::queue_anchor`], in order.
     /// `None` is a step that was not a single +1, so its seconds are unknown.
     queue_obs: VecDeque<Option<f64>>,
@@ -408,16 +443,12 @@ impl SglangBook {
             let unique =
                 hits.len() == 1 && claims.get(&(wait.model.clone(), hits[0])).copied() == Some(1);
             if unique
-                && let Some(finish) = self
-                    .models
-                    .get(&wait.model)
-                    .and_then(|model| model.finishes.get(hits[0]).filter(|finish| !finish.taken))
-            {
-                // A reported value is never stored over the row. A missing
-                // cached count is; so is a rate the row did not report.
-                stored.push((
-                    wait.seq,
-                    Fill {
+                && let Some(fill) = self.models.get(&wait.model).and_then(|model| {
+                    let finish = model.finishes.get(hits[0]).filter(|finish| !finish.taken)?;
+                    let finish_at = finish.at;
+                    // A reported value is never stored over the row. A missing
+                    // cached count is; so is a rate the row did not report.
+                    let fill = Fill {
                         cached: finish.cached,
                         prompt_tps: if wait.prompt_known {
                             None
@@ -425,8 +456,18 @@ impl SglangBook {
                             finish.prompt_tps
                         },
                         gen_tps: if wait.gen_known { None } else { finish.gen_tps },
-                    },
-                ));
+                    };
+                    // The finish's own scrape is not another scrape. Any
+                    // other recorded finish that could be this row blocks
+                    // the fill; the finish stays taken below.
+                    let blocked = model
+                        .sights
+                        .iter()
+                        .any(|sight| sight.at != finish_at && sight_could_be(sight, wait));
+                    (!blocked).then_some(fill)
+                })
+            {
+                stored.push((wait.seq, fill));
             }
             // Every finish this row fit is done. None of them is filled
             // unless it was the one stored above, and a later row must
@@ -452,6 +493,9 @@ impl SglangBook {
             model
                 .finishes
                 .retain(|finish| now.saturating_duration_since(finish.at) <= FINISH_FOR);
+            model
+                .sights
+                .retain(|sight| now.saturating_duration_since(sight.at) <= FINISH_FOR);
         }
     }
 }
@@ -470,7 +514,7 @@ impl Model {
             return;
         }
         if went_back(&prev, &snap) {
-            self.restart(snap);
+            self.restart(&prev, snap);
             return;
         }
         // Steps on this scrape are recorded before the finish consumes one,
@@ -487,6 +531,9 @@ impl Model {
         if gap || snap.running > 1.0 {
             self.dirty = true;
         }
+        // Every step of the finished count, clean or not. A row is filled
+        // from a clean window only when no other one of these could be it.
+        self.record_sight(&prev, &snap, gap);
         if one_finish(&prev, &snap) {
             if self.window_clean(&base, &snap) {
                 self.record(&base, &prev, &snap, queue);
@@ -575,8 +622,39 @@ impl Model {
             gen_tps,
             taken: false,
         });
-        while self.finishes.len() > 64 {
+        while self.finishes.len() > KEPT_FINISHES {
             self.finishes.pop_front();
+        }
+    }
+
+    /// Remember a step of the finished count. Across a gap the increases
+    /// are not known: the delta can hide a reset.
+    fn record_sight(&mut self, prev: &Snap, snap: &Snap, gap: bool) {
+        let n = snap.requests.saturating_sub(prev.requests);
+        if n == 0 {
+            return;
+        }
+        let lengths = if gap {
+            None
+        } else {
+            Some(SightLengths {
+                n,
+                prompt: snap.prompt.saturating_sub(prev.prompt),
+                generated: snap.generated.saturating_sub(prev.generated),
+            })
+        };
+        self.push_sight(Sight {
+            at: snap.at,
+            wall_lo: prev.wall,
+            wall_hi: snap.wall,
+            lengths,
+        });
+    }
+
+    fn push_sight(&mut self, sight: Sight) {
+        self.sights.push_back(sight);
+        while self.sights.len() > KEPT_FINISHES {
+            self.sights.pop_front();
         }
     }
 
@@ -618,13 +696,24 @@ impl Model {
         self.remember(snap);
     }
 
-    fn restart(&mut self, snap: Snap) {
+    fn restart(&mut self, prev: &Snap, snap: Snap) {
         self.finishes.clear();
+        self.sights.clear();
         self.since.clear();
         self.dirty = snap.running > 1.0;
         self.base = Some(snap);
         self.remember(snap);
         self.queue_baseline(&snap);
+        // The new process may already have finished requests. Their token
+        // increases are not a delta of the process this scrape replaced.
+        if snap.requests > 0 {
+            self.push_sight(Sight {
+                at: snap.at,
+                wall_lo: prev.wall,
+                wall_hi: snap.wall,
+                lengths: None,
+            });
+        }
     }
 
     /// The first scrape of a process. Steps before it were not seen.
@@ -818,6 +907,25 @@ fn stamp_fits(timestamp: Option<&str>, wall_lo: SystemTime, wall_hi: SystemTime)
     };
     let row = row as f64;
     row > lo - 1.0 && row <= hi + 0.5
+}
+
+/// `sight` could be `wait`'s request: the timestamp fits, and the
+/// lengths do too. Unknown lengths match any row whose timestamp fits.
+fn sight_could_be(sight: &Sight, wait: &Pending) -> bool {
+    if !stamp_fits(wait.timestamp.as_deref(), sight.wall_lo, sight.wall_hi) {
+        return false;
+    }
+    let Some(lengths) = sight.lengths else {
+        return true;
+    };
+    let Some(output) = wait.output else {
+        return false;
+    };
+    if lengths.n == 1 {
+        lengths.prompt == wait.input && lengths.generated == output
+    } else {
+        wait.input <= lengths.prompt && output <= lengths.generated
+    }
 }
 
 fn wall_secs(wall: SystemTime) -> Option<f64> {
@@ -1092,10 +1200,14 @@ mod tests {
         book.observe(
             "flash",
             clock.at(4_000),
-            SystemTime::UNIX_EPOCH,
+            wall_at(4_000),
             Some(totals(3, 3_000, 1_600, 1_201, (30.0, 3.0), (6.0, 3.0), 0.0)),
         );
-        book.activity(clock.at(4_500), &[claim(3, 1_000)]);
+        // The batch scrape's increases could hold a row of this length.
+        // This row ended at the later finish, not in that scrape.
+        let mut later = claim(3, 1_000);
+        later.timestamp = Some(stamp_secs(4));
+        book.activity(clock.at(4_500), &[later]);
         book.observe(
             "flash",
             clock.at(5_000),
@@ -1852,13 +1964,17 @@ mod tests {
         book.observe(
             "flash",
             clock.at(4_000),
-            SystemTime::UNIX_EPOCH,
+            wall_at(4_000),
             Some(Totals {
                 batch: 1,
                 ..totals(3, 3_000, 1_600, 1_201, (30.0, 3.0), (6.0, 3.0), 0.0)
             }),
         );
-        book.activity(clock.at(4_500), &[claim(3, 1_000)]);
+        // The mixed scrape's increases could hold a row of this length.
+        // This row ended at the later finish, not in that scrape.
+        let mut later = claim(3, 1_000);
+        later.timestamp = Some(stamp_secs(4));
+        book.activity(clock.at(4_500), &[later]);
         book.observe(
             "flash",
             clock.at(5_000),
@@ -2766,5 +2882,167 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
             None,
             "1.88 s also fits the finish that cached 590"
         );
+    }
+
+    /// Request 0 finishes cleanly. Request 1's own finish shares its scrape
+    /// with the next request's first token, so that window is not clean.
+    /// The row is request 1: the same prompt and output, a duration the
+    /// neighbour accepts, and an end second that fits both scrapes. Nothing
+    /// is filled.
+    #[test]
+    fn a_row_whose_own_unclean_finish_is_not_filled_from_its_neighbour() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        see(
+            &mut book,
+            &clock,
+            0,
+            totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0),
+        );
+        book.activity(clock.at(100), &[]);
+        see(
+            &mut book,
+            &clock,
+            2_000,
+            totals(1, 48_306, 42_066, 548, (0.704, 1.0), (0.2, 1.0), 0.0),
+        );
+        let mut row = measured(1, 48_306, 548, 1_144);
+        row.timestamp = Some(stamp_secs(2));
+        book.activity(clock.at(2_500), &[row]);
+        // One request finished, and two first tokens landed here.
+        see(
+            &mut book,
+            &clock,
+            3_000,
+            totals(2, 96_612, 42_066, 1_096, (1.848, 2.0), (1.4, 3.0), 0.0),
+        );
+        assert_eq!(book.fill(1), None, "the row's own finish was seen");
+    }
+
+    /// Two finishes in one scrape, with fewer prompt and generation tokens
+    /// than the row. That scrape cannot be the row, so the row's own clean
+    /// window still fills it.
+    #[test]
+    fn a_shorter_batch_finish_does_not_block_the_rows_own_window() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        see(
+            &mut book,
+            &clock,
+            0,
+            totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0),
+        );
+        book.activity(clock.at(100), &[]);
+        see(
+            &mut book,
+            &clock,
+            1_000,
+            totals(2, 100, 0, 10, (1.0, 2.0), (0.4, 2.0), 0.0),
+        );
+        let mut row = measured(1, 10_000, 500, 10_000);
+        row.timestamp = Some(stamp_secs(1));
+        book.activity(clock.at(1_500), &[row]);
+        see(
+            &mut book,
+            &clock,
+            2_000,
+            totals(3, 10_100, 1_000, 510, (11.0, 3.0), (2.4, 3.0), 0.0),
+        );
+        assert_eq!(book.fill(1).expect("the row's own window").cached, 1_000);
+    }
+
+    /// Two finishes in one scrape, and the row's prompt and output are at
+    /// most that scrape's increases. The row's second also fits it, so the
+    /// neighbour's clean window is not filled.
+    #[test]
+    fn a_batch_finish_long_enough_to_hold_the_row_blocks_the_neighbour() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        see(
+            &mut book,
+            &clock,
+            0,
+            totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0),
+        );
+        book.activity(clock.at(100), &[]);
+        see(
+            &mut book,
+            &clock,
+            1_000,
+            totals(2, 20_000, 0, 1_000, (1.0, 2.0), (0.4, 2.0), 0.0),
+        );
+        let mut row = measured(1, 10_000, 500, 10_000);
+        row.timestamp = Some(stamp_secs(1));
+        book.activity(clock.at(1_500), &[row]);
+        see(
+            &mut book,
+            &clock,
+            2_000,
+            totals(3, 30_000, 4_000, 1_500, (11.0, 3.0), (2.4, 3.0), 0.0),
+        );
+        assert_eq!(book.fill(1), None, "the batch scrape could be this row");
+    }
+
+    /// A scrape after a gap has no known token increases, so it can be any
+    /// row whose timestamp fits, even when the counters moved by less than
+    /// the row.
+    #[test]
+    fn a_finish_after_a_gap_blocks_any_row_in_its_interval() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        see(
+            &mut book,
+            &clock,
+            0,
+            totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0),
+        );
+        book.activity(clock.at(100), &[]);
+        see(
+            &mut book,
+            &clock,
+            11_000,
+            totals(1, 10, 0, 1, (0.2, 1.0), (0.1, 1.0), 0.0),
+        );
+        let mut row = measured(1, 1_000, 401, 10_000);
+        row.timestamp = Some(stamp_secs(11));
+        book.activity(clock.at(11_500), &[row]);
+        see(
+            &mut book,
+            &clock,
+            12_000,
+            totals(2, 1_010, 600, 402, (10.2, 2.0), (1.1, 2.0), 0.0),
+        );
+        assert_eq!(book.fill(1), None, "the gap scrape could be this row");
+    }
+
+    /// A restart's counters are not a delta of the process before it. A row
+    /// whose second falls in that interval is not filled from a later window.
+    #[test]
+    fn a_restart_with_finishes_already_counted_blocks_a_row_in_that_interval() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        see(
+            &mut book,
+            &clock,
+            0,
+            totals(4, 9_000, 1_000, 800, (40.0, 4.0), (8.0, 4.0), 0.0),
+        );
+        book.activity(clock.at(100), &[]);
+        see(
+            &mut book,
+            &clock,
+            2_000,
+            totals(1, 50, 0, 2, (0.3, 1.0), (0.1, 1.0), 0.0),
+        );
+        let mut row = measured(1, 1_000, 401, 10_000);
+        row.timestamp = Some(stamp_secs(2));
+        book.activity(clock.at(2_500), &[row]);
+        see(
+            &mut book,
+            &clock,
+            3_000,
+            totals(2, 1_050, 600, 403, (10.3, 2.0), (1.1, 2.0), 0.0),
+        );
+        assert_eq!(book.fill(1), None, "the restart could be this row");
     }
 }
