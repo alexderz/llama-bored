@@ -28,7 +28,7 @@ pub(crate) const MAX_JOB_DEPTH: usize = 8;
 /// Most files opened in one refresh.
 pub(crate) const MAX_JOB_FILES: usize = 8;
 /// Most `*.json` names collected from the directory before ranking by mtime.
-pub(crate) const MAX_JOB_NAMES: usize = 64;
+pub(crate) const MAX_JOB_NAMES: usize = 512;
 /// Longest file stem used as a path component.
 pub(crate) const MAX_STEM: usize = 128;
 /// Parsed durations longer than this are stored as this (ten years).
@@ -1220,6 +1220,48 @@ mod tests {
         let n = log.lines.len();
         jobs.refresh(Instant::now() + CHECK_EVERY, &mut log);
         assert_eq!(log.lines.len(), n, "the over-eight warning logs once");
+    }
+
+    #[test]
+    fn more_than_sixty_four_files_still_reads_the_newest() {
+        let dir = scratch("many-names");
+        let t0 = SystemTime::now() - Duration::from_secs(10_000);
+        for i in 0..70 {
+            write_job(
+                &dir,
+                &format!("old-{i:02}"),
+                &format!(r#"{{"schema":1,"name":"old-{i:02}","state":"running"}}"#).into_bytes(),
+            );
+            let path = dir.join(format!("old-{i:02}.json"));
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(t0 + Duration::from_secs(i as u64))
+                .unwrap();
+        }
+        write_job(
+            &dir,
+            "newest",
+            br#"{"schema":1,"name":"newest","state":"running"}"#,
+        );
+        let newest = dir.join("newest.json");
+        std::fs::File::options()
+            .write(true)
+            .open(&newest)
+            .unwrap()
+            .set_modified(t0 + Duration::from_secs(10_000))
+            .unwrap();
+        let mut jobs = Jobs::new(Some(dir));
+        let mut log = Mem::new();
+        jobs.refresh(Instant::now(), &mut log);
+        assert_eq!(jobs.jobs().len(), 8);
+        let names: Vec<&str> = jobs.jobs().iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(names[0], "newest", "newest mtime first: {names:?}");
+        assert!(
+            !names.contains(&"old-00"),
+            "an early directory-order name is not preferred: {names:?}"
+        );
     }
 
     #[test]
