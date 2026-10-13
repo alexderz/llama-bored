@@ -646,6 +646,11 @@ struct State<L> {
     events_failed: bool,
     /// A malformed `claims` frame was logged this session (#128).
     claims_failed: bool,
+    /// A vLLM or SGLang model was ready on the last good `/running` read.
+    /// The inflight snapshot field follows this, not the events thread, so
+    /// a llama.cpp-only box does not gain `inflight` when the stream runs
+    /// for claims (#128).
+    inflight_engines: bool,
     /// vLLM and SGLang requests' token shares (#80).
     live: LiveBook,
     /// Ready SGLang models whose `/v1/loads` answered non-2xx this load:
@@ -730,6 +735,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         events_view: EventsView::default(),
         events_failed: false,
         claims_failed: false,
+        inflight_engines: false,
         live: LiveBook::default(),
         loads_missing: HashSet::new(),
         loads_failed: false,
@@ -924,6 +930,12 @@ impl<L: Sink> State<L> {
             }
         }
         let ready: HashSet<String> = self.ready.iter().map(|model| model.id.clone()).collect();
+        if self.running_up {
+            self.inflight_engines = self
+                .ready
+                .iter()
+                .any(|model| matches!(model.backend, Backend::Vllm | Backend::SgLang));
+        }
         self.note_row_engines();
         if self.running_up {
             // A model that left `ready` in a good read was unloaded (or is
@@ -1907,21 +1919,15 @@ impl<L: Sink> State<L> {
                 // for vLLM or SGLang. Claims may open the stream for
                 // llama.cpp too (#128); that must not add an inflight
                 // field to the snapshot.
-                inflight: (events.connected
-                    && (self
-                        .ready
+                inflight: (events.connected && self.inflight_engines).then(|| {
+                    let key = activity::model_key(id);
+                    let n = events
+                        .requests
                         .iter()
-                        .any(|ready| matches!(ready.backend, Backend::Vllm | Backend::SgLang))
-                        || !self.running_up))
-                    .then(|| {
-                        let key = activity::model_key(id);
-                        let n = events
-                            .requests
-                            .iter()
-                            .filter(|req| req.model == key)
-                            .count();
-                        u16::try_from(n).unwrap_or(u16::MAX)
-                    }),
+                        .filter(|req| req.model == key)
+                        .count();
+                    u16::try_from(n).unwrap_or(u16::MAX)
+                }),
                 ..self.series.get(id, now, fresh)
             })
             .collect()

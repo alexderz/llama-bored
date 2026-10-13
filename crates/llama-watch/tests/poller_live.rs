@@ -20,6 +20,8 @@ use llama_watch::poller::{self, LlamaDetail};
 #[derive(Default)]
 struct World {
     running: Vec<u8>,
+    /// HTTP status for `/running`. 0 means 200.
+    running_status: u16,
     metrics: Vec<u8>,
     loads: Vec<u8>,
     /// Event frames, sent in order to every open `/api/events`.
@@ -91,7 +93,21 @@ fn answer(mut stream: TcpStream, world: &Mutex<World>, stop: &AtomicBool) {
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
         w.hits.push(path.clone());
         match path.as_str() {
-            "/running" => Some(w.running.clone()),
+            "/running" => {
+                let status = if w.running_status == 0 {
+                    200
+                } else {
+                    w.running_status
+                };
+                if status != 200 {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                Some(w.running.clone())
+            }
             "/api/metrics/activity" => Some(br#"{"data":[]}"#.to_vec()),
             "/api/events" => None,
             p if p.ends_with("/metrics") => Some(w.metrics.clone()),
@@ -392,4 +408,112 @@ fn claims_reach_the_detail_for_a_llama_cpp_model() {
     assert_eq!(detail.claims[0].model, "lcpp");
     assert!(detail.claims[0].in_use);
     assert!(detail.claims[0].hold_until.is_none());
+}
+
+fn no_inflight(detail: &LlamaDetail) -> bool {
+    detail.series.iter().all(|s| s.inflight.is_none())
+}
+
+/// llama.cpp-only: the events stream is connected for claims, but the
+/// snapshot has no `inflight` member before, during, or after a failed
+/// `/running` read.
+#[test]
+fn llamacpp_snapshot_has_no_inflight_when_running_fails() {
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        frames: vec![inflight("snapshot", serde_json::json!({"requests": []}))],
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), NoLog).expect("spawn");
+    let (_, detail) = wait(&rx, "loaded", |view, detail| {
+        view.ai == llama_core::sample::AiState::Loaded
+            && !detail.series.is_empty()
+            && detail.claims.is_empty()
+    });
+    assert!(
+        !detail.series.is_empty() && no_inflight(&detail),
+        "before: {:?}",
+        detail.series.iter().map(|s| s.inflight).collect::<Vec<_>>()
+    );
+    fake.edit(|w| w.running_status = 500);
+    let (_, detail) = wait(&rx, "running down", |view, _| {
+        view.ai == llama_core::sample::AiState::Down
+    });
+    assert!(
+        no_inflight(&detail),
+        "during: {:?}",
+        detail.series.iter().map(|s| s.inflight).collect::<Vec<_>>()
+    );
+    fake.edit(|w| w.running_status = 200);
+    let (_, detail) = wait(&rx, "running up", |view, detail| {
+        view.ai == llama_core::sample::AiState::Loaded && !detail.series.is_empty()
+    });
+    assert!(
+        !detail.series.is_empty() && no_inflight(&detail),
+        "after: {:?}",
+        detail.series.iter().map(|s| s.inflight).collect::<Vec<_>>()
+    );
+}
+
+#[derive(Clone)]
+struct MemLog(std::sync::Arc<Mutex<Vec<String>>>);
+
+impl Sink for MemLog {
+    fn write_line(&mut self, line: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(line.to_owned());
+    }
+}
+
+/// A malformed `claims` frame is logged once per session, not every round.
+#[test]
+fn a_malformed_claims_frame_is_logged_once_per_session() {
+    let log = MemLog(std::sync::Arc::new(Mutex::new(Vec::new())));
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        frames: vec![
+            inflight("snapshot", serde_json::json!({"requests": []})),
+            claims_frame(serde_json::json!({
+                "claims": [{
+                    "model": "lcpp",
+                    "holder": "eval-runner",
+                    "auto": false,
+                    "in_use": true,
+                }],
+            })),
+        ],
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), log.clone()).expect("spawn");
+    wait(&rx, "claims", |_, detail| {
+        detail
+            .claims
+            .first()
+            .is_some_and(|c| c.holder == "eval-runner")
+    });
+    fake.edit(|w| {
+        w.frames.push(
+            "event:message\ndata:{\"type\":\"claims\",\"data\":\"{not json\"}\n\n".to_owned(),
+        );
+    });
+    wait(&rx, "malformed kept the list", |_, detail| {
+        detail.claims.iter().any(|c| c.holder == "eval-runner")
+            && log
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|line| line.contains("claims frame did not parse"))
+    });
+    thread::sleep(Duration::from_millis(800));
+    let lines = log.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let n = lines
+        .iter()
+        .filter(|line| line.contains("claims frame did not parse"))
+        .count();
+    assert_eq!(n, 1, "logged every round: {lines:?}");
 }
