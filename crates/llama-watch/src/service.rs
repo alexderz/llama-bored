@@ -1101,7 +1101,7 @@ fn tty_model(
         setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
         job: job_and_note.0,
         job_note: job_and_note.1,
-        model_id: header_model_id(sample, watch, &tick.detail, &ctx.setup),
+        model_id: header_model_id(sample, watch, &tick.detail),
         claims: tick
             .detail
             .claims
@@ -1128,12 +1128,7 @@ fn tty_model(
 /// ([`crate::sources::events::claim_model`]). Same pairing of
 /// `detail.setup` and `sample.snapshot.models` as [`setup_view`]. Empty
 /// when that view is collapsed, or when the pair is stale (no `swap_id`).
-fn header_model_id(
-    sample: &WatchSample,
-    state: WatchState,
-    detail: &LlamaDetail,
-    _rules: &Rules,
-) -> String {
+fn header_model_id(sample: &WatchSample, state: WatchState, detail: &LlamaDetail) -> String {
     paired_setup(sample, detail, state)
         .map(|(setup, _)| setup.swap_id)
         .unwrap_or_default()
@@ -2455,7 +2450,7 @@ mod tests {
             "the 32-character key collides"
         );
         assert_eq!(
-            header_model_id(&sample, WatchState::Ready, &detail, &rules),
+            header_model_id(&sample, WatchState::Ready, &detail),
             q6,
             "the busy model is the second"
         );
@@ -2467,7 +2462,7 @@ mod tests {
         );
         detail.setup.pop();
         assert!(
-            header_model_id(&sample, WatchState::Ready, &detail, &rules).is_empty(),
+            header_model_id(&sample, WatchState::Ready, &detail).is_empty(),
             "a stale pair has no swap_id"
         );
         assert_eq!(
@@ -2477,9 +2472,9 @@ mod tests {
             Some("flash"),
             "SETUP still falls back to the snapshot name"
         );
-        assert!(header_model_id(&sample, WatchState::AiDown, &detail, &rules).is_empty());
+        assert!(header_model_id(&sample, WatchState::AiDown, &detail).is_empty());
         sample.snapshot.models.clear();
-        assert!(header_model_id(&sample, WatchState::Ready, &detail, &rules).is_empty());
+        assert!(header_model_id(&sample, WatchState::Ready, &detail).is_empty());
     }
 
     /// A llama-swap id longer than the 48-character display form still
