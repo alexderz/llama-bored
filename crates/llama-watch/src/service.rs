@@ -2355,7 +2355,7 @@ mod tests {
                 ..ModelSetup::default()
             }];
             tick.detail.claims = claims;
-            tty_model(&sample, &mut tick, mono, wall, &zone, &ctx)
+            tty_model(&sample, &mut tick, mono, wall, zone, &ctx)
         };
         let today = frame(Vec::new());
         let other = frame(vec![crate::sources::events::ModelClaim {
