@@ -27,8 +27,14 @@ pub(crate) const MAX_JOB_BYTES: u64 = 64 * 1024;
 pub(crate) const MAX_JOB_DEPTH: usize = 8;
 /// Most files opened in one refresh.
 pub(crate) const MAX_JOB_FILES: usize = 8;
+/// Most `*.json` names collected from the directory before ranking by mtime.
+pub(crate) const MAX_JOB_NAMES: usize = 64;
 /// Longest file stem used as a path component.
 pub(crate) const MAX_STEM: usize = 128;
+/// Parsed durations longer than this are stored as this (ten years).
+pub(crate) const MAX_DURATION_S: u64 = 10 * 365 * 24 * 60 * 60;
+/// An mtime more than this many seconds in the future counts as stale.
+pub(crate) const FUTURE_STALE_S: u64 = 60;
 /// Most points kept in one series, newest retained.
 pub(crate) const MAX_SERIES_POINTS: usize = 512;
 /// Most `rates` kept.
@@ -47,6 +53,7 @@ const MAX_UNIT: usize = 12;
 const MAX_RESULT: usize = 32;
 
 const DIR_CAUSE: &str = "jobs dir unreadable";
+const TOO_MANY: &str = "more than eight files";
 const UNREADABLE: &str = "unreadable";
 const TOO_BIG: &str = "too big";
 const NOT_JSON: &str = "not json";
@@ -55,13 +62,14 @@ const NOT_FILE: &str = "not a file";
 const BAD_SCHEMA: &str = "bad schema";
 const BAD_STATUS: &str = "bad status";
 
-/// `st_mtime`, its nanoseconds, and `st_size`, so a later stat can see
-/// whether the file changed without reading it.
+/// `st_mtime`, its nanoseconds, `st_size` and inode, so a later stat can
+/// see whether the file changed without reading it.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Stamp {
     mtime: i64,
     nsec: u64,
     len: i64,
+    ino: u64,
 }
 
 struct Entry {
@@ -236,6 +244,9 @@ impl Jobs {
             return;
         }
         self.listed = Some(now);
+        if !self.dir_still_here() {
+            self.fd = None;
+        }
         if self.fd.is_none() {
             self.ops = self.ops.saturating_add(1);
             self.dir_checked = Some(now);
@@ -263,16 +274,38 @@ impl Jobs {
                 return;
             }
         };
-        let keep: HashSet<&str> = names.iter().map(String::as_str).collect();
+        if names.len() > MAX_JOB_FILES {
+            self.log_cause(TOO_MANY, log);
+        } else {
+            self.logged.remove(TOO_MANY);
+        }
+        let mut ranked: Vec<(String, SystemTime)> = Vec::new();
+        for name in &names {
+            match self.stat_stem(name) {
+                Ok(Some(stat)) => ranked.push((name.clone(), mtime_of(&stat))),
+                Ok(None) => {}
+                Err(()) => {
+                    self.fd = None;
+                    self.dir_checked = Some(now);
+                    self.log_cause(DIR_CAUSE, log);
+                    self.stems.clear();
+                    return;
+                }
+            }
+        }
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(MAX_JOB_FILES);
+        let keep: HashSet<&str> = ranked.iter().map(|(stem, _)| stem.as_str()).collect();
         self.files.retain(|stem, _| keep.contains(stem.as_str()));
         self.logged.retain(|cause| {
             cause == DIR_CAUSE
+                || cause == TOO_MANY
                 || keep
                     .iter()
                     .any(|stem| cause.starts_with(&format!("{stem}: ")))
         });
         let mut listed = Vec::new();
-        for name in &names {
+        for (name, _) in &ranked {
             if self.refresh_one(name, now, log) {
                 self.fd = None;
                 self.dir_checked = Some(now);
@@ -296,6 +329,40 @@ impl Jobs {
             mb.cmp(&ma).then_with(|| a.cmp(b))
         });
         self.stems = listed;
+    }
+
+    /// `true` when the open directory handle still is the path.
+    fn dir_still_here(&self) -> bool {
+        let Some(fd) = self.fd.as_ref() else {
+            return false;
+        };
+        let Some(path) = self.dir.as_deref() else {
+            return false;
+        };
+        let Ok(fd_stat) = rustix::fs::fstat(fd) else {
+            return false;
+        };
+        let Ok(path_stat) = rustix::fs::lstat(path) else {
+            return false;
+        };
+        FileType::from_raw_mode(path_stat.st_mode) == FileType::Directory
+            && fd_stat.st_dev == path_stat.st_dev
+            && fd_stat.st_ino == path_stat.st_ino
+    }
+
+    /// Stat one `<stem>.json`. `Ok(None)` is missing. `Err` is a dead directory.
+    fn stat_stem(&mut self, stem: &str) -> Result<Option<rustix::fs::Stat>, ()> {
+        let name = format!("{stem}.json");
+        self.ops = self.ops.saturating_add(1);
+        let Some(dir) = self.fd.as_ref() else {
+            return Err(());
+        };
+        match rustix::fs::statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(Errno::NOENT) => Ok(None),
+            Err(err) if dir_gone(err) => Err(()),
+            Err(_) => Ok(None),
+        }
     }
 
     /// `true` when the directory fd itself is dead and the caller should
@@ -431,13 +498,15 @@ impl Jobs {
                     if !stem_ok(stem) {
                         continue;
                     }
+                    if names.len() >= MAX_JOB_NAMES {
+                        continue;
+                    }
                     names.push(stem.to_owned());
                 }
             }
         }
         names.sort();
         names.dedup();
-        names.truncate(MAX_JOB_FILES);
         Ok(names)
     }
 
@@ -533,6 +602,7 @@ fn stamp_of(stat: &rustix::fs::Stat) -> Stamp {
         mtime: stat.st_mtime,
         nsec: stat.st_mtime_nsec,
         len: stat.st_size,
+        ino: stat.st_ino,
     }
 }
 
@@ -608,9 +678,10 @@ fn too_deep(bytes: &[u8]) -> bool {
 }
 
 fn parse_job(stem: &str, bytes: &[u8], mtime: SystemTime) -> Result<Job, &'static str> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| NOT_JSON)?;
+    let cleaned = rewrite_nonfinite(bytes);
+    let value: serde_json::Value = serde_json::from_slice(&cleaned).map_err(|_| NOT_JSON)?;
     let obj = value.as_object().ok_or(NOT_JSON)?;
-    match obj.get("schema").and_then(as_u64) {
+    match obj.get("schema").and_then(serde_json::Value::as_u64) {
         Some(1) => {}
         _ => return Err(BAD_SCHEMA),
     }
@@ -636,10 +707,10 @@ fn parse_job(stem: &str, bytes: &[u8], mtime: SystemTime) -> Result<Job, &'stati
         .and_then(serde_json::Value::as_str)
         .and_then(|text| clean_cap(text, MAX_TITLE));
     let phase = obj.get("phase").and_then(parse_phase);
-    let step = obj.get("step").and_then(as_u64);
-    let total = obj.get("total").and_then(as_u64);
-    let elapsed_s = obj.get("elapsed_s").and_then(as_u64);
-    let eta_s = obj.get("eta_s").and_then(as_u64);
+    let step = obj.get("step").and_then(as_int);
+    let total = obj.get("total").and_then(as_int);
+    let elapsed_s = obj.get("elapsed_s").and_then(as_duration);
+    let eta_s = obj.get("eta_s").and_then(as_duration);
     let rate = obj.get("rate").and_then(parse_rate);
     let rates = obj
         .get("rates")
@@ -689,8 +760,8 @@ fn parse_phase(value: &serde_json::Value) -> Option<JobPhase> {
         .and_then(|text| clean_cap(text, MAX_LABEL))?;
     Some(JobPhase {
         label,
-        index: obj.get("index").and_then(as_u64),
-        of: obj.get("of").and_then(as_u64),
+        index: obj.get("index").and_then(as_int),
+        of: obj.get("of").and_then(as_int),
     })
 }
 
@@ -770,7 +841,7 @@ fn parse_phase_row(value: &serde_json::Value) -> Option<JobPhaseRow> {
             .get("state")
             .and_then(serde_json::Value::as_str)
             .and_then(PhaseMark::parse),
-        elapsed_s: obj.get("elapsed_s").and_then(as_u64),
+        elapsed_s: obj.get("elapsed_s").and_then(as_duration),
         result: obj
             .get("result")
             .and_then(serde_json::Value::as_str)
@@ -783,12 +854,74 @@ fn as_finite(value: &serde_json::Value) -> Option<f64> {
     n.is_finite().then_some(n)
 }
 
-fn as_u64(value: &serde_json::Value) -> Option<u64> {
-    let n = as_finite(value)?;
-    if n < 0.0 || n > u64::MAX as f64 {
-        return None;
+/// An integer JSON number. A float such as `1.4` or `921.5` is absent.
+fn as_int(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64()
+}
+
+fn as_duration(value: &serde_json::Value) -> Option<u64> {
+    Some(as_int(value)?.min(MAX_DURATION_S))
+}
+
+/// Replace bare `NaN` / `Infinity` / `-Infinity` outside strings with `null`,
+/// so a diverged loss does not reject the file. Tokens inside strings stay.
+fn rewrite_nonfinite(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if let Some(n) = nonfinite_token(&bytes[i..]) {
+            out.extend_from_slice(b"null");
+            changed = true;
+            i += n;
+            continue;
+        }
+        out.push(b);
+        i += 1;
     }
-    Some(n.round() as u64)
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    }
+}
+
+fn nonfinite_token(bytes: &[u8]) -> Option<usize> {
+    const TOKENS: &[&[u8]] = &[b"-Infinity", b"Infinity", b"NaN"];
+    for token in TOKENS {
+        if bytes.starts_with(token) && token_boundary(bytes, token.len()) {
+            return Some(token.len());
+        }
+    }
+    None
+}
+
+fn token_boundary(bytes: &[u8], end: usize) -> bool {
+    match bytes.get(end) {
+        None => true,
+        Some(b) => !b.is_ascii_alphanumeric() && *b != b'_',
+    }
 }
 
 /// A `text` value. Whitespace runs, including newlines and tabs, become
@@ -831,11 +964,56 @@ fn clean_cap(raw: &str, cap: usize) -> Option<String> {
     Some(cut_text(&cleaned, cap))
 }
 
-/// `true` when `mtime` is older than `stale_s` seconds before `now`.
+/// `true` when `mtime` is older than `stale_s` seconds before `now`, or more
+/// than [`FUTURE_STALE_S`] seconds in the future.
 pub fn is_stale(mtime: SystemTime, now: SystemTime, stale_s: u64) -> bool {
     match now.duration_since(mtime) {
         Ok(age) => age > Duration::from_secs(stale_s),
-        Err(_) => false,
+        Err(skew) => skew.duration() > Duration::from_secs(FUTURE_STALE_S),
+    }
+}
+
+/// Which job, if any, the dashboard should show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JobPick<'a> {
+    /// A live (`running` and fresh) job. `serving` keeps the inference view.
+    Live {
+        job: &'a Job,
+        more: usize,
+        serving: bool,
+    },
+    /// A fresh `done` or `failed` job: inference stays, with a one-line note.
+    Finished {
+        job: &'a Job,
+    },
+    None,
+}
+
+/// Decide the job view from the files the poller last read, newest first.
+pub fn pick_job<'a>(jobs: &'a [Job], serving: bool, stale_s: u64, now: SystemTime) -> JobPick<'a> {
+    let fresh: Vec<&Job> = jobs
+        .iter()
+        .filter(|job| !is_stale(job.mtime, now, stale_s))
+        .collect();
+    let live: Vec<&Job> = fresh
+        .iter()
+        .copied()
+        .filter(|job| job.state == JobState::Running)
+        .collect();
+    if let Some(job) = live.first() {
+        JobPick::Live {
+            job,
+            more: live.len().saturating_sub(1),
+            serving,
+        }
+    } else if let Some(job) = fresh
+        .iter()
+        .copied()
+        .find(|job| matches!(job.state, JobState::Done | JobState::Failed))
+    {
+        JobPick::Finished { job }
+    } else {
+        JobPick::None
     }
 }
 
@@ -1010,21 +1188,38 @@ mod tests {
     }
 
     #[test]
-    fn more_than_eight_files_looks_at_eight() {
+    fn more_than_eight_files_reads_the_newest_eight() {
         let dir = scratch("many");
+        let t0 = SystemTime::now() - Duration::from_secs(100);
         for i in 0..9 {
             write_job(
                 &dir,
                 &format!("job{i}"),
                 &format!(r#"{{"schema":1,"name":"job{i}","state":"running"}}"#).into_bytes(),
             );
+            let path = dir.join(format!("job{i}.json"));
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(t0 + Duration::from_secs(i as u64))
+                .unwrap();
         }
         let mut jobs = Jobs::new(Some(dir));
         let mut log = Mem::new();
         jobs.refresh(Instant::now(), &mut log);
         assert_eq!(jobs.jobs().len(), 8);
         assert_eq!(jobs.reads, 8);
-        assert!(log.lines.is_empty(), "{:?}", log.lines);
+        let names: Vec<&str> = jobs.jobs().iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(names[0], "job8", "newest mtime first: {names:?}");
+        assert!(
+            !names.contains(&"job0"),
+            "oldest leftover is not read: {names:?}"
+        );
+        assert_eq!(log.count(TOO_MANY), 1, "{:?}", log.lines);
+        let n = log.lines.len();
+        jobs.refresh(Instant::now() + CHECK_EVERY, &mut log);
+        assert_eq!(log.lines.len(), n, "the over-eight warning logs once");
     }
 
     #[test]
@@ -1034,24 +1229,59 @@ mod tests {
             "name": "n",
             "state": "running",
             "step": -1,
-            "total": 10,
+            "total": 10.5,
             "elapsed_s": 1e20,
             "eta_s": 4,
             "rate": {"value": null, "unit": "s/step"},
             "values": [
                 {"label": "loss", "value": 0.25},
-                {"label": "bad", "value": "nan"}
+                {"label": "bad", "value": "nan"},
+                {"label": "blew", "value": NaN},
+                {"label": "up", "value": Infinity},
+                {"label": "down", "value": -Infinity}
             ]
         }"#;
         let job = parse_job("n", body, UNIX_EPOCH).expect("parses");
         assert!(job.step.is_none(), "negative step is absent");
-        assert_eq!(job.total, Some(10));
-        assert!(job.elapsed_s.is_none(), "huge elapsed is absent");
+        assert!(job.total.is_none(), "fractional total is absent");
+        assert!(job.elapsed_s.is_none(), "float elapsed is absent");
         assert_eq!(job.eta_s, Some(4));
         assert!(job.rate.is_none());
         assert_eq!(job.values.len(), 1);
         assert_eq!(job.values[0].label, "loss");
         assert_eq!(job.values[0].value, 0.25);
+    }
+
+    #[test]
+    fn schema_must_be_the_integer_one() {
+        for body in [
+            br#"{"schema":1.4,"name":"n","state":"running"}"#.as_slice(),
+            br#"{"schema":1.0,"name":"n","state":"running"}"#.as_slice(),
+            br#"{"schema":2,"name":"n","state":"running"}"#.as_slice(),
+        ] {
+            assert_eq!(parse_job("n", body, UNIX_EPOCH), Err(BAD_SCHEMA));
+        }
+        assert!(parse_job("n", minimal(), UNIX_EPOCH).is_ok());
+    }
+
+    #[test]
+    fn a_huge_duration_clamps_to_ten_years() {
+        let body = format!(
+            r#"{{"schema":1,"name":"n","state":"running","elapsed_s":{max},"eta_s":{max},"phases":[{{"label":"p","elapsed_s":{max}}}]}}"#,
+            max = u64::MAX
+        );
+        let job = parse_job("n", body.as_bytes(), UNIX_EPOCH).expect("parses");
+        assert_eq!(job.elapsed_s, Some(MAX_DURATION_S));
+        assert_eq!(job.eta_s, Some(MAX_DURATION_S));
+        assert_eq!(job.phases[0].elapsed_s, Some(MAX_DURATION_S));
+    }
+
+    #[test]
+    fn nan_inside_a_string_is_not_rewritten() {
+        let body = br#"{"schema":1,"name":"NaN","state":"running","title":"Infinity"}"#;
+        let job = parse_job("n", body, UNIX_EPOCH).expect("parses");
+        assert_eq!(job.name, "NaN");
+        assert_eq!(job.title.as_deref(), Some("Infinity"));
     }
 
     #[test]
@@ -1092,6 +1322,8 @@ mod tests {
         assert!(!is_stale(fresh, now, 180));
         assert!(is_stale(old, now, 180));
         assert!(!is_stale(now + Duration::from_secs(10), now, 180));
+        assert!(!is_stale(now + Duration::from_secs(60), now, 180));
+        assert!(is_stale(now + Duration::from_secs(61), now, 180));
     }
 
     #[test]
@@ -1169,5 +1401,126 @@ mod tests {
         jobs.refresh(t0 + CHECK_EVERY + CHECK_EVERY, &mut log);
         assert_eq!(jobs.reads, 2, "a size change is read");
         assert_eq!(jobs.jobs()[0].state, JobState::Done);
+    }
+
+    #[test]
+    fn a_replaced_directory_is_reopened() {
+        let root = scratch("replace");
+        let dir = root.join("jobs");
+        std::fs::create_dir(&dir).unwrap();
+        write_job(&dir, "old", minimal());
+        let mut jobs = Jobs::new(Some(dir.clone()));
+        let mut log = Mem::new();
+        let t0 = Instant::now();
+        jobs.refresh(t0, &mut log);
+        assert_eq!(jobs.jobs()[0].name, "example-trainer");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        write_job(
+            &dir,
+            "new",
+            br#"{"schema":1,"name":"fresh-job","state":"running"}"#,
+        );
+        jobs.refresh(t0 + CHECK_EVERY, &mut log);
+        let names: Vec<&str> = jobs.jobs().iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(names, ["fresh-job"], "{names:?}");
+    }
+
+    #[test]
+    fn a_directory_that_appears_later_is_picked_up() {
+        let root = scratch("appear");
+        let dir = root.join("jobs");
+        let mut jobs = Jobs::new(Some(dir.clone()));
+        let mut log = Mem::new();
+        let t0 = Instant::now();
+        jobs.refresh(t0, &mut log);
+        assert!(jobs.jobs().is_empty());
+        assert_eq!(log.count(DIR_CAUSE), 1, "{:?}", log.lines);
+        std::fs::create_dir(&dir).unwrap();
+        write_job(&dir, "late", minimal());
+        jobs.refresh(t0 + CHECK_EVERY, &mut log);
+        assert_eq!(jobs.jobs().len(), 1);
+        assert_eq!(jobs.jobs()[0].name, "example-trainer");
+    }
+
+    fn job_at(name: &str, state: JobState, mtime: SystemTime) -> Job {
+        Job {
+            file: name.to_owned(),
+            name: name.to_owned(),
+            kind: Some("training".to_owned()),
+            title: None,
+            state,
+            phase: None,
+            step: None,
+            total: None,
+            elapsed_s: None,
+            eta_s: None,
+            rate: None,
+            rates: Vec::new(),
+            values: Vec::new(),
+            series: Vec::new(),
+            phases: Vec::new(),
+            mtime,
+        }
+    }
+
+    #[test]
+    fn pick_job_table() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let fresh = now - Duration::from_secs(10);
+        let old = now - Duration::from_secs(500);
+        let future = now + Duration::from_secs(90);
+        let running = job_at("run", JobState::Running, fresh);
+        let idle_run = job_at("run", JobState::Running, fresh);
+        let done = job_at("done", JobState::Done, fresh);
+        let failed = job_at("fail", JobState::Failed, fresh);
+        let stale = job_at("old", JobState::Running, old);
+        let skew = job_at("skew", JobState::Running, future);
+        let other = job_at("other", JobState::Running, fresh - Duration::from_secs(1));
+
+        match pick_job(std::slice::from_ref(&stale), false, 180, now) {
+            JobPick::None => {}
+            other => panic!("stale: {other:?}"),
+        }
+        match pick_job(std::slice::from_ref(&skew), false, 180, now) {
+            JobPick::None => {}
+            other => panic!("future mtime: {other:?}"),
+        }
+        match pick_job(std::slice::from_ref(&running), true, 180, now) {
+            JobPick::Live {
+                job,
+                more: 0,
+                serving: true,
+            } => assert_eq!(job.name, "run"),
+            other => panic!("running while serving: {other:?}"),
+        }
+        match pick_job(std::slice::from_ref(&idle_run), false, 180, now) {
+            JobPick::Live {
+                job,
+                more: 0,
+                serving: false,
+            } => assert_eq!(job.name, "run"),
+            other => panic!("running while idle: {other:?}"),
+        }
+        match pick_job(std::slice::from_ref(&done), false, 180, now) {
+            JobPick::Finished { job } => assert_eq!(job.name, "done"),
+            other => panic!("done: {other:?}"),
+        }
+        match pick_job(std::slice::from_ref(&failed), false, 180, now) {
+            JobPick::Finished { job } => assert_eq!(job.name, "fail"),
+            other => panic!("failed: {other:?}"),
+        }
+        match pick_job(&[running, other], false, 180, now) {
+            JobPick::Live {
+                job,
+                more: 1,
+                serving: false,
+            } => assert_eq!(job.name, "run"),
+            other => panic!("two running: {other:?}"),
+        }
+        match pick_job(&[], false, 180, now) {
+            JobPick::None => {}
+            other => panic!("none: {other:?}"),
+        }
     }
 }
