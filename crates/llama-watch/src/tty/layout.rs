@@ -93,7 +93,8 @@ pub struct Activity {
     pub cached_tok: u64,
     /// The engine did not report a cached count (#133). [`Self::cached_tok`]
     /// is then 0 for the counters that still read a number; RECENT prints
-    /// `--` and draws the prompt as one dim run. A reported 0 stays 0.
+    /// `--`. A finished row draws the prompt as one dim run. An in-flight
+    /// row keeps its progress and its cursor. A reported 0 stays 0.
     pub cached_unknown: bool,
     pub output_tok: u64,
     /// `None` when llama-swap reported no rate (a backend without timings)
@@ -2638,9 +2639,11 @@ fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
             ];
         }
     }
-    // #133: an unreported cached count is not zero new tokens. The prompt
-    // is one run; output is unchanged. A reported 0 takes the path below.
-    if req.cached_unknown {
+    // #133: a finished row with no cached count draws the prompt as one
+    // dim run. An in-flight row keeps the done/pending split and the
+    // cursor it had when an omitted count was read as zero; only the
+    // CACHED cell is `--`. A reported 0 takes the path below.
+    if req.cached_unknown && req.inflight.is_none() {
         return [
             (CtxPart::Prompt, req.input_tok),
             (CtxPart::New, 0),
@@ -2648,7 +2651,11 @@ fn ctx_parts(req: &Activity) -> [(CtxPart, u64); 4] {
             (CtxPart::Out, req.output_tok),
         ];
     }
-    let cached = req.cached_tok.min(req.input_tok);
+    let cached = if req.cached_unknown {
+        0
+    } else {
+        req.cached_tok.min(req.input_tok)
+    };
     let new = req.input_tok - cached;
     let (done, pending) = match req.inflight {
         Some(flight) if !flight.decoding && !flight.open && flight.target => {
@@ -2708,16 +2715,9 @@ fn draw_ctx_bar(
     let n_ctx = req.n_ctx.filter(|n| *n > 0);
     let scale = n_ctx.unwrap_or(relative_scale);
     let width = usize::from(span.w);
-    // An unknown cache has no new run for a prefill cursor to sit on.
-    let spin = req.inflight.and_then(|flight| {
-        if req.cached_unknown && !flight.decoding {
-            None
-        } else {
-            Some(Spin {
-                decoding: flight.decoding,
-                beats: flight.beats,
-            })
-        }
+    let spin = req.inflight.map(|flight| Spin {
+        decoding: flight.decoding,
+        beats: flight.beats,
     });
     let cells = ctx_cells(&parts, scale, width, spin);
     for (i, cell) in cells.iter().enumerate() {
