@@ -6334,12 +6334,18 @@ fn hold_claim() -> HeaderClaim {
         in_use: true,
         expires_at: None,
         hold_until: Some(claim_now() + Duration::from_secs(2 * 3600 + 43 * 60)),
+        hold_tz_offset_s: 0,
         hold_reason: "overnight eval, do not unload".to_owned(),
     }
 }
 
 fn header_line(model: &TtyModel, cols: u16) -> String {
     row_string(&draw(model, cols, 60), 0)
+}
+
+fn find_cells(chars: &[char], needle: &str) -> Option<usize> {
+    let n: Vec<char> = needle.chars().collect();
+    chars.windows(n.len()).position(|w| w == n.as_slice())
 }
 
 #[test]
@@ -6349,25 +6355,19 @@ fn header_claim_four_forms_at_192() {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
         in_use: true,
-        expires_at: None,
-        hold_until: None,
-        hold_reason: String::new(),
+        ..HeaderClaim::default()
     });
     let idle = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
-        in_use: false,
         expires_at: Some(now + Duration::from_secs(4 * 60 + 12)),
-        hold_until: None,
-        hold_reason: String::new(),
+        ..HeaderClaim::default()
     });
     let short = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "chat-ui".to_owned(),
-        in_use: false,
         expires_at: Some(now + Duration::from_secs(41)),
-        hold_until: None,
-        hold_reason: String::new(),
+        ..HeaderClaim::default()
     });
     let hold = header_claim_model(hold_claim());
     let h_in_use = header_line(&in_use, 192);
@@ -6427,18 +6427,14 @@ fn header_claim_hour_form_and_zero_at_expiry() {
     let hour = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
-        in_use: false,
         expires_at: Some(now + Duration::from_secs(3600 + 5 * 60)),
-        hold_until: None,
-        hold_reason: String::new(),
+        ..HeaderClaim::default()
     });
     let past = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
-        in_use: false,
         expires_at: Some(now - Duration::from_secs(1)),
-        hold_until: None,
-        hold_reason: String::new(),
+        ..HeaderClaim::default()
     });
     assert!(
         header_line(&hour, 192).contains("1 h 05 min left"),
@@ -6548,6 +6544,236 @@ fn no_claims_is_byte_identical_to_today() {
         assert_eq!(console_bytes(&ga), console_bytes(&gb), "{cols} grid empty");
         assert_eq!(console_bytes(&ga), console_bytes(&gc), "{cols} grid other");
     }
+}
+
+/// Shedding order, strictly: full; reason cut with the ellipsis (only
+/// when at least two cells of reason text remain before it); no reason;
+/// no label word; nothing. The reason is never drawn once the label is
+/// dropped.
+#[test]
+fn header_claim_sheds_in_order_from_160_to_240() {
+    let holder = "abcdefghijklmnopqrstuvwx";
+    assert_eq!(holder.chars().count(), 24);
+    let reason = "overnight eval, do not unload this model";
+    assert_eq!(reason.chars().count(), 40);
+    let now = claim_now();
+    let forms: [(&str, HeaderClaim); 4] = [
+        (
+            "in_use",
+            HeaderClaim {
+                model: "qwen3.6-35b-a3b".to_owned(),
+                holder: holder.to_owned(),
+                in_use: true,
+                ..HeaderClaim::default()
+            },
+        ),
+        (
+            "idle",
+            HeaderClaim {
+                model: "qwen3.6-35b-a3b".to_owned(),
+                holder: holder.to_owned(),
+                expires_at: Some(now + Duration::from_secs(4 * 60 + 12)),
+                ..HeaderClaim::default()
+            },
+        ),
+        (
+            "short",
+            HeaderClaim {
+                model: "qwen3.6-35b-a3b".to_owned(),
+                holder: holder.to_owned(),
+                expires_at: Some(now + Duration::from_secs(41)),
+                ..HeaderClaim::default()
+            },
+        ),
+        (
+            "hold",
+            HeaderClaim {
+                model: "qwen3.6-35b-a3b".to_owned(),
+                holder: holder.to_owned(),
+                hold_until: Some(now + Duration::from_secs(2 * 3600 + 43 * 60)),
+                hold_reason: reason.to_owned(),
+                ..HeaderClaim::default()
+            },
+        ),
+    ];
+    let names = ["Qwen 35B", &"N".repeat(40)];
+    for (form_name, claim) in forms {
+        let has_reason = !claim.hold_reason.is_empty();
+        let label = if claim.hold_until.is_some() {
+            "hold"
+        } else {
+            "claim"
+        };
+        for name in names {
+            let mut model = header_claim_model(claim.clone());
+            model.model_name = name.to_owned();
+            let mut blank = model.clone();
+            blank.claims.clear();
+            let mut rooms: Vec<(usize, u8)> = Vec::new();
+            for cols in (160u16..=240).rev() {
+                let grid = draw(&model, cols, 60);
+                let blank_grid = draw(&blank, cols, 60);
+                assert_eq!(grid.cols(), cols, "{form_name} {name} {cols} row width");
+                assert_eq!(blank_grid.cols(), cols);
+                let header: Vec<char> = (0..cols).map(|c| grid.get(c, 0).unwrap().ch).collect();
+                let blank_h: Vec<char> = (0..cols)
+                    .map(|c| blank_grid.get(c, 0).unwrap().ch)
+                    .collect();
+                let clock_word = if cols >= 200 { "COOL" } else { "2026-09-23" };
+                let clock = find_cells(&header, clock_word).unwrap_or_else(|| {
+                    panic!(
+                        "{form_name} {name} {cols} no {clock_word}: {}",
+                        header.iter().collect::<String>()
+                    )
+                });
+                let blank_clock = find_cells(&blank_h, clock_word).unwrap_or_else(|| {
+                    panic!(
+                        "{form_name} {name} {cols} blank no {clock_word}: {}",
+                        blank_h.iter().collect::<String>()
+                    )
+                });
+                assert_eq!(clock, blank_clock, "{form_name} {name} {cols} clock column");
+                assert!(
+                    clock >= 2,
+                    "{form_name} {name} {cols} clock has no gap: {}",
+                    header.iter().collect::<String>()
+                );
+                assert_eq!(
+                    &header[clock - 2..],
+                    &blank_h[clock - 2..],
+                    "{form_name} {name} {cols} right-hand items"
+                );
+                let left: String = header[..clock.saturating_sub(2)]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned();
+                let has_holder = left.contains(holder);
+                let has_label = left.contains(label);
+                let has_full_reason = has_reason && left.contains(reason);
+                let has_ellipsis = left.contains('\u{2026}');
+                let has_reason_bit =
+                    has_reason && (has_full_reason || (has_ellipsis && left.contains("overnight")));
+                assert!(
+                    !has_reason_bit || has_label,
+                    "{form_name} {name} {cols}: reason without label: {left}"
+                );
+                if has_holder {
+                    let last = left.chars().last().unwrap_or(' ');
+                    assert_ne!(
+                        last, '\u{00B7}',
+                        "{form_name} {name} {cols} ends in a separator: {left}"
+                    );
+                    if last == '\u{2026}' {
+                        let chars: Vec<char> = left.chars().collect();
+                        assert!(
+                            chars.len() >= 3,
+                            "{form_name} {name} {cols} lone ellipsis: {left}"
+                        );
+                        let a = chars[chars.len() - 3];
+                        let b = chars[chars.len() - 2];
+                        assert!(
+                            a != '\u{00B7}' && b != '\u{00B7}',
+                            "{form_name} {name} {cols} ellipsis after separator: {left}"
+                        );
+                    }
+                }
+                let step = if !has_holder {
+                    4
+                } else if !has_label {
+                    3
+                } else if has_reason && has_full_reason {
+                    0
+                } else if has_reason && has_reason_bit {
+                    1
+                } else {
+                    2
+                };
+                // Order follows leftover after swap, not total width: at
+                // 200 columns the COOL/CPU/GPU block takes room the clock
+                // alone does not, so a narrower row can show a fuller claim.
+                let leftover = find_cells(&header, &format!("swap {}", model.swap_line))
+                    .map(|at| {
+                        let after =
+                            at + "swap".chars().count() + 1 + model.swap_line.chars().count() + 3;
+                        clock.saturating_sub(2).saturating_sub(after)
+                    })
+                    .unwrap_or(0);
+                rooms.push((leftover, step));
+            }
+            rooms.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let mut seen = Vec::new();
+            for &(_, step) in &rooms {
+                if seen.last() != Some(&step) {
+                    seen.push(step);
+                }
+            }
+            let mut ordered = seen.clone();
+            ordered.sort();
+            assert_eq!(
+                seen, ordered,
+                "{form_name} {name}: forms {seen:?} are not in shedding order ({rooms:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn header_claim_is_not_drawn_when_swap_does_not_fit() {
+    let mut model = header_claim_model(hold_claim());
+    model.model_name = "N".repeat(48);
+    model.swap_line = "x".repeat(32);
+    let mut blank = model.clone();
+    blank.claims.clear();
+    let header = header_line(&model, 160);
+    let without = header_line(&blank, 160);
+    assert_eq!(header, without, "{header}");
+    assert!(!header.contains("operator"), "{header}");
+}
+
+#[test]
+fn two_claims_on_the_same_model_draw_the_first() {
+    let mut model = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: true,
+        ..HeaderClaim::default()
+    });
+    model.claims.push(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "chat-ui".to_owned(),
+        in_use: false,
+        ..HeaderClaim::default()
+    });
+    let header = header_line(&model, 192);
+    assert!(header.contains("eval-runner"), "{header}");
+    assert!(!header.contains("chat-ui"), "{header}");
+}
+
+#[test]
+fn header_matches_the_full_llama_swap_id() {
+    let q4 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q4_K_XL";
+    let q6 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q6_K_XL";
+    let mut model = header_claim_model(HeaderClaim {
+        model: q4.to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: true,
+        ..HeaderClaim::default()
+    });
+    model.model_id = q4.to_owned();
+    model.claims.push(HeaderClaim {
+        model: q6.to_owned(),
+        holder: "chat-ui".to_owned(),
+        in_use: true,
+        ..HeaderClaim::default()
+    });
+    let header = header_line(&model, 192);
+    assert!(header.contains("eval-runner"), "{header}");
+    assert!(!header.contains("chat-ui"), "{header}");
+    model.model_id = q6.to_owned();
+    let header = header_line(&model, 192);
+    assert!(header.contains("chat-ui"), "{header}");
+    assert!(!header.contains("eval-runner"), "{header}");
 }
 
 const CLAIMS_GOLDENS: [(&str, u16, u16); 1] = [("claims-192.json", 192, 60)];
