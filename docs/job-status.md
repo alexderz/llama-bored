@@ -64,7 +64,7 @@ integers; a fractional value is absent. Durations longer than ten years
 are stored as ten years.
 
 llama-watch looks at at most eight `*.json` files directly in `dir`
-(newest mtime first; at most 64 names are collected), opens them without
+(newest mtime first; at most 512 names are collected, then ranked), opens them without
 following a symlink, rejects a body over 64 KiB or JSON deeper than 8, and
 re-reads at most once a second and only when the mtime, size or inode
 changed. A file that fails a check is skipped and logged once. A writer
@@ -111,11 +111,21 @@ class JobStatusCallback:
         self.t0 = time.monotonic()
         self.loss = []
         self.step_t = []
+        self.values = {}
         self.last = time.monotonic()
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         logs = logs or {}
-        self._write(state, logs)
+        loss = logs.get("loss")
+        if _finite(loss):
+            self.loss.append(float(loss))
+            if len(self.loss) > 512:
+                self.loss = self.loss[-512:]
+        for key in ("loss", "learning_rate", "epoch", "grad_norm"):
+            val = logs.get(key)
+            if _finite(val):
+                self.values[key] = float(val)
+        self._write(state)
 
     def on_step_end(self, args, state, control, **kwargs):
         now = time.monotonic()
@@ -123,20 +133,15 @@ class JobStatusCallback:
         self.last = now
         if len(self.step_t) > 512:
             self.step_t = self.step_t[-512:]
-        self._write(state, {})
+        self._write(state)
 
     def on_train_end(self, args, state, control, **kwargs):
-        self._write(state, {}, done=True)
+        self._write(state, done=True)
 
-    def _write(self, state, logs, done=False):
+    def _write(self, state, done=False):
         elapsed = max(0, int(time.monotonic() - self.t0))
         step = int(getattr(state, "global_step", 0) or 0)
         total = self.total or getattr(state, "max_steps", None)
-        loss = logs.get("loss")
-        if _finite(loss):
-            self.loss.append(float(loss))
-            if len(self.loss) > 512:
-                self.loss = self.loss[-512:]
         rate = self.step_t[-1] if self.step_t else None
         if rate is not None and not _finite(rate):
             rate = None
@@ -160,7 +165,7 @@ class JobStatusCallback:
             body["rate"] = {"value": rate, "unit": "s/step"}
         values = []
         for key in ("loss", "learning_rate", "epoch", "grad_norm"):
-            val = logs.get(key)
+            val = self.values.get(key)
             if _finite(val):
                 label = {"learning_rate": "lr", "grad_norm": "grad"}.get(key, key)
                 values.append({"label": label, "value": float(val)})
