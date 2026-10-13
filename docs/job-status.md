@@ -47,22 +47,29 @@ temporary file in the same directory, then rename). Schema 1:
 }
 ```
 
-Required: `schema` (must be 1), `name`, `state` (`running`, `done` or
-`failed`). Everything else is optional; the view shows what is there.
-Unknown members are ignored. `kind` is a short token
-(`[A-Za-z0-9_.+-]`, at most 16 characters).
+Required: `schema` (must be the integer 1; a float such as `1.4` is
+rejected), `name`, `state` (`running`, `done` or `failed`). Everything
+else is optional; the view shows what is there. Unknown members are
+ignored. `kind` is a short token (`[A-Za-z0-9_.+-]`, at most 16
+characters).
 
 Caps: `rates` 4, `values` 8, `series` 4 with at most 512 points each
 (newest kept), `phases` 12. Text is sanitised like SETUP `text` (controls
 and escape sequences dropped) and cut: name 32, title 48, labels 16, units
-12, result 32 characters. A non-finite or out-of-range number makes that
-one member absent, not the whole file invalid. `step`, `total`,
-`elapsed_s` and `eta_s` are non-negative.
+12, result 32 characters. A non-finite number (`NaN`, `Infinity`,
+`-Infinity`, including those bare tokens as `json.dumps` writes them) or
+an out-of-range number makes that one member absent, not the whole file
+invalid. `step`, `total`, `elapsed_s` and `eta_s` are non-negative
+integers; a fractional value is absent. Durations longer than ten years
+are stored as ten years.
 
-llama-watch looks at at most eight `*.json` files directly in `dir`, opens
-them without following a symlink, rejects a body over 64 KiB or JSON
-deeper than 8, and re-reads at most once a second and only when the mtime
-or size changed. A file that fails a check is skipped and logged once.
+llama-watch looks at at most eight `*.json` files directly in `dir`
+(newest mtime first; at most 64 names are collected), opens them without
+following a symlink, rejects a body over 64 KiB or JSON deeper than 8, and
+re-reads at most once a second and only when the mtime, size or inode
+changed. A file that fails a check is skipped and logged once. A writer
+must write more often than `stale_s` or the job is treated as gone. An
+mtime more than 60 seconds in the future also counts as stale.
 
 A job is live when its file is younger than `stale_s` and `state` is
 `running`. With several live jobs the view shows the one whose file
@@ -78,13 +85,22 @@ installed with llama-bored.
 
 ```python
 import json
+import math
 import os
 import tempfile
 import time
 
 
+def _finite(value):
+    return isinstance(value, (int, float)) and math.isfinite(value)
+
+
 class JobStatusCallback:
-    """Write schema 1 status for llama-watch. Pass as a Trainer callback."""
+    """Write schema 1 status for llama-watch. Pass as a Trainer callback.
+
+    Write more often than llama-watch ``stale_s`` (default 180 s) or the
+    job is treated as gone.
+    """
 
     def __init__(self, dir, name, title, kind="training", total=None):
         self.path = os.path.join(dir, f"{name}.json")
@@ -107,6 +123,7 @@ class JobStatusCallback:
         self.last = now
         if len(self.step_t) > 512:
             self.step_t = self.step_t[-512:]
+        self._write(state, {})
 
     def on_train_end(self, args, state, control, **kwargs):
         self._write(state, {}, done=True)
@@ -116,11 +133,13 @@ class JobStatusCallback:
         step = int(getattr(state, "global_step", 0) or 0)
         total = self.total or getattr(state, "max_steps", None)
         loss = logs.get("loss")
-        if isinstance(loss, (int, float)):
+        if _finite(loss):
             self.loss.append(float(loss))
             if len(self.loss) > 512:
                 self.loss = self.loss[-512:]
         rate = self.step_t[-1] if self.step_t else None
+        if rate is not None and not _finite(rate):
+            rate = None
         eta = None
         if rate and total and step < total:
             eta = int(rate * (total - step))
@@ -142,19 +161,19 @@ class JobStatusCallback:
         values = []
         for key in ("loss", "learning_rate", "epoch", "grad_norm"):
             val = logs.get(key)
-            if isinstance(val, (int, float)):
+            if _finite(val):
                 label = {"learning_rate": "lr", "grad_norm": "grad"}.get(key, key)
                 values.append({"label": label, "value": float(val)})
         if values:
             body["values"] = values
         series = []
         if self.loss:
-            series.append({"label": "loss", "points": list(self.loss)})
+            series.append({"label": "loss", "points": [p for p in self.loss if _finite(p)]})
         if self.step_t:
-            series.append({"label": "s/step", "points": list(self.step_t)})
+            series.append({"label": "s/step", "points": [p for p in self.step_t if _finite(p)]})
         if series:
             body["series"] = series
-        raw = json.dumps(body, ensure_ascii=True)
+        raw = json.dumps(body, ensure_ascii=True, allow_nan=False)
         directory = os.path.dirname(self.path) or "."
         fd, tmp = tempfile.mkstemp(prefix=".job-", suffix=".tmp", dir=directory)
         try:
@@ -162,6 +181,7 @@ class JobStatusCallback:
                 out.write(raw)
                 out.flush()
                 os.fsync(out.fileno())
+            os.chmod(tmp, 0o644)
             os.replace(tmp, self.path)
         except Exception:
             try:
