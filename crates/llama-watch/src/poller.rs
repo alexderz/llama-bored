@@ -126,6 +126,7 @@ use llama_core::wire::CANONICAL_NAME_CHARS;
 use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, parse_capture};
 use crate::config::{PromptView, ValidWatchConfig};
+use crate::jobs::{self, Job, Jobs};
 use crate::live::{LOADS_CAP, LiveBook, LiveTokens, parse_loads};
 use crate::metrics::{
     DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, KvTokens,
@@ -218,6 +219,9 @@ pub struct LlamaDetail {
     /// vLLM and SGLang requests llama-swap has in flight (#80), oldest
     /// first, with what the engine's totals say of each.
     pub requests: Vec<LiveRequest>,
+    /// Job status files from `[jobs] dir`, newest mtime first. Empty when
+    /// the directory is unset. Not written to the snapshot.
+    pub jobs: Vec<Job>,
 }
 
 /// One vLLM or SGLang request in flight (#80), from llama-swap's
@@ -430,6 +434,10 @@ struct Limits {
     setup: Rules,
     /// `[setup] specs_dir`. `None` reads no spec files (#92).
     specs_dir: Option<PathBuf>,
+    /// `[jobs] dir`. `None` reads no job files.
+    jobs_dir: Option<PathBuf>,
+    /// `[llama] enabled`. False skips every llama-swap GET.
+    llama_enabled: bool,
 }
 
 impl Limits {
@@ -464,6 +472,8 @@ impl Limits {
                 .collect(),
             setup: Rules::compile(&config.setup).unwrap_or_default(),
             specs_dir: config.setup.specs_dir.clone(),
+            jobs_dir: config.jobs.dir.clone(),
+            llama_enabled: config.llama.enabled,
         }
     }
 }
@@ -541,6 +551,8 @@ struct State<L> {
     model_setup: Vec<ModelSetup>,
     /// Per-model spec files, read with `/running` (#92).
     specs: Specs,
+    /// Job status files, read at most once a second.
+    jobs: Jobs,
     ready: Vec<ReadyModel>,
     /// While `/running` fails: the models ready at the last good read and
     /// their servers, for the first good read after it (#46).
@@ -651,6 +663,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         SlotBook::without_text()
     };
     let specs = Specs::new(limits.specs_dir.clone());
+    let jobs = Jobs::new(limits.jobs_dir.clone());
     let mut state = State {
         limits,
         agent,
@@ -666,6 +679,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         model_kv: Vec::new(),
         model_setup: Vec::new(),
         specs,
+        jobs,
         ready: Vec::new(),
         down_ready: Vec::new(),
         gauges: HashMap::new(),
@@ -714,6 +728,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
     let mut next_metrics = Instant::now();
     let mut next_slots = Instant::now();
     let mut next_activity = Instant::now();
+    let mut next_jobs = Instant::now();
     loop {
         if stopped(&stop) {
             break;
@@ -724,38 +739,46 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         // with a non-2xx is not read again until the next pass (#70).
         state.round_skip.clear();
         state.round_blocked = false;
-        if now >= next_running || state.running_due {
+        if state.limits.llama_enabled && (now >= next_running || state.running_due) {
             state.poll_running();
             state.sync_events();
             next_running = Instant::now() + state.limits.running_interval;
             worked = true;
         }
-        if now >= next_metrics {
+        if state.limits.llama_enabled && now >= next_metrics {
             state.poll_metrics();
             next_metrics = Instant::now() + state.limits.metrics_interval;
             worked = true;
         }
-        if now >= next_slots {
+        if state.limits.llama_enabled && now >= next_slots {
             state.poll_slots();
             next_slots = Instant::now() + state.limits.slots_interval;
             worked = true;
         }
-        if now >= next_activity {
+        if state.limits.llama_enabled && now >= next_activity {
             state.poll_activity();
             next_activity = Instant::now() + state.limits.activity_interval;
+            worked = true;
+        }
+        if now >= next_jobs {
+            state.jobs.refresh(Instant::now(), &mut state.log);
+            next_jobs = Instant::now() + jobs::CHECK_EVERY;
             worked = true;
         }
         if worked && state.publish().is_err() {
             break;
         }
-        let mut next = if state.running_due {
-            Instant::now()
-        } else {
-            next_running
-        };
-        for candidate in [next_metrics, next_slots, next_activity] {
-            if candidate < next {
-                next = candidate;
+        let mut next = next_jobs;
+        if state.limits.llama_enabled {
+            next = if state.running_due {
+                Instant::now()
+            } else {
+                next_running
+            };
+            for candidate in [next_metrics, next_slots, next_activity, next_jobs] {
+                if candidate < next {
+                    next = candidate;
+                }
             }
         }
         let wait = next.saturating_duration_since(Instant::now());
@@ -1822,6 +1845,7 @@ impl<L: Sink> State<L> {
                 .collect(),
             series: self.model_series(now, &events),
             requests: self.live_requests(&events),
+            jobs: self.jobs.jobs().into_iter().cloned().collect(),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());

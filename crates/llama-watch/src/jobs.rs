@@ -75,7 +75,7 @@ struct Entry {
 
 /// One parsed status file. Text is already cleaned and capped.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Job {
+pub struct Job {
     /// File stem (`<stem>.json`).
     pub file: String,
     pub name: String,
@@ -97,7 +97,7 @@ pub(crate) struct Job {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum JobState {
+pub enum JobState {
     Running,
     Done,
     Failed,
@@ -113,7 +113,7 @@ impl JobState {
         })
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Done => "done",
@@ -123,32 +123,32 @@ impl JobState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JobPhase {
+pub struct JobPhase {
     pub label: String,
     pub index: Option<u64>,
     pub of: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JobRate {
+pub struct JobRate {
     pub value: f64,
     pub unit: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JobNumber {
+pub struct JobNumber {
     pub label: String,
     pub value: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JobSeries {
+pub struct JobSeries {
     pub label: String,
     pub points: Vec<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JobPhaseRow {
+pub struct JobPhaseRow {
     pub label: String,
     pub mark: Option<PhaseMark>,
     pub elapsed_s: Option<u64>,
@@ -157,7 +157,7 @@ pub(crate) struct JobPhaseRow {
 
 /// Phase row state mark, including `queued` which is not a job `state`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PhaseMark {
+pub enum PhaseMark {
     Done,
     Running,
     Queued,
@@ -832,7 +832,7 @@ fn clean_cap(raw: &str, cap: usize) -> Option<String> {
 }
 
 /// `true` when `mtime` is older than `stale_s` seconds before `now`.
-pub(crate) fn is_stale(mtime: SystemTime, now: SystemTime, stale_s: u64) -> bool {
+pub fn is_stale(mtime: SystemTime, now: SystemTime, stale_s: u64) -> bool {
     match now.duration_since(mtime) {
         Ok(age) => age > Duration::from_secs(stale_s),
         Err(_) => false,

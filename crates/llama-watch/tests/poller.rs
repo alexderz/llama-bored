@@ -956,6 +956,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 suspected_loads: Vec::new(),
                 series: Vec::new(),
                 requests: Vec::new(),
+                jobs: Vec::new(),
             },
         ));
     }

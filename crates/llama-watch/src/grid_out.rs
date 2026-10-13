@@ -695,6 +695,8 @@ mod tests {
             temps: None,
             ctx_history_h: 6,
             setup: None,
+            job: None,
+            job_note: None,
         }
     }
 
