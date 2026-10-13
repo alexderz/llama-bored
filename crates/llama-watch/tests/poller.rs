@@ -4001,3 +4001,52 @@ order = 21
         log.lines()
     );
 }
+
+fn jobs_scratch(name: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = root.join(format!("poller-job-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("jobs dir");
+    dir
+}
+
+fn jobs_watch(dir: &std::path::Path, extra: &str) -> ValidWatchConfig {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("watch-jobs-{}.toml", std::process::id()));
+    let text = format!(
+        r#"
+[llama]
+url = "http://127.0.0.1:1"
+enabled = false
+
+[jobs]
+dir = "{}"
+stale_s = 180
+{extra}
+"#,
+        dir.display()
+    );
+    std::fs::write(&path, text).expect("write watch.toml");
+    Config::load_validated(&path, 8).expect("valid watch config")
+}
+
+#[test]
+fn jobs_dir_with_llama_off_is_read() {
+    let dir = jobs_scratch("off");
+    std::fs::write(
+        dir.join("example-trainer.json"),
+        br#"{"schema":1,"name":"example-trainer","kind":"training","state":"running","title":"Example-2B"}"#,
+    )
+    .unwrap();
+    let config = jobs_watch(&dir, "");
+    assert!(!config.llama.enabled);
+    assert_eq!(config.jobs.dir.as_deref(), Some(dir.as_path()));
+    let log = MemLog::new();
+    let (_poller, rx) = spawn(&config, &log);
+    let (_view, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        !detail.jobs.is_empty()
+    });
+    assert_eq!(detail.jobs[0].name, "example-trainer");
+    assert_eq!(detail.jobs[0].kind.as_deref(), Some("training"));
+    assert_eq!(detail.jobs[0].state, llama_watch::jobs::JobState::Running);
+}

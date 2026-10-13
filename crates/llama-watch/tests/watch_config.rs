@@ -1970,4 +1970,15 @@ fn jobs_dir_is_an_absolute_path_and_stale_s_is_bounded() {
     assert!(cfg.jobs.dir.is_none());
     assert_eq!(cfg.jobs.stale_s, 60);
     cfg.validate(8).expect("stale_s only");
+
+    let cfg = Config::from_toml(
+        "[llama]\nenabled = false\n[jobs]\ndir = \"/var/lib/llama-bored/jobs\"\n",
+    )
+    .expect("parses");
+    assert!(!cfg.llama.enabled);
+    assert_eq!(
+        cfg.jobs.dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/llama-bored/jobs"))
+    );
+    cfg.validate(8).expect("jobs dir with llama off");
 }
