@@ -1288,11 +1288,11 @@ mod tests {
             &mut claims,
             serde_json::json!({
                 "claims":[claim_entry(
-                    "big", "Alex Derzhi", false, true, None, None, None,
+                    "big", "Pat Example", false, true, None, None, None,
                 )],
             }),
         );
-        assert_eq!(claims.view().0[0].holder, "Alex Derzhi");
+        assert_eq!(claims.view().0[0].holder, "Pat Example");
 
         apply_claims(
             &mut claims,
