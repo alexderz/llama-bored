@@ -1601,7 +1601,11 @@ fn a_llamacpp_image_gets_its_flags_once_its_metrics_say_llamacpp() {
     // fresh gate's check read, #70), so the flags are read as llama.cpp's
     // in the same round. Every upstream read sits between two `/running`
     // reads: the gate's, and the check after it.
-    let hits = server.hits();
+    let hits: Vec<String> = server
+        .hits()
+        .into_iter()
+        .filter(|path| path != "/api/events")
+        .collect();
     assert_eq!(
         hits[..8],
         [
