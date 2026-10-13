@@ -1416,4 +1416,44 @@ mod tests {
         assert_eq!(kept, &"m".repeat(128));
         assert!(!kept.contains('\u{2026}'));
     }
+
+    /// The 64-byte holder cap and the 256-byte reason cap bind on their
+    /// own: ASCII longer than the later character caps, cut at the literal
+    /// byte lengths.
+    #[test]
+    fn claim_byte_caps_cut_at_64_and_256() {
+        assert_eq!(CLAIM_HOLDER_BYTES, 64);
+        assert_eq!(CLAIM_REASON_BYTES, 256);
+        assert_eq!(
+            take_bytes(&"h".repeat(80), CLAIM_HOLDER_BYTES),
+            "h".repeat(64)
+        );
+        assert_eq!(
+            take_bytes(&"r".repeat(300), CLAIM_REASON_BYTES),
+            "r".repeat(256)
+        );
+        let gothic_r = "\u{10348}".repeat(65);
+        assert_eq!(gothic_r.len(), 260);
+        let reason_bytes = take_bytes(&gothic_r, CLAIM_REASON_BYTES);
+        assert_eq!(reason_bytes.len(), 256);
+        assert_eq!(reason_bytes.chars().count(), 64);
+        // 4-byte scalars: 16 fit in 64 bytes, 17 do not. The 24-character
+        // cap does not bind.
+        let gothic = "\u{10348}".repeat(17);
+        assert_eq!(gothic.len(), 68);
+        let held = take_bytes(&gothic, CLAIM_HOLDER_BYTES);
+        assert_eq!(held.len(), 64);
+        assert_eq!(held.chars().count(), 16);
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", &gothic, false, true, None, None, None)],
+            }),
+        );
+        let holder = &claims.view().0[0].holder;
+        assert_eq!(holder.chars().count(), 16);
+        assert_eq!(holder.as_str(), "\u{10348}".repeat(16));
+        assert!(!holder.contains('\u{2026}'));
+    }
 }
