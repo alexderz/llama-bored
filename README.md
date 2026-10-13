@@ -52,13 +52,14 @@ larger snapshot.
 **Engine.** tty11's header always names the inference engine serving the
 shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
 (a llama.cpp fork is `llama.cpp`); with no model loaded it says
-`engine --`. Its settings are in the SETUP block (below). A llama-swap
-build with model claims also shows the holder after `swap`: `claim
-eval-runner · in use`, `claim chat-ui · 4:12 left`, or `hold operator ·
-until 21:30 · overnight eval, do not unload`. No claim, or a llama-swap
-that never sends one, leaves the header as it is. The LCD starts the
-line under the model name with the short name (`llama.cpp`, `sglang`,
-`vllm`, `strata`, `openai`) and drops the quant first when space is short.
+`engine --`. Its settings are in the SETUP block (below). After `slots`
+and `swap`, a llama-swap build with model claims shows the holder:
+`claim eval-runner · in use`, `claim chat-ui · 4:12 left`, or `hold
+operator · until 21:30 · overnight eval, do not unload`. No claim, or a
+llama-swap that never sends one, leaves the header as it is. The LCD
+starts the line under the model name with the short name (`llama.cpp`,
+`sglang`, `vllm`, `strata`, `openai`) and drops the quant first when space
+is short.
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
 `openai`) as the `engine` label on every per-model series (see
 **llama-metrics** under Features).
@@ -184,8 +185,9 @@ Events, on a thread of its own so it never holds the poller; lines and
 frames capped at 256 KiB, the ~100 KB log history v256 sends on connect
 read through and dropped; reconnect after 1 s, doubling to 30 s; one
 fresh session every 2 minutes). Its `inflight` frames list every request
-llama-swap is serving; each vLLM or SGLang one is an in-flight row: `pp` until llama-swap has streamed a byte of the
-answer, then `gen`; DUR from the start llama-swap gives (`elapsed_ms`).
+llama-swap is serving; each vLLM or SGLang one is an in-flight row: `pp`
+until llama-swap has streamed a byte of the answer, then `gen`; DUR from
+the start llama-swap gives (`elapsed_ms`).
 Tokens come only from reads that happen anyway, through the fresh gate,
 so a row changes when a read does and never in between:
 
