@@ -410,6 +410,59 @@ fn claims_reach_the_detail_for_a_llama_cpp_model() {
     assert!(detail.claims[0].hold_until.is_none());
 }
 
+/// The poller stores `claim_model` of the raw `/running` id as
+/// `swap_id`. A 58-character id is kept whole; a 129-character id is
+/// cut the same way the claim is.
+#[test]
+fn poller_swap_id_matches_the_claim_model_for_ids_of_58_and_129_characters() {
+    let id58 = "a".repeat(58);
+    let id129 = "b".repeat(129);
+    let running = serde_json::to_vec(&serde_json::json!({
+        "running": [
+            {"model": id58, "state": "ready"},
+            {"model": id129, "state": "ready"},
+        ]
+    }))
+    .expect("json");
+    let fake = Fake::start(World {
+        running,
+        frames: vec![
+            inflight("snapshot", serde_json::json!({"requests": []})),
+            claims_frame(serde_json::json!({
+                "changes": [],
+                "claims": [
+                    {
+                        "model": id58,
+                        "holder": "eval-runner",
+                        "auto": false,
+                        "in_use": true,
+                    },
+                    {
+                        "model": id129,
+                        "holder": "chat-ui",
+                        "auto": false,
+                        "in_use": true,
+                    },
+                ],
+            })),
+        ],
+        ..World::default()
+    });
+    let backends = format!("\"{id58}\" = \"llamacpp\"\n\"{id129}\" = \"llamacpp\"");
+    let (_poller, rx) = poller::spawn(&config(fake.port, &backends), NoLog).expect("spawn");
+    let (_, detail) = wait(&rx, "setup and claims", |_, detail| {
+        detail.setup.len() == 2 && detail.claims.len() == 2
+    });
+    for n in 0..2 {
+        assert_eq!(
+            detail.setup[n].swap_id, detail.claims[n].model,
+            "setup[{n}].swap_id vs claims[{n}].model"
+        );
+    }
+    assert_eq!(detail.setup[0].swap_id, id58);
+    assert_eq!(detail.claims[0].model, id58);
+}
+
 fn no_inflight(detail: &LlamaDetail) -> bool {
     detail.series.iter().all(|s| s.inflight.is_none())
 }
