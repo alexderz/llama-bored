@@ -28,6 +28,7 @@ pub(crate) const MAX_JOB_DEPTH: usize = 8;
 /// Most files opened in one refresh.
 pub(crate) const MAX_JOB_FILES: usize = 8;
 /// Most `*.json` names collected from the directory before ranking by mtime.
+/// Listing stops at this many so a huge directory is not walked every second.
 pub(crate) const MAX_JOB_NAMES: usize = 512;
 /// Longest file stem used as a path component.
 pub(crate) const MAX_STEM: usize = 128;
@@ -499,7 +500,7 @@ impl Jobs {
                         continue;
                     }
                     if names.len() >= MAX_JOB_NAMES {
-                        continue;
+                        break;
                     }
                     names.push(stem.to_owned());
                 }
