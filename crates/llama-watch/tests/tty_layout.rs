@@ -6348,6 +6348,24 @@ fn find_cells(chars: &[char], needle: &str) -> Option<usize> {
     chars.windows(n.len()).position(|w| w == n.as_slice())
 }
 
+fn label_before_holder(left: &str, holder: &str, label: &str) -> bool {
+    let Some(at) = left.find(holder) else {
+        return false;
+    };
+    left[..at].ends_with(&format!("{label} "))
+}
+
+/// Reason text after the last separator following the holder (hold form:
+/// `holder · until HH:MM · reason`).
+fn hold_reason_drawn(left: &str, holder: &str) -> Option<String> {
+    let at = left.find(holder)?;
+    let tail = left[at..].trim_end();
+    let mut parts = tail.split(" \u{00B7} ");
+    let _holder = parts.next()?;
+    let _status = parts.next()?;
+    parts.next().map(str::to_owned)
+}
+
 #[test]
 fn header_claim_four_forms_at_192() {
     let now = claim_now();
@@ -6596,9 +6614,35 @@ fn header_claim_sheds_in_order_from_160_to_240() {
             },
         ),
     ];
+    let extra_holds: [(&str, &str); 4] = [
+        ("hold_1", "a"),
+        ("hold_2", "ab"),
+        ("hold_3", "abc"),
+        ("hold_sp", "a b c d e f"),
+    ];
+    let mut all_forms: Vec<(&str, HeaderClaim, String)> = forms
+        .into_iter()
+        .map(|(n, c)| {
+            let r = c.hold_reason.clone();
+            (n, c, r)
+        })
+        .collect();
+    for (name, reason) in extra_holds {
+        all_forms.push((
+            name,
+            HeaderClaim {
+                model: "qwen3.6-35b-a3b".to_owned(),
+                holder: holder.to_owned(),
+                hold_until: Some(now + Duration::from_secs(2 * 3600 + 43 * 60)),
+                hold_reason: reason.to_owned(),
+                ..HeaderClaim::default()
+            },
+            reason.to_owned(),
+        ));
+    }
     let names = ["Qwen 35B", &"N".repeat(40)];
-    for (form_name, claim) in forms {
-        let has_reason = !claim.hold_reason.is_empty();
+    for (form_name, claim, whole_reason) in all_forms {
+        let has_reason = !whole_reason.is_empty();
         let label = if claim.hold_until.is_some() {
             "hold"
         } else {
@@ -6649,35 +6693,32 @@ fn header_claim_sheds_in_order_from_160_to_240() {
                     .trim_end()
                     .to_owned();
                 let has_holder = left.contains(holder);
-                let has_label = left.contains(label);
-                let has_full_reason = has_reason && left.contains(reason);
-                let has_ellipsis = left.contains('\u{2026}');
-                let has_reason_bit =
-                    has_reason && (has_full_reason || (has_ellipsis && left.contains("overnight")));
+                let has_label = label_before_holder(&left, holder, label);
+                let drawn_reason = hold_reason_drawn(&left, holder);
                 assert!(
-                    !has_reason_bit || has_label,
+                    drawn_reason.is_none() || has_label,
                     "{form_name} {name} {cols}: reason without label: {left}"
                 );
+                if let Some(part) = drawn_reason.as_deref() {
+                    let whole = part == whole_reason;
+                    let cut_ok = part
+                        .strip_suffix('\u{2026}')
+                        .is_some_and(|head| head.chars().filter(|c| *c != ' ').count() >= 2);
+                    assert!(
+                        whole || cut_ok,
+                        "{form_name} {name} {cols}: bad reason {part:?} in {left}"
+                    );
+                }
                 if has_holder {
                     let last = left.chars().last().unwrap_or(' ');
                     assert_ne!(
                         last, '\u{00B7}',
                         "{form_name} {name} {cols} ends in a separator: {left}"
                     );
-                    if last == '\u{2026}' {
-                        let chars: Vec<char> = left.chars().collect();
-                        assert!(
-                            chars.len() >= 3,
-                            "{form_name} {name} {cols} lone ellipsis: {left}"
-                        );
-                        let a = chars[chars.len() - 3];
-                        let b = chars[chars.len() - 2];
-                        assert!(
-                            a != '\u{00B7}' && b != '\u{00B7}',
-                            "{form_name} {name} {cols} ellipsis after separator: {left}"
-                        );
-                    }
                 }
+                let has_full_reason =
+                    has_reason && drawn_reason.as_deref() == Some(whole_reason.as_str());
+                let has_reason_bit = drawn_reason.is_some();
                 let step = if !has_holder {
                     4
                 } else if !has_label {
