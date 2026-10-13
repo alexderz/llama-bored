@@ -82,14 +82,21 @@ requests finished in that window, the row shows their average; if none
 did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
 per-request prefill or decode time. A finished row is filled only when
 one streaming request was alone in the engine and the row's prompt,
-output, duration and end time match that window (duration within the
-larger of one second and five percent). The end time is llama-swap's
-timestamp, truncated to the second; it has to fall between the metrics
-scrape before the finish and the scrape that shows it, widened by 1.5
-seconds on each side, and only one row and one finish may fit. The fill
-is the cached tokens, prompt tok/s of the tokens that were not cached
-over the time to the first token, and generation tok/s of the tokens
-after the first over the rest of the request. The rates are marked `~`,
+output, duration and end time match that window. The duration is the
+engine's end-to-end time plus llama-swap's overhead: at least 0.1 s
+under it, and at most the larger of 0.5 s and two percent over it.
+The timestamp is the end time truncated to the second. That second
+fits a finish when it is after one second before the scrape that
+preceded the finish, and at most 0.5 s after the scrape that showed
+it. Only one row and one clean finish may fit. Another scrape that
+stepped the finished count blocks the fill when the second fits it
+and the lengths do: one finish must equal the row's prompt and
+output, and two or more must have increased by at least that many
+tokens. After a gap, a reset or a restart the increases are not
+known, so the second alone is enough. The fill is the cached tokens,
+prompt tok/s of the tokens that were not cached over the time to the
+first token, and generation tok/s of the tokens after the first over
+the rest of the request. The rates are marked `~`,
 the same way as vLLM. The cached count is not: the column is a fixed
 width and a prefix would be clipped. A non-streaming request gets the
 cached count only; both rates stay `--`. The prompt rate stays `--`
