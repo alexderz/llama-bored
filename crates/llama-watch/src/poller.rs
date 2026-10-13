@@ -141,7 +141,7 @@ use crate::setup_rules::{Found, Rules};
 use crate::setup_specs::Specs;
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::KvLayout;
-use crate::sources::events::{Events, EventsView, ModelClaim};
+use crate::sources::events::{Events, EventsView, ModelClaim, claim_model};
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
 use crate::tty::grid::Cell;
@@ -265,8 +265,11 @@ pub struct ModelEngineLive {
 pub struct ModelSetup {
     /// [`activity::model_key`] of the llama-swap id, to match RECENT rows.
     pub key: String,
-    /// The llama-swap id, sanitised for display.
+    /// The llama-swap id, sanitised for display (48 characters).
     pub id: String,
+    /// The llama-swap id at the claims cap, from [`crate::sources::events::claim_model`].
+    /// The header matches a claim against this, not [`Self::id`].
+    pub swap_id: String,
     /// The llama-swap `name` (or alias), sanitised.
     pub name: String,
     /// Values the rules took from the launch command and the model name.
@@ -895,6 +898,7 @@ impl<L: Sink> State<L> {
             .map(|info| ModelSetup {
                 key: activity::model_key(&info.id),
                 id: sanitize(&info.id, llama_core::detail::MAX_FULL_NAME_CHARS),
+                swap_id: claim_model(&info.id).unwrap_or_default(),
                 name: info.full_name.clone(),
                 found: info.setup.clone(),
                 engine: EngineValues::default(),

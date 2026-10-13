@@ -489,7 +489,10 @@ fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
     })
 }
 
-fn claim_model(raw: &str) -> Option<String> {
+/// Sanitised llama-swap id at the claims cap. The poller stores the same
+/// string as [`crate::poller::ModelSetup::swap_id`], so a header match
+/// uses one function on both sides.
+pub(crate) fn claim_model(raw: &str) -> Option<String> {
     let raw = take_bytes(raw, CLAIM_MODEL_BYTES);
     let cleaned = sanitize(raw, CLAIM_MODEL_BYTES);
     (!cleaned.is_empty()).then_some(cleaned)

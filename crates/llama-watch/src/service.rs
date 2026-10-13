@@ -1124,17 +1124,18 @@ fn tty_model(
     }
 }
 
-/// llama-swap id of the model SETUP names: the same pairing of
+/// llama-swap id of the model SETUP names, at the claims cap
+/// ([`crate::sources::events::claim_model`]). Same pairing of
 /// `detail.setup` and `sample.snapshot.models` as [`setup_view`]. Empty
-/// when that view is collapsed.
+/// when that view is collapsed, or when the pair is stale (no `swap_id`).
 fn header_model_id(
     sample: &WatchSample,
     state: WatchState,
     detail: &LlamaDetail,
-    rules: &Rules,
+    _rules: &Rules,
 ) -> String {
-    setup_view(sample, detail, state, rules)
-        .map(|view| view.id)
+    paired_setup(sample, detail, state)
+        .map(|(setup, _)| setup.swap_id)
         .unwrap_or_default()
 }
 
@@ -1187,6 +1188,30 @@ fn setup_view(
     state: WatchState,
     rules: &Rules,
 ) -> Option<SetupView> {
+    let (setup, model) = paired_setup(sample, detail, state)?;
+    let live = LiveCtx {
+        backend: model.backend.map(|info| info.kind).unwrap_or_default(),
+        detail: model.detail.as_ref(),
+        info: model.backend.as_ref(),
+        engine: Some(&setup.engine),
+    };
+    let rows = rules.rows(&setup.found, &live);
+    Some(SetupView {
+        id: setup.id,
+        name: setup.name,
+        more: sample.snapshot.models.len() - 1,
+        rows,
+    })
+}
+
+/// The SETUP entry that [`setup_view`] would show, and the snapshot model
+/// it is paired with. A length mismatch falls back to the snapshot, with
+/// an empty `swap_id`.
+fn paired_setup<'a>(
+    sample: &'a WatchSample,
+    detail: &'a LlamaDetail,
+    state: WatchState,
+) -> Option<(ModelSetup, &'a llama_core::sample::ModelInfo)> {
     if !matches!(state, WatchState::Generating | WatchState::Ready) {
         return None;
     }
@@ -1221,19 +1246,7 @@ fn setup_view(
         name: model.full_name.clone().unwrap_or_default(),
         ..ModelSetup::default()
     });
-    let live = LiveCtx {
-        backend: model.backend.map(|info| info.kind).unwrap_or_default(),
-        detail: model.detail.as_ref(),
-        info: model.backend.as_ref(),
-        engine: Some(&setup.engine),
-    };
-    let rows = rules.rows(&setup.found, &live);
-    Some(SetupView {
-        id: setup.id,
-        name: setup.name,
-        more: models.len() - 1,
-        rows,
-    })
+    Some((setup, model))
 }
 
 /// IN and OUT for one frame, both from [`pick_slot`]. Advances the OUT
@@ -2348,12 +2361,29 @@ mod tests {
         tick.heard = true;
         tick.detail.setup = vec![ModelSetup {
             key: crate::activity::model_key(setup_id),
-            id: setup_id.to_owned(),
+            id: llama_core::names::sanitize(setup_id, llama_core::detail::MAX_FULL_NAME_CHARS),
+            swap_id: crate::sources::events::claim_model(setup_id).unwrap_or_default(),
             name: "m".to_owned(),
             ..ModelSetup::default()
         }];
         tick.detail.claims = claims;
         (sample, tick, frame_ctx(None, true))
+    }
+
+    fn apply_claim(model: &str, holder: &str) -> crate::sources::events::ModelClaim {
+        let mut claims = crate::sources::events::Claims::default();
+        let inner = serde_json::json!({
+            "claims": [{
+                "model": model,
+                "holder": holder,
+                "auto": false,
+                "in_use": true,
+            }],
+        })
+        .to_string();
+        let envelope = serde_json::json!({"type": "claims", "data": inner});
+        claims.apply(envelope.to_string().as_bytes());
+        claims.view().0.into_iter().next().expect("claim")
     }
 
     fn claim_entry(model: &str, holder: &str) -> crate::sources::events::ModelClaim {
@@ -2408,12 +2438,14 @@ mod tests {
         detail.setup = vec![
             ModelSetup {
                 key: crate::activity::model_key(q4),
-                id: q4.to_owned(),
+                id: llama_core::names::sanitize(q4, llama_core::detail::MAX_FULL_NAME_CHARS),
+                swap_id: crate::sources::events::claim_model(q4).unwrap_or_default(),
                 ..ModelSetup::default()
             },
             ModelSetup {
                 key: crate::activity::model_key(q6),
-                id: q6.to_owned(),
+                id: llama_core::names::sanitize(q6, llama_core::detail::MAX_FULL_NAME_CHARS),
+                swap_id: crate::sources::events::claim_model(q6).unwrap_or_default(),
                 ..ModelSetup::default()
             },
         ];
@@ -2434,14 +2466,87 @@ mod tests {
             Some(q6)
         );
         detail.setup.pop();
+        assert!(
+            header_model_id(&sample, WatchState::Ready, &detail, &rules).is_empty(),
+            "a stale pair has no swap_id"
+        );
         assert_eq!(
-            header_model_id(&sample, WatchState::Ready, &detail, &rules),
-            "flash",
-            "a stale pair falls back to the snapshot, like setup_view"
+            setup_view(&sample, &detail, WatchState::Ready, &rules)
+                .map(|v| v.id)
+                .as_deref(),
+            Some("flash"),
+            "SETUP still falls back to the snapshot name"
         );
         assert!(header_model_id(&sample, WatchState::AiDown, &detail, &rules).is_empty());
         sample.snapshot.models.clear();
         assert!(header_model_id(&sample, WatchState::Ready, &detail, &rules).is_empty());
+    }
+
+    /// A llama-swap id longer than the 48-character display form still
+    /// matches its claim: `Claims::apply` → `tty_model` → `layout`.
+    #[test]
+    fn a_claim_matches_ids_of_48_49_58_and_128_characters() {
+        for n in [48usize, 49, 58, 128] {
+            let id = "m".repeat(n);
+            let holder = format!("h{n}");
+            let claim = apply_claim(&id, &holder);
+            assert_eq!(claim.model, id, "{n}");
+            let (sample, mut tick, ctx) = claim_tick(vec![claim], &id);
+            let model = tty_model(
+                &sample,
+                &mut tick,
+                Instant::now(),
+                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                Zone::utc(),
+                &ctx,
+            );
+            assert_eq!(model.model_id, id, "{n}");
+            let grid = layout::layout(&model, 192, 60);
+            let header: String = (0..grid.cols())
+                .map(|c| grid.get(c, 0).unwrap().ch)
+                .collect();
+            assert!(
+                header.contains(&holder),
+                "{n}-character id must show its claim: {header}"
+            );
+        }
+    }
+
+    /// Two ids equal in their first 60 characters show only their own claim.
+    #[test]
+    fn two_ids_equal_in_their_first_60_characters_keep_their_own_claim() {
+        let a = format!("{}A{}", "x".repeat(60), "y".repeat(7));
+        let b = format!("{}B{}", "x".repeat(60), "y".repeat(7));
+        assert_eq!(&a[..60], &b[..60]);
+        assert_eq!(a.chars().count(), 68);
+        assert_eq!(b.chars().count(), 68);
+        let mut claims = crate::sources::events::Claims::default();
+        let inner = serde_json::json!({
+            "claims": [
+                {"model": a, "holder": "eval-runner", "auto": false, "in_use": true},
+                {"model": b, "holder": "chat-ui", "auto": false, "in_use": true},
+            ],
+        })
+        .to_string();
+        let envelope = serde_json::json!({"type": "claims", "data": inner});
+        claims.apply(envelope.to_string().as_bytes());
+        let list = claims.view().0;
+        assert_eq!(list.len(), 2);
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (id, keep, drop) in [
+            (a.as_str(), "eval-runner", "chat-ui"),
+            (b.as_str(), "chat-ui", "eval-runner"),
+        ] {
+            let (sample, mut tick, ctx) = claim_tick(list.clone(), id);
+            let model = tty_model(&sample, &mut tick, Instant::now(), wall, Zone::utc(), &ctx);
+            assert_eq!(model.model_id, id);
+            let grid = layout::layout(&model, 192, 60);
+            let header: String = (0..grid.cols())
+                .map(|c| grid.get(c, 0).unwrap().ch)
+                .collect();
+            assert!(header.contains(keep), "{id}: {header}");
+            assert!(!header.contains(drop), "{id}: {header}");
+        }
     }
 
     /// A hold that ends after a daylight-saving change uses the zone
