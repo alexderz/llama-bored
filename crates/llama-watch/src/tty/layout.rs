@@ -287,12 +287,15 @@ pub struct TtyModel {
 pub struct HeaderClaim {
     /// llama-swap model id, matched against [`TtyModel::model_id`].
     pub model: String,
-    /// Holder token, already sanitised.
+    /// Holder, already sanitised as SETUP `text`, at most 24 characters.
     pub holder: String,
     pub in_use: bool,
     pub expires_at: Option<SystemTime>,
     /// Set for an explicit hold.
     pub hold_until: Option<SystemTime>,
+    /// Seconds east of UTC at [`Self::hold_until`], so a hold that ends
+    /// after a daylight-saving change shows that hour. Unused otherwise.
+    pub hold_tz_offset_s: i32,
     /// Already sanitised. Empty when there is none.
     pub hold_reason: String,
 }
@@ -574,17 +577,21 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         name_fg(model),
         limit,
     );
-    let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
-    let tag_at = if model.model_id.is_empty() {
-        tag_at
+    let after_slots = x;
+    let after_swap = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
+    // The claim sits after `swap`. When `swap` itself was not drawn, the
+    // claim is not drawn either: it must not take that field's place.
+    // Two claims on the same model: the first is shown.
+    let tag_at = if after_swap == after_slots || model.model_id.is_empty() {
+        after_swap
     } else if let Some(claim) = model
         .claims
         .iter()
         .find(|claim| claim.model == model.model_id)
     {
-        paint_claim(grid, tag_at, claim, model.now, model.tz_offset_s, limit)
+        paint_claim(grid, after_swap, claim, model.now, model.tz_offset_s, limit)
     } else {
-        tag_at
+        after_swap
     };
     let mut note_at = tag_at;
     if !model.show_text {
@@ -769,7 +776,9 @@ fn paint_field(
 const SEP_CELLS: usize = 3;
 
 /// Header claim for the model the header names (#128). Sheds in order:
-/// cut the reason, drop the reason, drop the label, draw nothing. Never
+/// full; reason cut with the ellipsis (only when at least two cells of
+/// reason text remain before the ellipsis); no reason; no label word;
+/// nothing. The reason is never drawn once the label is dropped. Never
 /// cuts the holder; if the holder alone does not fit, draws nothing.
 fn paint_claim(
     grid: &mut Grid,
@@ -805,12 +814,13 @@ fn paint_claim(
         core
     };
     let leftover = room.saturating_sub(used);
-    let shown_reason = if reason.is_empty() {
+    // The reason rides with the label. Once the label is dropped, the
+    // reason is gone too. A cut needs at least two cells of reason text
+    // before the ellipsis, so a one-cell leftover is not a lone `…`.
+    let shown_reason = if !keep_label || reason.is_empty() {
         None
-    } else if leftover > SEP_CELLS {
-        Some(cut_text(reason, leftover - SEP_CELLS))
     } else {
-        None
+        fit_reason(reason, leftover)
     };
 
     let mut col = usize::from(x);
@@ -870,10 +880,28 @@ struct ClaimStatus {
     fg: C16,
 }
 
+/// Reason text that fits in `leftover` cells after the core, or none.
+/// A cut is drawn only when at least two cells of reason text remain
+/// before the ellipsis.
+fn fit_reason(reason: &str, leftover: usize) -> Option<String> {
+    if leftover <= SEP_CELLS {
+        return None;
+    }
+    let room = leftover - SEP_CELLS;
+    let n = reason.chars().count();
+    if n <= room {
+        return Some(reason.to_owned());
+    }
+    if room < 3 {
+        return None;
+    }
+    Some(cut_text(reason, room))
+}
+
 fn claim_status(claim: &HeaderClaim, now: SystemTime, tz_offset_s: i32) -> Option<ClaimStatus> {
     if let Some(until) = claim.hold_until {
         return Some(ClaimStatus {
-            text: format_until(until, now, tz_offset_s),
+            text: format_until(until, now, tz_offset_s, claim.hold_tz_offset_s),
             fg: C16::BrightWhite,
         });
     }
@@ -904,12 +932,12 @@ fn format_left(secs: u64) -> String {
     }
 }
 
-fn format_until(until: SystemTime, now: SystemTime, tz_offset_s: i32) -> String {
-    let zone = crate::localtime::Zone::fixed(tz_offset_s);
+fn format_until(until: SystemTime, now: SystemTime, now_off: i32, until_off: i32) -> String {
     let until_s = unix_secs(until);
     let now_s = unix_secs(now);
-    let until_local = crate::localtime::format_local(until_s, &zone);
-    let now_local = crate::localtime::format_local(now_s, &zone);
+    let until_local =
+        crate::localtime::format_local(until_s, &crate::localtime::Zone::fixed(until_off));
+    let now_local = crate::localtime::format_local(now_s, &crate::localtime::Zone::fixed(now_off));
     let hm = until_local.get(11..16).unwrap_or("--:--");
     if until_local.get(..10) == now_local.get(..10) {
         format!("until {hm}")
@@ -6490,6 +6518,7 @@ mod tests {
             in_use: false,
             expires_at: Some(now + Duration::from_secs(expires_in)),
             hold_until: None,
+            hold_tz_offset_s: 0,
             hold_reason: String::new(),
         }
     }
@@ -6516,17 +6545,40 @@ mod tests {
     fn hold_until_adds_the_date_when_it_is_not_today() {
         let now = from_rfc("2026-10-12T18:00:00Z");
         assert_eq!(
-            format_until(from_rfc("2026-10-12T21:00:00Z"), now, 0),
+            format_until(from_rfc("2026-10-12T21:00:00Z"), now, 0, 0),
             "until 21:00"
         );
         assert_eq!(
-            format_until(from_rfc("2026-10-14T00:00:00Z"), now, 0),
+            format_until(from_rfc("2026-10-14T00:00:00Z"), now, 0, 0),
             "until 10-14 00:00"
         );
         // Offset +5:30: 18:00 UTC is 23:30 local; 21:00 UTC is 02:30 next local day.
         assert_eq!(
-            format_until(from_rfc("2026-10-12T21:00:00Z"), now, 5 * 3600 + 30 * 60),
+            format_until(
+                from_rfc("2026-10-12T21:00:00Z"),
+                now,
+                5 * 3600 + 30 * 60,
+                5 * 3600 + 30 * 60
+            ),
             "until 10-13 02:30"
+        );
+    }
+
+    /// A hold that ends after a daylight-saving change uses the offset at
+    /// that end time, not the offset at now.
+    #[test]
+    fn hold_until_uses_the_offset_at_the_end_time() {
+        let now = from_rfc("2026-03-08T06:00:00Z");
+        let until = from_rfc("2026-03-08T12:00:00Z");
+        // Now is still EST (UTC−5); the hold ends in EDT (UTC−4).
+        assert_eq!(
+            format_until(until, now, -5 * 3600, -4 * 3600),
+            "until 08:00"
+        );
+        // The same instants with now's offset on the end time would be 07:00.
+        assert_eq!(
+            format_until(until, now, -5 * 3600, -5 * 3600),
+            "until 07:00"
         );
     }
 
@@ -6559,6 +6611,7 @@ mod tests {
             in_use: false,
             expires_at: None,
             hold_until: Some(now + Duration::from_secs(3600)),
+            hold_tz_offset_s: 0,
             hold_reason: "overnight eval, do not unload".to_owned(),
         };
         let full = claim_row(&claim, now, 0, 80);
