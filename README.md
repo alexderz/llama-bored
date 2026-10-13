@@ -1012,6 +1012,26 @@ long) fails `watch.toml` validation with its index:
 `setup.field[3]: unknown kind "nubmer"`. `packaging/watch.example.toml`
 has a copy-paste block for a vLLM container configured by `-e` env vars.
 
+**Job view** (`watch.toml`, `[jobs]`): a batch job writes a JSON status
+file; while a fresh file says `running` and llama-swap's `/running` list
+is empty (or llama-swap is down), tty11 shows that job in place of
+GENERATION, PROMPT, the charts, SLOTS and RECENT. The header, the meters,
+FANS and TEMPS stay. Leave `dir` unset and nothing is opened.
+
+```toml
+[jobs]
+dir = "/var/lib/llama-bored/jobs"   # absolute; unset opens nothing
+stale_s = 180                       # 10..=3600; default 180
+```
+
+The format, the caps, and a reference Trainer callback are in
+[`docs/job-status.md`](docs/job-status.md). Files are `<name>.json`
+directly in `dir`, at most 64 KiB and eight files, opened without
+following a symlink, re-read at most once a second. A file older than
+`stale_s` is not shown. When a model is serving, the inference view stays
+and a one-line note names the live job. Job data does not enter the
+snapshot.
+
 **tty11 colours** (`watch.toml`, `[tty]`): the console has 16 colour slots,
 and llama-watch loads its own palette into them, built from the LCD's heat
 ramp (deep blue through violet and magenta to red, blackbody gold for

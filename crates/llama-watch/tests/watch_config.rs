@@ -46,6 +46,12 @@ fn packaged_example_parses_and_validates() {
         "{text}"
     );
     assert!(!text.contains("\nspecs_dir"), "{text}");
+    assert!(text.contains("#[jobs]"), "{text}");
+    assert!(
+        text.contains("#dir = \"/var/lib/llama-bored/jobs\""),
+        "{text}"
+    );
+    assert!(!text.contains("\ndir = "), "{text}");
     assert!(text.contains("#\"my-sglang-model\" = \"sglang\""), "{text}");
     assert!(text.contains("#channels = [2, 3, 5, 6]"), "{text}");
 

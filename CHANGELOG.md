@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- llama-watch shows a job view for a training run or other batch job when no model is serving (#129). `[jobs] dir` names an absolute directory of `<name>.json` status files; unset, nothing is opened and every frame is unchanged. `stale_s` (default 180) hides a file whose mtime is older.
+
 ## 0.5.6 — 2026-10-12
 
 Exact colours on the grid file: one continuous ramp along a bar, and a normal temperature keeps the normal colour.
