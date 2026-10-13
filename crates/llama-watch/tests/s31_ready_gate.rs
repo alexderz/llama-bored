@@ -260,6 +260,36 @@ fn upstream_hits(fake: &Fake) -> usize {
         .count()
 }
 
+/// The events thread starts only while a model is ready. Forcing it on
+/// (`wanted = true`) would ask `/api/events` with an empty `/running` list.
+#[test]
+fn no_events_request_while_no_model_is_ready() {
+    let server = Server::start(Fake {
+        status: 200,
+        running: running(&[]),
+        ready: HashSet::new(),
+        swapping: false,
+        fresh: false,
+        metrics: HashMap::new(),
+        hits: Vec::new(),
+        violations: Vec::new(),
+    });
+    let config = config(server.port);
+    let (poller, _rx) = poller::spawn(&config, NoLog).expect("spawn");
+    server.set_running(200, running(&[]));
+    thread::sleep(Duration::from_millis(500));
+    drop(poller);
+    let hits = server.with(|fake| fake.hits.clone());
+    assert!(
+        hits.iter().any(|path| path == "/running"),
+        "poller ran: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|path| path != "/api/events"),
+        "events while no model is ready: {hits:?}"
+    );
+}
+
 #[test]
 fn no_upstream_request_for_a_model_that_is_not_ready() {
     // A swap in progress: two ready models, one loading, one unloading.
