@@ -82,16 +82,24 @@ requests finished in that window, the row shows their average; if none
 did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
 per-request prefill or decode time. A finished row is filled only when
 one streaming request was alone in the engine and the row's prompt,
-output and duration match that window (duration within the larger of
-one second and five percent): the cached tokens, prompt tok/s of the
-tokens that were not cached over the time to the first token, and
-generation tok/s of the tokens after the first over the rest of the
-request. The rates are marked `~`, the same way as vLLM. The cached
-count is not: the column is a fixed width and a prefix would be
-clipped. A non-streaming request gets the cached count only; both
-rates stay `--`. Queue time over five percent of the time to the first
-token leaves the prompt rate `--`. The cached count and the generation
-rate stay. A value llama-swap already reported is never replaced.
+output, duration and end time match that window (duration within the
+larger of one second and five percent). The end time is llama-swap's
+timestamp, truncated to the second; it has to fall between the metrics
+scrape before the finish and the scrape that shows it, widened by 1.5
+seconds on each side, and only one row and one finish may fit. The fill
+is the cached tokens, prompt tok/s of the tokens that were not cached
+over the time to the first token, and generation tok/s of the tokens
+after the first over the rest of the request. The rates are marked `~`,
+the same way as vLLM. The cached count is not: the column is a fixed
+width and a prefix would be clipped. A non-streaming request gets the
+cached count only; both rates stay `--`. The prompt rate stays `--`
+unless that request's own queue time is known and is at most five
+percent of its time to the first token. The queue histogram steps when
+a request leaves the queue, so the step is kept from then and matched
+to the finish in order from the last idle scrape; a step that was not a
+single departure, or that cannot be tied to this finish, is not used.
+The cached count and the generation rate stay. A value llama-swap
+already reported is never replaced.
 A missing cached count is still filled, and so is a rate the row did
 not report. Two requests, a second request running, a counter that
 went backwards, a missed scrape, or a row that does not match fill
@@ -486,7 +494,7 @@ only gauges) and OpenAI-compatible servers. SGLang's request counter
 generation and cached counters, its end-to-end and
 time-to-first-token histograms, and its queue-time histogram are still
 read to fill one RECENT row when one streaming request was alone and
-the row matches its prompt, output and duration. A non-streaming
+the row matches its prompt, output, duration and end time. A non-streaming
 request contributes its cached count only. None of these fill the
 prefill or decode seconds.
 
