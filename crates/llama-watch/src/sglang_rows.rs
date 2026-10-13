@@ -14,8 +14,9 @@
 //! nothing else ran, no counter went backwards, and no scrape was missed
 //! for longer than [`crate::speeds::PENDING_FOR`]. The llama-swap row is
 //! that request only when its prompt, output and duration match the
-//! window (duration within the larger of one second and five percent) and
-//! its timestamp falls between the scrape before the finish and the finish
+//! window (no more than 0.1 s shorter than the engine's end-to-end time,
+//! and no more than the larger of 0.5 s and two percent longer) and its
+//! timestamp falls between the scrape before the finish and the finish
 //! scrape, widened by [`STAMP_SLACK`]. The match has to be unique in both
 //! directions. No match, or more than one, fills nothing.
 //!
@@ -826,15 +827,18 @@ fn wall_secs(wall: SystemTime) -> Option<f64> {
     secs.is_finite().then_some(secs)
 }
 
-/// `duration_ms` agrees with the window's end-to-end seconds. The slack
-/// is the larger of one second and five percent (36_468 ms against 36.47 s).
+/// `duration_ms` agrees with the window's end-to-end seconds.
+/// llama-swap's duration covers the engine's time plus its own overhead,
+/// so it is never meaningfully shorter: at least 0.1 s under, and at most
+/// the larger of 0.5 s and two percent over (36_468 ms against 36.47 s).
 fn duration_agrees(duration_ms: u64, e2e_s: f64) -> bool {
     if !e2e_s.is_finite() || e2e_s < 0.0 {
         return false;
     }
     let row_s = duration_ms as f64 / 1000.0;
-    let tol = (e2e_s * 0.05).max(1.0);
-    (row_s - e2e_s).abs() <= tol
+    let delta = row_s - e2e_s;
+    let over = (e2e_s * 0.02).max(0.5);
+    delta >= -0.1 && delta <= over
 }
 
 fn whole_delta(before: f64, now: f64) -> Option<i64> {
@@ -1984,7 +1988,8 @@ mod tests {
         );
         assert_eq!(far.fill(1), None, "duration 20 s against 10 s");
 
-        // Exactly one second off still agrees: the floor is one second.
+        // One second over does not agree. Two percent of 10 s is 0.2 s,
+        // so the upper bound is 0.5 s.
         let mut edge = SglangBook::default();
         edge.observe(
             "flash",
@@ -2006,7 +2011,7 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             Some(totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)),
         );
-        assert_eq!(edge.fill(1).expect("one second").cached, 600);
+        assert_eq!(edge.fill(1), None, "one second over 10 s");
 
         // 36_468 ms against 36.47 s agrees; two seconds past it does not.
         // The row is read before the scrape that shows the finish.
@@ -2043,7 +2048,7 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
         );
-        assert_eq!(past.fill(1), None, "36.47 s plus 2 s is past five percent");
+        assert_eq!(past.fill(1), None, "36.47 s plus 2 s is past two percent");
 
         // The same finish, read after the scrape that showed it.
         let mut after = SglangBook::default();
@@ -2068,6 +2073,48 @@ mod tests {
             Some(totals(1, 1_000, 600, 401, (36.47, 1.0), (2.0, 1.0), 0.0)),
         );
         assert_eq!(after.fill(1).expect("read after the finish").cached, 600);
+    }
+
+    /// llama-swap's duration is the engine's end-to-end time plus its own
+    /// overhead: no more than 0.1 s shorter, and no more than the larger
+    /// of 0.5 s and two percent longer.
+    #[test]
+    fn duration_slack_is_one_sided() {
+        let clock = Clock(Instant::now());
+        let run = |e2e: f64, duration_ms: u64| {
+            let mut book = SglangBook::default();
+            book.observe(
+                "flash",
+                clock.at(0),
+                SystemTime::UNIX_EPOCH,
+                Some(totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0)),
+            );
+            book.activity(clock.at(50), &[]);
+            book.activity(clock.at(80), &[measured(1, 1_000, 401, duration_ms)]);
+            book.observe(
+                "flash",
+                clock.at(1_000),
+                SystemTime::UNIX_EPOCH,
+                Some(totals(1, 1_000, 600, 401, (e2e, 1.0), (1.0, 1.0), 0.0)),
+            );
+            book.fill(1).map(|fill| fill.cached)
+        };
+        // 10 s engine: two percent is 0.2 s, so the upper bound is 0.5 s.
+        assert_eq!(run(10.0, 9_900), Some(600), "0.1 s shorter still agrees");
+        assert_eq!(run(10.0, 9_899), None, "0.101 s shorter does not");
+        assert_eq!(run(10.0, 10_500), Some(600), "0.5 s longer still agrees");
+        assert_eq!(run(10.0, 10_501), None, "0.501 s longer does not");
+        // 100 s engine: two percent is 2 s, which is the upper bound.
+        assert_eq!(
+            run(100.0, 102_000),
+            Some(600),
+            "two percent longer still agrees"
+        );
+        assert_eq!(
+            run(100.0, 102_001),
+            None,
+            "one millisecond past two percent does not"
+        );
     }
 
     #[test]
@@ -2646,20 +2693,20 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
             3_300,
             totals(2, 13_691, 2_567, 833, (3.35, 2.0), (1.4, 2.0), 0.0),
         );
-        let mut first = measured(1, 4_691, 823, 2_200);
-        first.timestamp = Some(stamp_secs(4));
+        let mut first = measured(1, 4_691, 823, 2_300);
+        first.timestamp = Some(stamp_secs(3));
         book.activity(clock.at(4_000), &[first]);
-        // The confirming scrape is also the next finish. Second 4 sits in
-        // both widened intervals, and 2.2 s agrees with 2.35 s and 1.97 s.
+        // The confirming scrape is also the next finish. Second 3 sits in
+        // both intervals, and 2.3 s agrees with 2.35 s and 1.97 s.
         see(
             &mut book,
             &clock,
             4_900,
             totals(3, 18_382, 2_863, 1_656, (5.32, 3.0), (2.4, 3.0), 0.0),
         );
-        assert_eq!(book.fill(1), None, "second 4 fits two finishes");
-        let mut second = measured(2, 4_691, 823, 1_700);
-        second.timestamp = Some(stamp_secs(6));
+        assert_eq!(book.fill(1), None, "second 3 fits two finishes");
+        let mut second = measured(2, 4_691, 823, 1_880);
+        second.timestamp = Some(stamp_secs(5));
         book.activity(clock.at(5_500), &[second]);
         see(
             &mut book,
@@ -2670,7 +2717,7 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
         assert_eq!(
             book.fill(2),
             None,
-            "1.7 s also fits the finish that cached 590"
+            "1.88 s also fits the finish that cached 590"
         );
     }
 }
