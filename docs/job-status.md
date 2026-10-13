@@ -64,8 +64,10 @@ integers; a fractional value is absent. Durations longer than ten years
 are stored as ten years.
 
 llama-watch looks at at most eight `*.json` files directly in `dir`
-(newest mtime first; at most 512 names are collected, then ranked), opens them without
-following a symlink, rejects a body over 64 KiB or JSON deeper than 8, and
+(newest mtime first). It collects at most 512 names in directory order,
+then ranks those by mtime; past 512 `.json` files the newest can be
+missed. It opens them without following a symlink, rejects a body over
+64 KiB or JSON deeper than 8, and
 re-reads at most once a second and only when the mtime, size or inode
 changed. A file that fails a check is skipped and logged once. A writer
 must write more often than `stale_s` or the job is treated as gone. An
