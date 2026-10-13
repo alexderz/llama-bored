@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use llama_core::gridfile::{self, GridImage, HEARTBEAT};
 use llama_core::log::Sink;
@@ -959,6 +959,10 @@ fn busy_frame() -> TtyModel {
         }),
         job: None,
         job_note: None,
+        model_id: String::new(),
+        claims: Vec::new(),
+        now: UNIX_EPOCH,
+        tz_offset_s: 0,
     }
 }
 

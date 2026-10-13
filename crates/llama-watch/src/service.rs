@@ -33,7 +33,8 @@ use crate::tty::chart::TokenChart;
 use crate::tty::ctx_history::CtxBook;
 use crate::tty::grid::Cell;
 use crate::tty::layout::{
-    self, Activity, HealthSeg, HealthStatus, InFlight, SetupView, Slot, TtyModel, WatchState,
+    self, Activity, HeaderClaim, HealthSeg, HealthStatus, InFlight, SetupView, Slot, TtyModel,
+    WatchState,
 };
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
@@ -1100,6 +1101,43 @@ fn tty_model(
         setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
         job: job_and_note.0,
         job_note: job_and_note.1,
+        model_id: header_model_id(sample, watch, &tick.detail),
+        claims: tick
+            .detail
+            .claims
+            .iter()
+            .map(|claim| HeaderClaim {
+                model: claim.model.clone(),
+                holder: claim.holder.clone(),
+                in_use: claim.in_use,
+                expires_at: claim.expires_at,
+                hold_until: claim.hold_until,
+                hold_reason: claim.hold_reason.clone(),
+            })
+            .collect(),
+        now: wall,
+        tz_offset_s: zone.offset_at(unix_secs_of(wall)),
+    }
+}
+
+fn header_model_id(sample: &WatchSample, state: WatchState, detail: &LlamaDetail) -> String {
+    if !matches!(state, WatchState::Generating | WatchState::Ready) {
+        return String::new();
+    }
+    if sample.snapshot.models.is_empty() {
+        return String::new();
+    }
+    detail
+        .setup
+        .first()
+        .map(|setup| setup.key.clone())
+        .unwrap_or_default()
+}
+
+fn unix_secs_of(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -2297,6 +2335,71 @@ mod tests {
         );
     }
 
+    /// No `claims` frame, an empty list, and a claim for a model the header
+    /// does not name, all go through [`tty_model`] to the same console and
+    /// grid bytes (#128).
+    #[test]
+    fn no_claims_frame_is_byte_identical_to_today() {
+        let sample = backend_sample(vec![served("m", "ready", None)]);
+        let ctx = frame_ctx(None, true);
+        let mono = Instant::now();
+        let wall = UNIX_EPOCH;
+        let zone = Zone::utc();
+        let frame = |claims: Vec<crate::sources::events::ModelClaim>| {
+            let mut tick = TickState::new(2, 6);
+            tick.heard = true;
+            tick.detail.setup = vec![ModelSetup {
+                key: "m".to_owned(),
+                id: "m".to_owned(),
+                name: "m".to_owned(),
+                ..ModelSetup::default()
+            }];
+            tick.detail.claims = claims;
+            tty_model(&sample, &mut tick, mono, wall, &zone, &ctx)
+        };
+        let today = frame(Vec::new());
+        let other = frame(vec![crate::sources::events::ModelClaim {
+            model: "other".to_owned(),
+            holder: "eval-runner".to_owned(),
+            auto: false,
+            in_use: true,
+            expires_at: None,
+            hold_until: None,
+            hold_reason: String::new(),
+        }]);
+        assert!(today.claims.is_empty());
+        assert_eq!(today.model_id, "m");
+        assert_eq!(other.model_id, "m");
+        for cols in [160u16, 192, 213] {
+            let a = layout::layout(&today, cols, 60);
+            let b = layout::layout(&other, cols, 60);
+            let mut term_a = crate::tty::term::Term::new(
+                Vec::new(),
+                move || Ok(crate::tty::term::Size { cols, rows: 60 }),
+                Duration::from_secs(60),
+                Instant::now(),
+            )
+            .expect("term");
+            let mut term_b = crate::tty::term::Term::new(
+                Vec::new(),
+                move || Ok(crate::tty::term::Size { cols, rows: 60 }),
+                Duration::from_secs(60),
+                Instant::now(),
+            )
+            .expect("term");
+            term_a.render(&a, Instant::now()).expect("render");
+            term_b.render(&b, Instant::now()).expect("render");
+            assert_eq!(term_a.out(), term_b.out(), "{cols} console");
+            let ga = layout::layout_exact(&today, cols, 60);
+            let gb = layout::layout_exact(&other, cols, 60);
+            assert_eq!(
+                crate::grid_out::image_of(&ga, llama_core::palette::Palette::Llama, 1, 0),
+                crate::grid_out::image_of(&gb, llama_core::palette::Palette::Llama, 1, 0),
+                "{cols} grid"
+            );
+        }
+    }
+
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
     /// none, and marks them; a llama.cpp row keeps its own.
     /// #75: a busy slot is RECENT's first row, keyed and scaled like the
@@ -2942,7 +3045,7 @@ mod tests {
                     series: Vec::new(),
                     requests: Vec::new(),
                     jobs: Vec::new(),
-                claims: Vec::new(),
+                    claims: Vec::new(),
                 },
             ))
         }
@@ -3094,7 +3197,7 @@ mod tests {
                     series: Vec::new(),
                     requests: Vec::new(),
                     jobs: Vec::new(),
-                claims: Vec::new(),
+                    claims: Vec::new(),
                 },
             ))
         }

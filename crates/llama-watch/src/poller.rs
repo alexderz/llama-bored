@@ -1903,16 +1903,25 @@ impl<L: Sink> State<L> {
                     .engine_facts
                     .get(id)
                     .and_then(|facts| facts.values.get("version").cloned()),
-                // #80: llama-swap's own count, while its stream is up.
-                inflight: events.connected.then(|| {
-                    let key = activity::model_key(id);
-                    let n = events
-                        .requests
+                // #80: llama-swap's own count, while its stream is up
+                // for vLLM or SGLang. Claims may open the stream for
+                // llama.cpp too (#128); that must not add an inflight
+                // field to the snapshot.
+                inflight: (events.connected
+                    && (self
+                        .ready
                         .iter()
-                        .filter(|req| req.model == key)
-                        .count();
-                    u16::try_from(n).unwrap_or(u16::MAX)
-                }),
+                        .any(|ready| matches!(ready.backend, Backend::Vllm | Backend::SgLang))
+                        || !self.running_up))
+                    .then(|| {
+                        let key = activity::model_key(id);
+                        let n = events
+                            .requests
+                            .iter()
+                            .filter(|req| req.model == key)
+                            .count();
+                        u16::try_from(n).unwrap_or(u16::MAX)
+                    }),
                 ..self.series.get(id, now, fresh)
             })
             .collect()

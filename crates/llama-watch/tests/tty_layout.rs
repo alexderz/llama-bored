@@ -10,12 +10,13 @@ use llama_watch::config::{ChartGlyphs, Config};
 use llama_watch::jobs::{
     Job, JobNumber, JobPhase, JobPhaseRow, JobRate, JobSeries, JobState, PhaseMark,
 };
+use llama_watch::localtime::parse_rfc3339;
 use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
-    Activity, HealthSeg, HealthStatus, JobView, SetupItem, SetupRow, SetupView, Slot, TtyModel,
-    WatchState, layout, layout_exact, replay_shown,
+    Activity, HeaderClaim, HealthSeg, HealthStatus, JobView, SetupItem, SetupRow, SetupView, Slot,
+    TtyModel, WatchState, layout, layout_exact, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -1976,6 +1977,10 @@ fn sample(state: WatchState) -> TtyModel {
         },
         job: None,
         job_note: None,
+        model_id: String::new(),
+        claims: Vec::new(),
+        now: UNIX_EPOCH,
+        tz_offset_s: 0,
     }
 }
 
@@ -5068,11 +5073,16 @@ fn temps_goldens_match_character_and_colour() {
 /// temps frame and a hot one (activity past 100, generation past its ceiling).
 type GridGolden = fn() -> TtyModel;
 
-const GRID_EXACT_GOLDENS: [(&str, GridGolden); 3] = [
+const GRID_EXACT_GOLDENS: [(&str, GridGolden); 4] = [
     ("temps-192.json", temps_model),
     ("hot-192.json", hot_model),
     ("job-192.json", job_grid_model),
+    ("claims-192.json", claims_grid_model),
 ];
+
+fn claims_grid_model() -> TtyModel {
+    header_claim_model(hold_claim())
+}
 
 fn job_grid_model() -> TtyModel {
     job_model(example_job(), 0)
@@ -6301,6 +6311,264 @@ fn a_stale_job_does_not_replace_inference() {
     assert!(text.contains("GENERATION"), "{text}");
     assert!(!text.contains("PHASES"), "{text}");
     assert!(!text.contains("TRAINING"), "{text}");
+}
+
+fn claim_now() -> std::time::SystemTime {
+    let unix = parse_rfc3339("2026-10-12T18:47:14Z").expect("rfc3339");
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(unix).expect("unix"))
+}
+
+fn header_claim_model(claim: HeaderClaim) -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    model.model_id = "qwen3.6-35b-a3b".to_owned();
+    model.now = claim_now();
+    model.tz_offset_s = 0;
+    model.claims = vec![claim];
+    model
+}
+
+fn hold_claim() -> HeaderClaim {
+    HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "operator".to_owned(),
+        in_use: true,
+        expires_at: None,
+        hold_until: Some(claim_now() + Duration::from_secs(2 * 3600 + 43 * 60)),
+        hold_reason: "overnight eval, do not unload".to_owned(),
+    }
+}
+
+fn header_line(model: &TtyModel, cols: u16) -> String {
+    row_string(&draw(model, cols, 60), 0)
+}
+
+#[test]
+fn header_claim_four_forms_at_192() {
+    let now = claim_now();
+    let in_use = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: true,
+        expires_at: None,
+        hold_until: None,
+        hold_reason: String::new(),
+    });
+    let idle = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: false,
+        expires_at: Some(now + Duration::from_secs(4 * 60 + 12)),
+        hold_until: None,
+        hold_reason: String::new(),
+    });
+    let short = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "chat-ui".to_owned(),
+        in_use: false,
+        expires_at: Some(now + Duration::from_secs(41)),
+        hold_until: None,
+        hold_reason: String::new(),
+    });
+    let hold = header_claim_model(hold_claim());
+    let h_in_use = header_line(&in_use, 192);
+    let h_idle = header_line(&idle, 192);
+    let h_short = header_line(&short, 192);
+    let h_hold = header_line(&hold, 192);
+    assert!(
+        h_in_use.contains("claim eval-runner") && h_in_use.contains("in use"),
+        "{h_in_use}"
+    );
+    assert!(
+        h_idle.contains("claim eval-runner") && h_idle.contains("4:12 left"),
+        "{h_idle}"
+    );
+    assert!(
+        h_short.contains("claim chat-ui") && h_short.contains("0:41 left"),
+        "{h_short}"
+    );
+    assert!(
+        h_hold.contains("hold operator")
+            && h_hold.contains("until 21:30")
+            && h_hold.contains("overnight eval, do not unload"),
+        "{h_hold}"
+    );
+    let grid = draw(&in_use, 192, 60);
+    let text = row_string(&grid, 0);
+    let holder = char_at(&text, "eval-runner");
+    assert_eq!(grid.get(holder as u16, 0).unwrap().fg, C16::BrightCyan);
+    let label = char_at(&text, "claim");
+    assert_eq!(grid.get(label as u16, 0).unwrap().fg, C16::BrightBlack);
+    let use_at = char_at(&text, "in use");
+    assert_eq!(grid.get(use_at as u16, 0).unwrap().fg, C16::BrightGreen);
+
+    let grid = draw(&idle, 192, 60);
+    let text = row_string(&grid, 0);
+    let left = char_at(&text, "4:12 left");
+    assert_eq!(grid.get(left as u16, 0).unwrap().fg, C16::BrightWhite);
+
+    let grid = draw(&short, 192, 60);
+    let text = row_string(&grid, 0);
+    let left = char_at(&text, "0:41 left");
+    assert_eq!(grid.get(left as u16, 0).unwrap().fg, C16::Yellow);
+
+    let grid = draw(&hold, 192, 60);
+    let text = row_string(&grid, 0);
+    let hold_at = char_at(&text, "hold");
+    assert_eq!(grid.get(hold_at as u16, 0).unwrap().fg, C16::Yellow);
+    let until = char_at(&text, "until 21:30");
+    assert_eq!(grid.get(until as u16, 0).unwrap().fg, C16::BrightWhite);
+    let reason = char_at(&text, "overnight");
+    assert_eq!(grid.get(reason as u16, 0).unwrap().fg, C16::White);
+}
+
+#[test]
+fn header_claim_hour_form_and_zero_at_expiry() {
+    let now = claim_now();
+    let hour = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: false,
+        expires_at: Some(now + Duration::from_secs(3600 + 5 * 60)),
+        hold_until: None,
+        hold_reason: String::new(),
+    });
+    let past = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        in_use: false,
+        expires_at: Some(now - Duration::from_secs(1)),
+        hold_until: None,
+        hold_reason: String::new(),
+    });
+    assert!(
+        header_line(&hour, 192).contains("1 h 05 min left"),
+        "{}",
+        header_line(&hour, 192)
+    );
+    assert!(
+        header_line(&past, 192).contains("0:00 left"),
+        "{}",
+        header_line(&past, 192)
+    );
+}
+
+#[test]
+fn header_claim_hold_that_ends_tomorrow() {
+    let mut claim = hold_claim();
+    claim.hold_until = Some(claim_now() + Duration::from_secs(20 * 3600));
+    let header = header_line(&header_claim_model(claim), 192);
+    assert!(header.contains("until 10-13"), "{header}");
+}
+
+#[test]
+fn header_claim_covers_160_192_213() {
+    let model = header_claim_model(hold_claim());
+    for cols in [160u16, 192, 213] {
+        let header = header_line(&model, cols);
+        assert!(
+            header.contains("operator") && header.contains("until"),
+            "{cols}: {header}"
+        );
+    }
+}
+
+#[test]
+fn header_claim_for_another_model_draws_nothing() {
+    let mut model = header_claim_model(hold_claim());
+    model.model_id = "other".to_owned();
+    let with = header_line(&model, 192);
+    let mut blank = model.clone();
+    blank.claims.clear();
+    let without = header_line(&blank, 192);
+    assert_eq!(with, without);
+    assert!(!with.contains("operator"), "{with}");
+}
+
+#[test]
+fn header_claim_does_not_overlap_the_clock() {
+    let model = header_claim_model(hold_claim());
+    for cols in [160u16, 192, 213] {
+        let grid = draw(&model, cols, 60);
+        let header = row_string(&grid, 0);
+        let clock = if cols >= 200 {
+            char_at(&header, "COOL")
+        } else {
+            char_at(&header, "2026-09-23")
+        };
+        let holder = char_at(&header, "operator");
+        let mut end = holder;
+        let mut gap = 0usize;
+        for col in holder..clock {
+            if grid.get(col as u16, 0).unwrap().ch == ' ' {
+                gap += 1;
+                if gap >= 3 {
+                    break;
+                }
+            } else {
+                gap = 0;
+                end = col + 1;
+            }
+        }
+        assert!(
+            end + 2 <= clock,
+            "{cols}: claim ends at {end}, clock at {clock}\n{header}"
+        );
+        for col in end..clock {
+            assert_eq!(
+                grid.get(col as u16, 0).unwrap().ch,
+                ' ',
+                "{cols} col {col} between claim and clock is not blank: {header}"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_claims_is_byte_identical_to_today() {
+    let today = sample(WatchState::Generating);
+    let mut empty = today.clone();
+    empty.claims.clear();
+    empty.model_id = "qwen3.6-35b-a3b".to_owned();
+    let mut other = empty.clone();
+    other.claims = vec![hold_claim()];
+    other.model_id = "other".to_owned();
+    for cols in [160u16, 192, 213] {
+        let a = draw(&today, cols, 60);
+        let b = draw(&empty, cols, 60);
+        let c = draw(&other, cols, 60);
+        assert_eq!(console_bytes(&a), console_bytes(&b), "{cols} empty claims");
+        assert_eq!(
+            console_bytes(&a),
+            console_bytes(&c),
+            "{cols} other-model claim"
+        );
+        let ga = layout_exact(&today, cols, 60);
+        let gb = layout_exact(&empty, cols, 60);
+        let gc = layout_exact(&other, cols, 60);
+        assert_eq!(console_bytes(&ga), console_bytes(&gb), "{cols} grid empty");
+        assert_eq!(console_bytes(&ga), console_bytes(&gc), "{cols} grid other");
+    }
+}
+
+const CLAIMS_GOLDENS: [(&str, u16, u16); 1] = [("claims-192.json", 192, 60)];
+
+#[test]
+fn claims_golden_matches_character_and_colour() {
+    for (name, cols, rows) in CLAIMS_GOLDENS {
+        let fix = load(name);
+        assert_eq!((fix.w, fix.h), (cols, rows), "{name}");
+        assert_frame(name, &fix, &header_claim_model(hold_claim()));
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #128 claims goldens"]
+fn dump_claims_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in CLAIMS_GOLDENS {
+        let grid = draw(&header_claim_model(hold_claim()), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write claims golden");
+    }
 }
 
 const JOB_GOLDENS: [(&str, u16, u16); 3] = [
