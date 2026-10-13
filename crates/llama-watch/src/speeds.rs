@@ -18,7 +18,9 @@
 //! (`prompt_tokens_total`, `generation_tokens_total`) move while a request
 //! is in flight and the times only when it ends, so their quotient over a
 //! short window is not a speed; the per-request sums are used instead.
-//! SGLang has no per-request prefill or decode time, so it gets none.
+//! SGLang has no per-request prefill or decode time. One finished row is
+//! filled from its counters when the scrapes show exactly that request
+//! ([`crate::sglang_rows`]); anything else stays without a number.
 //!
 //! [`window`] is that maths. [`SpeedBook`] gives a new activity row the
 //! speeds of the requests that finished between the metrics read before

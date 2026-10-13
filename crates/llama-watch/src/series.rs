@@ -17,6 +17,12 @@
 //! | spec drafts (tokens, accepted) | activity draft fields | engine counters ([`crate::metrics::EngineBook`]) | none | engine counters | none |
 //! | running, waiting, KV fill | `requests_processing`, `requests_deferred`, `kv_cache_usage_ratio` (older builds) | on [`llama_core::backend::BackendInfo`] | same | same | none |
 //!
+//! SGLang's `num_requests_total`, `prompt_tokens_total`,
+//! `generation_tokens_total`, `cached_tokens_total`, and the end-to-end
+//! and time-to-first-token histograms are also read to fill one RECENT
+//! row when the scrapes show exactly that request (#133). They do not
+//! add prefill or decode seconds: that row of the table stays none.
+//!
 //! A model whose server has no usable `/metrics` (and is counted from
 //! llama-swap's activity rows, like [`crate::metrics::DecodedCounter`])
 //! gets its generated tokens from those rows instead.
