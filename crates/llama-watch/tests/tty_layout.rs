@@ -1,18 +1,21 @@
 //! Text goldens for the tty11 layout. Frames are compared cell by cell.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use llama_core::backend::{Backend, BackendInfo, EngineStats};
 use llama_core::detail::ModelDetail;
 use llama_watch::collector::LoadSource;
 use llama_watch::config::{ChartGlyphs, Config};
+use llama_watch::jobs::{
+    Job, JobNumber, JobPhase, JobPhaseRow, JobRate, JobSeries, JobState, PhaseMark,
+};
 use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
-    Activity, HealthSeg, HealthStatus, SetupItem, SetupRow, SetupView, Slot, TtyModel, WatchState,
-    layout, layout_exact, replay_shown,
+    Activity, HealthSeg, HealthStatus, JobView, SetupItem, SetupRow, SetupView, Slot, TtyModel,
+    WatchState, layout, layout_exact, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -1971,6 +1974,8 @@ fn sample(state: WatchState) -> TtyModel {
             WatchState::Generating | WatchState::Ready => Some(qwen_setup()),
             WatchState::AiDown | WatchState::Starting | WatchState::NoLlama => None,
         },
+        job: None,
+        job_note: None,
     }
 }
 
@@ -5063,8 +5068,15 @@ fn temps_goldens_match_character_and_colour() {
 /// temps frame and a hot one (activity past 100, generation past its ceiling).
 type GridGolden = fn() -> TtyModel;
 
-const GRID_EXACT_GOLDENS: [(&str, GridGolden); 2] =
-    [("temps-192.json", temps_model), ("hot-192.json", hot_model)];
+const GRID_EXACT_GOLDENS: [(&str, GridGolden); 3] = [
+    ("temps-192.json", temps_model),
+    ("hot-192.json", hot_model),
+    ("job-192.json", job_grid_model),
+];
+
+fn job_grid_model() -> TtyModel {
+    job_model(example_job(), 0)
+}
 
 fn hot_model() -> TtyModel {
     let mut model = temps_model();
@@ -6089,4 +6101,229 @@ fn the_grid_file_carries_the_original_characters_to_the_viewer() {
 
 fn grid_text(grid: &llama_watch::tty::Grid) -> String {
     grid.cells().iter().map(|cell| cell.ch).collect()
+}
+
+fn example_job() -> Job {
+    Job {
+        file: "example-trainer".to_owned(),
+        name: "example-trainer".to_owned(),
+        kind: Some("training".to_owned()),
+        title: Some("Example-2B".to_owned()),
+        state: JobState::Running,
+        phase: Some(JobPhase {
+            label: "2B".to_owned(),
+            index: Some(2),
+            of: Some(3),
+        }),
+        step: Some(921),
+        total: Some(1075),
+        elapsed_s: Some(15_381),
+        eta_s: Some(2559),
+        rate: Some(JobRate {
+            value: 16.62,
+            unit: Some("s/step".to_owned()),
+        }),
+        rates: vec![
+            JobNumber {
+                label: "rows/s".to_owned(),
+                value: 0.96,
+            },
+            JobNumber {
+                label: "tok/s".to_owned(),
+                value: 1540.0,
+            },
+        ],
+        values: vec![
+            JobNumber {
+                label: "loss".to_owned(),
+                value: 0.2544,
+            },
+            JobNumber {
+                label: "lr".to_owned(),
+                value: 1.276e-5,
+            },
+            JobNumber {
+                label: "epoch".to_owned(),
+                value: 0.8465,
+            },
+            JobNumber {
+                label: "grad".to_owned(),
+                value: 0.348,
+            },
+        ],
+        series: vec![
+            JobSeries {
+                label: "loss".to_owned(),
+                points: vec![3.285, 0.846, 0.539, 0.254],
+            },
+            JobSeries {
+                label: "s/step".to_owned(),
+                points: vec![16.4, 16.7, 16.6],
+            },
+        ],
+        phases: vec![
+            JobPhaseRow {
+                label: "synthetic test".to_owned(),
+                mark: Some(PhaseMark::Done),
+                elapsed_s: Some(356),
+                result: Some("pass".to_owned()),
+            },
+            JobPhaseRow {
+                label: "0.8B".to_owned(),
+                mark: Some(PhaseMark::Done),
+                elapsed_s: Some(10_186),
+                result: Some("val 98.2 %".to_owned()),
+            },
+            JobPhaseRow {
+                label: "2B".to_owned(),
+                mark: Some(PhaseMark::Running),
+                elapsed_s: Some(15_381),
+                result: None,
+            },
+            JobPhaseRow {
+                label: "4B".to_owned(),
+                mark: Some(PhaseMark::Queued),
+                elapsed_s: None,
+                result: None,
+            },
+        ],
+        mtime: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    }
+}
+
+fn job_model(job: Job, more: usize) -> TtyModel {
+    let mut model = sample(WatchState::Ready);
+    model.model_name = "--".to_owned();
+    model.slots = Vec::new();
+    model.requests = Vec::new();
+    model.setup = None;
+    model.job = Some(JobView { job, more });
+    model.job_note = None;
+    model
+}
+
+fn painted(model: &TtyModel, cols: u16, rows: u16) -> String {
+    let grid = draw(model, cols, rows);
+    (0..grid.rows())
+        .map(|row| row_string(&grid, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn job_view_running_shows_title_progress_digits_phases() {
+    let model = job_model(example_job(), 0);
+    let text = painted(&model, 192, 60);
+    assert!(text.contains("TRAINING"), "{text}");
+    assert!(text.contains("example-trainer"), "{text}");
+    assert!(text.contains("Example-2B"), "{text}");
+    assert!(text.contains("2 of 3"), "{text}");
+    assert!(text.contains("STEP"), "{text}");
+    assert!(text.contains("921"), "{text}");
+    assert!(text.contains("1,075"), "{text}");
+    assert!(text.contains("left"), "{text}");
+    assert!(text.contains("SECONDS / STEP"), "{text}");
+    assert!(text.contains("LOSS"), "{text}");
+    assert!(text.contains("VALUES"), "{text}");
+    assert!(text.contains("PHASES"), "{text}");
+    assert!(text.contains("JOB"), "{text}");
+    assert!(text.contains("running"), "{text}");
+    assert!(!text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("RECENT"), "{text}");
+}
+
+#[test]
+fn job_view_minimal_shows_name_and_state() {
+    let job = Job {
+        file: "n".to_owned(),
+        name: "only-name".to_owned(),
+        kind: None,
+        title: None,
+        state: JobState::Running,
+        phase: None,
+        step: None,
+        total: None,
+        elapsed_s: None,
+        eta_s: None,
+        rate: None,
+        rates: Vec::new(),
+        values: Vec::new(),
+        series: Vec::new(),
+        phases: Vec::new(),
+        mtime: UNIX_EPOCH,
+    };
+    let text = painted(&job_model(job, 0), 160, 26);
+    assert!(text.contains("only-name"), "{text}");
+    assert!(text.contains("JOB"), "{text}");
+    assert!(text.contains("running"), "{text}");
+    assert!(!text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("STEP"), "{text}");
+}
+
+#[test]
+fn several_live_jobs_add_plus_n_after_the_name() {
+    let text = painted(&job_model(example_job(), 2), 192, 60);
+    assert!(text.contains("+2"), "{text}");
+}
+
+#[test]
+fn a_serving_model_keeps_inference_and_a_job_note() {
+    let mut model = sample(WatchState::Generating);
+    model.job = None;
+    model.job_note = Some("example-trainer 921/1,075 43 min left".to_owned());
+    let text = painted(&model, 192, 60);
+    assert!(text.contains("GENERATION"), "{text}");
+    assert!(text.contains("RECENT"), "{text}");
+    assert!(text.contains("example-trainer"), "{text}");
+    assert!(text.contains("43 min left"), "{text}");
+    assert!(!text.contains("PHASES"), "{text}");
+}
+
+#[test]
+fn done_and_failed_notes_sit_in_the_header() {
+    let mut model = sample(WatchState::Ready);
+    model.job = None;
+    model.job_note = Some("example-trainer done 4 h 16 min".to_owned());
+    let text = painted(&model, 192, 60);
+    assert!(text.contains("example-trainer done 4 h 16 min"), "{text}");
+    assert!(text.contains("GENERATION"), "{text}");
+    model.job_note = Some("example-trainer failed 12 min".to_owned());
+    let text = painted(&model, 192, 60);
+    assert!(text.contains("example-trainer failed 12 min"), "{text}");
+}
+
+#[test]
+fn a_stale_job_does_not_replace_inference() {
+    let mut model = sample(WatchState::Ready);
+    model.job = None;
+    model.job_note = None;
+    let text = painted(&model, 192, 60);
+    assert!(text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("PHASES"), "{text}");
+    assert!(!text.contains("TRAINING"), "{text}");
+}
+
+const JOB_GOLDENS: [(&str, u16, u16); 3] = [
+    ("job-192.json", 192, 60),
+    ("job-213.json", 213, 60),
+    ("job-160x26.json", 160, 26),
+];
+
+#[test]
+fn job_view_goldens_match_character_and_colour() {
+    for (name, cols, rows) in JOB_GOLDENS {
+        let fix = load(name);
+        assert_eq!((fix.w, fix.h), (cols, rows), "{name}");
+        assert_frame(name, &fix, &job_model(example_job(), 0));
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the job-view goldens"]
+fn dump_job_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in JOB_GOLDENS {
+        let grid = draw(&job_model(example_job(), 0), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write job golden");
+    }
 }
