@@ -80,17 +80,24 @@ uncached prompt tokens over prefill time, and generated tokens after the
 first over decode time (speculative decoding included). If several
 requests finished in that window, the row shows their average; if none
 did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
-per-request prefill or decode time. A finished row is filled from the
-engine's counters when the scrapes between one finish and the next show
-exactly that one request: the cached tokens, prompt tok/s of the tokens
-that were not cached over the time to the first token, and generation
-tok/s of the tokens after the first over the rest of the request. The
-rates are marked `~`, the same way as vLLM. The cached count is not: the
-column is a fixed width and a prefix would be clipped. Two requests in
-one scrape, a second request running at the same time, a counter that
-went backwards, a missed scrape, or a row llama-swap already measured
-stay `--` and are never overwritten. The same window
-speeds are at the end of the model's backend line on tty11 when it fits;
+per-request prefill or decode time. A finished row is filled only when
+one streaming request was alone in the engine and the row's prompt,
+output and duration match that window (duration within the larger of
+one second and five percent): the cached tokens, prompt tok/s of the
+tokens that were not cached over the time to the first token, and
+generation tok/s of the tokens after the first over the rest of the
+request. The rates are marked `~`, the same way as vLLM. The cached
+count is not: the column is a fixed width and a prefix would be
+clipped. A non-streaming request gets the cached count only; both
+rates stay `--`. Queue time over five percent of the time to the first
+token leaves the prompt rate `--`. The cached count and the generation
+rate stay. A value llama-swap already reported is never replaced.
+A missing cached count is still filled, and so is a rate the row did
+not report. Two requests, a second request running, a counter that
+went backwards, a missed scrape, or a row that does not match fill
+nothing. An engine with no `cached_tokens_total` series fills nothing.
+The same window speeds are at the end of the model's backend line on
+tty11 when it fits;
 the exporter carries the counters they come from instead
 (`llamabored_model_prefill_seconds_total` and friends, see
 **llama-metrics** under Features). Strata reports no histograms
@@ -149,8 +156,11 @@ than the out run, since out is yellow too). Without a context size the
 bar is scaled to the largest such row shown and marked `~`. With
 `chart_glyphs = "halves"` the heights fall back to `▄` (and the header
 key's mark with them) and the colours carry the rest. A cached count the
-engine did not report is `--`, and the prompt is one dim run in that
-same grey, not all new. A reported 0 stays 0 and the prompt is all new.
+engine did not report is `--`. On a finished row the prompt is one dim
+run in that same grey, not all new. On an in-flight row the done and
+pending runs and the prefill cursor stay as they were when an omitted
+count was read as zero; only the CACHED cell is `--`. A reported 0
+stays 0 and the prompt is all new.
 
 **Head spinner** (#96). An in-flight row's growing run — new while it is
 still in prefill, out once it decodes — carries a one-cell cursor at its
@@ -471,10 +481,14 @@ summary` and a `_sum` and `_count` sample per model, both counters to
 `rate()`. Not reported, so absent: TTFT and ITL for llama.cpp, Strata and
 OpenAI-compatible servers; prefill and decode seconds for SGLang and
 OpenAI-compatible servers; speculative counters for SGLang (it reports
-only gauges) and OpenAI-compatible servers. SGLang's request, prompt,
-generation and cached counters, and its end-to-end and time-to-first-token
-histograms, are still read to fill one RECENT row when the scrapes show
-exactly that request; they do not fill the prefill or decode seconds.
+only gauges) and OpenAI-compatible servers. SGLang's request counter
+(the `is_streaming="false"` series as well as the sum), prompt,
+generation and cached counters, its end-to-end and
+time-to-first-token histograms, and its queue-time histogram are still
+read to fill one RECENT row when one streaming request was alone and
+the row matches its prompt, output and duration. A non-streaming
+request contributes its cached count only. None of these fill the
+prefill or decode seconds.
 
 Host and exporter:
 
