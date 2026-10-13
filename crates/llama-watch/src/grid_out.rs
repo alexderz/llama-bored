@@ -615,7 +615,7 @@ fn writer_loop<L: Sink>(mut writer: GridWriter, mut log: L, shared: &Shared) {
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     use llama_core::gridfile;
     use llama_core::log::Sink;
@@ -697,6 +697,10 @@ mod tests {
             setup: None,
             job: None,
             job_note: None,
+            model_id: String::new(),
+            claims: Vec::new(),
+            now: UNIX_EPOCH,
+            tz_offset_s: 0,
         }
     }
 

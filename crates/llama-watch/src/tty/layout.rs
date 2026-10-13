@@ -4,6 +4,8 @@
 //! [`Term::rows`](super::term::Term::rows). The last row and the last column
 //! stay blank so the console cannot scroll.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use llama_core::color::{self, Rgb, act_color};
 
 use super::chart::{self, ChartBucket, Ink};
@@ -269,6 +271,30 @@ pub struct TtyModel {
     pub job: Option<JobView>,
     /// One-line job note in the header when the inference view is showing.
     pub job_note: Option<String>,
+    /// llama-swap id of the model the header names. Empty when the header
+    /// names no model; the claim is then not drawn (#128).
+    pub model_id: String,
+    /// Latest model claims from llama-swap's `/api/events` (#128).
+    pub claims: Vec<HeaderClaim>,
+    /// Wall clock for the claim countdown. Tests inject this.
+    pub now: SystemTime,
+    /// Seconds east of UTC, for a hold's `until HH:MM` in local time.
+    pub tz_offset_s: i32,
+}
+
+/// One model claim as the header draws it (#128).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderClaim {
+    /// llama-swap model id, matched against [`TtyModel::model_id`].
+    pub model: String,
+    /// Holder token, already sanitised.
+    pub holder: String,
+    pub in_use: bool,
+    pub expires_at: Option<SystemTime>,
+    /// Set for an explicit hold.
+    pub hold_until: Option<SystemTime>,
+    /// Already sanitised. Empty when there is none.
+    pub hold_reason: String,
 }
 
 /// The job shown in place of the inference panels.
@@ -549,6 +575,17 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         limit,
     );
     let tag_at = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
+    let tag_at = if model.model_id.is_empty() {
+        tag_at
+    } else if let Some(claim) = model
+        .claims
+        .iter()
+        .find(|claim| claim.model == model.model_id)
+    {
+        paint_claim(grid, tag_at, claim, model.now, model.tz_offset_s, limit)
+    } else {
+        tag_at
+    };
     let mut note_at = tag_at;
     if !model.show_text {
         let tag_end = usize::from(tag_at).saturating_add(TEXT_OFF_TAG.chars().count());
@@ -727,6 +764,180 @@ fn paint_field(
     let drawn = value.chars().count().min(32);
     paint_fit(grid, col_u16(vx), row, value, value_fg, C16::Black, drawn);
     col_u16(vx.saturating_add(drawn).saturating_add(3))
+}
+
+const SEP_CELLS: usize = 3;
+
+/// Header claim for the model the header names (#128). Sheds in order:
+/// cut the reason, drop the reason, drop the label, draw nothing. Never
+/// cuts the holder; if the holder alone does not fit, draws nothing.
+fn paint_claim(
+    grid: &mut Grid,
+    x: u16,
+    claim: &HeaderClaim,
+    now: SystemTime,
+    tz_offset_s: i32,
+    limit: usize,
+) -> u16 {
+    let hold = claim.hold_until.is_some();
+    let label = if hold { "hold" } else { "claim" };
+    let holder = claim.holder.as_str();
+    if holder.is_empty() {
+        return x;
+    }
+    let status = claim_status(claim, now, tz_offset_s);
+    let reason = claim.hold_reason.as_str();
+    let holder_w = holder.chars().count();
+    let status_w = status
+        .as_ref()
+        .map(|s| SEP_CELLS + s.text.chars().count())
+        .unwrap_or(0);
+    let core = holder_w.saturating_add(status_w);
+    let room = limit.saturating_sub(usize::from(x));
+    if core > room {
+        return x;
+    }
+    let label_w = label.chars().count().saturating_add(1);
+    let keep_label = label_w.saturating_add(core) <= room;
+    let used = if keep_label {
+        label_w.saturating_add(core)
+    } else {
+        core
+    };
+    let leftover = room.saturating_sub(used);
+    let shown_reason = if reason.is_empty() {
+        None
+    } else if leftover >= SEP_CELLS + 1 {
+        Some(cut_text(reason, leftover - SEP_CELLS))
+    } else {
+        None
+    };
+
+    let mut col = usize::from(x);
+    if keep_label {
+        let fg = if hold { C16::Yellow } else { C16::BrightBlack };
+        paint_fit(
+            grid,
+            col_u16(col),
+            0,
+            label,
+            fg,
+            C16::Black,
+            label.chars().count(),
+        );
+        col += label.chars().count() + 1;
+    }
+    paint_fit(
+        grid,
+        col_u16(col),
+        0,
+        holder,
+        C16::BrightCyan,
+        C16::Black,
+        holder_w,
+    );
+    col += holder_w;
+    if let Some(status) = &status {
+        col += paint_sep(grid, col);
+        paint_fit(
+            grid,
+            col_u16(col),
+            0,
+            &status.text,
+            status.fg,
+            C16::Black,
+            status.text.chars().count(),
+        );
+        col += status.text.chars().count();
+    }
+    if let Some(reason) = shown_reason.as_deref().filter(|r| !r.is_empty()) {
+        col += paint_sep(grid, col);
+        let n = paint_detail_fg(
+            grid,
+            col,
+            0,
+            reason,
+            leftover.saturating_sub(SEP_CELLS),
+            C16::White,
+        );
+        col += n;
+    }
+    col_u16(col.saturating_add(3))
+}
+
+struct ClaimStatus {
+    text: String,
+    fg: C16,
+}
+
+fn claim_status(claim: &HeaderClaim, now: SystemTime, tz_offset_s: i32) -> Option<ClaimStatus> {
+    if let Some(until) = claim.hold_until {
+        return Some(ClaimStatus {
+            text: format_until(until, now, tz_offset_s),
+            fg: C16::BrightWhite,
+        });
+    }
+    if claim.in_use {
+        return Some(ClaimStatus {
+            text: "in use".to_owned(),
+            fg: C16::BrightGreen,
+        });
+    }
+    let expires = claim.expires_at?;
+    let left = expires.duration_since(now).unwrap_or(Duration::ZERO);
+    let secs = left.as_secs();
+    Some(ClaimStatus {
+        text: format!("{} left", format_left(secs)),
+        fg: if secs < 60 {
+            C16::Yellow
+        } else {
+            C16::BrightWhite
+        },
+    })
+}
+
+fn format_left(secs: u64) -> String {
+    if secs < 3600 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{} h {:02} min", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn format_until(until: SystemTime, now: SystemTime, tz_offset_s: i32) -> String {
+    let zone = crate::localtime::Zone::fixed(tz_offset_s);
+    let until_s = unix_secs(until);
+    let now_s = unix_secs(now);
+    let until_local = crate::localtime::format_local(until_s, &zone);
+    let now_local = crate::localtime::format_local(now_s, &zone);
+    let hm = until_local.get(11..16).unwrap_or("--:--");
+    if until_local.get(..10) == now_local.get(..10) {
+        format!("until {hm}")
+    } else {
+        let date = until_local.get(5..10).unwrap_or("--");
+        format!("until {date} {hm}")
+    }
+}
+
+fn unix_secs(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+fn paint_sep(grid: &mut Grid, col: usize) -> usize {
+    paint(grid, col_u16(col), 0, ' ', C16::BrightBlack, C16::Black);
+    paint(
+        grid,
+        col_u16(col + 1),
+        0,
+        '\u{00B7}',
+        C16::BrightBlack,
+        C16::Black,
+    );
+    paint(grid, col_u16(col + 2), 0, ' ', C16::BrightBlack, C16::Black);
+    SEP_CELLS
 }
 
 fn col_u16(col: usize) -> u16 {
@@ -6260,5 +6471,122 @@ mod tests {
         assert_eq!(compact_k(ctx.used), "91k");
         assert_eq!(compact_k(ctx.n_ctx), "262k");
         assert_eq!(compact_k(0), "0");
+    }
+
+    fn t(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn claim_row(claim: &HeaderClaim, now: SystemTime, tz: i32, limit: usize) -> String {
+        let mut grid = Grid::new(80, 2);
+        paint_claim(&mut grid, 0, claim, now, tz, limit);
+        (0..80).map(|c| grid.get(c, 0).unwrap().ch).collect()
+    }
+
+    fn idle_claim(holder: &str, expires_in: u64, now: SystemTime) -> HeaderClaim {
+        HeaderClaim {
+            model: "big".to_owned(),
+            holder: holder.to_owned(),
+            in_use: false,
+            expires_at: Some(now + Duration::from_secs(expires_in)),
+            hold_until: None,
+            hold_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn claim_time_left_is_m_ss_then_h_min() {
+        assert_eq!(format_left(0), "0:00");
+        assert_eq!(format_left(41), "0:41");
+        assert_eq!(format_left(4 * 60 + 12), "4:12");
+        assert_eq!(format_left(59), "0:59");
+        assert_eq!(format_left(60), "1:00");
+        assert_eq!(format_left(3599), "59:59");
+        assert_eq!(format_left(3600), "1 h 00 min");
+        assert_eq!(format_left(3600 + 5 * 60), "1 h 05 min");
+        assert_eq!(format_left(10 * 3600 + 12 * 60), "10 h 12 min");
+    }
+
+    fn from_rfc(text: &str) -> SystemTime {
+        let unix = crate::localtime::parse_rfc3339(text).expect("rfc3339");
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(unix).unwrap())
+    }
+
+    #[test]
+    fn hold_until_adds_the_date_when_it_is_not_today() {
+        let now = from_rfc("2026-10-12T18:00:00Z");
+        assert_eq!(
+            format_until(from_rfc("2026-10-12T21:00:00Z"), now, 0),
+            "until 21:00"
+        );
+        assert_eq!(
+            format_until(from_rfc("2026-10-14T00:00:00Z"), now, 0),
+            "until 10-14 00:00"
+        );
+        // Offset +5:30: 18:00 UTC is 23:30 local; 21:00 UTC is 02:30 next local day.
+        assert_eq!(
+            format_until(from_rfc("2026-10-12T21:00:00Z"), now, 5 * 3600 + 30 * 60),
+            "until 10-13 02:30"
+        );
+    }
+
+    #[test]
+    fn claim_status_goes_amber_under_a_minute_and_stays_at_zero() {
+        let now = t(1_000);
+        let under = idle_claim("eval-runner", 59, now);
+        let on = idle_claim("eval-runner", 60, now);
+        let past = HeaderClaim {
+            expires_at: Some(now - Duration::from_secs(5)),
+            ..idle_claim("eval-runner", 0, now)
+        };
+        let s59 = claim_status(&under, now, 0).expect("status");
+        let s60 = claim_status(&on, now, 0).expect("status");
+        let s0 = claim_status(&past, now, 0).expect("status");
+        assert_eq!(s59.text, "0:59 left");
+        assert_eq!(s59.fg, C16::Yellow);
+        assert_eq!(s60.text, "1:00 left");
+        assert_eq!(s60.fg, C16::BrightWhite);
+        assert_eq!(s0.text, "0:00 left");
+        assert_eq!(s0.fg, C16::Yellow);
+    }
+
+    #[test]
+    fn claim_sheds_reason_then_label_then_nothing() {
+        let now = t(1_000);
+        let claim = HeaderClaim {
+            model: "big".to_owned(),
+            holder: "operator".to_owned(),
+            in_use: false,
+            expires_at: None,
+            hold_until: Some(now + Duration::from_secs(3600)),
+            hold_reason: "overnight eval, do not unload".to_owned(),
+        };
+        let full = claim_row(&claim, now, 0, 80);
+        assert!(
+            full.contains("hold operator") && full.contains("overnight eval"),
+            "{full:?}"
+        );
+
+        // `hold operator · until HH:MM · ` is 4+1+8+3+11+3 = 30, plus reason.
+        let cut = claim_row(&claim, now, 0, 30 + 8);
+        let cut: String = cut.trim_end().chars().collect();
+        assert!(cut.contains("hold operator"), "{cut:?}");
+        assert!(cut.contains('\u{2026}'), "{cut:?}");
+        assert!(!cut.contains("unload"), "{cut:?}");
+
+        let no_reason = claim_row(&claim, now, 0, 30);
+        let no_reason: String = no_reason.trim_end().chars().collect();
+        assert!(no_reason.starts_with("hold operator"), "{no_reason:?}");
+        assert!(!no_reason.contains("overnight"), "{no_reason:?}");
+        assert!(!no_reason.contains('\u{2026}'), "{no_reason:?}");
+
+        // holder (8) + sep (3) + until HH:MM (11) = 22. Label does not fit.
+        let no_label = claim_row(&claim, now, 0, 22);
+        let no_label: String = no_label.trim_end().chars().collect();
+        assert!(no_label.starts_with("operator"), "{no_label:?}");
+        assert!(!no_label.contains("hold"), "{no_label:?}");
+
+        let nothing = claim_row(&claim, now, 0, 7);
+        assert!(nothing.chars().all(|c| c == ' '), "{nothing:?}");
     }
 }
