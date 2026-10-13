@@ -16,8 +16,10 @@
 //! that request only when its prompt, output and duration match the
 //! window (no more than 0.1 s shorter than the engine's end-to-end time,
 //! and no more than the larger of 0.5 s and two percent longer) and its
-//! timestamp falls between the scrape before the finish and the finish
-//! scrape, widened by [`STAMP_SLACK`]. The match has to be unique in both
+//! timestamp is the end time truncated to the second, so the row ended in
+//! `[T, T+1)`. It fits a finish seen in `(t_prev, t_fin]` when
+//! `t_prev - 1 s < T <= t_fin + 0.5 s`: llama-swap's end is the engine's
+//! end or at most half a second later. The match has to be unique in both
 //! directions. No match, or more than one, fills nothing.
 //!
 //! A non-streaming finish (`is_streaming="false"` on `num_requests_total`)
@@ -44,10 +46,6 @@ use crate::speeds::{MAX_MODELS, MAX_PENDING, MAX_ROWS, PENDING_FOR};
 const HISTORY_CAP: usize = 512;
 /// Untaken finishes older than this cannot meet a row.
 const FINISH_FOR: Duration = Duration::from_secs(30);
-/// How far a row's timestamp may sit outside the finish's two scrapes.
-/// One second of that is llama-swap truncating the end time; the rest is
-/// the proxy writing the row a little later.
-const STAMP_SLACK: Duration = Duration::from_millis(1_500);
 /// Queue steps remembered since the idle anchor. Past this the order is
 /// no longer trusted.
 const QUEUE_CAP: usize = 64;
@@ -396,7 +394,7 @@ impl SglangBook {
                         && wait
                             .duration_ms
                             .is_some_and(|ms| duration_agrees(ms, finish.e2e_s))
-                        && stamp_fits(wait.timestamp.as_deref(), finish)
+                        && stamp_fits(wait.timestamp.as_deref(), finish.wall_lo, finish.wall_hi)
                 })
                 .map(|(index, _)| index)
                 .collect();
@@ -802,21 +800,24 @@ fn hide_prompt(queue: QueueTie, ttft_s: f64) -> bool {
     }
 }
 
-/// The row's timestamp, truncated to the second, lies in the finish's
-/// scrape interval widened by [`STAMP_SLACK`] on each side.
-fn stamp_fits(timestamp: Option<&str>, finish: &Finish) -> bool {
+/// The row's timestamp, truncated to the second, fits the finish.
+///
+/// `T` is the end time with the fraction dropped, so the row ended in
+/// `[T, T+1)`. The finish is in `(wall_lo, wall_hi]`, and llama-swap's
+/// end is at most 0.5 s after the engine's, so the row fits when
+/// `wall_lo - 1 s < T <= wall_hi + 0.5 s`.
+fn stamp_fits(timestamp: Option<&str>, wall_lo: SystemTime, wall_hi: SystemTime) -> bool {
     let Some(text) = timestamp else {
         return false;
     };
     let Some(row) = parse_rfc3339(text) else {
         return false;
     };
-    let (Some(lo), Some(hi)) = (wall_secs(finish.wall_lo), wall_secs(finish.wall_hi)) else {
+    let (Some(lo), Some(hi)) = (wall_secs(wall_lo), wall_secs(wall_hi)) else {
         return false;
     };
-    let slack = STAMP_SLACK.as_secs_f64();
     let row = row as f64;
-    row >= lo - slack && row <= hi + slack
+    row > lo - 1.0 && row <= hi + 0.5
 }
 
 fn wall_secs(wall: SystemTime) -> Option<f64> {
@@ -2503,6 +2504,50 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
         book.observe("flash", clock.at(ms), wall_at(ms), Some(totals));
     }
 
+    /// The timestamp is the end time truncated to the second. The finish
+    /// lies in `(t_prev, t_fin]` and llama-swap's end is at most 0.5 s
+    /// later, so the row fits when `t_prev - 1 s < T <= t_fin + 0.5 s`.
+    #[test]
+    fn the_end_time_fits_only_inside_the_scrape_bounds() {
+        let clock = Clock(Instant::now());
+        let run = |prev_ms: u64, fin_ms: u64, row_secs: i64| {
+            let mut book = SglangBook::default();
+            see(
+                &mut book,
+                &clock,
+                prev_ms,
+                totals(0, 0, 0, 0, (0.0, 0.0), (0.0, 0.0), 0.0),
+            );
+            book.activity(clock.at(prev_ms + 1), &[]);
+            let mut row = measured(1, 1_000, 401, 10_000);
+            row.timestamp = Some(stamp_secs(row_secs));
+            book.activity(clock.at(prev_ms + 2), &[row]);
+            see(
+                &mut book,
+                &clock,
+                fin_ms,
+                totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0),
+            );
+            book.fill(1).map(|fill| fill.cached)
+        };
+        assert_eq!(
+            run(11_000, 12_000, 10),
+            None,
+            "T = t_prev - 1 s does not fit"
+        );
+        assert_eq!(
+            run(10_999, 12_000, 10),
+            Some(600),
+            "just after t_prev - 1 s fits"
+        );
+        assert_eq!(run(10_000, 10_500, 11), Some(600), "T = t_fin + 0.5 s fits");
+        assert_eq!(
+            run(10_000, 10_499, 11),
+            None,
+            "just after t_fin + 0.5 s does not"
+        );
+    }
+
     /// Two finishes with the same prompt, output and a duration either row
     /// would accept. Each row's own end time picks one finish.
     #[test]
@@ -2555,8 +2600,8 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
     }
 
     /// The neighbour's finish is the only one recorded, and the row's
-    /// duration would accept it. The row ended more than 1.5 s before that
-    /// finish's previous scrape, so it is not that request.
+    /// duration would accept it. The row's second is not after one second
+    /// before that finish's previous scrape, so it is not that request.
     #[test]
     fn a_row_timestamp_outside_the_finish_scrapes_fills_nothing() {
         let clock = Clock(Instant::now());
@@ -2647,7 +2692,9 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
             4_000,
             totals(2, 9_382, 2_763, 1_646, (4.32, 2.0), (2.0, 2.0), 0.0),
         );
-        // Seconds 2 and 3 both lie in [0 − 1.5, 2 + 1.5] and in [2 − 1.5, 4 + 1.5].
+        // Second 2 lies in both `(0 - 1, 2 + 0.5]` and `(2 - 1, 4 + 0.5]`.
+        // Second 3 lies only in the second. The first row claims both
+        // finishes, so the second row is not the only claim on its finish.
         let mut first = measured(1, 4_691, 823, 2_462);
         first.timestamp = Some(stamp_secs(2));
         let mut second = measured(2, 4_691, 823, 2_062);
