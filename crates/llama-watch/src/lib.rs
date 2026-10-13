@@ -6,6 +6,7 @@ pub mod collector;
 pub mod config;
 pub mod grid_out;
 pub mod inflight;
+mod jobs;
 pub mod kv;
 pub mod live;
 mod load;

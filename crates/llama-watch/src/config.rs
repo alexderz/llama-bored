@@ -341,6 +341,19 @@ pub enum InvalidWatchConfig {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// `[jobs] dir` is not an absolute path of a sane length.
+    /// The directory is not opened here.
+    #[error("jobs.dir: {reason}")]
+    JobsDir {
+        /// What is wrong with the path.
+        reason: String,
+    },
+    /// `[jobs] stale_s` is outside 10..=3600.
+    #[error("jobs.stale_s {stale_s} is outside 10..=3600")]
+    JobsStale {
+        /// Offending age in seconds.
+        stale_s: u64,
+    },
 }
 
 /// `[collector]`.
@@ -987,6 +1000,9 @@ pub struct Config {
     /// The full-Unicode grid file for llama-view (#107). Off by default.
     #[serde(default)]
     pub grid: GridFile,
+    /// Batch-job status files for the job view. Unset `dir` reads nothing.
+    #[serde(default)]
+    pub jobs: Jobs,
 }
 
 /// Where `[grid] path` points unless the config says otherwise: a directory
@@ -1089,6 +1105,29 @@ impl Default for Setup {
             defaults: true,
             field: Vec::new(),
             specs_dir: None,
+        }
+    }
+}
+
+/// `[jobs]`: a directory of `<name>.json` status files for the job view.
+/// Unset `dir` (the default) opens nothing and the dashboard is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Jobs {
+    /// Absolute directory of job status files. Unset reads nothing.
+    /// Not opened at load.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// A file whose mtime is older than this many seconds is not shown.
+    #[serde(default = "defaults::jobs_stale_s")]
+    pub stale_s: u64,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            stale_s: defaults::jobs_stale_s(),
         }
     }
 }
@@ -1257,6 +1296,9 @@ mod defaults {
     }
     pub(super) fn setup_order() -> u16 {
         1000
+    }
+    pub(super) fn jobs_stale_s() -> u64 {
+        180
     }
 }
 
@@ -1578,6 +1620,14 @@ impl Config {
         }
         crate::setup_rules::Rules::compile(&self.setup)
             .map_err(|(field, reason)| InvalidWatchConfig::Setup { field, reason })?;
+        if let Some(dir) = &self.jobs.dir {
+            specs_dir_ok(dir).map_err(|reason| InvalidWatchConfig::JobsDir { reason })?;
+        }
+        if !(JOBS_STALE_MIN..=JOBS_STALE_MAX).contains(&self.jobs.stale_s) {
+            return Err(InvalidWatchConfig::JobsStale {
+                stale_s: self.jobs.stale_s,
+            });
+        }
         Ok(())
     }
 }
@@ -1585,6 +1635,9 @@ impl Config {
 /// Longest `specs_dir`, in bytes. Long enough for a temp dir under this
 /// worktree; short enough that a config cannot name an absurd path.
 const MAX_SPECS_DIR: usize = 4096;
+/// `[jobs] stale_s` inclusive bounds.
+const JOBS_STALE_MIN: u64 = 10;
+const JOBS_STALE_MAX: u64 = 3600;
 
 /// `specs_dir` is an absolute path with no `.` or `..` component. It is
 /// not opened: a missing directory is a read error later, not a bad config.
