@@ -139,6 +139,7 @@ use crate::recent::{Merged, Recent};
 use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
 use crate::setup_specs::Specs;
+use crate::sglang_rows::{Claim, SglangBook, Totals};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::KvLayout;
 use crate::sources::events::{Events, EventsView, ModelClaim, claim_model};
@@ -587,6 +588,8 @@ struct State<L> {
     engines: EngineBook,
     /// Engine-measured speeds given to RECENT rows (#35).
     speeds: SpeedBook,
+    /// SGLang cached tokens and speeds from a single-request window (#133).
+    sglang: SglangBook,
     /// Per-model cumulative numbers for llama-metrics (#71).
     series: SeriesBook,
     /// Server kind `/metrics` gave each loaded model the launch command did
@@ -709,6 +712,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         prompt_cache: PromptCache::default(),
         engines: EngineBook::default(),
         speeds: SpeedBook::default(),
+        sglang: SglangBook::default(),
         series: SeriesBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
@@ -1025,6 +1029,7 @@ impl<L: Sink> State<L> {
     fn forget_engine(&mut self, id: &str) {
         self.engines.forget(id);
         self.speeds.forget(id);
+        self.sglang.forget(id);
         self.series.forget_gauges(id);
     }
 
@@ -1194,6 +1199,10 @@ impl<L: Sink> State<L> {
                 );
                 let engine = self.engines.observe(&model.id, sample);
                 self.speeds.observe(&model.id, now, sample.speeds);
+                if model.backend == Backend::SgLang {
+                    self.sglang
+                        .observe(&model.id, now, Totals::from_sample(sample));
+                }
                 self.gauges
                     .insert(model.id.clone(), Gauges::of(sample, engine, live, now));
                 if let Some(prompt) = sample.prompt_total {
@@ -1672,6 +1681,7 @@ impl<L: Sink> State<L> {
         let now = Instant::now();
         if merged.baseline {
             self.speeds.activity(now, &[]);
+            self.sglang.activity(now, &[]);
             return;
         }
         let rows = &merged.new;
@@ -1688,6 +1698,28 @@ impl<L: Sink> State<L> {
             );
         }
         self.speeds.activity(now, &measure);
+        let mut claims = Vec::new();
+        for model in self
+            .ready
+            .iter()
+            .filter(|model| model.backend == Backend::SgLang)
+        {
+            let key = activity::model_key(&model.id);
+            for row in rows.iter().filter(|row| row.model == key) {
+                let Some(input) = row.input_tokens else {
+                    continue;
+                };
+                claims.push(Claim {
+                    seq: row.seq,
+                    model: model.id.clone(),
+                    input,
+                    reported: row.cached_tokens.is_some()
+                        || row.prompt_tps.is_some()
+                        || row.gen_tps.is_some(),
+                });
+            }
+        }
+        self.sglang.activity(now, &claims);
         for model in &self.ready {
             let key = activity::model_key(&model.id);
             for row in rows.iter().filter(|row| row.model == key) {
@@ -1956,18 +1988,32 @@ impl<L: Sink> State<L> {
     }
 
     /// RECENT rows, newest first from llama-watch's own ring (#44), with
-    /// the engine's speeds where llama-swap gave none (#35).
+    /// the engine's speeds where llama-swap gave none (#35) and, for one
+    /// SGLang request, the counters of that request (#133). The fill is
+    /// applied on this copy: the prompt counters and the snapshot never
+    /// see it, and a value llama-swap reported is left as it was.
     fn measured_activity(&self) -> Vec<ActivityRow> {
         let mut rows = self.recent.rows(self.activity_rows());
         for row in &mut rows {
-            let Some(speeds) = self.speeds.speeds(row.seq) else {
+            if let Some(speeds) = self.speeds.speeds(row.seq) {
+                if row.prompt_tps.is_none() {
+                    row.engine_prompt_tps = speeds.prefill;
+                }
+                if row.gen_tps.is_none() {
+                    row.engine_gen_tps = speeds.decode;
+                }
+            }
+            let Some(fill) = self.sglang.fill(row.seq) else {
                 continue;
             };
-            if row.prompt_tps.is_none() {
-                row.engine_prompt_tps = speeds.prefill;
+            if row.cached_tokens.is_none() {
+                row.cached_tokens = Some(fill.cached);
             }
-            if row.gen_tps.is_none() {
-                row.engine_gen_tps = speeds.decode;
+            if row.prompt_tps.is_none() && row.engine_prompt_tps.is_none() {
+                row.engine_prompt_tps = fill.prompt_tps;
+            }
+            if row.gen_tps.is_none() && row.engine_gen_tps.is_none() {
+                row.engine_gen_tps = fill.gen_tps;
             }
         }
         rows

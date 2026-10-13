@@ -2827,6 +2827,139 @@ fn vllm_rows_get_the_engine_speeds_of_the_window_they_finished_in() {
     );
 }
 
+/// Cumulative SGLang counters. Both `is_streaming` series and both
+/// `cache_source` series are present so a last-wins parse cannot match.
+#[allow(clippy::too_many_arguments)]
+fn sglang_window(
+    requests: (u64, u64),
+    prompt: u64,
+    cached: (u64, u64),
+    generated: u64,
+    e2e: (f64, f64),
+    ttft: (f64, f64),
+    running: u32,
+) -> Vec<u8> {
+    format!(
+        "sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"true\"}} {true_n}.0\n\
+sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"false\"}} {false_n}.0\n\
+sglang:prompt_tokens_total{{model_name=\"flash\"}} {prompt}.0\n\
+sglang:generation_tokens_total{{model_name=\"flash\"}} {generated}.0\n\
+sglang:cached_tokens_total{{cache_source=\"device\",model_name=\"flash\"}} {device}.0\n\
+sglang:cached_tokens_total{{cache_source=\"host\",model_name=\"flash\"}} {host}.0\n\
+sglang:e2e_request_latency_seconds_sum{{model_name=\"flash\"}} {e2e_sum}\n\
+sglang:e2e_request_latency_seconds_count{{model_name=\"flash\"}} {e2e_count}\n\
+sglang:time_to_first_token_seconds_sum{{model_name=\"flash\"}} {ttft_sum}\n\
+sglang:time_to_first_token_seconds_count{{model_name=\"flash\"}} {ttft_count}\n\
+sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n",
+        true_n = requests.0,
+        false_n = requests.1,
+        device = cached.0,
+        host = cached.1,
+        e2e_sum = e2e.0,
+        e2e_count = e2e.1,
+        ttft_sum = ttft.0,
+        ttft_count = ttft.1,
+    )
+    .into_bytes()
+}
+
+/// One activity row. `cache`, `prompt` and `gen` are llama-swap's numbers;
+/// `-1` is its "not reported".
+fn sglang_activity(rows: &[(i64, i64, i64, f64, f64)]) -> Vec<u8> {
+    let data: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, input, cache, prompt, gen_rate)| {
+            serde_json::json!({
+                "id": id,
+                "timestamp": format!("2026-10-13T10:00:{id:02}Z"),
+                "model": "flash",
+                "tokens": {
+                    "input_tokens": input,
+                    "output_tokens": 401,
+                    "cache_tokens": cache,
+                    "prompt_per_second": prompt,
+                    "tokens_per_second": gen_rate
+                },
+                "duration_ms": 10_000,
+                "resp_status_code": 200
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "data": data })).expect("json")
+}
+
+/// #133: one SGLang request's counters fill its row; a row llama-swap
+/// already measured is left alone.
+#[test]
+fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
+    let mut world = World::running(running_cmd("flash", SGLANG_CMD));
+    world.metrics.insert(
+        "flash".to_owned(),
+        sglang_window((0, 0), 0, (0, 0), 0, (0.0, 0.0), (0.0, 0.0), 0),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(3), |view, _| {
+        view.models.first().is_some_and(|model| {
+            model.backend.is_some_and(|info| {
+                info.kind == llama_core::backend::Backend::SgLang && info.running == Some(0)
+            })
+        })
+    });
+    thread::sleep(Duration::from_millis(500));
+
+    // Prompt 1,000 (600 cached), TTFT 2 s, 401 generated, e2e 10 s.
+    server.update(|world| {
+        world.metrics.insert(
+            "flash".to_owned(),
+            sglang_window((1, 0), 1_000, (400, 200), 401, (10.0, 1.0), (2.0, 1.0), 0),
+        );
+        world.activity = sglang_activity(&[(1, 1_000, -1, -1.0, -1.0)]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 1 && row.cached_tokens.is_some())
+    });
+    let row = detail.activity.iter().find(|row| row.id == 1).expect("row");
+    assert_eq!(row.cached_tokens, Some(600));
+    assert!((row.engine_prompt_tps.expect("prompt") - 200.0).abs() < 1e-6);
+    assert!((row.engine_gen_tps.expect("gen") - 50.0).abs() < 1e-6);
+    assert_eq!((row.prompt_tps, row.gen_tps), (None, None));
+
+    thread::sleep(Duration::from_millis(500));
+    // A second request whose row already has a cached count and a prompt
+    // rate. The window is clean (prompt 500, cached 300, TTFT 2 s, 100
+    // generated, e2e 4 s) and must not replace those values.
+    server.update(|world| {
+        world.metrics.insert(
+            "flash".to_owned(),
+            sglang_window((2, 0), 1_500, (700, 200), 501, (14.0, 2.0), (4.0, 2.0), 0),
+        );
+        world.activity = sglang_activity(&[(2, 500, 0, 12.5, -1.0), (1, 1_000, -1, -1.0, -1.0)]);
+    });
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.activity.iter().any(|row| row.id == 2)
+    });
+    thread::sleep(Duration::from_millis(800));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, _| true);
+    let reported = detail.activity.iter().find(|row| row.id == 2).expect("row");
+    assert_eq!(reported.cached_tokens, Some(0));
+    assert_eq!(reported.prompt_tps, Some(12.5));
+    assert_eq!(reported.gen_tps, None);
+    assert_eq!(
+        (reported.engine_prompt_tps, reported.engine_gen_tps),
+        (None, None)
+    );
+    let kept = detail.activity.iter().find(|row| row.id == 1).expect("row");
+    assert_eq!(kept.cached_tokens, Some(600));
+    assert!((kept.engine_prompt_tps.expect("kept") - 200.0).abs() < 1e-6);
+    assert!((kept.engine_gen_tps.expect("kept") - 50.0).abs() < 1e-6);
+}
+
 // ---- #46: engine and counter state across restarts and engine changes ------
 
 /// A failed `/running` read forgets the engines' windows: the old

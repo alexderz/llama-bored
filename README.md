@@ -80,7 +80,16 @@ uncached prompt tokens over prefill time, and generated tokens after the
 first over decode time (speculative decoding included). If several
 requests finished in that window, the row shows their average; if none
 did, it keeps `--`. Nothing is derived from DURATION. SGLang reports no
-per-request prefill or decode time, so its rows keep `--`. The same window
+per-request prefill or decode time. A finished row is filled from the
+engine's counters when the scrapes between one finish and the next show
+exactly that one request: the cached tokens, prompt tok/s of the tokens
+that were not cached over the time to the first token, and generation
+tok/s of the tokens after the first over the rest of the request. The
+rates are marked `~`, the same way as vLLM. The cached count is not: the
+column is a fixed width and a prefix would be clipped. Two requests in
+one scrape, a second request running at the same time, a counter that
+went backwards, a missed scrape, or a row llama-swap already measured
+stay `--` and are never overwritten. The same window
 speeds are at the end of the model's backend line on tty11 when it fits;
 the exporter carries the counters they come from instead
 (`llamabored_model_prefill_seconds_total` and friends, see
@@ -462,7 +471,10 @@ summary` and a `_sum` and `_count` sample per model, both counters to
 `rate()`. Not reported, so absent: TTFT and ITL for llama.cpp, Strata and
 OpenAI-compatible servers; prefill and decode seconds for SGLang and
 OpenAI-compatible servers; speculative counters for SGLang (it reports
-only gauges) and OpenAI-compatible servers.
+only gauges) and OpenAI-compatible servers. SGLang's request, prompt,
+generation and cached counters, and its end-to-end and time-to-first-token
+histograms, are still read to fill one RECENT row when the scrapes show
+exactly that request; they do not fill the prefill or decode seconds.
 
 Host and exporter:
 

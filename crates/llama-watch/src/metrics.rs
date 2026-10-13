@@ -37,6 +37,9 @@ struct Names {
     decode: &'static [&'static str],
     running: &'static [&'static str],
     prompt: &'static [&'static str],
+    /// Finished-request counter. SGLang only; both `is_streaming` series
+    /// are summed (#133).
+    requests: &'static [&'static str],
     queued: &'static [&'static str],
     /// KV fill 0..=1, newest name first; the first name that appears wins.
     kv: &'static [&'static str],
@@ -93,6 +96,7 @@ const LLAMACPP: Names = Names {
     decode: &["llamacpp:n_decode_total"],
     running: &["llamacpp:requests_processing"],
     prompt: &["llamacpp:prompt_tokens_total"],
+    requests: NONE,
     // #71: requests waiting for a slot. Read for llama-metrics only; the
     // tty keeps its slot view.
     queued: &["llamacpp:requests_deferred"],
@@ -131,6 +135,7 @@ const SGLANG: Names = Names {
     decode: &["sglang:generation_tokens_total"],
     running: &["sglang:num_running_reqs"],
     prompt: &["sglang:prompt_tokens_total"],
+    requests: &["sglang:num_requests_total"],
     queued: &["sglang:num_queue_reqs"],
     // #79: not `token_usage`, which is the fullest of the full-attention,
     // sliding-window and Mamba pools. The KV fill is used / capacity from
@@ -169,6 +174,7 @@ const VLLM: Names = Names {
     decode: &["vllm:generation_tokens_total"],
     running: &["vllm:num_requests_running"],
     prompt: &["vllm:prompt_tokens_total"],
+    requests: NONE,
     queued: &["vllm:num_requests_waiting"],
     kv: &["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
     // The capacity is a `cache_config_info` label (#79).
@@ -289,6 +295,9 @@ pub struct MetricsSample {
     /// Prompt-token counter (`llamacpp:prompt_tokens_total`,
     /// `*:prompt_tokens_total`).
     pub prompt_total: Option<u64>,
+    /// Finished requests (`sglang:num_requests_total`), both streaming
+    /// series summed. Other engines leave it `None` (#133).
+    pub requests_total: Option<u64>,
     /// Requests waiting. SGLang and vLLM only.
     pub queued: Option<f64>,
     /// KV cache fill, 0..=1: used / capacity where [`Self::kv`] has both
@@ -394,6 +403,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut decode = Acc::default();
     let mut running = Acc::default();
     let mut prompt = Acc::default();
+    let mut requests = Acc::default();
     let mut queued = Acc::default();
     let mut kv: [Option<f64>; 2] = [None, None];
     let mut kv_used = Acc::default();
@@ -427,6 +437,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             running.add(value, names.sum);
         } else if names.prompt.contains(&name) {
             prompt.add(value, names.sum);
+        } else if names.requests.contains(&name) {
+            requests.add(value, names.sum);
         } else if names.queued.contains(&name) {
             queued.add(value, names.sum);
         } else if names.predicted.contains(&name) {
@@ -551,6 +563,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         n_decode_total: decode.0.and_then(finite_u64),
         requests_processing: running.0,
         prompt_total: prompt.0.and_then(finite_u64),
+        requests_total: requests.0.and_then(finite_u64),
         queued: queued.0,
         kv_fill: if kv.approx {
             engine_fill
@@ -2833,6 +2846,21 @@ sglang:num_queue_reqs{model_name=\"x\"} -3
         let sample = parse_metrics_for(Backend::SgLang, &cached);
         assert_eq!(sample.cached_total, Some(4500), "summed over cache sources");
         assert_eq!(parse_metrics(&cached).cached_total, None);
+        assert_eq!(sample.requests_total, None, "the counter was absent");
+        let requests = format!(
+            "{body}sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"true\"}} 3.0\n\
+             sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"false\"}} 4.0\n"
+        );
+        assert_eq!(
+            parse_metrics_for(Backend::SgLang, &requests).requests_total,
+            Some(7),
+            "both streaming series, not the last one"
+        );
+        assert_eq!(
+            parse_metrics_for(Backend::Vllm, &requests).requests_total,
+            None
+        );
+        assert_eq!(parse_metrics(&requests).requests_total, None);
         // The llama.cpp name is not read for SGLang, nor SGLang's for llama.cpp.
         assert_eq!(parse_metrics(body).n_decode_total, Some(99));
         assert_eq!(parse_metrics(body).requests_processing, None);
