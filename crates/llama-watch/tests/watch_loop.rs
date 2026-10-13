@@ -1331,6 +1331,7 @@ fn empty_detail() -> LlamaDetail {
         series: Vec::new(),
         requests: Vec::new(),
         jobs: Vec::new(),
+        claims: Vec::new(),
     }
 }
 

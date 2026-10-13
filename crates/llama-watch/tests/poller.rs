@@ -290,6 +290,14 @@ fn reply(world: &mut World, path: &str) -> Action {
             location: None,
         };
     }
+    if path == "/api/events" {
+        return Action::Respond {
+            status: 200,
+            reason: "OK",
+            body: Vec::new(),
+            location: None,
+        };
+    }
     if let Some(id) = path.strip_prefix("/api/captures/") {
         return match world.captures.get(id) {
             Some(body) => Action::Respond {
@@ -957,6 +965,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 series: Vec::new(),
                 requests: Vec::new(),
                 jobs: Vec::new(),
+                claims: Vec::new(),
             },
         ));
     }
@@ -2306,7 +2315,7 @@ fn allowed_path(path: &str) -> bool {
     let capture = path
         .strip_prefix("/api/captures/")
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-    // #80: llama-swap's event stream, while a vLLM or SGLang model is ready.
+    // #80, #128: llama-swap's event stream, while a model is ready.
     path == "/running"
         || path == "/api/metrics/activity"
         || path == "/api/events"

@@ -503,6 +503,7 @@ impl TickState {
                 series: Vec::new(),
                 requests: Vec::new(),
                 jobs: Vec::new(),
+                claims: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -2941,6 +2942,7 @@ mod tests {
                     series: Vec::new(),
                     requests: Vec::new(),
                     jobs: Vec::new(),
+                claims: Vec::new(),
                 },
             ))
         }
@@ -3092,6 +3094,7 @@ mod tests {
                     series: Vec::new(),
                     requests: Vec::new(),
                     jobs: Vec::new(),
+                claims: Vec::new(),
                 },
             ))
         }
