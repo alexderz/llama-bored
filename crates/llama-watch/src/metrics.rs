@@ -38,8 +38,11 @@ struct Names {
     running: &'static [&'static str],
     prompt: &'static [&'static str],
     /// Finished-request counter. SGLang only; both `is_streaming` series
-    /// are summed (#133).
+    /// are summed (#133). The `is_streaming="false"` series is also kept
+    /// on its own: a non-streaming finish has no prompt or generation rate.
     requests: &'static [&'static str],
+    /// Queue-time histogram base (`_sum` / `_count`). SGLang only (#133).
+    queue_time: &'static [&'static str],
     queued: &'static [&'static str],
     /// KV fill 0..=1, newest name first; the first name that appears wins.
     kv: &'static [&'static str],
@@ -97,6 +100,7 @@ const LLAMACPP: Names = Names {
     running: &["llamacpp:requests_processing"],
     prompt: &["llamacpp:prompt_tokens_total"],
     requests: NONE,
+    queue_time: NONE,
     // #71: requests waiting for a slot. Read for llama-metrics only; the
     // tty keeps its slot view.
     queued: &["llamacpp:requests_deferred"],
@@ -136,6 +140,7 @@ const SGLANG: Names = Names {
     running: &["sglang:num_running_reqs"],
     prompt: &["sglang:prompt_tokens_total"],
     requests: &["sglang:num_requests_total"],
+    queue_time: &["sglang:queue_time_seconds"],
     queued: &["sglang:num_queue_reqs"],
     // #79: not `token_usage`, which is the fullest of the full-attention,
     // sliding-window and Mamba pools. The KV fill is used / capacity from
@@ -175,6 +180,7 @@ const VLLM: Names = Names {
     running: &["vllm:num_requests_running"],
     prompt: &["vllm:prompt_tokens_total"],
     requests: NONE,
+    queue_time: NONE,
     queued: &["vllm:num_requests_waiting"],
     kv: &["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
     // The capacity is a `cache_config_info` label (#79).
@@ -298,6 +304,11 @@ pub struct MetricsSample {
     /// Finished requests (`sglang:num_requests_total`), both streaming
     /// series summed. Other engines leave it `None` (#133).
     pub requests_total: Option<u64>,
+    /// Finished non-streaming requests, the `is_streaming="false"` series
+    /// of `num_requests_total` alone. `None` when that series is absent.
+    pub requests_batch: Option<u64>,
+    /// Time a request waited in the queue (`sglang:queue_time_seconds`).
+    pub queue_time: Option<Hist>,
     /// Requests waiting. SGLang and vLLM only.
     pub queued: Option<f64>,
     /// KV cache fill, 0..=1: used / capacity where [`Self::kv`] has both
@@ -404,6 +415,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut running = Acc::default();
     let mut prompt = Acc::default();
     let mut requests = Acc::default();
+    let mut batch = Acc::default();
+    let mut queue_time = HistAcc::default();
     let mut queued = Acc::default();
     let mut kv: [Option<f64>; 2] = [None, None];
     let mut kv_used = Acc::default();
@@ -439,6 +452,11 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             prompt.add(value, names.sum);
         } else if names.requests.contains(&name) {
             requests.add(value, names.sum);
+            if label_value(line, "is_streaming").as_deref() == Some("false") {
+                batch.add(value, names.sum);
+            }
+        } else if let Some((_, is_count)) = hist_part(names.queue_time, name) {
+            queue_time.add(is_count, value);
         } else if names.queued.contains(&name) {
             queued.add(value, names.sum);
         } else if names.predicted.contains(&name) {
@@ -564,6 +582,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         requests_processing: running.0,
         prompt_total: prompt.0.and_then(finite_u64),
         requests_total: requests.0.and_then(finite_u64),
+        requests_batch: batch.0.and_then(finite_u64),
+        queue_time: queue_time.get(),
         queued: queued.0,
         kv_fill: if kv.approx {
             engine_fill
@@ -701,7 +721,9 @@ fn label_value(line: &str, key: &str) -> Option<String> {
 /// `\n`) are decoded. Scanning stops at the first malformed byte or after
 /// [`MAX_LABELS`] pairs; a value longer than [`MAX_LABEL_VALUE`] bytes is
 /// left out. Only the keys in [`CACHE_KEYS`] and `sleep_state` are kept,
-/// so the result is small whatever the line holds.
+/// so the result is small whatever the line holds. `is_streaming` is
+/// kept too: the non-streaming series of `num_requests_total` is counted
+/// on its own (#133).
 fn labels_of(line: &str) -> Vec<(&str, String)> {
     let mut out = Vec::new();
     let Some(open) = line.find('{') else {
@@ -752,7 +774,10 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
                 value.push(ch);
             }
         }
-        if !too_long && value.is_ascii() && (key == "sleep_state" || CACHE_KEYS.contains(&key)) {
+        if !too_long
+            && value.is_ascii()
+            && (key == "sleep_state" || key == "is_streaming" || CACHE_KEYS.contains(&key))
+        {
             out.push((key, value));
         }
         match bytes.get(at) {
@@ -2851,13 +2876,39 @@ sglang:num_queue_reqs{model_name=\"x\"} -3
             "{body}sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"true\"}} 3.0\n\
              sglang:num_requests_total{{model_name=\"flash\",is_streaming=\"false\"}} 4.0\n"
         );
+        let sample = parse_metrics_for(Backend::SgLang, &requests);
         assert_eq!(
-            parse_metrics_for(Backend::SgLang, &requests).requests_total,
+            sample.requests_total,
             Some(7),
             "both streaming series, not the last one"
         );
         assert_eq!(
+            sample.requests_batch,
+            Some(4),
+            "the is_streaming=\"false\" series on its own"
+        );
+        assert_eq!(
             parse_metrics_for(Backend::Vllm, &requests).requests_total,
+            None
+        );
+        assert_eq!(
+            parse_metrics_for(Backend::Vllm, &requests).requests_batch,
+            None
+        );
+        let queued_time = format!(
+            "{requests}sglang:queue_time_seconds_sum{{model_name=\"flash\"}} 1.25\n\
+             sglang:queue_time_seconds_count{{model_name=\"flash\"}} 4.0\n"
+        );
+        let sample = parse_metrics_for(Backend::SgLang, &queued_time);
+        assert_eq!(
+            sample.queue_time,
+            Some(Hist {
+                sum: 1.25,
+                count: 4.0
+            })
+        );
+        assert_eq!(
+            parse_metrics_for(Backend::Vllm, &queued_time).queue_time,
             None
         );
         assert_eq!(parse_metrics(&requests).requests_total, None);
