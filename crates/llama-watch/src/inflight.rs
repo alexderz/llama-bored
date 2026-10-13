@@ -96,8 +96,12 @@ pub struct Flight {
     pub prompt: u64,
     /// `prompt` is the whole prompt. False for a llama.cpp slot in prefill.
     pub prompt_known: bool,
-    /// Prompt tokens reused from the cache (0 when unknown).
+    /// Prompt tokens reused from the cache (0 when unknown or omitted).
     pub cached: u64,
+    /// The source omitted the cached count (#133). Distinct from a
+    /// reported 0, and from Strata, which counts every live input token
+    /// as new. RECENT prints `--` and does not paint the prompt as new.
+    pub cached_unknown: bool,
     /// Prompt tokens computed so far beyond the cache.
     pub processed: u64,
     /// [`Self::processed`] is the engine's own count against the whole
@@ -254,6 +258,8 @@ impl Tracker {
             flight.prompt_known = total.is_some();
             flight.progress = total.is_some();
             flight.cached = cached;
+            // Absent is not zero. Strata's live path sets 0 on purpose.
+            flight.cached_unknown = slot.prompt_cached.is_none();
             flight.processed = prompt - cached;
             flight.decoded = slot.n_decoded;
             flight.decoding = slot.n_decoded > 0;
@@ -298,6 +304,7 @@ impl Tracker {
             flight.prompt_known = total.is_some();
             flight.progress = total.is_some();
             flight.cached = 0;
+            flight.cached_unknown = false;
             flight.processed = if decoding {
                 prompt
             } else {
@@ -422,6 +429,10 @@ impl Tracker {
                 // Only an exact prompt matches a finished row by count.
                 flight.prompt_known = tokens.prompt.is_some() && !tokens.approx;
                 flight.cached = cached;
+                // A prompt with no cached count is unknown, including an
+                // approximate share. No prompt at all stays `--` via
+                // `prompt_unknown`, and the flag stays off.
+                flight.cached_unknown = tokens.prompt.is_some() && tokens.cached.is_none();
                 flight.processed = prompt - cached;
                 flight.decoded = tokens.output.unwrap_or(0);
                 flight.gen_tps = tokens.gen_tps;
@@ -435,6 +446,7 @@ impl Tracker {
                 flight.prompt = 0;
                 flight.prompt_known = false;
                 flight.cached = 0;
+                flight.cached_unknown = false;
                 flight.processed = 0;
                 flight.decoded = 0;
                 flight.gen_tps = None;
@@ -519,6 +531,7 @@ impl Tracker {
             flight.prompt_known = slot.prompt_tokens.is_some();
             flight.progress = progress;
             flight.cached = 0;
+            flight.cached_unknown = false;
             flight.processed = if progress {
                 live.prompt_read.unwrap_or(0).min(prompt)
             } else {
@@ -591,6 +604,7 @@ impl Tracker {
             prompt: 0,
             prompt_known: false,
             cached: 0,
+            cached_unknown: false,
             processed: 0,
             progress: false,
             decoded: 0,

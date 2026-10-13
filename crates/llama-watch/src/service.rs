@@ -1964,6 +1964,7 @@ fn layout_requests(
             model: key,
             input_tok: flight.prompt,
             cached_tok: flight.cached,
+            cached_unknown: flight.cached_unknown,
             output_tok: flight.decoded,
             prompt_tps: flight.prompt_tps,
             gen_tps: flight.gen_tps,
@@ -2004,6 +2005,10 @@ fn layout_requests(
             model: row.model.clone(),
             input_tok: prompt.whole,
             cached_tok: prompt.cached,
+            // #133: llama-swap's `-1` is already `None`. A reported 0 is
+            // `Some(0)` and stays a number. An engine fill lands here as
+            // `Some` before this copy is drawn.
+            cached_unknown: row.cached_tokens.is_none(),
             output_tok: row.output_tokens.unwrap_or(0),
             prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
             gen_tps: row.gen_tps.or(row.engine_gen_tps),
@@ -2766,6 +2771,138 @@ mod tests {
             .map(|req| (req.input_tok, req.cached_tok))
             .collect();
         assert_eq!(ins, vec![(102_252, 102_231), (9_000, 8_192), (600, 100)]);
+    }
+
+    /// #133: a missing cached count stays unknown on the row. A reported 0
+    /// is a measurement. The split's cached number is still 0 either way.
+    #[test]
+    fn recent_cached_unknown_is_not_a_reported_zero() {
+        let page = br#"{"data":[
+            {"id":6,"timestamp":"2026-10-03T10:00:06Z","model":"sglang","tokens":{"input_tokens":1000,"output_tokens":40,"cache_tokens":-1}},
+            {"id":5,"timestamp":"2026-10-03T10:00:05Z","model":"sglang","tokens":{"input_tokens":1000,"output_tokens":40,"cache_tokens":0}},
+            {"id":4,"timestamp":"2026-10-03T10:00:04Z","model":"vllm","tokens":{"input_tokens":900,"output_tokens":20,"cache_tokens":-1}},
+            {"id":3,"timestamp":"2026-10-03T10:00:03Z","model":"vllm","tokens":{"input_tokens":900,"output_tokens":20,"cache_tokens":0}},
+            {"id":2,"timestamp":"2026-10-03T10:00:02Z","model":"lcpp","tokens":{"input_tokens":500,"output_tokens":10,"cache_tokens":-1}},
+            {"id":1,"timestamp":"2026-10-03T10:00:01Z","model":"lcpp","tokens":{"input_tokens":500,"output_tokens":10,"cache_tokens":0}}
+        ]}"#;
+        let mut rows = crate::activity::parse_activity(page).expect("page");
+        for (row, engine) in rows.iter_mut().zip([
+            Backend::SgLang,
+            Backend::SgLang,
+            Backend::Vllm,
+            Backend::Vllm,
+            Backend::LlamaCpp,
+            Backend::LlamaCpp,
+        ]) {
+            row.engine = Some(engine);
+        }
+        let recent = RecentCtx {
+            flights: &[],
+            ctx_sizes: &BTreeMap::new(),
+            ids: &[],
+        };
+        let shown = layout_requests(&rows, WatchState::Ready, Zone::utc(), &recent);
+        let got: Vec<(u64, u64, bool)> = shown
+            .iter()
+            .map(|req| (req.input_tok, req.cached_tok, req.cached_unknown))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1_000, 0, true),
+                (1_000, 0, false),
+                (900, 0, true),
+                (900, 0, false),
+                (500, 0, true),
+                (500, 0, false),
+            ]
+        );
+    }
+
+    /// #133: an omitted in-flight cache is unknown. Strata's explicit 0,
+    /// and a llama.cpp slot that reported 0, stay 0.
+    #[test]
+    fn inflight_omitted_cache_is_unknown_and_a_reported_zero_is_not() {
+        use crate::live::LiveTokens;
+        use crate::poller::LiveRequest;
+        let mut omitted = slot(0, 1, true, "", "");
+        omitted.model = "cpp".to_owned();
+        omitted.n_prompt_tokens = 100;
+        omitted.n_decoded = 5;
+        omitted.prompt_cached = None;
+        let mut zero = slot(1, 2, true, "", "");
+        zero.model = "cpp0".to_owned();
+        zero.n_prompt_tokens = 80;
+        zero.n_prompt_tokens_processed = 80;
+        zero.n_decoded = 3;
+        zero.prompt_cached = Some(0);
+        let vllm = LiveRequest {
+            model: "vllm".to_owned(),
+            id: "a".to_owned(),
+            engine: Backend::Vllm,
+            started: Instant::now(),
+            started_wall: UNIX_EPOCH,
+            resp_bytes: 10,
+            tokens: Some(LiveTokens {
+                prompt: Some(900),
+                cached: None,
+                output: Some(4),
+                ..LiveTokens::default()
+            }),
+        };
+        let strata = ModelEngineLive {
+            model: "strata".to_owned(),
+            live: EngineLive {
+                state: Some("generating".to_owned()),
+                prompt_tokens: Some(400),
+                generated: Some(8),
+                ..EngineLive::default()
+            },
+        };
+        let mut tracker = crate::inflight::Tracker::default();
+        let now = Instant::now();
+        tracker.poll(
+            &crate::inflight::Poll {
+                slots: &[omitted, zero],
+                engine_live: &[strata],
+                requests: &[vllm],
+                activity: &[],
+                ids: &[],
+                prompt_tps: None,
+                gen_tps: None,
+            },
+            now,
+            UNIX_EPOCH,
+        );
+        let flights = tracker.flights();
+        let recent = RecentCtx {
+            flights: &flights,
+            ctx_sizes: &BTreeMap::new(),
+            ids: &[],
+        };
+        let shown = layout_requests(&[], WatchState::Ready, Zone::utc(), &recent);
+        let row = |name: &str| {
+            shown
+                .iter()
+                .find(|req| req.model == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let cpp = row("cpp");
+        assert!(cpp.cached_unknown);
+        assert_eq!(cpp.cached_tok, 0);
+        assert_eq!(cpp.input_tok, 96, "held 100, five decoded, cache omitted");
+        let cpp0 = row("cpp0");
+        assert!(!cpp0.cached_unknown);
+        assert_eq!((cpp0.input_tok, cpp0.cached_tok), (80, 0));
+        let vllm = row("vllm");
+        assert!(vllm.cached_unknown);
+        assert_eq!((vllm.input_tok, vllm.cached_tok), (900, 0));
+        let strata = row("strata");
+        assert!(
+            !strata.cached_unknown,
+            "Strata counts every live token as new"
+        );
+        assert_eq!((strata.input_tok, strata.cached_tok), (400, 0));
     }
 
     #[test]
