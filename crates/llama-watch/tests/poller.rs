@@ -2937,7 +2937,7 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
         );
         world.activity = sglang_activity(
             &[(1, 1_000, 401, -1, -1.0, -1.0, 10_000)],
-            &[stamp1.clone()],
+            std::slice::from_ref(&stamp1),
         );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
