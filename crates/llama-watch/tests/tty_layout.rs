@@ -6319,6 +6319,147 @@ fn job_view_goldens_match_character_and_colour() {
 }
 
 #[test]
+fn job_view_header_shows_kind_and_job_name() {
+    let model = job_model(example_job(), 0);
+    let grid = draw(&model, 192, 60);
+    let header = row_string(&grid, 0);
+    assert!(header.contains("TRAINING"), "{header}");
+    assert!(header.contains("example-trainer"), "{header}");
+    assert!(!header.contains("READY"), "{header}");
+    assert!(!header.contains("Qwen"), "{header}");
+}
+
+#[test]
+fn job_phase_marks_are_distinct_without_colour() {
+    let text = painted(&job_model(example_job(), 0), 192, 60);
+    assert!(text.contains('•'), "{text}");
+    assert!(text.contains('>'), "{text}");
+    assert!(text.contains('·'), "{text}");
+    let mut failed = example_job();
+    failed.phases[3].mark = Some(PhaseMark::Failed);
+    let text = painted(&job_model(failed, 0), 192, 60);
+    assert!(text.contains('x'), "{text}");
+}
+
+#[test]
+fn text_off_does_not_overpaint_the_job_note() {
+    let mut model = sample(WatchState::Generating);
+    model.show_text = false;
+    model.job = None;
+    model.job_note = Some("example-trainer 921/1,075 43 min left".to_owned());
+    let header = row_string(&draw(&model, 240, 60), 0);
+    assert!(header.contains("text off"), "{header}");
+    assert!(header.contains("example-trainer"), "{header}");
+}
+
+fn job_temps_model() -> TtyModel {
+    let mut model = job_model(example_job(), 0);
+    model.fans = Some(ref_fans());
+    model.temps = Some(ref_temps());
+    model
+}
+
+#[test]
+fn job_view_keeps_fans_and_temps() {
+    let grid = draw(&job_temps_model(), 192, 60);
+    let all = painted(&job_temps_model(), 192, 60);
+    assert!(all.contains("FANS"), "{all}");
+    assert!(all.contains("TEMPS"), "{all}");
+    assert!(all.contains("PHASES"), "{all}");
+    assert!(all.contains("TRAINING"), "{all}");
+    let fans = row_with(&grid, "FANS");
+    let temps = row_with(&grid, "TEMPS");
+    let health = grid.rows() - 3;
+    assert!(fans < health, "FANS above the health rule");
+    assert!(temps < health, "TEMPS above the health rule");
+}
+
+#[test]
+fn job_charts_fill_the_room_and_pair_when_wide() {
+    let model = job_model(example_job(), 0);
+    let grid = draw(&model, 192, 60);
+    let step = row_with(&grid, "s/step");
+    let chart = row_string(&grid, step);
+    assert!(
+        chart.contains("loss"),
+        "wide frame puts the first two series side by side\n{chart}\n{}",
+        painted(&model, 192, 60)
+    );
+    let health = grid.rows() - 3;
+    let chart_bottom = (step + 1..health)
+        .rev()
+        .find(|&row| {
+            (0..grid.cols()).any(|col| {
+                let ch = grid.get(col, row).unwrap().ch;
+                ch != ' ' && ch != '|'
+            })
+        })
+        .expect("chart ink");
+    let height = chart_bottom.saturating_sub(step) + 1;
+    assert!(
+        (5..=16).contains(&height),
+        "each chart is 5..=16 rows, got {height} (rows {step}..={chart_bottom})"
+    );
+}
+
+#[test]
+fn a_poller_job_file_reaches_the_frame() {
+    use llama_watch::config::Config;
+    use llama_watch::jobs::JobState;
+    use llama_watch::poller;
+
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = root.join(format!("tty-job-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("example-trainer.json"),
+        br#"{"schema":1,"name":"example-trainer","kind":"training","title":"Example-2B","state":"running"}"#,
+    )
+    .unwrap();
+    let cfg_path = root.join(format!("tty-job-{}.toml", std::process::id()));
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[llama]
+url = "http://127.0.0.1:1"
+enabled = false
+
+[jobs]
+dir = "{}"
+"#,
+            dir.display()
+        ),
+    )
+    .unwrap();
+    let config = Config::load_validated(&cfg_path, 8).expect("valid");
+    let (poller, rx) = poller::spawn(&config, llama_core::log::Stderr).expect("spawn");
+    let start = Instant::now();
+    let job = loop {
+        match rx.try_recv() {
+            Ok((_, detail)) if !detail.jobs.is_empty() => break detail.jobs[0].clone(),
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "poller job timeout"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("poller stopped"),
+        }
+    };
+    drop(poller);
+    assert_eq!(job.state, JobState::Running);
+    let text = painted(&job_model(job, 0), 192, 60);
+    assert!(text.contains("TRAINING"), "{text}");
+    assert!(text.contains("Example-2B"), "{text}");
+    assert!(text.contains("example-trainer"), "{text}");
+    assert!(!text.contains("GENERATION"), "{text}");
+}
+
+#[test]
 #[ignore = "run with --ignored to write the job-view goldens"]
 fn dump_job_goldens() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
