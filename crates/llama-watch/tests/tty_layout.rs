@@ -6324,7 +6324,11 @@ fn job_view_header_shows_kind_and_job_name() {
     let grid = draw(&model, 192, 60);
     let header = row_string(&grid, 0);
     assert!(header.contains("TRAINING"), "{header}");
-    assert!(header.contains("example-trainer"), "{header}");
+    assert!(
+        header.contains("job example-trainer"),
+        "the word before the name is job\n{header}"
+    );
+    assert!(!header.contains("model"), "{header}");
     assert!(!header.contains("READY"), "{header}");
     assert!(!header.contains("Qwen"), "{header}");
 }
@@ -6397,8 +6401,44 @@ fn job_charts_fill_the_room_and_pair_when_wide() {
         .expect("chart ink");
     let height = chart_bottom.saturating_sub(step) + 1;
     assert!(
-        (5..=16).contains(&height),
-        "each chart is 5..=16 rows, got {height} (rows {step}..={chart_bottom})"
+        height >= 5,
+        "each chart is at least 5 rows, got {height} (rows {step}..={chart_bottom})"
+    );
+    assert!(
+        chart_bottom + 1 >= health,
+        "charts share every leftover row, height {height} rows {step}..={chart_bottom} health {health}"
+    );
+}
+
+#[test]
+fn four_job_series_use_two_rows_when_each_still_gets_five() {
+    let mut job = example_job();
+    job.series.push(JobSeries {
+        label: "curve-a".to_owned(),
+        points: vec![1.0, 2.0, 1.5],
+    });
+    job.series.push(JobSeries {
+        label: "curve-b".to_owned(),
+        points: vec![4.0, 3.0, 3.5],
+    });
+    let model = job_model(job, 0);
+    let grid = draw(&model, 192, 60);
+    let top = row_with(&grid, "s/step");
+    let second = row_with(&grid, "curve-a");
+    assert!(
+        second > top,
+        "three or four series use a second chart row\n{}",
+        painted(&model, 192, 60)
+    );
+    let pair = row_string(&grid, second);
+    assert!(
+        pair.contains("curve-b"),
+        "the second row pairs the last two series\n{pair}"
+    );
+    let health = grid.rows() - 3;
+    assert!(
+        second + 5 <= health,
+        "each chart still gets 5 rows (second row {second}, health {health})"
     );
 }
 
