@@ -8,7 +8,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Added
 
-- llama-watch shows a model claim from a llama-swap build with model claims (#128). The same `/api/events` stream already read for in-flight requests now also keeps the latest `claims` list (at most 16; forgotten on reconnect). The header names the holder after `swap`: `claim <holder> · in use` or `· M:SS left`, and `hold <holder> · until HH:MM` with the reason when it is an explicit hold. A llama-swap that never sends a `claims` frame leaves today's frame unchanged. The list does not enter the snapshot, the LCD or the metrics.
+- llama-watch shows a model claim from a llama-swap build with model claims (#128). The `/api/events` stream already read for in-flight requests now also opens when only llama.cpp models are ready, and keeps the latest `claims` list (at most 16; forgotten on reconnect). The header names the holder after `swap`: `claim <holder> · in use` or `· M:SS left`, and `hold <holder> · until HH:MM` with the reason when it is an explicit hold. A llama-swap that never sends a `claims` frame leaves today's frame unchanged. The list does not enter the snapshot, the LCD or the metrics.
 - llama-watch shows a job view for a training run or other batch job when no model is serving (#129). `[jobs] dir` names an absolute directory of `<name>.json` status files; unset, nothing is opened and every frame is unchanged. `stale_s` (default 180) hides a file whose mtime is older.
 
 ### Fixed
