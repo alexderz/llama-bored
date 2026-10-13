@@ -18,10 +18,12 @@
 //! A llama-swap build with model claims also sends `claims` frames on this
 //! same stream (#128): the whole list on connect and again after every
 //! change. Only the `claims` array is kept; `changes` and `at` are
-//! ignored. An entry without a usable `model` or `holder` is skipped, not
-//! the list. A frame whose `data` does not parse leaves the previous list
-//! in place. The list is forgotten when the stream reconnects, until the
-//! first `claims` frame of the new session.
+//! ignored. `"claims": null` is an empty list. An entry without a usable
+//! `model` or `holder` is skipped, not the list. Two claims on the same
+//! model are both kept; the header draws the first. A frame whose `data`
+//! does not parse leaves the previous list in place. The list is forgotten
+//! when the stream reconnects, until the first `claims` frame of the new
+//! session.
 //!
 //! This is llama-swap's own API, like `/running`: it names no model path
 //! and cannot make llama-swap load one (#70). One long-lived connection on
@@ -50,7 +52,7 @@ use serde::Deserialize;
 
 use crate::activity::model_key;
 use crate::localtime::parse_rfc3339;
-use crate::setup_rules::{text_held, token_held};
+use crate::setup_rules::text_held;
 
 /// Longest SSE line kept, bytes. A longer one (v256's log history) is read
 /// through and dropped.
@@ -66,11 +68,11 @@ pub const MAX_ENDED: usize = 64;
 pub const MAX_CLAIMS: usize = 16;
 /// Longest llama-swap model id kept on a claim, bytes.
 const CLAIM_MODEL_BYTES: usize = 128;
-/// Longest holder kept before token sanitising, bytes.
+/// Longest holder kept before text sanitising, bytes.
 const CLAIM_HOLDER_BYTES: usize = 64;
 /// Longest hold reason kept before text sanitising, bytes.
 const CLAIM_REASON_BYTES: usize = 256;
-/// Holder as drawn: SETUP's token kind, at most this many characters.
+/// Holder as drawn: SETUP's text kind, at most this many characters.
 const CLAIM_HOLDER_CHARS: usize = 24;
 /// Hold reason as drawn: SETUP's text kind, at most this many characters.
 const CLAIM_REASON_CHARS: usize = 40;
@@ -118,9 +120,12 @@ pub struct EndedRequest {
 /// One model claim from a `claims` frame (#128).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelClaim {
-    /// [`model_key`] of the llama-swap model id.
+    /// Sanitised llama-swap model id, at most 128 bytes. Not
+    /// [`model_key`]: two ids that share their first 31 characters stay
+    /// distinct.
     pub model: String,
-    /// Holder as a short token (SETUP's `token` kind, at most 24 characters).
+    /// Holder as SETUP's `text` kind, at most 24 characters with the
+    /// ellipsis rule. A space or a non-ASCII character is kept.
     pub holder: String,
     /// An automatic claim from use, as opposed to an explicit one.
     pub auto: bool,
@@ -388,8 +393,10 @@ pub struct Claims {
 
 #[derive(Deserialize)]
 struct ClaimsEvent {
+    /// `null` is an empty list (a server may encode one that way). Missing
+    /// is the same. Any other JSON type fails the frame.
     #[serde(default)]
-    claims: Vec<serde_json::Value>,
+    claims: Option<Vec<serde_json::Value>>,
 }
 
 impl Claims {
@@ -420,6 +427,7 @@ impl Claims {
         };
         self.list = event
             .claims
+            .unwrap_or_default()
             .into_iter()
             .filter_map(keep_claim)
             .take(MAX_CLAIMS)
@@ -448,7 +456,7 @@ fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
     let model = obj.get("model").and_then(serde_json::Value::as_str)?;
     let holder = obj.get("holder").and_then(serde_json::Value::as_str)?;
     let model = claim_model(model)?;
-    let holder = token_held(take_bytes(holder, CLAIM_HOLDER_BYTES), CLAIM_HOLDER_CHARS)?;
+    let holder = holder_held(holder)?;
     let auto = obj
         .get("auto")
         .and_then(serde_json::Value::as_bool)
@@ -483,11 +491,27 @@ fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
 
 fn claim_model(raw: &str) -> Option<String> {
     let raw = take_bytes(raw, CLAIM_MODEL_BYTES);
-    let cleaned = sanitize(raw, 32);
-    if cleaned.is_empty() {
-        return None;
+    let cleaned = sanitize(raw, CLAIM_MODEL_BYTES);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// SETUP's `text` kind, then at most [`CLAIM_HOLDER_CHARS`] with the
+/// ellipsis rule. Empty after sanitising is nothing.
+fn holder_held(raw: &str) -> Option<String> {
+    let text = text_held(take_bytes(raw, CLAIM_HOLDER_BYTES), usize::MAX)?;
+    Some(ellipsis_chars(&text, CLAIM_HOLDER_CHARS))
+}
+
+fn ellipsis_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
     }
-    Some(model_key(raw))
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('\u{2026}');
+    out
 }
 
 fn take_bytes(text: &str, max: usize) -> &str {
@@ -1135,8 +1159,9 @@ mod tests {
             }),
         );
         let list = claims.view().0;
-        assert_eq!(list[0].holder.len(), CLAIM_HOLDER_CHARS);
-        assert_eq!(list[0].hold_reason.chars().count(), CLAIM_REASON_CHARS);
+        assert_eq!(list[0].holder.chars().count(), 24);
+        assert!(list[0].holder.ends_with('\u{2026}'));
+        assert_eq!(list[0].hold_reason.chars().count(), 40);
     }
 
     #[test]
@@ -1169,9 +1194,9 @@ mod tests {
             .collect();
         apply_claims(&mut claims, serde_json::json!({"claims": many}));
         let list = claims.view().0;
-        assert_eq!(list.len(), MAX_CLAIMS);
+        assert_eq!(list.len(), 16);
         assert_eq!(list[0].holder, "h0");
-        assert_eq!(list[MAX_CLAIMS - 1].holder, format!("h{}", MAX_CLAIMS - 1));
+        assert_eq!(list[15].holder, "h15");
     }
 
     #[test]
@@ -1194,5 +1219,169 @@ mod tests {
             }),
         );
         assert_eq!(claims.view().0[0].holder, "chat-ui");
+    }
+
+    /// Two llama-swap ids that share their first 31 characters stay
+    /// distinct: `model_key`'s 32-character cut would make both `…` and
+    /// they would show each other's claim.
+    #[test]
+    fn two_ids_that_share_their_first_31_characters_stay_distinct() {
+        let q4 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q4_K_XL";
+        let q6 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q6_K_XL";
+        assert_eq!(&q4[..31], &q6[..31]);
+        assert_ne!(q4, q6);
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[
+                    claim_entry(q4, "eval-runner", false, true, None, None, None),
+                    claim_entry(q6, "chat-ui", true, false, None, None, None),
+                ],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].model, q4);
+        assert_eq!(list[0].holder, "eval-runner");
+        assert_eq!(list[1].model, q6);
+        assert_eq!(list[1].holder, "chat-ui");
+        assert_ne!(list[0].model, list[1].model);
+    }
+
+    /// `"claims": null` is an empty list, not a malformed frame: a server
+    /// may encode an empty list that way. It clears a previous list and
+    /// logs nothing.
+    #[test]
+    fn a_null_claims_array_is_an_empty_list() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "eval-runner", false, false, None, None, None)],
+            }),
+        );
+        assert_eq!(claims.view().0.len(), 1);
+        let text = frame(
+            "claims",
+            &serde_json::json!({"claims": serde_json::Value::Null}),
+        );
+        let mut parser = SseParser::default();
+        parser.feed(text.as_bytes(), |data| claims.apply(data));
+        let (list, err) = claims.view();
+        assert!(list.is_empty(), "{list:?}");
+        assert!(err.is_none(), "{err:?}");
+    }
+
+    /// A holder is SETUP's `text` kind, then 24 characters with the
+    /// ellipsis rule. A space or a non-ASCII character does not drop the
+    /// claim; only an empty result after sanitising skips the entry.
+    #[test]
+    fn a_holder_with_a_space_or_an_accent_is_kept() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    "big", "Alex Derzhi", false, true, None, None, None,
+                )],
+            }),
+        );
+        assert_eq!(claims.view().0[0].holder, "Alex Derzhi");
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry("big", "José", false, true, None, None, None)],
+            }),
+        );
+        assert_eq!(claims.view().0[0].holder, "José");
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    "big", "\u{1b}[2Jeval-runner", false, true, None, None, None,
+                )],
+            }),
+        );
+        assert_eq!(claims.view().0[0].holder, "[2Jeval-runner");
+        assert!(!claims.view().0[0].holder.contains('\u{1b}'));
+
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[
+                    claim_entry("gone", "\u{1b}\u{07}\n\t", false, true, None, None, None),
+                    claim_entry("big", "chat-ui", true, true, None, None, None),
+                ],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].model, "big");
+        assert_eq!(list[0].holder, "chat-ui");
+    }
+
+    /// Two claims on the same model: both are kept, in order. The header
+    /// draws the first.
+    #[test]
+    fn two_claims_on_the_same_model_keep_the_first() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[
+                    claim_entry("big", "eval-runner", false, true, None, None, None),
+                    claim_entry("big", "chat-ui", true, false, None, None, None),
+                ],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].holder, "eval-runner");
+        assert_eq!(list[1].holder, "chat-ui");
+        assert_eq!(list[0].model, list[1].model);
+    }
+
+    /// Byte caps: a 128-byte model id is kept (then sanitised), a holder
+    /// of 64 bytes is cut before text sanitising, a reason of 256 bytes
+    /// too.
+    #[test]
+    fn claim_byte_caps_are_128_64_and_256() {
+        let mut claims = Claims::default();
+        let model = "m".repeat(128);
+        let holder = "h".repeat(64);
+        let reason = "r".repeat(256);
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(
+                    &model, &holder, false, false, None,
+                    Some("2026-10-12T02:37:04Z"), Some(&reason),
+                )],
+            }),
+        );
+        let list = claims.view().0;
+        assert_eq!(list[0].model.chars().count(), 128);
+        assert_eq!(list[0].model, "m".repeat(128));
+        assert_eq!(list[0].holder.chars().count(), 24);
+        assert_eq!(list[0].holder, format!("{}{}", "h".repeat(23), '\u{2026}'));
+        assert_eq!(list[0].hold_reason.chars().count(), 40);
+        assert_eq!(list[0].hold_reason, "r".repeat(40));
+
+        let too_long = "m".repeat(129);
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims":[claim_entry(&too_long, "chat-ui", false, true, None, None, None)],
+            }),
+        );
+        let kept = &claims.view().0[0].model;
+        // 129 bytes, cut to 128, then sanitise at 128 characters: the
+        // 128-byte cap binds, so this is 128 `m`s, not 127 `m`s and `…`.
+        assert_eq!(kept.chars().count(), 128);
+        assert_eq!(kept, &"m".repeat(128));
+        assert!(!kept.contains('\u{2026}'));
     }
 }

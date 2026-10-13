@@ -11,6 +11,23 @@ use std::time::{Duration, Instant};
 
 use llama_watch::sources::events::{Events, EventsView};
 
+fn claims_frame(holder: &str) -> String {
+    let data = serde_json::json!({
+        "changes": [],
+        "claims": [{
+            "model": "m",
+            "holder": holder,
+            "auto": false,
+            "in_use": true,
+            "expires_at": null,
+            "hold_until": null,
+        }],
+    })
+    .to_string();
+    let envelope = serde_json::json!({"type": "claims", "data": data});
+    format!("event:message\ndata:{envelope}\n\n")
+}
+
 /// One `inflight` snapshot frame listing `ids` for model `m`, shaped like
 /// a v256 capture (invented content).
 fn snapshot(ids: &[&str]) -> String {
@@ -156,6 +173,41 @@ fn no_endpoint_is_a_failure_with_backoff() {
         seen.load(Ordering::Relaxed),
         1,
         "backs off before asking again"
+    );
+    drop(events);
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// A reconnect forgets the claims list until the new session's first
+/// `claims` frame. The stream loop calls `new_session`; a unit test that
+/// calls it itself would still pass if that call were removed.
+#[test]
+fn a_reconnect_forgets_claims_until_the_new_sessions_frame() {
+    let first = snapshot(&["1"]) + &claims_frame("eval-runner");
+    let second = snapshot(&["2"]);
+    let (url, _, stop) = start(Script {
+        replies: vec![
+            (200, first, Duration::from_millis(400)),
+            (200, second, Duration::from_secs(30)),
+        ],
+    });
+    let events = Events::spawn(&url, Duration::from_secs(1)).expect("spawn");
+    let first = wait(&events, "first claims", |view| {
+        view.connected && view.claims.iter().any(|c| c.holder == "eval-runner")
+    });
+    assert_eq!(first.claims[0].holder, "eval-runner");
+    wait(&events, "the stream closed", |view| !view.connected);
+    let view = events.view();
+    assert!(
+        view.claims.is_empty(),
+        "reconnect must forget the list: {:?}",
+        view.claims
+    );
+    let second = wait(&events, "reconnected", |view| view.connected);
+    assert!(
+        second.claims.is_empty(),
+        "no claims frame yet: {:?}",
+        second.claims
     );
     drop(events);
     stop.store(true, Ordering::Relaxed);
