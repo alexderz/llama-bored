@@ -456,22 +456,22 @@ mod tests {
         let out = renderer
             .render(4, 1, &blocks(Color::Rgb(147, 30, 221)))
             .to_vec();
-        let text = String::from_utf8(out).unwrap();
-        let before = text.split('█').next().unwrap();
-        let index = |lead: &str| {
-            let rest = before.split(lead).nth(1).expect(lead);
-            rest.split('m').next().unwrap().to_owned()
-        };
-        assert_eq!(index("\x1b[38;5;"), index("\x1b[48;5;"));
-        // The letter after the blocks is back on the cell's own background.
-        let after = text.rsplit('█').next().unwrap();
-        assert!(after.contains("\x1b[48;5;"), "{after:?}");
-        assert!(after.ends_with('▄'));
+        // 92 is the cube colour nearest (147, 30, 221). 251 is the grey
+        // nearest the palette's white, 16 is black. The half block adds
+        // no background: that would be another 48;5 before ▄.
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[0m\x1b[2J\x1b[H\x1b[1;1H\
+             \x1b[38;5;92m\x1b[48;5;92m██\
+             \x1b[38;5;251m\x1b[48;5;16mA\
+             \x1b[38;5;92m▄"
+        );
     }
 
     #[test]
     fn sixteen_colours_send_a_full_block_as_it_is() {
-        // A 16-colour background has eight colours, so nothing is added.
+        // 16-colour output is left as it is. The eight-colour limit is the
+        // Linux console's.
         let mut renderer = Renderer::new();
         let out = renderer.render(4, 1, &blocks(Color::BrightRed)).to_vec();
         assert_eq!(
