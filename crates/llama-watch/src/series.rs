@@ -22,8 +22,8 @@
 //! `cached_tokens_total`, the end-to-end and time-to-first-token
 //! histograms, and `queue_time_seconds` are also read to fill one RECENT
 //! row when one streaming request was alone and the row matches its
-//! prompt, output and duration (#133). They do not add prefill or decode
-//! seconds: that row of the table stays none.
+//! prompt, output, duration and end time (#133). They do not add prefill
+//! or decode seconds: that row of the table stays none.
 //!
 //! A model whose server has no usable `/metrics` (and is counted from
 //! llama-swap's activity rows, like [`crate::metrics::DecodedCounter`])

@@ -20,10 +20,12 @@
 //! short window is not a speed; the per-request sums are used instead.
 //! SGLang has no per-request prefill or decode time. One finished streaming
 //! row is filled from its counters when that request was alone and the row
-//! matches its prompt, output and duration ([`crate::sglang_rows`]); a
-//! non-streaming request gets the cached count only. The `is_streaming="false"`
-//! series and the queue-time histogram are read for that and still do not
-//! add prefill or decode seconds. Anything else stays without a number.
+//! matches its prompt, output, duration and end time ([`crate::sglang_rows`]);
+//! a non-streaming request gets the cached count only. The prompt rate stays
+//! unset when that request's own queue time is unknown or over five percent
+//! of its time to the first token. The `is_streaming="false"` series and the
+//! queue-time histogram are read for that and still do not add prefill or
+//! decode seconds. Anything else stays without a number.
 //!
 //! [`window`] is that maths. [`SpeedBook`] gives a new activity row the
 //! speeds of the requests that finished between the metrics read before
