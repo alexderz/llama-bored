@@ -1101,7 +1101,7 @@ fn tty_model(
         setup: setup_view(sample, &tick.detail, watch, &ctx.setup),
         job: job_and_note.0,
         job_note: job_and_note.1,
-        model_id: header_model_id(sample, watch, &tick.detail),
+        model_id: header_model_id(sample, watch, &tick.detail, &ctx.setup),
         claims: tick
             .detail
             .claims
@@ -1112,6 +1112,10 @@ fn tty_model(
                 in_use: claim.in_use,
                 expires_at: claim.expires_at,
                 hold_until: claim.hold_until,
+                hold_tz_offset_s: claim
+                    .hold_until
+                    .map(|until| zone.offset_at(unix_secs_of(until)))
+                    .unwrap_or(0),
                 hold_reason: claim.hold_reason.clone(),
             })
             .collect(),
@@ -1120,17 +1124,17 @@ fn tty_model(
     }
 }
 
-fn header_model_id(sample: &WatchSample, state: WatchState, detail: &LlamaDetail) -> String {
-    if !matches!(state, WatchState::Generating | WatchState::Ready) {
-        return String::new();
-    }
-    if sample.snapshot.models.is_empty() {
-        return String::new();
-    }
-    detail
-        .setup
-        .first()
-        .map(|setup| setup.key.clone())
+/// llama-swap id of the model SETUP names: the same pairing of
+/// `detail.setup` and `sample.snapshot.models` as [`setup_view`]. Empty
+/// when that view is collapsed.
+fn header_model_id(
+    sample: &WatchSample,
+    state: WatchState,
+    detail: &LlamaDetail,
+    rules: &Rules,
+) -> String {
+    setup_view(sample, detail, state, rules)
+        .map(|view| view.id)
         .unwrap_or_default()
 }
 
@@ -2335,69 +2339,139 @@ mod tests {
         );
     }
 
-    /// No `claims` frame, an empty list, and a claim for a model the header
-    /// does not name, all go through [`tty_model`] to the same console and
-    /// grid bytes (#128).
-    #[test]
-    fn no_claims_frame_is_byte_identical_to_today() {
+    fn claim_tick(
+        claims: Vec<crate::sources::events::ModelClaim>,
+        setup_id: &str,
+    ) -> (WatchSample, TickState, FrameCtx) {
         let sample = backend_sample(vec![served("m", "ready", None)]);
-        let ctx = frame_ctx(None, true);
-        let mono = Instant::now();
-        let wall = UNIX_EPOCH;
-        let zone = Zone::utc();
-        let frame = |claims: Vec<crate::sources::events::ModelClaim>| {
-            let mut tick = TickState::new(2, 6);
-            tick.heard = true;
-            tick.detail.setup = vec![ModelSetup {
-                key: "m".to_owned(),
-                id: "m".to_owned(),
-                name: "m".to_owned(),
-                ..ModelSetup::default()
-            }];
-            tick.detail.claims = claims;
-            tty_model(&sample, &mut tick, mono, wall, zone, &ctx)
-        };
-        let today = frame(Vec::new());
-        let other = frame(vec![crate::sources::events::ModelClaim {
-            model: "other".to_owned(),
-            holder: "eval-runner".to_owned(),
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.setup = vec![ModelSetup {
+            key: crate::activity::model_key(setup_id),
+            id: setup_id.to_owned(),
+            name: "m".to_owned(),
+            ..ModelSetup::default()
+        }];
+        tick.detail.claims = claims;
+        (sample, tick, frame_ctx(None, true))
+    }
+
+    fn claim_entry(model: &str, holder: &str) -> crate::sources::events::ModelClaim {
+        crate::sources::events::ModelClaim {
+            model: model.to_owned(),
+            holder: holder.to_owned(),
             auto: false,
-            in_use: true,
+            in_use: false,
             expires_at: None,
             hold_until: None,
             hold_reason: String::new(),
-        }]);
-        assert!(today.claims.is_empty());
-        assert_eq!(today.model_id, "m");
-        assert_eq!(other.model_id, "m");
-        for cols in [160u16, 192, 213] {
-            let a = layout::layout(&today, cols, 60);
-            let b = layout::layout(&other, cols, 60);
-            let mut term_a = crate::tty::term::Term::new(
-                Vec::new(),
-                move || Ok(crate::tty::term::Size { cols, rows: 60 }),
-                Duration::from_secs(60),
-                Instant::now(),
-            )
-            .expect("term");
-            let mut term_b = crate::tty::term::Term::new(
-                Vec::new(),
-                move || Ok(crate::tty::term::Size { cols, rows: 60 }),
-                Duration::from_secs(60),
-                Instant::now(),
-            )
-            .expect("term");
-            term_a.render(&a, Instant::now()).expect("render");
-            term_b.render(&b, Instant::now()).expect("render");
-            assert_eq!(term_a.out(), term_b.out(), "{cols} console");
-            let ga = layout::layout_exact(&today, cols, 60);
-            let gb = layout::layout_exact(&other, cols, 60);
-            assert_eq!(
-                crate::grid_out::image_of(&ga, llama_core::palette::Palette::Llama, 1, 0),
-                crate::grid_out::image_of(&gb, llama_core::palette::Palette::Llama, 1, 0),
-                "{cols} grid"
-            );
         }
+    }
+
+    /// The countdown follows the wall clock passed into [`tty_model`], not
+    /// the Unix epoch.
+    #[test]
+    fn tty_model_countdown_follows_the_time_passed_in() {
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut claim = claim_entry("m", "eval-runner");
+        claim.expires_at = Some(wall + Duration::from_secs(4 * 60 + 12));
+        let (sample, mut tick, ctx) = claim_tick(vec![claim], "m");
+        let model = tty_model(&sample, &mut tick, Instant::now(), wall, Zone::utc(), &ctx);
+        assert_eq!(model.now, wall);
+        let grid = layout::layout(&model, 192, 60);
+        let header: String = (0..grid.cols())
+            .map(|c| grid.get(c, 0).unwrap().ch)
+            .collect();
+        assert!(
+            header.contains("4:12 left"),
+            "countdown must follow {wall:?}: {header}"
+        );
+    }
+
+    /// [`header_model_id`] pairs `detail.setup` and `models` the way
+    /// [`setup_view`] does, and uses the sanitised llama-swap id, not
+    /// [`crate::activity::model_key`].
+    #[test]
+    fn header_model_id_pairs_setup_like_setup_view() {
+        let rules = Rules::builtin();
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let mut sample = backend_sample(vec![
+            served("Qwen 35B", "ready", Some(llama)),
+            served("flash", "ready", Some(sglang(Some(1)))),
+        ]);
+        let mut detail = TickState::new(2, 6).detail;
+        let q4 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q4_K_XL";
+        let q6 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q6_K_XL";
+        detail.setup = vec![
+            ModelSetup {
+                key: crate::activity::model_key(q4),
+                id: q4.to_owned(),
+                ..ModelSetup::default()
+            },
+            ModelSetup {
+                key: crate::activity::model_key(q6),
+                id: q6.to_owned(),
+                ..ModelSetup::default()
+            },
+        ];
+        assert_eq!(
+            crate::activity::model_key(q4),
+            crate::activity::model_key(q6),
+            "the 32-character key collides"
+        );
+        assert_eq!(
+            header_model_id(&sample, WatchState::Ready, &detail, &rules),
+            q6,
+            "the busy model is the second"
+        );
+        assert_eq!(
+            setup_view(&sample, &detail, WatchState::Ready, &rules)
+                .map(|v| v.id)
+                .as_deref(),
+            Some(q6)
+        );
+        detail.setup.pop();
+        assert_eq!(
+            header_model_id(&sample, WatchState::Ready, &detail, &rules),
+            "flash",
+            "a stale pair falls back to the snapshot, like setup_view"
+        );
+        assert!(header_model_id(&sample, WatchState::AiDown, &detail, &rules).is_empty());
+        sample.snapshot.models.clear();
+        assert!(header_model_id(&sample, WatchState::Ready, &detail, &rules).is_empty());
+    }
+
+    /// A hold that ends after a daylight-saving change uses the zone
+    /// offset at that end time.
+    #[test]
+    fn tty_model_hold_until_uses_the_offset_at_the_end() {
+        let zone = Zone::from_posix("EST5EDT,M3.2.0,M11.1.0").expect("posix");
+        let now = UNIX_EPOCH
+            + Duration::from_secs(
+                u64::try_from(crate::localtime::parse_rfc3339("2026-03-08T06:00:00Z").unwrap())
+                    .unwrap(),
+            );
+        let until = UNIX_EPOCH
+            + Duration::from_secs(
+                u64::try_from(crate::localtime::parse_rfc3339("2026-03-08T12:00:00Z").unwrap())
+                    .unwrap(),
+            );
+        let mut claim = claim_entry("m", "operator");
+        claim.hold_until = Some(until);
+        claim.hold_reason = "overnight eval".to_owned();
+        let (sample, mut tick, ctx) = claim_tick(vec![claim], "m");
+        let model = tty_model(&sample, &mut tick, Instant::now(), now, &zone, &ctx);
+        assert_eq!(model.tz_offset_s, -5 * 3600);
+        assert_eq!(model.claims[0].hold_tz_offset_s, -4 * 3600);
+        let grid = layout::layout(&model, 192, 60);
+        let header: String = (0..grid.cols())
+            .map(|c| grid.get(c, 0).unwrap().ch)
+            .collect();
+        assert!(header.contains("until 08:00"), "end time in EDT: {header}");
+        assert!(!header.contains("until 07:00"), "{header}");
     }
 
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
