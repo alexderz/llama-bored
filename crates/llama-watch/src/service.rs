@@ -2262,6 +2262,40 @@ mod tests {
         assert!(note.contains("failed"), "{note}");
     }
 
+    #[test]
+    fn tty_model_takes_serving_from_the_sample() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let fresh = now - Duration::from_secs(10);
+        let running = job_at("run", JobState::Running, fresh);
+        let mut tick = TickState::new(2, 6);
+        tick.detail.jobs = vec![running];
+        let ctx = frame_ctx(None, true);
+        let mono = Instant::now();
+
+        let serving = backend_sample(vec![served("m", "ready", None)]);
+        let model = tty_model(&serving, &mut tick, mono, now, Zone::utc(), &ctx);
+        assert!(
+            model.job.is_none(),
+            "a serving model keeps inference: {:?}",
+            model.job
+        );
+        let note = model
+            .job_note
+            .as_deref()
+            .expect("a serving model with a live job is a one-line note");
+        assert!(note.starts_with("run"), "{note}");
+
+        let idle = backend_sample(Vec::new());
+        let model = tty_model(&idle, &mut tick, mono, now, Zone::utc(), &ctx);
+        let view = model.job.expect("idle with a live job is the job view");
+        assert_eq!(view.job.name, "run");
+        assert!(
+            model.job_note.is_none(),
+            "idle live job has no note: {:?}",
+            model.job_note
+        );
+    }
+
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
     /// none, and marks them; a llama.cpp row keeps its own.
     /// #75: a busy slot is RECENT's first row, keyed and scaled like the
