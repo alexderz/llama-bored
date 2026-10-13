@@ -1713,9 +1713,10 @@ impl<L: Sink> State<L> {
                     seq: row.seq,
                     model: model.id.clone(),
                     input,
-                    reported: row.cached_tokens.is_some()
-                        || row.prompt_tps.is_some()
-                        || row.gen_tps.is_some(),
+                    output: row.output_tokens,
+                    duration_ms: row.duration_ms,
+                    prompt_known: row.prompt_tps.is_some(),
+                    gen_known: row.gen_tps.is_some(),
                 });
             }
         }
@@ -1991,7 +1992,9 @@ impl<L: Sink> State<L> {
     /// the engine's speeds where llama-swap gave none (#35) and, for one
     /// SGLang request, the counters of that request (#133). The fill is
     /// applied on this copy: the prompt counters and the snapshot never
-    /// see it, and a value llama-swap reported is left as it was.
+    /// see it. A value llama-swap reported is left as it was. A missing
+    /// cached count is filled even when a rate was reported, and a missing
+    /// rate is filled the same way.
     fn measured_activity(&self) -> Vec<ActivityRow> {
         let mut rows = self.recent.rows(self.activity_rows());
         for row in &mut rows {
