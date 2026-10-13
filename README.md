@@ -1026,11 +1026,12 @@ stale_s = 180                       # 10..=3600; default 180
 
 The format, the caps, and a reference Trainer callback are in
 [`docs/job-status.md`](docs/job-status.md). Files are `<name>.json`
-directly in `dir`, at most 64 KiB and eight files, opened without
-following a symlink, re-read at most once a second. A file older than
-`stale_s` is not shown. When a model is serving, the inference view stays
-and a one-line note names the live job. Job data does not enter the
-snapshot.
+directly in `dir`, at most 64 KiB, opened without following a symlink.
+Up to 64 names are collected and the eight newest by mtime are read, at
+most once a second. A file older than `stale_s` is not shown. A writer
+must write more often than `stale_s`. When a model is serving, the
+inference view stays and a one-line note names the live job. Job data
+does not enter the snapshot.
 
 **tty11 colours** (`watch.toml`, `[tty]`): the console has 16 colour slots,
 and llama-watch loads its own palette into them, built from the LCD's heat
