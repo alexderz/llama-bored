@@ -596,10 +596,11 @@ const STUCK_TAG: &str = "stopping (stuck?)";
 /// Cells kept blank between the header text and the clock (#39).
 const CLOCK_GAP: usize = 2;
 
-/// `model <full name>  <detail>`, the detail in grey. The detail ends by
-/// column `limit` (exclusive), dropping whole trailing ` · item`s (#39).
+/// `model <full name>  <detail>`, the detail in grey; `job <name>` while
+/// the job view is up. The detail ends by column `limit` (exclusive),
+/// dropping whole trailing ` · item`s (#39).
 fn paint_model(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
-    let label = "model";
+    let label = if model.job.is_some() { "job" } else { "model" };
     let label_len = label.chars().count();
     paint_fit(grid, x, 0, label, C16::BrightBlack, C16::Black, label_len);
     let vx = usize::from(x).saturating_add(label_len).saturating_add(1);
@@ -4611,11 +4612,15 @@ pub(crate) struct DigitFmt {
 
 /// Big-digit text: at most four characters (`16.6`, `0.25`, `1540`, `9999`).
 /// Never contains `e`. A value of 10,000 or more uses a k/M scale in the
-/// caption; a value under 0.01 uses `x1eN` there.
+/// caption; above the M range, and under 0.01, the caption is `x1eN`.
+/// A magnitude so small the scaled text would be empty or non-finite is `0`.
 #[allow(dead_code)]
 pub(crate) fn job_digits(value: f64) -> String {
     job_digit_fmt(value).text
 }
+
+/// Largest magnitude Mega can show as four digits (`9999` × 1e6).
+const MEGA_MAX: f64 = 9_999.5 * 1_000_000.0;
 
 pub(crate) fn job_digit_fmt(value: f64) -> DigitFmt {
     if !value.is_finite() {
@@ -4627,45 +4632,82 @@ pub(crate) fn job_digit_fmt(value: f64) -> DigitFmt {
     let sign = if value < 0.0 { "-" } else { "" };
     let abs = value.abs();
     if abs == 0.0 {
-        return DigitFmt {
-            text: "0".to_owned(),
-            scale: DigitScale::One,
-        };
+        return zero_digits();
     }
-    if abs >= 1_000_000.0 {
-        return DigitFmt {
-            text: format!("{sign}{}", four_char(abs / 1_000_000.0)),
-            scale: DigitScale::Mega,
-        };
+    if abs >= 1_000_000.0 && abs < MEGA_MAX {
+        return scaled_digits(sign, four_char(abs / 1_000_000.0), DigitScale::Mega);
     }
-    if abs >= 9999.5 {
-        return DigitFmt {
-            text: format!("{sign}{}", four_char(abs / 1_000.0)),
-            scale: DigitScale::Kilo,
-        };
+    if (9999.5..1_000_000.0).contains(&abs) {
+        return scaled_digits(sign, four_char(abs / 1_000.0), DigitScale::Kilo);
     }
-    if abs >= 0.01 {
-        return DigitFmt {
-            text: format!("{sign}{}", four_char(abs)),
-            scale: DigitScale::One,
-        };
+    if (0.01..9999.5).contains(&abs) {
+        return scaled_digits(sign, four_char(abs), DigitScale::One);
     }
-    let mut exp = abs.log10().floor() as i32;
-    let mut mantissa = abs / 10f64.powi(exp);
-    if mantissa >= 9.995 {
-        exp += 1;
-        mantissa = abs / 10f64.powi(exp);
+    exp_digits(sign, abs)
+}
+
+fn zero_digits() -> DigitFmt {
+    DigitFmt {
+        text: "0".to_owned(),
+        scale: DigitScale::One,
+    }
+}
+
+fn scaled_digits(sign: &str, body: String, scale: DigitScale) -> DigitFmt {
+    if !digit_body_ok(&body) {
+        return zero_digits();
     }
     DigitFmt {
-        text: format!("{sign}{mantissa:.2}"),
+        text: format!("{sign}{body}"),
+        scale,
+    }
+}
+
+fn digit_body_ok(body: &str) -> bool {
+    !body.is_empty()
+        && body.chars().count() <= 4
+        && body.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+fn exp_digits(sign: &str, abs: f64) -> DigitFmt {
+    let log = abs.log10();
+    if !log.is_finite() {
+        return zero_digits();
+    }
+    let mut exp = log.floor() as i32;
+    let Some(mut mantissa) = mantissa_at(abs, exp) else {
+        return zero_digits();
+    };
+    if mantissa >= 9.995 {
+        exp = exp.saturating_add(1);
+        match mantissa_at(abs, exp) {
+            Some(next) => mantissa = next,
+            None => return zero_digits(),
+        }
+    }
+    let body = format!("{mantissa:.2}");
+    if !digit_body_ok(&body) {
+        return zero_digits();
+    }
+    DigitFmt {
+        text: format!("{sign}{body}"),
         scale: DigitScale::Exp(exp),
     }
+}
+
+fn mantissa_at(abs: f64, exp: i32) -> Option<f64> {
+    let pow = 10f64.powi(exp);
+    if !pow.is_finite() || pow == 0.0 {
+        return None;
+    }
+    let m = abs / pow;
+    m.is_finite().then_some(m)
 }
 
 /// At most four characters, no exponent. `abs` is in a range that fits.
 fn four_char(abs: f64) -> String {
     if abs >= 1000.0 {
-        format!("{:.0}", abs.min(9999.0))
+        format!("{:.0}", abs)
     } else if abs >= 100.0 {
         format!("{:.0}", abs)
     } else if abs >= 10.0 {
@@ -5188,7 +5230,6 @@ fn draw_job_phases(
 /// Narrowest chart when pairing two series side by side.
 const JOB_CHART_PAIR_W: u16 = 60;
 const JOB_CHART_H_MIN: u16 = 5;
-const JOB_CHART_H_MAX: u16 = 16;
 
 fn draw_job_charts(
     grid: &mut Grid,
@@ -5205,6 +5246,8 @@ fn draw_job_charts(
     }
     let left = 2u16;
     let width = right.saturating_sub(left).saturating_add(1);
+    // Two series sit side by side when the frame is wide enough. Three or
+    // four series use two rows of pairs when each chart still gets 5 rows.
     let pair = series.len() >= 2 && width >= JOB_CHART_PAIR_W * 2;
     let rows_n = if pair {
         series.len().div_ceil(2)
@@ -5269,16 +5312,15 @@ fn split_chart_heights(count: u16, rows: u16) -> Vec<u16> {
     }
     let gaps = fit.saturating_sub(1);
     let usable = rows.saturating_sub(gaps);
-    let base = (usable / fit).clamp(JOB_CHART_H_MIN, JOB_CHART_H_MAX);
+    let base = (usable / fit).max(JOB_CHART_H_MIN);
     let mut heights = vec![base; usize::from(fit)];
     let mut leftover = usable.saturating_sub(base * fit);
     for h in &mut heights {
-        let add = leftover.min(JOB_CHART_H_MAX.saturating_sub(*h));
-        *h += add;
-        leftover -= add;
         if leftover == 0 {
             break;
         }
+        *h += 1;
+        leftover -= 1;
     }
     heights
 }
@@ -5521,6 +5563,66 @@ mod tests {
         assert_eq!(fmt.text, "0");
         assert_eq!(scale_caption("ROWS / S", DigitScale::Kilo), "K ROWS / S");
         assert_eq!(scale_caption("LR", DigitScale::Exp(-5)), "LR x1e-5");
+
+        let (fmt, _) = paint_digits(9.9994e9);
+        assert_eq!(fmt.text, "9999");
+        assert_eq!(fmt.scale, DigitScale::Mega);
+        assert_shown_is_true(9.9994e9, &fmt);
+        let (fmt, _) = paint_digits(1e10);
+        assert_eq!(fmt.text, "1.00");
+        assert_eq!(fmt.scale, DigitScale::Exp(10));
+        assert_shown_is_true(1e10, &fmt);
+        let (fmt, _) = paint_digits(1e12);
+        assert_eq!(fmt.text, "1.00");
+        assert_eq!(fmt.scale, DigitScale::Exp(12));
+        assert_shown_is_true(1e12, &fmt);
+        let (fmt, _) = paint_digits(f64::MAX);
+        assert_eq!(fmt.text, "1.80");
+        assert_eq!(fmt.scale, DigitScale::Exp(308));
+        assert_shown_is_true(f64::MAX, &fmt);
+        let (fmt, _) = paint_digits(-9.9994e9);
+        assert_eq!(fmt.text, "-9999");
+        assert_eq!(fmt.scale, DigitScale::Mega);
+        assert_shown_is_true(-9.9994e9, &fmt);
+        let (fmt, _) = paint_digits(-1e10);
+        assert_eq!(fmt.text, "-1.00");
+        assert_eq!(fmt.scale, DigitScale::Exp(10));
+        let (fmt, _) = paint_digits(-1e12);
+        assert_eq!(fmt.text, "-1.00");
+        assert_eq!(fmt.scale, DigitScale::Exp(12));
+        let (fmt, _) = paint_digits(-f64::MAX);
+        assert_eq!(fmt.text, "-1.80");
+        assert_eq!(fmt.scale, DigitScale::Exp(308));
+        let (fmt, _) = paint_digits(5e-310);
+        assert_eq!(fmt.text, "0");
+        assert_eq!(fmt.scale, DigitScale::One);
+    }
+
+    fn assert_shown_is_true(value: f64, fmt: &DigitFmt) {
+        let n: f64 = fmt.text.parse().expect("digit text");
+        let got = match fmt.scale {
+            DigitScale::One => n.abs().log10(),
+            DigitScale::Kilo => n.abs().log10() + 3.0,
+            DigitScale::Mega => n.abs().log10() + 6.0,
+            DigitScale::Exp(exp) => n.abs().log10() + f64::from(exp),
+        };
+        let want = value.abs().log10();
+        assert!(
+            (got - want).abs() < 0.01,
+            "digits+caption {} {:?} are not the true value {value} (log10 {got} vs {want})",
+            fmt.text,
+            fmt.scale
+        );
+        assert_eq!(fmt.text.starts_with('-'), value < 0.0);
+    }
+
+    #[test]
+    fn job_chart_heights_share_every_row() {
+        assert_eq!(split_chart_heights(1, 24), vec![24]);
+        assert_eq!(split_chart_heights(2, 24), vec![12, 11]);
+        assert_eq!(split_chart_heights(2, 11), vec![5, 5]);
+        assert_eq!(split_chart_heights(2, 10), vec![10]);
+        assert!(split_chart_heights(1, 24)[0] > 16);
     }
 
     #[test]
