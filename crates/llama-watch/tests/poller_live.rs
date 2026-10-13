@@ -354,3 +354,42 @@ fn sglang_loads_are_read_only_while_a_request_is_in_flight() {
     }
     assert!(seen > 0);
 }
+
+fn claims_frame(body: serde_json::Value) -> String {
+    frame("claims", &body)
+}
+
+/// A llama-swap build with model claims sends them on the same stream.
+/// Any ready model starts that stream (#128), not only vLLM or SGLang.
+#[test]
+fn claims_reach_the_detail_for_a_llama_cpp_model() {
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        frames: vec![
+            inflight("snapshot", serde_json::json!({"requests": []})),
+            claims_frame(serde_json::json!({
+                "changes": [],
+                "claims": [{
+                    "model": "lcpp",
+                    "holder": "eval-runner",
+                    "auto": false,
+                    "in_use": true,
+                    "expires_at": null,
+                    "hold_until": null,
+                }],
+            })),
+        ],
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), NoLog).expect("spawn");
+    let (_, detail) = wait(&rx, "claims", |_, detail| {
+        detail
+            .claims
+            .first()
+            .is_some_and(|c| c.holder == "eval-runner")
+    });
+    assert_eq!(detail.claims[0].model, "lcpp");
+    assert!(detail.claims[0].in_use);
+    assert!(detail.claims[0].hold_until.is_none());
+}
