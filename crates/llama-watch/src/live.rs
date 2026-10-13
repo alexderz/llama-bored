@@ -387,6 +387,7 @@ mod tests {
             requests,
             ended,
             failure: None,
+            ..EventsView::default()
         }
     }
 
