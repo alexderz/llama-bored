@@ -1112,37 +1112,27 @@ fn job_and_note(
     stale_s: u64,
     now: SystemTime,
 ) -> (Option<layout::JobView>, Option<String>) {
-    let fresh: Vec<&crate::jobs::Job> = jobs
-        .iter()
-        .filter(|job| !crate::jobs::is_stale(job.mtime, now, stale_s))
-        .collect();
-    let live: Vec<&crate::jobs::Job> = fresh
-        .iter()
-        .copied()
-        .filter(|job| job.state == crate::jobs::JobState::Running)
-        .collect();
-    if let Some(job) = live.first() {
-        let more = live.len().saturating_sub(1);
-        if serving {
-            (None, Some(layout::job_note_line(job, more, true)))
-        } else {
-            (
-                Some(layout::JobView {
-                    job: (*job).clone(),
-                    more,
-                }),
-                None,
-            )
+    match crate::jobs::pick_job(jobs, serving, stale_s, now) {
+        crate::jobs::JobPick::Live {
+            job,
+            more,
+            serving: true,
+        } => (None, Some(layout::job_note_line(job, more, true))),
+        crate::jobs::JobPick::Live {
+            job,
+            more,
+            serving: false,
+        } => (
+            Some(layout::JobView {
+                job: job.clone(),
+                more,
+            }),
+            None,
+        ),
+        crate::jobs::JobPick::Finished { job } => {
+            (None, Some(layout::job_note_line(job, 0, false)))
         }
-    } else if let Some(job) = fresh.iter().copied().find(|job| {
-        matches!(
-            job.state,
-            crate::jobs::JobState::Done | crate::jobs::JobState::Failed
-        )
-    }) {
-        (None, Some(layout::job_note_line(job, 0, false)))
-    } else {
-        (None, None)
+        crate::jobs::JobPick::None => (None, None),
     }
 }
 

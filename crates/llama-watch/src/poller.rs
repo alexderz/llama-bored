@@ -728,6 +728,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
     let mut next_metrics = Instant::now();
     let mut next_slots = Instant::now();
     let mut next_activity = Instant::now();
+    let jobs_on = state.limits.jobs_dir.is_some();
     let mut next_jobs = Instant::now();
     loop {
         if stopped(&stop) {
@@ -760,7 +761,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
             next_activity = Instant::now() + state.limits.activity_interval;
             worked = true;
         }
-        if now >= next_jobs {
+        if jobs_on && now >= next_jobs {
             state.jobs.refresh(Instant::now(), &mut state.log);
             next_jobs = Instant::now() + jobs::CHECK_EVERY;
             worked = true;
@@ -768,20 +769,25 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         if worked && state.publish().is_err() {
             break;
         }
-        let mut next = next_jobs;
+        let mut next: Option<Instant> = None;
         if state.limits.llama_enabled {
-            next = if state.running_due {
+            next = Some(if state.running_due {
                 Instant::now()
             } else {
                 next_running
-            };
-            for candidate in [next_metrics, next_slots, next_activity, next_jobs] {
-                if candidate < next {
-                    next = candidate;
+            });
+            for candidate in [next_metrics, next_slots, next_activity] {
+                if next.is_none_or(|at| candidate < at) {
+                    next = Some(candidate);
                 }
             }
         }
-        let wait = next.saturating_duration_since(Instant::now());
+        if jobs_on && next.is_none_or(|at| next_jobs < at) {
+            next = Some(next_jobs);
+        }
+        let wait = next
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+            .saturating_duration_since(Instant::now());
         match stop.recv_timeout(wait) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
