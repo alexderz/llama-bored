@@ -103,6 +103,15 @@ fn a_truncated_or_malformed_table_is_refused() {
 }
 
 #[test]
+fn a_scalar_past_unicode_is_refused() {
+    // U+110000 is the scalar after U+10FFFF. Its UTF-8 is a 4-byte sequence
+    // whose lead is F4, so a check that only rejects a lead above F4 accepts it.
+    let table = [0xF4, 0x90, 0x80, 0x80, 0xFF];
+    let bytes = psf(1, 1, &blank(1), &table);
+    assert_eq!(Psf2::parse(&bytes), Err(FontError::Unicode("bad utf-8")));
+}
+
+#[test]
 fn hostile_fonts_do_not_panic() {
     let samples: [&[u8]; 6] = [
         &[],

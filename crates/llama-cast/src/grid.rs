@@ -318,8 +318,15 @@ fn draw_text(frame: &mut [u8], font: &Psf2, x0: usize, y0: usize, text: &[u8], c
 fn draw_on_last_row(frame: &mut [u8], font: &Psf2, cols: u16, rows: u16, text: &[u8]) {
     let (off_x, off_y) = origin(cols, rows, font);
     let height = font.height();
+    // The last row that fits in the frame completely. A row that runs past
+    // the bottom stays the cell, so the notice is not cut in half.
     let mut row = usize::from(rows).saturating_sub(1);
-    while off_y.saturating_add(row * height) >= FRAME_HEIGHT && row > 0 {
+    while row > 0
+        && off_y
+            .saturating_add(row.saturating_mul(height))
+            .saturating_add(height)
+            > FRAME_HEIGHT
+    {
         row -= 1;
     }
     let y0 = off_y + row * height;
