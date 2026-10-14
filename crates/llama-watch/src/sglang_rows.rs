@@ -1024,10 +1024,12 @@ fn coverage_gap(prev: &Snap, snap: &Snap) -> bool {
 }
 
 /// A scrape stamped after `T + 6 s` has been seen, so the isolation window
-/// is closed. A row with no timestamp is already decided: it fills nothing.
+/// is closed. A row with no timestamp never gets here: [`stamp_fits`]
+/// refuses it before a finish can be a hit, so a missing window is not
+/// treated as a decision.
 fn isolation_decided(model: &Model, timestamp: Option<&str>) -> bool {
     let Some(win_hi) = isolation_hi(timestamp) else {
-        return true;
+        return false;
     };
     model
         .probes
@@ -1096,6 +1098,9 @@ fn span_covered(model: &Model, win_lo: f64, win_hi: f64) -> bool {
                 covered_from = None;
             }
         } else if covered_from.is_none() && stamp <= win_lo {
+            // The watcher's gap probe ages out after [`FINISH_FOR`]. A
+            // later scrape at or before the window is not a gap, and it
+            // is what coverage starts from.
             covered_from = Some(stamp);
         }
         if covered_from.is_some_and(|from| from <= win_lo) && stamp > win_hi {
@@ -3348,5 +3353,394 @@ sglang:time_to_first_token_seconds_count{model_name=\"flash\",is_streaming=\"tru
         }
         assert_eq!(book.models["flash"].finishes.len(), 64);
         assert_eq!(book.models["flash"].sights.len(), 64);
+    }
+
+    fn streaming_done() -> Totals {
+        totals(1, 1_000, 600, 401, (10.0, 1.0), (2.0, 1.0), 0.0)
+    }
+
+    /// A clean streaming finish at second `row_sec`, covered through the
+    /// scrape before it and not yet decided. The window is
+    /// `[row_sec - 5, row_sec + 6]`.
+    fn open_at(book: &mut SglangBook, clock: &Clock, row_sec: i64) {
+        let fin = (row_sec as u64) * 1_000;
+        grid(book, clock, 0, fin - 2_000, zeros());
+        book.activity(clock.at(100), &[]);
+        see(book, clock, fin, streaming_done());
+        book.activity(
+            clock.at(fin + 100),
+            &[stamp_claim(claim(1, 1_000), row_sec)],
+        );
+    }
+
+    fn decide(book: &mut SglangBook, clock: &Clock, row_sec: i64) {
+        settle(
+            book,
+            clock,
+            (row_sec as u64) * 1_000,
+            row_sec,
+            streaming_done(),
+        );
+    }
+
+    /// One extra finish sight on the open row at second 40. `n` is the
+    /// finished-count step that sight recorded.
+    fn with_neighbour(lo_ms: u64, hi_ms: u64, n: Option<u64>) -> Option<Fill> {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        book.models
+            .get_mut("flash")
+            .unwrap()
+            .sights
+            .push_back(Sight {
+                at: clock.at(hi_ms.saturating_add(3)),
+                wall_lo: wall_at(lo_ms),
+                wall_hi: wall_at(hi_ms),
+                n,
+            });
+        decide(&mut book, &clock, 40);
+        book.fill(1)
+    }
+
+    /// The row is second 40, so the window is `[35, 46]`. A second finish
+    /// whose interval touches that window blocks the row. One that ends a
+    /// millisecond before it, or starts on its end, does not. `n` is 1 for
+    /// two separate finishes, 2 for one scrape that stepped twice, and 5
+    /// for a longer step.
+    #[test]
+    fn a_second_finish_just_inside_the_window_blocks_and_just_outside_does_not() {
+        for n in [Some(1u64), Some(2), Some(5)] {
+            assert_eq!(
+                with_neighbour(34_000, 35_000, n).map(|fill| fill.cached),
+                None,
+                "n = {n:?} ending at T - 5 still overlaps"
+            );
+            assert_eq!(
+                with_neighbour(34_000, 34_999, n).map(|fill| fill.cached),
+                Some(600),
+                "n = {n:?} ending just before T - 5 does not overlap"
+            );
+            assert_eq!(
+                with_neighbour(45_999, 47_000, n).map(|fill| fill.cached),
+                None,
+                "n = {n:?} starting just before T + 6 still overlaps"
+            );
+            assert_eq!(
+                with_neighbour(46_000, 47_000, n).map(|fill| fill.cached),
+                Some(600),
+                "n = {n:?} starting at T + 6 does not overlap"
+            );
+        }
+    }
+
+    /// The neighbour is a real second request, shorter than the row, so the
+    /// length checks would still accept the row's own finish.
+    #[test]
+    fn a_shorter_second_request_inside_the_window_blocks_and_one_past_the_end_does_not() {
+        let run = |prev_ms: u64, fin_ms: u64| {
+            let clock = Clock(Instant::now());
+            let mut book = SglangBook::default();
+            let own = streaming_done();
+            let short = totals(2, 1_010, 600, 403, (11.0, 2.0), (2.2, 2.0), 0.0);
+            grid(&mut book, &clock, 0, 38_000, zeros());
+            book.activity(clock.at(100), &[]);
+            see(&mut book, &clock, 40_000, own);
+            book.activity(clock.at(40_100), &[stamp_claim(claim(1, 1_000), 40)]);
+            let mut ms = 42_000u64;
+            while ms < prev_ms {
+                see(&mut book, &clock, ms, own);
+                ms += 2_000;
+            }
+            see(&mut book, &clock, prev_ms, own);
+            see(&mut book, &clock, fin_ms, short);
+            if fin_ms <= 46_000 {
+                settle(&mut book, &clock, fin_ms, 40, short);
+            }
+            book.fill(1).map(|fill| fill.cached)
+        };
+        assert_eq!(
+            run(45_999, 47_000),
+            None,
+            "the shorter finish starts just before T + 6"
+        );
+        assert_eq!(
+            run(46_000, 48_000),
+            Some(600),
+            "the shorter finish starts at T + 6"
+        );
+    }
+
+    /// `hi == T - 5` overlaps, and this sight has no count. Coverage is
+    /// intact, so skipping the sight would fill the row.
+    #[test]
+    fn a_sight_with_no_count_blocks_even_when_the_span_is_covered() {
+        assert_eq!(
+            with_neighbour(34_000, 35_000, None).map(|fill| fill.cached),
+            None
+        );
+    }
+
+    /// The finish's own sight is gone. Another sight in the window has
+    /// `n == 1` but a different instant, which is what the cap does when
+    /// later unclean steps push the own sight out. The count is one and
+    /// it is not this finish.
+    #[test]
+    fn a_finish_whose_own_sight_is_missing_stays_empty() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        let model = book.models.get_mut("flash").unwrap();
+        let finish_at = model.finishes[0].at;
+        model.sights.clear();
+        model.sights.push_back(Sight {
+            at: clock.at(39_000),
+            wall_lo: wall_at(38_000),
+            wall_hi: wall_at(40_000),
+            n: Some(1),
+        });
+        assert_ne!(model.sights[0].at, finish_at);
+        decide(&mut book, &clock, 40);
+        assert_eq!(book.fill(1), None);
+    }
+
+    #[test]
+    fn a_sight_with_no_wall_time_blocks_the_row() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        let before = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("before the epoch");
+        book.models
+            .get_mut("flash")
+            .unwrap()
+            .sights
+            .push_back(Sight {
+                at: clock.at(39_000),
+                wall_lo: before,
+                wall_hi: before,
+                n: Some(1),
+            });
+        decide(&mut book, &clock, 40);
+        assert_eq!(book.fill(1), None, "a stamp with no wall time blocks");
+    }
+
+    #[test]
+    fn a_probe_with_no_wall_time_blocks_the_row() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        let before = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("before the epoch");
+        book.models
+            .get_mut("flash")
+            .unwrap()
+            .probes
+            .push_back(Probe {
+                at: clock.at(40_000),
+                stamp: before,
+                gap: false,
+            });
+        decide(&mut book, &clock, 40);
+        assert_eq!(book.fill(1), None, "a probe with no wall time blocks");
+    }
+
+    /// Isolation decides on a scrape strictly after `T + 6`, and the span
+    /// is covered only by a scrape strictly after that too. A scrape sitting
+    /// on `T + 6` does neither.
+    #[test]
+    fn a_scrape_stamped_at_t_plus_6_does_not_decide_the_row() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        let done = streaming_done();
+        see(&mut book, &clock, 42_000, done);
+        see(&mut book, &clock, 44_000, done);
+        see(&mut book, &clock, 46_000, done);
+        assert_eq!(book.fill(1), None, "T + 6 is not past the window");
+        see(&mut book, &clock, 48_000, done);
+        assert_eq!(book.fill(1).map(|fill| fill.cached), Some(600));
+    }
+
+    /// The scrape on `T + 6` would cover the span if the bound were `>=`.
+    /// The next probe is a gap past the window, so it decides the row and
+    /// then drops the coverage it would have closed.
+    #[test]
+    fn a_scrape_on_the_window_end_does_not_cover_when_the_next_probe_is_a_gap() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        let done = streaming_done();
+        see(&mut book, &clock, 42_000, done);
+        see(&mut book, &clock, 44_000, done);
+        see(&mut book, &clock, 46_000, done);
+        see(&mut book, &clock, 49_001, done);
+        assert_eq!(book.fill(1), None);
+    }
+
+    /// The only probe at or before `T - 5` is the watcher, stamped on that
+    /// edge or one millisecond inside it.
+    #[test]
+    fn a_break_that_ends_on_the_window_start_can_cover_and_one_just_inside_cannot() {
+        let run = |start_ms: u64| {
+            let clock = Clock(Instant::now());
+            let mut book = SglangBook::default();
+            let done = streaming_done();
+            let mut ms = start_ms;
+            obs(&mut book, &clock, ms, ms, ms, Some(zeros()), true);
+            book.activity(clock.at(ms + 1), &[]);
+            ms += 1_000;
+            while ms < 40_000 {
+                obs(&mut book, &clock, ms, ms, ms, Some(zeros()), true);
+                ms += 1_000;
+            }
+            obs(&mut book, &clock, 40_000, 40_000, 40_000, Some(done), true);
+            book.activity(clock.at(40_050), &[stamp_claim(claim(1, 1_000), 40)]);
+            settle(&mut book, &clock, 40_000, 40, done);
+            book.fill(1).map(|fill| fill.cached)
+        };
+        assert_eq!(run(35_000), Some(600), "a break ending at T - 5 can cover");
+        assert_eq!(run(35_001), None, "a break ending just inside cannot");
+    }
+
+    /// The watcher's gap probe is older than [`FINISH_FOR`] by the time a
+    /// row at second 40 is decided. Coverage then starts from a later
+    /// scrape that is not a gap. A non-gap stamped exactly on `T - 5`
+    /// starts it, and one a millisecond inside does not.
+    #[test]
+    fn a_later_scrape_starts_coverage_once_the_watcher_probe_has_aged_out() {
+        let clock = Clock(Instant::now());
+        let mut book = SglangBook::default();
+        open_at(&mut book, &clock, 40);
+        decide(&mut book, &clock, 40);
+        let probes = &book.models["flash"].probes;
+        assert!(
+            probes.iter().all(|probe| probe.at >= clock.at(18_000)),
+            "the watcher probe has aged out"
+        );
+        assert_eq!(book.fill(1).map(|fill| fill.cached), Some(600));
+
+        let covered = |stamp_ms: u64| {
+            let mut model = Model::default();
+            model.probes.push_back(Probe {
+                at: clock.at(stamp_ms),
+                stamp: wall_at(stamp_ms),
+                gap: false,
+            });
+            model.probes.push_back(Probe {
+                at: clock.at(50_000),
+                stamp: wall_at(50_000),
+                gap: false,
+            });
+            span_covered(&model, 35.0, 46.0)
+        };
+        assert!(covered(35_000), "a non-gap scrape on T - 5 starts coverage");
+        assert!(
+            !covered(35_001),
+            "a non-gap scrape just inside T - 5 does not"
+        );
+    }
+
+    /// Three seconds is not a hole. A millisecond over is, inside the
+    /// window and on each edge, on the monotonic clock and the wall clock.
+    /// The row is second 40, so the window is `[35, 46]`. The scrape before
+    /// the pair sits at or before 35 s, and the row's own finish is later.
+    #[test]
+    fn a_coverage_gap_of_three_seconds_is_covered_and_a_millisecond_over_is_not() {
+        let gap_between = |earlier: u64, later: u64| {
+            let clock = Clock(Instant::now());
+            let mut book = SglangBook::default();
+            let done = streaming_done();
+            obs(&mut book, &clock, 0, 0, 0, Some(zeros()), true);
+            obs(
+                &mut book,
+                &clock,
+                earlier,
+                earlier,
+                earlier,
+                Some(zeros()),
+                true,
+            );
+            book.activity(clock.at(earlier + 1), &[]);
+            obs(&mut book, &clock, later, later, later, Some(zeros()), true);
+            let mut ms = later + 2_000;
+            while ms < 40_000 {
+                obs(&mut book, &clock, ms, ms, ms, Some(zeros()), true);
+                ms += 2_000;
+            }
+            obs(&mut book, &clock, 40_000, 40_000, 40_000, Some(done), true);
+            book.activity(clock.at(40_050), &[stamp_claim(claim(1, 1_000), 40)]);
+            settle(&mut book, &clock, 40_000, 40, done);
+            book.fill(1).map(|fill| fill.cached)
+        };
+        // Just inside the low end: the later scrape is 1 ms after T - 5.
+        assert_eq!(
+            gap_between(31_999, 35_000),
+            Some(600),
+            "3.001 s ending on T - 5 still starts coverage"
+        );
+        assert_eq!(
+            gap_between(32_001, 35_001),
+            Some(600),
+            "exactly 3 s just inside the window is covered"
+        );
+        assert_eq!(
+            gap_between(32_000, 35_001),
+            None,
+            "3.001 s just inside the window is a hole"
+        );
+        assert_eq!(
+            gap_between(34_000, 37_000),
+            Some(600),
+            "exactly 3 s inside the window is covered"
+        );
+        assert_eq!(
+            gap_between(33_999, 37_000),
+            None,
+            "3.001 s inside the window is a hole"
+        );
+
+        // On the high end the finish is already recorded and the spacing
+        // is two later idle scrapes, so the row's own match stays put.
+        let edge = |gap_ms: u64| {
+            let clock = Clock(Instant::now());
+            let mut book = SglangBook::default();
+            open_at(&mut book, &clock, 40);
+            let done = streaming_done();
+            let end = 46_000u64;
+            see(&mut book, &clock, 42_000, done);
+            see(&mut book, &clock, end - gap_ms, done);
+            see(&mut book, &clock, end, done);
+            see(&mut book, &clock, end + 2_000, done);
+            book.fill(1).map(|fill| fill.cached)
+        };
+        assert_eq!(
+            edge(3_000),
+            Some(600),
+            "exactly 3 s ending at T + 6 is covered"
+        );
+        assert_eq!(edge(3_001), None, "3.001 s ending at T + 6 is a hole");
+
+        // Wall delta alone. Monotonic is 2.6 s, inside both the coverage
+        // gap and the clock-step bound. Wall is exactly 3 s, or 1 ms over.
+        let wall = |wall_ms: u64| {
+            let clock = Clock(Instant::now());
+            let mut book = SglangBook::default();
+            open_at(&mut book, &clock, 40);
+            let done = streaming_done();
+            obs(&mut book, &clock, 42_600, 42_600, wall_ms, Some(done), true);
+            see(&mut book, &clock, 44_600, done);
+            see(&mut book, &clock, 46_600, done);
+            see(&mut book, &clock, 48_600, done);
+            book.fill(1).map(|fill| fill.cached)
+        };
+        assert_eq!(
+            wall(43_000),
+            Some(600),
+            "a wall delta of exactly 3 s is covered"
+        );
+        assert_eq!(wall(43_001), None, "a wall delta of 3.001 s is a hole");
     }
 }
