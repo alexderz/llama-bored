@@ -1,10 +1,12 @@
 //! Grid frames: exact RGB, centre and crop, a missing glyph, the font pick,
 //! and a bad file (stale, future, truncated, bad magic, missing). The stale
-//! cases pass the clock in; they do not read `SystemTime`.
+//! cases pass the clock in; they do not read `SystemTime`, except the one
+//! test that checks `GridSource` uses the real clock.
 
 mod common;
 
 use std::os::unix::fs::symlink;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use llama_cast::config::Font;
 use llama_cast::font::Psf2;
@@ -381,4 +383,365 @@ fn a_missing_file_and_a_symlink_do_not_end_the_stream() {
     let text = b"waiting for grid - unreadable";
     let x = (FRAME_WIDTH - text.len() * 8) / 2;
     assert_eq!(pixel(&frame, x, y), NOTICE_GREY);
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn notice_origin(text: &[u8]) -> (usize, usize) {
+    ((FRAME_WIDTH - text.len() * 8) / 2, (FRAME_HEIGHT - 8) / 2)
+}
+
+/// Both calls must return. A blocking open keeps the worker thread, and the
+/// timeout fails the test; the process exit ends that thread.
+fn two_frames(source: GridSource) -> Vec<u8> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first = vec![0_u8; FRAME_BYTES];
+        let mut second = vec![0_u8; FRAME_BYTES];
+        let once = source.frame(&mut first);
+        let again = source.frame(&mut second);
+        let _ = tx.send((once, again, first));
+    });
+    let (once, again, frame) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a fifo blocked the stream");
+    once.expect("frame");
+    again.expect("the stream goes on");
+    frame
+}
+
+#[test]
+fn a_fifo_at_the_grid_path_returns_at_once_with_the_unreadable_notice() {
+    let dir = common::scratch("grid-fifo");
+    let path = dir.join("grid");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success(), "mkfifo");
+    let font = identity();
+    let frame = two_frames(GridSource::new(path, vec![font.clone()], false));
+    // "unreadable" is longer than "refused", so its first pixel sits further left.
+    let (ux, y) = notice_origin(b"waiting for grid - unreadable");
+    let (rx, _) = notice_origin(b"waiting for grid - refused");
+    assert_eq!((ux, y, rx), (844, 536, 856));
+    assert_eq!(
+        pixel(&frame, ux, y),
+        NOTICE_GREY,
+        "a fifo is the unreadable notice"
+    );
+    assert_eq!(pixel(&frame, rx, y), [0, 0, 0]);
+
+    // `/dev/null` reads as empty. Without the fstat, that is "refused".
+    let frame = two_frames(GridSource::new("/dev/null".into(), vec![font], false));
+    assert_eq!(
+        pixel(&frame, ux, y),
+        NOTICE_GREY,
+        "a device is not a regular file"
+    );
+    assert_eq!(pixel(&frame, rx, y), [0, 0, 0]);
+}
+
+#[test]
+fn grid_cap_reads_a_file_at_the_cap_and_refuses_one_byte_over() {
+    let cap = gridfile::file_len(gridfile::MAX_COLS, gridfile::MAX_ROWS);
+    assert_eq!(llama_cast::source::grid_cap(), cap);
+    let dir = common::scratch("grid-cap");
+    let at = dir.join("at");
+    let over = dir.join("over");
+    std::fs::File::create(&at)
+        .unwrap()
+        .set_len(u64::try_from(cap).unwrap())
+        .unwrap();
+    std::fs::File::create(&over)
+        .unwrap()
+        .set_len(u64::try_from(cap + 1).unwrap())
+        .unwrap();
+    let font = identity();
+    let (rx, y) = notice_origin(b"waiting for grid - refused");
+    let (ux, _) = notice_origin(b"waiting for grid - unreadable");
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    GridSource::new(at, vec![font.clone()], false)
+        .frame(&mut frame)
+        .unwrap();
+    assert_eq!(
+        pixel(&frame, rx, y),
+        NOTICE_GREY,
+        "a file at the cap is read"
+    );
+    assert_eq!(pixel(&frame, ux, y), [0, 0, 0]);
+    GridSource::new(over, vec![font], false)
+        .frame(&mut frame)
+        .unwrap();
+    assert_eq!(
+        pixel(&frame, ux, y),
+        NOTICE_GREY,
+        "one byte over the cap is refused"
+    );
+    assert_eq!(pixel(&frame, rx, y), [0, 0, 0]);
+}
+
+fn agrees(bytes: &[u8]) {
+    match (grid::open_bytes(bytes), gridfile::decode(bytes)) {
+        (Ok(view), Ok(image)) => {
+            assert_eq!(view.cols, image.cols);
+            assert_eq!(view.rows, image.rows);
+            assert_eq!(view.unix_ms, image.unix_ms);
+        }
+        (Err(left), Err(right)) => assert_eq!(left, right, "{bytes:?}"),
+        (Ok(view), Err(err)) => panic!("open_bytes accepted {}x{}: {err}", view.cols, view.rows),
+        (Err(err), Ok(image)) => {
+            panic!(
+                "open_bytes refused ({err}) a {}x{} grid",
+                image.cols, image.rows
+            );
+        }
+    }
+}
+
+fn header(cols: u16, rows: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(gridfile::MAGIC);
+    out.extend_from_slice(&cols.to_le_bytes());
+    out.extend_from_slice(&rows.to_le_bytes());
+    out.extend_from_slice(&1_u32.to_le_bytes());
+    out.extend_from_slice(&1_000_u64.to_le_bytes());
+    out
+}
+
+#[test]
+fn open_bytes_accepts_exactly_when_gridfile_decode_does() {
+    let valid = file(2, 2, 1_700, vec![cell('A', RED, BLUE); 4]);
+    for n in 0..=valid.len() {
+        agrees(&valid[..n]);
+    }
+    let mut magic = valid.clone();
+    magic[0] = b'X';
+    agrees(&magic);
+    agrees(&header(0, 1));
+    agrees(&header(1, 0));
+    agrees(&header(0, 0));
+    agrees(&header(1025, 1));
+    agrees(&header(1, 513));
+    agrees(&[0]);
+    let mut short = valid.clone();
+    short.pop();
+    agrees(&short);
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    agrees(&trailing);
+    // The header says 3x1. The body is the four cells of the 2x2 file.
+    let mut lies = header(3, 1);
+    lies.extend_from_slice(&valid[gridfile::HEADER_LEN..]);
+    agrees(&lies);
+}
+
+#[test]
+fn an_age_of_5000_ms_is_fresh_and_5001_ms_is_stale() {
+    assert_eq!(grid::stale_secs(10_000, 15_000), None);
+    assert_eq!(grid::stale_secs(10_000, 15_001), Some(5));
+    let font = identity();
+    let bytes = file(1, 1, 10_000, vec![cell('A', RED, BLUE)]);
+    let frame = paint(&bytes, &font, 15_000, &mut Hold::new());
+    assert_eq!(pixel(&frame, 956, 536), RED, "5000 ms is the cell");
+    let frame = paint(&bytes, &font, 15_001, &mut Hold::new());
+    let mut buf = [0_u8; 64];
+    let n = write_notice(Notice::Stale(5), &mut buf);
+    let text = &buf[..n];
+    assert_eq!(text, b"waiting for grid - no update for 5 s");
+    let (x0, y) = notice_origin(text);
+    let hyphen = text.iter().position(|byte| *byte == b'-').unwrap();
+    assert_eq!(pixel(&frame, x0 + hyphen * 8, y), NOTICE_GREY);
+    assert_ne!(pixel(&frame, 956, 536), RED, "5001 ms is not the cell");
+}
+
+#[test]
+fn a_fresh_grid_file_through_grid_source_uses_the_real_clock() {
+    let dir = common::scratch("grid-clock");
+    let path = dir.join("grid");
+    let font = identity();
+    let now = unix_now_ms();
+    std::fs::write(&path, file(1, 1, now, vec![cell('A', RED, BLUE)])).unwrap();
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    GridSource::new(path.clone(), vec![font.clone()], false)
+        .frame(&mut frame)
+        .unwrap();
+    assert_eq!(
+        pixel(&frame, 956, 536),
+        RED,
+        "a file stamped now has no notice"
+    );
+    std::fs::write(
+        &path,
+        file(1, 1, now.saturating_sub(10_000), vec![cell('A', RED, BLUE)]),
+    )
+    .unwrap();
+    GridSource::new(path, vec![font], false)
+        .frame(&mut frame)
+        .unwrap();
+    assert_ne!(
+        pixel(&frame, 956, 536),
+        RED,
+        "a file stamped ten seconds ago is the notice"
+    );
+}
+
+#[test]
+fn a_smaller_frame_clears_the_pixels_a_larger_grid_painted() {
+    let fonts = vec![
+        psf(128, 12, 24, 0, 0, &[]),
+        psf(128, 12, 22, 0, 0, &[]),
+        psf(128, 10, 18, 0, 0, &[]),
+        psf(128, 9, 18, 0, 0, &[]),
+    ];
+    let dir = common::scratch("grid-resize");
+    let path = dir.join("grid");
+    let now = unix_now_ms();
+    let big = file(213, 60, now, vec![cell('A', RED, RED); 213 * 60]);
+    std::fs::write(&path, &big).unwrap();
+    let source = GridSource::new(path.clone(), fonts, true);
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    source.frame(&mut frame).unwrap();
+    // Inside the 213x60 picture (origin x = 1) and outside the centred 10x3.
+    assert_eq!(pixel(&frame, 100, 100), RED);
+    assert_eq!(
+        pixel(&frame, 0, 0),
+        [0, 0, 0],
+        "the margin is not the sample"
+    );
+    let small = file(10, 3, now, vec![cell('A', BLUE, BLUE); 30]);
+    std::fs::write(&path, small).unwrap();
+    source.frame(&mut frame).unwrap();
+    assert_eq!(pixel(&frame, 100, 100), [0, 0, 0]);
+}
+
+#[test]
+fn the_notice_uses_the_font_index_of_the_last_good_frame() {
+    // 12x24 does not fit 213x60, so the held index is the 9x18. Its top-left
+    // pixel is lit; the 12x24's is not. Forcing the index to 0 leaves (1, 1062) dark.
+    let fonts = vec![
+        psf(128, 12, 24, 0, 0x00, &[]),
+        psf(128, 9, 18, 0, 0x80, &[]),
+    ];
+    let dir = common::scratch("grid-font-index");
+    let path = dir.join("grid");
+    let now = unix_now_ms();
+    std::fs::write(
+        &path,
+        file(213, 60, now, vec![cell('A', RED, BLUE); 213 * 60]),
+    )
+    .unwrap();
+    let source = GridSource::new(path.clone(), fonts, true);
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    source.frame(&mut frame).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    source.frame(&mut frame).unwrap();
+    assert_eq!(pixel(&frame, 1, 1062), NOTICE_GREY);
+}
+
+#[test]
+fn compose_breaks_ties_toward_the_earlier_font_and_accepts_an_exact_fit() {
+    let earlier = psf(128, 8, 8, 0, 0x80, &[]);
+    let later = psf(128, 16, 4, 0, 0x00, &[]);
+    let bytes = file(1, 1, 1_000, vec![cell('A', RED, BLUE)]);
+    let mut frame = vec![0_u8; FRAME_BYTES];
+    compose(
+        GridRead::Data(&bytes),
+        1_000,
+        &[earlier, later],
+        true,
+        &mut Hold::new(),
+        &mut frame,
+    )
+    .unwrap();
+    // 8x8 is centred at (956, 536). The 16x4 is centred at (952, 538), so
+    // this pixel is above that cell.
+    assert_eq!(pixel(&frame, 956, 536), RED);
+
+    let exact = psf(128, 8, 8, 0, 0, &[]);
+    let smaller = psf(128, 8, 4, 0, 0, &[]);
+    // 135 * 8 = 1080, so the 8px font fits exactly. A strict `<` rejects it
+    // and the 4px font, centred lower, leaves y = 0 black.
+    let tall = file(1, 135, 1_000, vec![cell('A', RED, BLUE); 135]);
+    compose(
+        GridRead::Data(&tall),
+        1_000,
+        &[exact, smaller],
+        true,
+        &mut Hold::new(),
+        &mut frame,
+    )
+    .unwrap();
+    let x = (FRAME_WIDTH - 8) / 2;
+    assert_eq!(pixel(&frame, x, 0), BLUE);
+}
+
+#[test]
+fn the_refused_notice_does_not_say_missing() {
+    let mut refused = [0_u8; 64];
+    let mut missing = [0_u8; 64];
+    let rn = write_notice(Notice::Refused, &mut refused);
+    let mn = write_notice(Notice::Missing, &mut missing);
+    assert_eq!(&refused[..rn], b"waiting for grid - refused");
+    assert_eq!(&missing[..mn], b"waiting for grid - missing");
+    assert_ne!(&refused[..rn], &missing[..mn]);
+}
+
+#[test]
+fn an_unshowable_scalar_is_not_drawn_when_the_font_maps_it() {
+    let mut glyphs = vec![0_u8; 16];
+    glyphs[0] = 0xFF;
+    glyphs[8 + 7] = 0x01;
+    let table = [
+        0x1B, 0xFF, // U+001B, not showable
+        0xEF, 0xBF, 0xBD, 0xFF, // U+FFFD
+    ];
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0x864A_B572_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&32_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    bytes.extend_from_slice(&8_u32.to_le_bytes());
+    bytes.extend_from_slice(&glyphs);
+    bytes.extend_from_slice(&table);
+    let font = Psf2::parse(&bytes).unwrap();
+
+    let mut raw = header(1, 1);
+    raw.extend_from_slice(&0x1B_u32.to_le_bytes());
+    raw.extend_from_slice(&RED);
+    raw.extend_from_slice(&BLUE);
+    let frame = paint(&raw, &font, 1_000, &mut Hold::new());
+    let x = (FRAME_WIDTH - 8) / 2;
+    let y = (FRAME_HEIGHT - 8) / 2;
+    assert_eq!(pixel(&frame, x, y), BLUE, "U+001B is not drawn");
+    assert_eq!(pixel(&frame, x + 7, y + 7), RED, "the cell is U+FFFD");
+}
+
+#[test]
+fn a_stale_notice_on_a_tall_grid_uses_the_last_full_row() {
+    let font = psf(128, 8, 7, 0, 0, &[]);
+    // 155 * 7 = 1085. Row 154 starts at y = 1078 and runs past 1080.
+    // Row 153 starts at y = 1071 and ends at 1078.
+    let bytes = file(1, 155, 0, vec![cell('A', RED, BLUE); 155]);
+    let mut hold = Hold::new();
+    let frame = paint(&bytes, &font, 0, &mut hold);
+    let x = (FRAME_WIDTH - 8) / 2;
+    assert_eq!(pixel(&frame, x, 1071), BLUE);
+    assert_eq!(pixel(&frame, x, 1078), BLUE);
+    let frame = paint(&bytes, &font, 5_001, &mut hold);
+    assert_eq!(
+        pixel(&frame, x, 1071),
+        [0, 0, 0],
+        "the last full row is cleared"
+    );
+    assert_eq!(pixel(&frame, x, 1078), BLUE, "a cropped row stays the cell");
 }

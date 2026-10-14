@@ -1,9 +1,13 @@
 //! Every file llama-cast reads besides its config: the tty11 screen, the
 //! grid file (grid mode only), the console font, and the machine id (hashed
 //! into the UDN). Each is opened read-only, `O_NOFOLLOW | O_NOCTTY |
-//! O_CLOEXEC`, and read with a size cap. Also the host name, from `uname(2)`
-//! (no file), for the friendly name. The grid's clock is read here and
-//! passed into `grid::compose`; that function does not read the time.
+//! O_CLOEXEC`, and read with a size cap. The grid is also opened
+//! non-blocking and kept only when `fstat` on that descriptor says it is a
+//! regular file, so a FIFO there cannot stall the stream. vcsa is a
+//! character device and stays on the plain open. Also the host name, from
+//! `uname(2)` (no file), for the friendly name. The grid's clock is read
+//! here and passed into `grid::compose`; that function does not read the
+//! time.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -13,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use llama_core::gridfile;
 use llama_core::palette::Palette;
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 
 use crate::config::Font;
 use crate::font::{MAX_FONT_BYTES, Psf2};
@@ -37,7 +41,31 @@ pub fn read_capped(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let file = File::from(fd);
+    read_limited(File::from(fd), path, cap)
+}
+
+/// The grid file only. Non-blocking, then refused unless `fstat` on the
+/// opened descriptor says it is a regular file. No second path lookup.
+/// Anything else is an error, which the frame path turns into the
+/// unreadable notice. A FIFO opened for reading the ordinary way never
+/// returns.
+fn read_grid(path: &Path) -> io::Result<Vec<u8>> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    let stat = rustix::fs::fstat(&fd)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    read_limited(File::from(fd), path, grid_cap())
+}
+
+fn read_limited(file: File, path: &Path, cap: usize) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
     file.take(limit).read_to_end(&mut out)?;
@@ -117,7 +145,7 @@ impl FrameSource for VcsaSource {
     }
 }
 
-/// Largest grid file `read_capped` will accept: the `gridfile` caps.
+/// Largest grid file the grid reader will accept: the `gridfile` caps.
 #[must_use]
 pub fn grid_cap() -> usize {
     gridfile::file_len(gridfile::MAX_COLS, gridfile::MAX_ROWS)
@@ -156,7 +184,7 @@ impl GridSource {
 impl FrameSource for GridSource {
     fn frame(&self, frame: &mut [u8]) -> io::Result<()> {
         let now = unix_now_ms();
-        let read_result = read_capped(&self.path, grid_cap());
+        let read_result = read_grid(&self.path);
         let read = match &read_result {
             Ok(bytes) => GridRead::Data(bytes),
             Err(err) if err.kind() == io::ErrorKind::NotFound => GridRead::Missing,
@@ -177,7 +205,7 @@ pub enum GridInspect {
 /// Read the grid once. A file that decodes, stale or not, reports its size
 /// and the font that would be used. Anything else is [`GridInspect::Note`].
 pub fn inspect_grid(path: &Path, fonts: &[(Font, Psf2)], auto: bool) -> GridInspect {
-    let bytes = match read_capped(path, grid_cap()) {
+    let bytes = match read_grid(path) {
         Ok(bytes) => bytes,
         Err(err) => return GridInspect::Note(format!("grid {}: {err}", path.display())),
     };
