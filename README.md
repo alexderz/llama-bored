@@ -52,8 +52,15 @@ larger snapshot.
 **Engine.** tty11's header always names the inference engine serving the
 shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
 (a llama.cpp fork is `llama.cpp`); with no model loaded it says
-`engine --`. Its settings are in the SETUP block (below). After `slots`
-and `swap`, a llama-swap build with model claims shows the holder:
+`engine --`. Its settings are in the SETUP block (below). While the shown
+model is llama-swap `starting` or `stopping`, the word is `LOADING` or
+`STOPPING` (yellow on black) and `slots` is `--`. `swap` is `loading M:SS`
+while any model is `starting`, otherwise `stopping M:SS` while any is
+`stopping`, otherwise `none`, counted from when llama-watch first saw that
+state (`H:MM:SS` past an hour; the longest when several models are in it).
+A `ready` header shows that swap, not `none`, while another model is
+starting or stopping. After `slots` and `swap`, a llama-swap build with
+model claims shows the holder:
 `claim eval-runner · in use`, `claim chat-ui · 4:12 left`, or `hold
 operator · until 21:30 · overnight eval, do not unload`. No claim, or a
 llama-swap that never sends one, leaves the header as it is. The LCD

@@ -14,6 +14,7 @@ All notable changes to llama-bored. Versions follow
 ### Fixed
 
 - A short exact-colour run reaches both end stops (#130). Cells of a bar, a rate scale and a chart column are sampled at the ends, so the first cell is the first stop and the last cell of a full run is the top of its scale; before, a cell was sampled at its centre, and a chart column of two to four rows and the last cell of a rate scale stopped short of the stops. A positive-infinite rate is the end of the blackbody tail. The console and `exact_colors = false` are unchanged.
+- tty11's header shows `LOADING` or `STOPPING` (yellow on black) while the shown model is llama-swap `starting` or `stopping`, with `slots --`. `swap` is `loading M:SS` while any model is `starting`, otherwise `stopping M:SS` while any is `stopping` (from when that state was first seen, `H:MM:SS` past an hour; the longest of several), including beside a `ready` header. The stuck mark after a minute of `stopping` stays (#135).
 
 ## 0.5.6 — 2026-10-12
 
