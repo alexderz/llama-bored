@@ -11,7 +11,8 @@
 //!   Kraken's vendor id (1e71), NVML, llama API paths or `https://`; the
 //!   only `/dev` path is `/dev/vcsa11`, in `source.rs`;
 //! - file reads only in `config.rs` (the `--config` argument) and
-//!   `source.rs` (vcsa11, the font, machine-id: read-only, `O_NOFOLLOW`);
+//!   `source.rs` (vcsa11, the grid file, the font, machine-id: read-only,
+//!   `O_NOFOLLOW`);
 //!   no file writes anywhere;
 //! - one process spawn: `Command::new` once, in `encoder.rs`, with
 //!   `env_clear()` and the pinned argument vector (the startup probe and
@@ -47,6 +48,7 @@ const ALLOWED_PATH_LITERALS: &[&str] = &[
     "/etc/machine-id",
     "/usr/local/share/llama-bored",
     "/usr/bin/ffmpeg",
+    "/run/llama-watch-grid/grid",
 ];
 const DEPENDENCIES: &[&str] = &[
     "llama-core",
@@ -97,6 +99,7 @@ fn cast_source_reaches_only_what_it_needs() {
         "dlna.rs",
         "encoder.rs",
         "font.rs",
+        "grid.rs",
         "http.rs",
         "main.rs",
         "render.rs",
@@ -135,7 +138,7 @@ fn cast_source_reaches_only_what_it_needs() {
     for needle in [
         "source::VCSA_PATH",
         "source::MACHINE_ID_PATH",
-        "source::font_path(config.font)",
+        "source::font_path(",
     ] {
         assert!(service.contains(needle), "service.rs must use {needle}");
     }
@@ -146,6 +149,7 @@ fn cast_source_reaches_only_what_it_needs() {
         "OFlags::NOCTTY",
         "MAX_VCSA_BYTES",
         "MAX_FONT_BYTES",
+        "gridfile::file_len",
     ] {
         assert!(source.contains(needle), "source.rs must use {needle}");
     }

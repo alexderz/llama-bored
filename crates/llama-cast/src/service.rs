@@ -13,13 +13,14 @@ use llama_core::log::{self, Priority};
 use rustix::net::{AddressFamily, SocketType, ipproto, sockopt};
 use sd_notify::NotifyState;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Font, Source};
 use crate::discovery::{self, Advert};
 use crate::dlna::Device;
 use crate::encoder::{self, Codec, Encoder, Settings};
+use crate::font::Psf2;
 use crate::http::{self, App, Limits, Live, ServerConfig, Stats};
 use crate::render::FRAME_BYTES;
-use crate::source::{self, FrameSource, VcsaSource};
+use crate::source::{self, FrameSource, GridSource, VcsaSource};
 use crate::ssdp;
 
 /// Exit status for a usage or config error. The unit does not restart on it.
@@ -55,7 +56,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, Str
     }
 }
 
-/// The production stream: ffmpeg fed from tty11.
+/// The production stream: ffmpeg fed from tty11 or the grid file.
 pub struct FfmpegLive {
     pub ffmpeg: PathBuf,
     pub settings: Settings,
@@ -63,6 +64,8 @@ pub struct FfmpegLive {
     /// `Err` refuses the stream without spawning ffmpeg.
     pub codec: Result<Codec, String>,
     pub source: Arc<dyn FrameSource>,
+    /// Named in the error when the first frame cannot be read.
+    pub origin: String,
 }
 
 impl Live for FfmpegLive {
@@ -77,12 +80,12 @@ impl Live for FfmpegLive {
             Ok(codec) => *codec,
             Err(message) => return Err(io::Error::other(message.clone())),
         };
-        // An unreadable tty11 is a 500 with the reason logged, not an
-        // empty 200.
+        // An unreadable picture is a 500 with the reason logged, not an
+        // empty 200. A grid that is missing or stale still returns a frame.
         let mut probe = vec![0_u8; FRAME_BYTES];
         self.source
             .frame(&mut probe)
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", source::VCSA_PATH)))?;
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", self.origin)))?;
         drop(probe);
         let encoder = Encoder::start(&self.ffmpeg, codec, self.settings, Arc::clone(&self.source))?;
         Ok(Box::new(encoder))
@@ -114,7 +117,7 @@ fn summary(config: &Config) -> String {
         .map(ToString::to_string)
         .collect();
     format!(
-        "listen {} allow [{}] interface_addr {} name {:?} title {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} encoder {} font {} palette {}",
+        "listen {} allow [{}] interface_addr {} name {:?} title {:?} fps {} max_clients {} bitrate_kbps {} keyframe_s {} preroll_s {} ffmpeg {} encoder {} source {} font {} palette {}",
         config.listen,
         nets.join(", "),
         config.interface_addr,
@@ -127,9 +130,30 @@ fn summary(config: &Config) -> String {
         config.preroll_s,
         config.ffmpeg.display(),
         config.encoder,
-        config.font.label(),
+        config.source.label(),
+        font_summary(config),
         config.palette.label(),
     )
+}
+
+fn font_summary(config: &Config) -> &'static str {
+    match (config.source, config.font) {
+        (Source::Grid, None) => "auto",
+        (_, Some(font)) => font.label(),
+        (Source::Tty, None) => Font::Hack12x24.label(),
+    }
+}
+
+fn load_fonts(config: &Config) -> Result<Vec<(Font, Psf2)>, (PathBuf, io::Error)> {
+    let mut out = Vec::with_capacity(config.fonts_to_load().len());
+    for font in config.fonts_to_load() {
+        let path = source::font_path(font);
+        match source::load_font(&path) {
+            Ok(psf) => out.push((font, psf)),
+            Err(err) => return Err((path, err)),
+        }
+    }
+    Ok(out)
 }
 
 /// Run a parsed command. Returns the process exit status.
@@ -153,11 +177,13 @@ pub fn execute(command: &Command) -> i32 {
 }
 
 fn check(config: &Config) -> i32 {
-    let font_path = source::font_path(config.font);
-    if let Err(e) = source::load_font(&font_path) {
-        err(&format!("font {}: {e}", font_path.display()));
-        return EXIT_CONFIG;
-    }
+    let fonts = match load_fonts(config) {
+        Ok(fonts) => fonts,
+        Err((path, error)) => {
+            err(&format!("font {}: {error}", path.display()));
+            return EXIT_CONFIG;
+        }
+    };
     let host = match source::machine_udn(Path::new(source::MACHINE_ID_PATH)) {
         Ok(udn) => config::host_label(&source::nodename(), &udn),
         Err(e) => {
@@ -173,6 +199,14 @@ fn check(config: &Config) -> i32 {
         config.base_url(),
         crate::dlna::STREAM_PATH
     );
+    if config.source == Source::Grid {
+        match source::inspect_grid(&config.grid, &fonts, config.font.is_none()) {
+            source::GridInspect::Ready { cols, rows, font } => {
+                println!("grid {cols}x{rows} font {font}");
+            }
+            source::GridInspect::Note(text) => println!("note: {text}"),
+        }
+    }
     match encoder::resolve(&config.ffmpeg, config.encoder) {
         Ok(codec) => {
             println!("encoder: {codec}");
@@ -230,11 +264,10 @@ fn bye(config: &Config) -> i32 {
 }
 
 fn run(config: &Config) -> i32 {
-    let font_path = source::font_path(config.font);
-    let font = match source::load_font(&font_path) {
-        Ok(font) => font,
-        Err(e) => {
-            err(&format!("font {}: {e}", font_path.display()));
+    let fonts = match load_fonts(config) {
+        Ok(fonts) => fonts,
+        Err((path, error)) => {
+            err(&format!("font {}: {error}", path.display()));
             return EXIT_CONFIG;
         }
     };
@@ -245,22 +278,37 @@ fn run(config: &Config) -> i32 {
             return 1;
         }
     };
-    let screen: Arc<dyn FrameSource> = Arc::new(VcsaSource::new(
-        PathBuf::from(source::VCSA_PATH),
-        font,
-        config.palette,
-    ));
-    // A missing or unreadable tty11 is logged, not fatal: each stream
-    // retries, and ends at once while it stays unreadable.
-    let mut probe = vec![0_u8; FRAME_BYTES];
-    if let Err(e) = screen.frame(&mut probe) {
-        log::emit(
-            &mut log::Stderr,
-            Priority::Warning,
-            &format!("{}: {e}", source::VCSA_PATH),
-        );
-    }
-    drop(probe);
+    let (screen, origin): (Arc<dyn FrameSource>, String) = if config.source == Source::Tty {
+        let Some((_, font)) = fonts.into_iter().next() else {
+            err("font: none configured");
+            return EXIT_CONFIG;
+        };
+        let screen: Arc<dyn FrameSource> = Arc::new(VcsaSource::new(
+            PathBuf::from(source::VCSA_PATH),
+            font,
+            config.palette,
+        ));
+        // A missing or unreadable tty11 is logged, not fatal: each stream
+        // retries, and ends at once while it stays unreadable.
+        let mut probe = vec![0_u8; FRAME_BYTES];
+        if let Err(e) = screen.frame(&mut probe) {
+            log::emit(
+                &mut log::Stderr,
+                Priority::Warning,
+                &format!("{}: {e}", source::VCSA_PATH),
+            );
+        }
+        (screen, source::VCSA_PATH.to_owned())
+    } else {
+        // A missing grid is a notice on the picture, not a failed start.
+        let auto = config.font.is_none();
+        let psfs = fonts.into_iter().map(|(_, psf)| psf).collect();
+        let origin = config.grid.display().to_string();
+        (
+            Arc::new(GridSource::new(config.grid.clone(), psfs, auto)),
+            origin,
+        )
+    };
     let listener = match TcpListener::bind(config.listen) {
         Ok(listener) => listener,
         Err(e) => {
@@ -303,7 +351,12 @@ fn run(config: &Config) -> i32 {
     log::emit(
         &mut log::Stderr,
         Priority::Info,
-        &format!("casting tty11 as {:?}: {}", device.name, summary(config)),
+        &format!(
+            "casting {} as {:?}: {}",
+            config.source.label(),
+            device.name,
+            summary(config)
+        ),
     );
     let app = Arc::new(App {
         device,
@@ -312,6 +365,7 @@ fn run(config: &Config) -> i32 {
             settings: config.encode_settings(),
             codec,
             source: screen,
+            origin,
         }),
     });
     let server = ServerConfig {

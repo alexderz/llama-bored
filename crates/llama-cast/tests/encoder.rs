@@ -109,8 +109,10 @@ fn argument_vector_is_pinned() {
     assert_eq!(
         ffmpeg_args(Codec::Libx264, DEFAULTS).join(" "),
         "-hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i - \
+         -vf scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p \
          -c:v libx264 -preset veryfast -tune stillimage,zerolatency -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
          -b:v 4000k -minrate 4000k -maxrate 4000k -bufsize 4000k -x264-params nal-hrd=cbr \
+         -bsf:v h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0 \
          -flush_packets 1 -pat_period 0.1 -f mpegts -"
     );
     // bitrate_kbps = 0: no rate options, x264 is quality-based.
@@ -125,7 +127,9 @@ fn argument_vector_is_pinned() {
         )
         .join(" "),
         "-hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i - \
+         -vf scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p \
          -c:v libx264 -preset veryfast -tune stillimage,zerolatency -pix_fmt yuv420p -r 10 -g 20 -bf 0 \
+         -bsf:v h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0 \
          -flush_packets 1 -pat_period 0.1 -f mpegts -"
     );
     let five = ffmpeg_args(Codec::Libx264, with_fps(5));
@@ -144,10 +148,7 @@ fn argument_vector_is_pinned() {
     assert!(slow.contains(&"20000k".to_owned()));
     // No shell, no file, no network output: input and output are pipes.
     for arg in ffmpeg_args(Codec::Libx264, DEFAULTS) {
-        assert!(
-            !arg.contains('/') && !arg.contains(':') || arg == "-c:v" || arg == "-b:v",
-            "{arg}"
-        );
+        assert!(arg_is_fixed(&arg), "{arg}");
     }
     // The pre-roll: the first frame plus preroll_s seconds of it.
     assert_eq!(DEFAULTS.burst_frames(), 7);
@@ -532,7 +533,24 @@ fn a_pin_is_honoured_and_a_missing_one_names_what_ffmpeg_has() {
 }
 
 const HEAD: &str = "-hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i -";
+const VF_420: &str = "-vf scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p";
+const VF_NV12: &str = "-vf scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=nv12";
+const VF_VAAPI: &str =
+    "-vf scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=nv12,hwupload";
+const BSF: &str = "-bsf:v h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0";
 const TAIL: &str = "-flush_packets 1 -pat_period 0.1 -f mpegts -";
+
+/// No shell and no path. The colour filter and the bitstream tag are the
+/// only arguments that contain a colon besides `-c:v`, `-b:v` and `-bsf:v`.
+fn arg_is_fixed(arg: &str) -> bool {
+    !arg.contains('/')
+        && (!arg.contains(':')
+            || arg == "-c:v"
+            || arg == "-b:v"
+            || arg == "-bsf:v"
+            || arg.starts_with("scale=")
+            || arg.starts_with("h264_metadata="))
+}
 
 fn zero_rate() -> Settings {
     Settings {
@@ -548,76 +566,80 @@ fn each_encoder_has_one_fixed_argument_vector() {
     assert_eq!(
         join(Codec::Libopenh264),
         format!(
-            "{HEAD} -c:v libopenh264 -allow_skip_frames 0 -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
-             -rc_mode bitrate -b:v 4000k -maxrate 4000k {TAIL}"
+            "{HEAD} {VF_420} -c:v libopenh264 -allow_skip_frames 0 -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
+             -rc_mode bitrate -b:v 4000k -maxrate 4000k {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::Libopenh264),
         format!(
-            "{HEAD} -c:v libopenh264 -allow_skip_frames 0 -pix_fmt yuv420p -r 10 -g 10 -bf 0 {TAIL}"
+            "{HEAD} {VF_420} -c:v libopenh264 -allow_skip_frames 0 -pix_fmt yuv420p -r 10 -g 10 -bf 0 {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join(Codec::H264Nvenc),
         format!(
-            "{HEAD} -c:v h264_nvenc -preset p1 -tune ull -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
-             -rc cbr -b:v 4000k -maxrate 4000k -bufsize 4000k {TAIL}"
+            "{HEAD} {VF_420} -c:v h264_nvenc -preset p1 -tune ull -pix_fmt yuv420p -r 10 -g 10 -bf 0 \
+             -rc cbr -b:v 4000k -maxrate 4000k -bufsize 4000k {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::H264Nvenc),
         format!(
-            "{HEAD} -c:v h264_nvenc -preset p1 -tune ull -pix_fmt yuv420p -r 10 -g 10 -bf 0 {TAIL}"
+            "{HEAD} {VF_420} -c:v h264_nvenc -preset p1 -tune ull -pix_fmt yuv420p -r 10 -g 10 -bf 0 {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join(Codec::H264Qsv),
         format!(
-            "{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 \
-             -b:v 4000k -maxrate 4000k -bufsize 4000k {TAIL}"
+            "{HEAD} {VF_NV12} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 \
+             -b:v 4000k -maxrate 4000k -bufsize 4000k {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::H264Qsv),
-        format!("{HEAD} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 {TAIL}")
+        format!(
+            "{HEAD} {VF_NV12} -c:v h264_qsv -preset veryfast -pix_fmt nv12 -r 10 -g 10 -bf 0 {BSF} {TAIL}"
+        )
     );
     let vaapi_head = "-hide_banner -loglevel error -init_hw_device vaapi=cast \
          -filter_hw_device cast -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i -";
     assert_eq!(
         join(Codec::H264Vaapi),
         format!(
-            "{vaapi_head} -vf format=yuv420p,format=nv12,hwupload -c:v h264_vaapi -r 10 -g 10 -bf 0 \
-             -rc_mode CBR -b:v 4000k -maxrate 4000k -bufsize 4000k {TAIL}"
+            "{vaapi_head} {VF_VAAPI} -c:v h264_vaapi -r 10 -g 10 -bf 0 \
+             -rc_mode CBR -b:v 4000k -maxrate 4000k -bufsize 4000k {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::H264Vaapi),
-        format!(
-            "{vaapi_head} -vf format=yuv420p,format=nv12,hwupload -c:v h264_vaapi -r 10 -g 10 -bf 0 {TAIL}"
-        )
+        format!("{vaapi_head} {VF_VAAPI} -c:v h264_vaapi -r 10 -g 10 -bf 0 {BSF} {TAIL}")
     );
     assert_eq!(
         join(Codec::H264Amf),
         format!(
-            "{HEAD} -c:v h264_amf -usage ultralowlatency -quality speed -pix_fmt yuv420p \
-             -r 10 -g 10 -bf 0 -rc cbr -b:v 4000k -maxrate 4000k -bufsize 4000k {TAIL}"
+            "{HEAD} {VF_420} -c:v h264_amf -usage ultralowlatency -quality speed -pix_fmt yuv420p \
+             -r 10 -g 10 -bf 0 -rc cbr -b:v 4000k -maxrate 4000k -bufsize 4000k {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join0(Codec::H264Amf),
         format!(
-            "{HEAD} -c:v h264_amf -usage ultralowlatency -quality speed -pix_fmt yuv420p \
-             -r 10 -g 10 -bf 0 {TAIL}"
+            "{HEAD} {VF_420} -c:v h264_amf -usage ultralowlatency -quality speed -pix_fmt yuv420p \
+             -r 10 -g 10 -bf 0 {BSF} {TAIL}"
         )
     );
     assert_eq!(
         join(Codec::H264V4l2m2m),
-        format!("{HEAD} -c:v h264_v4l2m2m -pix_fmt yuv420p -r 10 -g 10 -bf 0 -b:v 4000k {TAIL}")
+        format!(
+            "{HEAD} {VF_420} -c:v h264_v4l2m2m -pix_fmt yuv420p -r 10 -g 10 -bf 0 -b:v 4000k {BSF} {TAIL}"
+        )
     );
     assert_eq!(
         join0(Codec::H264V4l2m2m),
-        format!("{HEAD} -c:v h264_v4l2m2m -pix_fmt yuv420p -r 10 -g 10 -bf 0 {TAIL}")
+        format!(
+            "{HEAD} {VF_420} -c:v h264_v4l2m2m -pix_fmt yuv420p -r 10 -g 10 -bf 0 {BSF} {TAIL}"
+        )
     );
 
     // Only the numeric settings change between configs. No device path.
@@ -643,12 +665,17 @@ fn each_encoder_has_one_fixed_argument_vector() {
         assert_eq!(args[at + 1], "20", "{codec}");
         assert!(args.contains(&"500k".to_owned()), "{codec}");
         assert!(!args.iter().any(|a| a.contains("4000")), "{codec}");
+        assert!(
+            args.iter().any(|a| a.contains("out_color_matrix=bt709")),
+            "{codec} has no BT.709 conversion"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.contains("colour_primaries=1") && a.contains("video_full_range_flag=0")),
+            "{codec} has no colour tags"
+        );
         for arg in &args {
-            assert!(!arg.contains('/'), "{codec} {arg}");
-            assert!(
-                !arg.contains(':') || arg == "-c:v" || arg == "-b:v",
-                "{codec} {arg}"
-            );
+            assert!(arg_is_fixed(arg), "{codec} {arg}");
         }
     }
 }
@@ -706,6 +733,7 @@ fn a_refused_encoder_does_not_spawn_or_read_a_frame() {
         settings: DEFAULTS,
         codec: Err("ffmpeg has no usable H.264 encoder (H.264 encoders it has: none)".to_owned()),
         source: Arc::new(PanicSource),
+        origin: llama_cast::source::VCSA_PATH.to_owned(),
     };
     assert_eq!(
         live.refused(),
@@ -721,6 +749,7 @@ fn a_refused_encoder_does_not_spawn_or_read_a_frame() {
         settings: DEFAULTS,
         codec: Ok(Codec::Libx264),
         source: Arc::new(PanicSource),
+        origin: llama_cast::source::VCSA_PATH.to_owned(),
     };
     assert!(ready.refused().is_none());
 }

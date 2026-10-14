@@ -443,13 +443,33 @@ impl Settings {
     }
 }
 
+/// RGB24 full range to 4:2:0 limited range, BT.709. ffmpeg 8.1's default
+/// for a 1920x1080 `rgb24` input is BT.601; a 1080p player assumes BT.709,
+/// so every encoder uses this filter and the bitstream is tagged to match.
+/// The filter's output layout is the encoder's pixel format, so a later
+/// `-pix_fmt` does not convert a second time.
+const COLOR_MATRIX: &str = "scale=in_range=pc:out_range=tv:out_color_matrix=bt709";
+/// H.264 VUI: 1 is BT.709, `video_full_range_flag` 0 is limited range.
+/// One bitstream filter, so libx264, libopenh264 and the hardware encoders
+/// all carry the same tags. `-color_primaries` does not land in this MPEG-TS.
+const COLOR_TAG: &str = "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0";
+
+fn color_filter(layout: &str, hwupload: bool) -> String {
+    if hwupload {
+        format!("{COLOR_MATRIX},format={layout},hwupload")
+    } else {
+        format!("{COLOR_MATRIX},format={layout}")
+    }
+}
+
 /// The argument vector after the program name.
 ///
-/// The same stream for every encoder: raw RGB24 in, MPEG-TS out, yuv420p,
+/// The same stream for every encoder: raw RGB24 in, MPEG-TS out, 4:2:0,
 /// no B-frames, GOP from `keyframe_s`, output at [`OUTPUT_FPS`], packets
 /// flushed as they are muxed, PAT/PMT every 100 ms. Each viewer has its
 /// own ffmpeg, so its stream begins with PAT, PMT and an IDR. Only the
 /// numbers from `settings` are interpolated; every other token is fixed.
+/// Colour conversion and tags are the same vector for every encoder.
 ///
 /// With `bitrate_kbps` set, libx264 is CBR with filler (`nal-hrd=cbr`),
 /// so a still dashboard still arrives at that rate. That vector is the
@@ -471,6 +491,12 @@ pub fn ffmpeg_args(codec: Codec, settings: Settings) -> Vec<String> {
     args.extend([
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-r", &fps, "-i", "-",
     ]);
+    let vf = match codec {
+        Codec::H264Vaapi => color_filter("nv12", true),
+        Codec::H264Qsv => color_filter("nv12", false),
+        _ => color_filter("yuv420p", false),
+    };
+    args.extend(["-vf", &vf]);
     match codec {
         Codec::Libx264 => {
             args.extend([
@@ -578,11 +604,10 @@ pub fn ffmpeg_args(codec: Codec, settings: Settings) -> Vec<String> {
             }
         }
         Codec::H264Vaapi => {
-            // yuv420p, then nv12, the 4:2:0 layout the hardware surface
-            // accepts. `-rc_mode CBR` with the buffer equal to the rate.
+            // The filter above ends in nv12 and hwupload: the 4:2:0 layout
+            // the hardware surface accepts. `-rc_mode CBR` with the buffer
+            // equal to the rate.
             args.extend([
-                "-vf",
-                "format=yuv420p,format=nv12,hwupload",
                 "-c:v",
                 "h264_vaapi",
                 "-r",
@@ -640,6 +665,8 @@ pub fn ffmpeg_args(codec: Codec, settings: Settings) -> Vec<String> {
         }
     }
     args.extend([
+        "-bsf:v",
+        COLOR_TAG,
         "-flush_packets",
         "1",
         "-pat_period",

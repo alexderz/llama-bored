@@ -1,17 +1,23 @@
 //! Every file llama-cast reads besides its config: the tty11 screen, the
-//! console font, and the machine id (hashed into the UDN). Each is opened
-//! read-only, `O_NOFOLLOW | O_NOCTTY | O_CLOEXEC`, and read with a size cap.
-//! Also the host name, from `uname(2)` (no file), for the friendly name.
+//! grid file (grid mode only), the console font, and the machine id (hashed
+//! into the UDN). Each is opened read-only, `O_NOFOLLOW | O_NOCTTY |
+//! O_CLOEXEC`, and read with a size cap. Also the host name, from `uname(2)`
+//! (no file), for the friendly name. The grid's clock is read here and
+//! passed into `grid::compose`; that function does not read the time.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use llama_core::gridfile;
 use llama_core::palette::Palette;
 use rustix::fs::{Mode, OFlags};
 
 use crate::config::Font;
 use crate::font::{MAX_FONT_BYTES, Psf2};
+use crate::grid::{self, GridRead, Hold};
 use crate::render::{self, MAX_VCSA_BYTES, Screen};
 
 /// tty11's screen and attributes (`root:llama-view 0640`, udev rule
@@ -108,5 +114,99 @@ impl FrameSource for VcsaSource {
             Screen::parse(&bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         render::render_into(&screen, &self.font, self.palette, frame);
         Ok(())
+    }
+}
+
+/// Largest grid file `read_capped` will accept: the `gridfile` caps.
+#[must_use]
+pub fn grid_cap() -> usize {
+    gridfile::file_len(gridfile::MAX_COLS, gridfile::MAX_ROWS)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The grid file, painted with one or more console fonts. `auto` picks a
+/// font from the file's size on each fresh frame. A bad file returns `Ok`
+/// and the picture carries a notice, so the stream keeps going.
+pub struct GridSource {
+    path: PathBuf,
+    fonts: Vec<Psf2>,
+    auto: bool,
+    hold: Mutex<Hold>,
+}
+
+impl GridSource {
+    #[must_use]
+    pub fn new(path: PathBuf, fonts: Vec<Psf2>, auto: bool) -> Self {
+        Self {
+            path,
+            fonts,
+            auto,
+            hold: Mutex::new(Hold::new()),
+        }
+    }
+}
+
+impl FrameSource for GridSource {
+    fn frame(&self, frame: &mut [u8]) -> io::Result<()> {
+        let now = unix_now_ms();
+        let read_result = read_capped(&self.path, grid_cap());
+        let read = match &read_result {
+            Ok(bytes) => GridRead::Data(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => GridRead::Missing,
+            Err(_) => GridRead::Unreadable,
+        };
+        let mut hold = self.hold.lock().unwrap_or_else(|err| err.into_inner());
+        grid::compose(read, now, &self.fonts, self.auto, &mut hold, frame)
+    }
+}
+
+/// What `check` says about a grid file. An unreadable file is a note, not
+/// a failed config: llama-watch may be down while `cast.toml` is fine.
+pub enum GridInspect {
+    Ready { cols: u16, rows: u16, font: String },
+    Note(String),
+}
+
+/// Read the grid once. A file that decodes, stale or not, reports its size
+/// and the font that would be used. Anything else is [`GridInspect::Note`].
+pub fn inspect_grid(path: &Path, fonts: &[(Font, Psf2)], auto: bool) -> GridInspect {
+    let bytes = match read_capped(path, grid_cap()) {
+        Ok(bytes) => bytes,
+        Err(err) => return GridInspect::Note(format!("grid {}: {err}", path.display())),
+    };
+    let view = match grid::open_bytes(&bytes) {
+        Ok(view) => view,
+        Err(err) => return GridInspect::Note(format!("grid {}: {err}", path.display())),
+    };
+    let index = if auto {
+        let kinds: Vec<Font> = fonts.iter().map(|(font, _)| *font).collect();
+        let picked = grid::pick_font(&kinds, view.cols, view.rows);
+        fonts
+            .iter()
+            .position(|(font, _)| *font == picked)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let label = fonts
+        .get(index)
+        .map(|(font, _)| font.label())
+        .unwrap_or("12x24");
+    let font = if auto {
+        format!("auto ({label})")
+    } else {
+        label.to_owned()
+    };
+    GridInspect::Ready {
+        cols: view.cols,
+        rows: view.rows,
+        font,
     }
 }
