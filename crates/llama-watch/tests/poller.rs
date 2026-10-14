@@ -2863,16 +2863,41 @@ sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n",
     .into_bytes()
 }
 
-/// This second, as llama-swap writes an activity timestamp.
-fn sglang_stamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_secs() as i64;
+/// `sec`, as llama-swap writes an activity timestamp.
+fn sglang_stamp_at(sec: i64) -> String {
     format!(
         "{}Z",
-        llama_watch::localtime::format_local(now, llama_watch::localtime::Zone::utc())
+        llama_watch::localtime::format_local(sec, llama_watch::localtime::Zone::utc())
     )
+}
+
+/// The unix second once the clock is 50 ms past it, and the second is at
+/// least `earliest`. Row stamps are whole seconds. Posting in the last
+/// fraction of a second lets the scrape that sees the finish land in the
+/// next second and overlap the following row's window.
+fn wait_row_second(earliest: i64) -> i64 {
+    let phase_ms = 50u64;
+    let slack_ms = 100u64;
+    loop {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
+        let sec = now.as_secs() as i64;
+        let frac = now.subsec_millis() as u64;
+        if sec >= earliest && (phase_ms..phase_ms + slack_ms).contains(&frac) {
+            return sec;
+        }
+        let target_sec = if sec < earliest {
+            earliest
+        } else if frac < phase_ms {
+            sec
+        } else {
+            sec + 1
+        };
+        let now_ms = now.as_secs() * 1_000 + frac;
+        let target_ms = (target_sec as u64) * 1_000 + phase_ms;
+        thread::sleep(Duration::from_millis(
+            target_ms.saturating_sub(now_ms).max(1),
+        ));
+    }
 }
 
 /// One activity page. `cache`, `prompt` and `gen_rate` are llama-swap's
@@ -2928,11 +2953,15 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     });
     // Idle scrapes, so the watcher's start is outside the first row's
     // isolation window. A row is filled only after a scrape stamped
-    // more than six seconds past its end.
+    // more than six seconds past its end. Each request starts just after
+    // a second boundary. The next row is eight seconds later, so its
+    // window opens at the previous second plus three: a finish scrape
+    // that slips into the following second stays a second clear of it.
     thread::sleep(Duration::from_secs(6));
+    let sec1 = wait_row_second(0);
 
     // Prompt 1,000 (600 cached), TTFT 2 s, 401 generated, e2e 10 s.
-    let stamp1 = sglang_stamp();
+    let stamp1 = sglang_stamp_at(sec1);
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
@@ -2955,13 +2984,13 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     assert!((row.engine_gen_tps.expect("gen") - 50.0).abs() < 1e-6);
     assert_eq!((row.prompt_tps, row.gen_tps), (None, None));
 
-    // A second request, only after the first row is decided, so this
-    // finish sits outside that row's window. The row already has a cached
-    // count and a prompt rate. The window is clean (prompt 500, cached
-    // 300, TTFT 2 s, 100 generated, e2e 4 s). Those reported values stay.
-    // The generation rate was not reported, so it is filled:
-    // (100 − 1) / (4 − 2) = 49.5.
-    let stamp2 = sglang_stamp();
+    // A second request, only after the first row is decided and a second
+    // clear of that finish. The row already has a cached count and a
+    // prompt rate. The window is clean (prompt 500, cached 300, TTFT 2 s,
+    // 100 generated, e2e 4 s). Those reported values stay. The generation
+    // rate was not reported, so it is filled: (100 − 1) / (4 − 2) = 49.5.
+    let sec2 = wait_row_second(sec1 + 8);
+    let stamp2 = sglang_stamp_at(sec2);
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
@@ -2994,6 +3023,10 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
 
     // A rate was reported and the cached count was not, after the second
     // row is decided. The count is filled (100); the prompt rate stays 8.
+    // The stamp is chosen before the update: sleeping while that closure
+    // holds the server lock stalls a metrics read, and a read over two
+    // seconds is treated as a model load and not scraped again.
+    let stamp3 = sglang_stamp_at(wait_row_second(sec2 + 8));
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
@@ -3005,7 +3038,7 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
                 (2, 500, 100, 0, 12.5, -1.0, 4_000),
                 (1, 1_000, 401, -1, -1.0, -1.0, 10_000),
             ],
-            &[sglang_stamp(), stamp2, stamp1],
+            &[stamp3, stamp2, stamp1],
         );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(12), |_, detail| {
