@@ -1,7 +1,8 @@
 //! `cast.toml`: where to listen, who may connect, how SSDP announces the
 //! server, and how the stream is encoded. The screen (`/dev/vcsa11`), the
 //! machine id and the font directory are compile-time constants in
-//! `source.rs`; the config file itself is the CLI argument.
+//! `source.rs`. The grid path defaults here and is opened only in grid
+//! mode. The config file itself is the CLI argument.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -54,10 +55,35 @@ pub const MAX_PREROLL_S: u32 = 10;
 pub const DEFAULT_FFMPEG: &str = "/usr/bin/ffmpeg";
 /// Default H.264 encoder: pick from what that binary offers.
 pub const DEFAULT_ENCODER: &str = "auto";
-/// Longest `ffmpeg` path.
+/// Longest `ffmpeg` or `grid` path.
 pub const MAX_PATH_BYTES: usize = 255;
+/// The grid file llama-view reads. Used when `source` is `grid` and `grid`
+/// is omitted. Not opened in tty mode.
+pub const DEFAULT_GRID: &str = "/run/llama-watch-grid/grid";
 
-/// The console font tty11 uses. Must match `[tty] font` in watch.toml.
+/// Where the picture comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Source {
+    /// `/dev/vcsa11`, today's path.
+    Tty,
+    /// The grid file, one RGB pair per cell.
+    Grid,
+}
+
+impl Source {
+    /// The `source` value as written in the config.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tty => "tty",
+            Self::Grid => "grid",
+        }
+    }
+}
+
+/// A shipped console font. In tty mode this must match `[tty] font` in
+/// watch.toml. `9x18` is for the cast's grid only; llama-watch does not
+/// load it onto tty11.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 pub enum Font {
     #[default]
@@ -67,9 +93,19 @@ pub enum Font {
     Hack12x22,
     #[serde(rename = "10x18")]
     Hack10x18,
+    #[serde(rename = "9x18")]
+    Hack9x18,
 }
 
 impl Font {
+    /// Every font the cast ships, largest cell first.
+    pub const SHIPPED: [Self; 4] = [
+        Self::Hack12x24,
+        Self::Hack12x22,
+        Self::Hack10x18,
+        Self::Hack9x18,
+    ];
+
     /// The file name under the installed font directory.
     #[must_use]
     pub fn file_name(self) -> &'static str {
@@ -77,6 +113,7 @@ impl Font {
             Self::Hack12x24 => "llama-hack-12x24.psfu",
             Self::Hack12x22 => "llama-hack-12x22.psfu",
             Self::Hack10x18 => "llama-hack-10x18.psfu",
+            Self::Hack9x18 => "llama-hack-9x18.psfu",
         }
     }
 
@@ -87,6 +124,18 @@ impl Font {
             Self::Hack12x24 => "12x24",
             Self::Hack12x22 => "12x22",
             Self::Hack10x18 => "10x18",
+            Self::Hack9x18 => "9x18",
+        }
+    }
+
+    /// Glyph cell, in pixels. The PSF files are built to these sizes.
+    #[must_use]
+    pub fn cell_size(self) -> (usize, usize) {
+        match self {
+            Self::Hack12x24 => (12, 24),
+            Self::Hack12x22 => (12, 22),
+            Self::Hack10x18 => (10, 18),
+            Self::Hack9x18 => (9, 18),
         }
     }
 }
@@ -134,6 +183,10 @@ pub enum ConfigError {
     Preroll,
     #[error("ffmpeg must be an absolute, normalised path of at most 255 bytes")]
     Ffmpeg,
+    #[error("source must be \"tty\" or \"grid\"")]
+    Source,
+    #[error("grid must be an absolute, normalised path of at most 255 bytes")]
+    Grid,
     #[error(
         "encoder must be \"auto\", \"libx264\", \"libopenh264\", \"h264_nvenc\", \"h264_qsv\", \"h264_vaapi\", \"h264_amf\" or \"h264_v4l2m2m\""
     )]
@@ -164,8 +217,15 @@ struct Raw {
     ffmpeg: String,
     #[serde(default = "default_encoder")]
     encoder: String,
+    #[serde(default = "default_source")]
+    source: String,
+    /// Present in either mode. Validated when set; opened only for `grid`.
     #[serde(default)]
-    font: Font,
+    grid: Option<String>,
+    /// Absent in tty mode means [`Font::Hack12x24`]. Absent in grid mode
+    /// means pick a shipped font from the grid's size.
+    #[serde(default)]
+    font: Option<Font>,
     #[serde(default)]
     palette: Palette,
 }
@@ -206,6 +266,10 @@ fn default_encoder() -> String {
     DEFAULT_ENCODER.to_owned()
 }
 
+fn default_source() -> String {
+    "tty".to_owned()
+}
+
 /// A validated config.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -234,9 +298,16 @@ pub struct Config {
     pub ffmpeg: PathBuf,
     /// Which H.264 encoder to ask that binary for. `auto` probes it.
     pub encoder: EncoderChoice,
-    /// The tty11 console font.
-    pub font: Font,
+    /// Tty11, or the grid file.
+    pub source: Source,
+    /// Absolute grid path. The default is [`DEFAULT_GRID`]. Opened only when
+    /// [`Self::source`] is [`Source::Grid`].
+    pub grid: PathBuf,
+    /// `None` in tty mode is [`Font::Hack12x24`]. `None` in grid mode picks
+    /// a shipped font per frame size.
+    pub font: Option<Font>,
     /// The colours tty11 shows; must match `[tty] palette` in watch.toml.
+    /// Ignored in grid mode: the file carries RGB.
     pub palette: Palette,
 }
 
@@ -293,6 +364,20 @@ impl Config {
         let Some(encoder) = parse_choice(&raw.encoder) else {
             return Err(ConfigError::Encoder);
         };
+        let source = match raw.source.as_str() {
+            "tty" => Source::Tty,
+            "grid" => Source::Grid,
+            _ => return Err(ConfigError::Source),
+        };
+        let grid = match raw.grid {
+            Some(text) => {
+                if !clean_absolute(&text) || text.len() > MAX_PATH_BYTES {
+                    return Err(ConfigError::Grid);
+                }
+                PathBuf::from(text)
+            }
+            None => PathBuf::from(DEFAULT_GRID),
+        };
         Ok(Self {
             listen,
             allow: Allowlist::new(nets),
@@ -306,9 +391,28 @@ impl Config {
             preroll_s: raw.preroll_s,
             ffmpeg,
             encoder,
+            source,
+            grid,
             font: raw.font,
             palette: raw.palette,
         })
+    }
+
+    /// The font tty mode loads. An omitted `font` is 12x24.
+    #[must_use]
+    pub fn tty_font(&self) -> Font {
+        self.font.unwrap_or(Font::Hack12x24)
+    }
+
+    /// Fonts to load at start. Grid mode with no `font` loads every shipped
+    /// font once; the frame path then picks among them.
+    #[must_use]
+    pub fn fonts_to_load(&self) -> Vec<Font> {
+        match (self.source, self.font) {
+            (Source::Grid, None) => Font::SHIPPED.to_vec(),
+            (Source::Tty, None) => vec![Font::Hack12x24],
+            (_, Some(font)) => vec![font],
+        }
     }
 
     /// Read `path` (the `--config` argument), capped at 64 KiB, and validate.

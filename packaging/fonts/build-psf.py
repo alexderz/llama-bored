@@ -6,8 +6,9 @@ Usage:
   build-psf.py --check TTF WxH OUT  rebuild in memory, compare with OUT byte
                                     for byte, exit 1 on any difference
   build-psf.py --self-test          rebuild llama-hack-12x24.psfu,
-                                    llama-hack-12x22.psfu and
-                                    llama-hack-10x18.psfu from Hack Regular
+                                    llama-hack-12x22.psfu,
+                                    llama-hack-10x18.psfu and
+                                    llama-hack-9x18.psfu from Hack Regular
                                     and compare each; skip (exit 0 with a
                                     note) when Pillow or the TTF is absent
 
@@ -22,11 +23,16 @@ The committed fonts are built with:
   packaging/fonts/build-psf.py \\
     /usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf 10x18 \\
     packaging/fonts/llama-hack-10x18.psfu
+  packaging/fonts/build-psf.py \\
+    /usr/share/fonts/source-foundry-hack-fonts/Hack-Regular.ttf 9x18 \\
+    packaging/fonts/llama-hack-9x18.psfu
 
 12x22 is `[tty] font = "12x22"`: two more rows on a 1080-line screen
 (160x49 at 1920x1080 instead of 160x45). 10x18 is `[tty] font = "10x18"`
 (#73): Hack at 15 px for a 1080p screen viewed up close, 192x60 at
 1920x1080. 10x18 was added 2026-10-07 with the same reference inputs.
+9x18 is the cast's grid font for a 213x60 grid (1917x1080). It is not a
+`[tty] font` value: tty11 is not switched to it.
 
 Reference inputs (2026-09-25): Hack 3.003
 (source-foundry-hack-fonts-3.003-7.fc44), Pillow 12.3.0, FreeType 2.14.3.
@@ -70,6 +76,7 @@ SELF_TEST_FONTS = (
     ((12, 24), os.path.join(HERE, "llama-hack-12x24.psfu")),
     ((12, 22), os.path.join(HERE, "llama-hack-12x22.psfu")),
     ((10, 18), os.path.join(HERE, "llama-hack-10x18.psfu")),
+    ((9, 18), os.path.join(HERE, "llama-hack-9x18.psfu")),
 )
 
 

@@ -5,7 +5,9 @@ mod common;
 use std::net::Ipv4Addr;
 
 use llama_cast::acl::CidrError;
-use llama_cast::config::{Config, ConfigError, Font, Palette, expand, host_label};
+use llama_cast::config::{
+    Config, ConfigError, DEFAULT_GRID, Font, Palette, Source, expand, host_label,
+};
 use llama_cast::encoder::{Codec, EncoderChoice, Settings};
 use llama_cast::service::{Command, parse_args};
 
@@ -41,7 +43,8 @@ fn the_documented_config_parses() {
     assert_eq!(cfg.max_clients, 2);
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
     assert_eq!(cfg.encoder, EncoderChoice::Auto);
-    assert_eq!(cfg.font, Font::Hack12x24);
+    assert_eq!(cfg.source, Source::Tty);
+    assert_eq!(cfg.font, Some(Font::Hack12x24));
     assert_eq!(cfg.palette, Palette::Llama);
     assert_eq!(cfg.base_url(), "http://192.168.1.20:19478");
 }
@@ -70,8 +73,11 @@ fn defaults_fill_everything_but_listen_and_allow() {
     );
     assert_eq!(cfg.ffmpeg.to_str(), Some("/usr/bin/ffmpeg"));
     assert_eq!(cfg.encoder, EncoderChoice::Auto);
-    assert_eq!(cfg.font, Font::Hack12x24);
-    assert_eq!(cfg.font.file_name(), "llama-hack-12x24.psfu");
+    assert_eq!(cfg.source, Source::Tty);
+    assert!(cfg.font.is_none(), "an omitted font stays unset");
+    assert_eq!(cfg.tty_font(), Font::Hack12x24);
+    assert_eq!(cfg.tty_font().file_name(), "llama-hack-12x24.psfu");
+    assert_eq!(cfg.grid.to_str(), Some(DEFAULT_GRID));
     assert_eq!(
         cfg.palette,
         Palette::Llama,
@@ -275,9 +281,9 @@ fn name_fps_clients_font_and_ffmpeg_bounds() {
     assert!(with("max_clients = 2", "max_clients = 4").is_ok());
     assert_eq!(
         with("\"12x24\"", "\"12x22\"").unwrap().font,
-        Font::Hack12x22
+        Some(Font::Hack12x22)
     );
-    let ten = with("\"12x24\"", "\"10x18\"").unwrap().font;
+    let ten = with("\"12x24\"", "\"10x18\"").unwrap().font.unwrap();
     assert_eq!(ten, Font::Hack10x18);
     assert_eq!(ten.file_name(), "llama-hack-10x18.psfu");
     assert_eq!(ten.label(), "10x18");
@@ -455,4 +461,70 @@ fn cli_is_run_check_or_bye_with_a_config() {
     ] {
         assert!(args(bad).is_err(), "{bad:?}");
     }
+}
+
+/// #137: `source` and `grid`. An omitted font is 12x24 on tty and auto on
+/// the grid. A set `grid` is checked in both modes; tty does not open it.
+#[test]
+fn source_and_grid_keys() {
+    let bare = GOOD.replace("font = \"12x24\"\n", "");
+    let tty = Config::from_toml(&bare).unwrap();
+    assert_eq!(tty.source, Source::Tty);
+    assert!(tty.font.is_none());
+    assert_eq!(tty.tty_font(), Font::Hack12x24);
+    assert_eq!(tty.fonts_to_load(), vec![Font::Hack12x24]);
+    assert_eq!(tty.grid.to_str(), Some(DEFAULT_GRID));
+
+    let grid = Config::from_toml(&format!("{bare}source = \"grid\"\n")).unwrap();
+    assert_eq!(grid.source, Source::Grid);
+    assert!(grid.font.is_none());
+    assert_eq!(grid.fonts_to_load(), Font::SHIPPED.to_vec());
+    assert_eq!(grid.palette, Palette::Llama, "palette is kept, and unused");
+
+    let pinned = Config::from_toml(&format!("{bare}source = \"grid\"\nfont = \"9x18\"\n")).unwrap();
+    assert_eq!(pinned.font, Some(Font::Hack9x18));
+    assert_eq!(pinned.font.unwrap().file_name(), "llama-hack-9x18.psfu");
+    assert_eq!(pinned.fonts_to_load(), vec![Font::Hack9x18]);
+    let nine = with("\"12x24\"", "\"9x18\"").unwrap();
+    assert_eq!(nine.source, Source::Tty);
+    assert_eq!(nine.font, Some(Font::Hack9x18));
+
+    let coloured = Config::from_toml(&format!(
+        "{}source = \"grid\"\n",
+        bare.replace("palette = \"llama\"", "palette = \"vga\"")
+    ))
+    .unwrap();
+    assert_eq!(coloured.palette, Palette::Vga);
+
+    for bad in ["vcsa", "TTY", "grid ", ""] {
+        let err = Config::from_toml(&format!("{bare}source = \"{bad}\"\n"));
+        assert!(matches!(err, Err(ConfigError::Source)), "{bad}: {err:?}");
+    }
+    for bad in [
+        "grid",
+        "./grid",
+        "/run/../grid",
+        "/run/./grid",
+        "/run//grid",
+        "/",
+        "",
+    ] {
+        let err = Config::from_toml(&format!("{bare}grid = \"{bad}\"\n"));
+        assert!(matches!(err, Err(ConfigError::Grid)), "{bad}: {err:?}");
+    }
+    let err = Config::from_toml(&format!("{bare}grid = \"/tmp/a\\nb\"\n"));
+    assert!(matches!(err, Err(ConfigError::Grid)), "{err:?}");
+    let too_long = format!("/{}", "a".repeat(255));
+    let err = Config::from_toml(&format!("{bare}grid = \"{too_long}\"\n"));
+    assert!(matches!(err, Err(ConfigError::Grid)), "256 bytes");
+    let fits = format!("/{}", "a".repeat(254));
+    let cfg = Config::from_toml(&format!("{bare}grid = \"{fits}\"\n")).unwrap();
+    assert_eq!(
+        cfg.source,
+        Source::Tty,
+        "a grid path in tty mode is not a source"
+    );
+    assert_eq!(cfg.grid.to_str(), Some(fits.as_str()));
+    let err = Config::from_toml(&format!("{bare}source_mode = \"grid\"\n"));
+    assert!(matches!(err, Err(ConfigError::Parse(_))), "{err:?}");
 }
