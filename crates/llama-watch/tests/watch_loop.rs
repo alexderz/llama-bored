@@ -409,6 +409,48 @@ fn tick_loop_keeps_a_chart_ring_from_the_decoded_counter() {
 }
 
 #[test]
+fn tick_loop_spreads_a_decoded_step_over_the_poll_arrival() {
+    // Ticks every 0.1 s; a new view every 0.3 s; the counter rises on every
+    // second poll. The 40-token step first seen at t = 2.1 s covers (1.8 s, 2.1 s]
+    // and splits 2:1 across the 2 s boundary only when ingest uses the view's
+    // arrival instant. Updating llama_at every tick dumps that step into column 1.
+    let fx = Fixture::new("chart-poll-at");
+    let models = Arc::new(Mutex::new(Vec::new()));
+    let mut feed = Sparse {
+        items: VecDeque::new(),
+        every: 3,
+        wait: 0,
+        gave: false,
+    };
+    for n in [0_u64, 40, 40, 80, 80, 120, 120, 160] {
+        let mut view = view_named("beta");
+        view.decoded_total = Some(n);
+        feed.items.push_back((view, empty_detail()));
+    }
+    fx.drive(
+        feed,
+        fx.collector(),
+        OkPublish,
+        RecRender {
+            models: Arc::clone(&models),
+        },
+        RecNotify::default(),
+        StopAfter::new(22),
+        MemLog::new(),
+    );
+    let models = models.lock().expect("models").clone();
+    assert_eq!(models.len(), 22);
+    let last = &models[21].chart;
+    assert_eq!(last.len(), 2, "{last:?}");
+    let col0 = last[0].gen_tps.expect("column 0");
+    let col1 = last[1].gen_tps.expect("column 1");
+    assert!(
+        (col0 - 220.0 / 3.0).abs() < 0.01 && (col1 - 20.0 / 3.0).abs() < 0.01,
+        "poll-arrival split of (1.8 s, 2.1 s], got {last:?}"
+    );
+}
+
+#[test]
 fn the_layout_receives_the_configured_rate_ceilings() {
     let fx = Fixture::new("ceilings");
     let models = Arc::new(Mutex::new(Vec::new()));
@@ -1245,6 +1287,30 @@ impl LlamaFeed for Paced {
         let item = self.items.pop_front()?;
         self.hold = true;
         Some(item)
+    }
+}
+
+/// One view every `every` ticks; idle ticks return nothing.
+struct Sparse {
+    items: VecDeque<(LlamaView, LlamaDetail)>,
+    every: u32,
+    wait: u32,
+    gave: bool,
+}
+
+impl LlamaFeed for Sparse {
+    fn poll(&mut self) -> Option<(LlamaView, LlamaDetail)> {
+        if self.gave {
+            self.gave = false;
+            return None;
+        }
+        if self.wait > 0 {
+            self.wait -= 1;
+            return None;
+        }
+        self.wait = self.every.saturating_sub(1);
+        self.gave = true;
+        self.items.pop_front()
     }
 }
 
