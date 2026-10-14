@@ -134,16 +134,16 @@ impl TokenChart {
         if self.last_at == Some(at) {
             return;
         }
-        if let (Some(prev_count), Some(prev_at)) = (self.last_decoded, self.last_at) {
-            if count >= prev_count {
-                // A poll held across a rollover already filled later columns
-                // as measured zero. The step is news about `(prev_at, start]`.
-                let end = match self.start {
-                    Some(start) if !rolled && prev_at < start && at > start => start,
-                    _ => at,
-                };
-                self.credit(prev_at, end, (count - prev_count) as f64);
-            }
+        if let (Some(prev_count), Some(prev_at)) = (self.last_decoded, self.last_at)
+            && count >= prev_count
+        {
+            // A poll held across a rollover already filled later columns
+            // as measured zero. The step is news about `(prev_at, start]`.
+            let end = match self.start {
+                Some(start) if !rolled && prev_at < start && at > start => start,
+                _ => at,
+            };
+            self.credit(prev_at, end, (count - prev_count) as f64);
         }
         self.last_decoded = Some(count);
         self.last_at = Some(at);
