@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.6.0 — 2026-10-14
+
+The TV stream in exact colour from the grid file, model claims and a job view on the dashboard, a GPU BUSY header for work outside llama-swap, and cached tokens and rates on SGLang rows.
+
 ### Added
 
 - llama-cast can take its picture from the grid file (`source = "grid"`, default path `/run/llama-watch-grid/grid`) and draw each cell in that cell's RGB. `font` may be omitted in that mode; the cast then picks the largest shipped font that fits the grid in 1920x1080, or the smallest when none fits. `llama-hack-9x18.psfu` is that smallest font, so a 213x60 grid fills 1917x1080. A missing, unreadable, refused or stale grid keeps the last good frame and draws a one-line notice. Tty mode is unchanged apart from the colour tags below (#137).
