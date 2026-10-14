@@ -839,6 +839,13 @@ idle_color = "#101830"
 ```
 
 With no `[[light]]` entries every fan shows activity on the LCD's colour ramp.
+
+`packaging/light.example.toml` lists every target: `aura.fans`,
+`aura.chain[N]`, `aura.chain[A..B]`, `aura.chain[A..=B]`, `aura.chain[B..A]`,
+`aura.chain[B..=A]`, `keyboard.all`, `keyboard.keys["F1".."F12"]`, a key name
+such as `"Number Pad +"`, and `led:N`. `aura.chain[4..2]` is fans 2 and 3 from
+the far end, the last LED of fan 3 back to the first LED of fan 2, so two
+strips mounted end to end grow toward the point where they meet.
 **Mirrored vs chained:** on a splitter every fan receives the same data, so
 all fans always show the same thing. Per-fan metrics (`aura.chain[N]`) need
 the fans daisy-chained on one data line (fan N is LEDs `N × leds_per_fan` on).
@@ -1122,18 +1129,6 @@ redraw, and the unit's stop step (`llama-watch tty-reset`) puts the kernel's
 colours back (`ESC ] R`), so a later login on tty11 is unaffected. Other
 consoles are never touched. Set `palette` in `cast.toml` to the same value;
 llama-view takes `--palette` (default `llama`).
-
-**Case RGB** (`light.toml`). With `fans = "chain"`, one `[[light]]` target
-names a run of fans:
-
-- `aura.chain[2]` is fan 2.
-- `aura.chain[0..2]` is fans 0 and 1 as one span (`aura.chain[0..=1]` is
-  those same fans).
-- `aura.chain[4..2]` is fans 2 and 3 from the far end: the last LED of fan
-  3 back to the first LED of fan 2. `aura.chain[4..=2]` includes fan 4.
-
-Two strips mounted end to end grow toward the point where they meet.
-`packaging/light.example.toml` lists every target.
 
 ## Watch tty11 over SSH or in tmux
 
