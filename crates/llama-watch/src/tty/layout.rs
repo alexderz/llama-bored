@@ -206,8 +206,8 @@ pub struct TtyModel {
     pub model_loading: bool,
     /// The header model is llama-swap `stopping`: the state word is `STOPPING`.
     pub model_stopping: bool,
-    /// A compute process outside llama-swap holds at least 256 MiB, no model
-    /// is listed, and no job view is up: the state word is `GPU BUSY`.
+    /// llama-swap has answered and lists no model, no job view is up, and a
+    /// compute process holds at least 256 MiB: the state word is `GPU BUSY`.
     /// The rest of the frame stays on [`Self::state`].
     pub gpu_busy: bool,
     pub slots_line: String,
