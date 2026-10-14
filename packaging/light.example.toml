@@ -54,6 +54,7 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #   target      "aura.fans"                 every fan (default)
 #               "aura.chain[2]"             one fan on a daisy chain (fans = "chain")
 #               "aura.chain[0..2]"          fans 0 and 1 as one span ("0..=1" also works)
+#               "aura.chain[4..2]"          fans 2 and 3 from the far end ("4..=2" is fans 2, 3 and 4)
 #               'keyboard.keys["F1".."F12"]' keys F1 to F12 as one span, left to right
 #               'keyboard.keys["W","A","S","D"]' these keys as one span, in this order
 #               "keyboard.all"              every key
@@ -158,7 +159,8 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # --- example: daisy-chained
 # # Needs the fans daisy-chained (or a hub with one data line): fan 0 is the
 # # first on the chain. Rear = GPU, front 1 = CPU, front 2 = activity,
-# # top = tokens/s on a log scale.
+# # top = tokens/s on a log scale. `aura.chain[4..2]` is fans 2 and 3 from
+# # the far end, so two strips mounted end to end grow toward where they meet.
 # [aura]
 # fans = "chain"
 # chain_len = 4
