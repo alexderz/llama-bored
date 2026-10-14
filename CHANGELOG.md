@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- llama-light: a descending Aura chain span runs backwards, LED by LED. `aura.chain[4..2]` is fans 2 and 3 from the last LED of fan 3 back to the first LED of fan 2, so two strips can grow toward where they meet (#143).
+
 ## 0.6.0 — 2026-10-14
 
 The TV stream in exact colour from the grid file, model claims and a job view on the dashboard, a GPU BUSY header for work outside llama-swap, and cached tokens and rates on SGLang rows.
