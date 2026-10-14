@@ -1,8 +1,10 @@
 # llama-cast: the tty11 dashboard as a live DLNA/UPnP video on the LAN, for
 # smart TVs (Roku Media Player on TCL Roku TVs is tested).
-# LAN-exposed by design. It reads /dev/vcsa11 (read-only, through the
-# llama-view group), the console font, /etc/machine-id and its config;
-# writes no file; dials nothing; and runs only the configured ffmpeg.
+# LAN-exposed by design. tty mode reads /dev/vcsa11 (read-only, through the
+# llama-view group). grid mode reads the grid file in /run/llama-watch-grid
+# through that same group; no extra device or path is granted. It also
+# reads the console font, /etc/machine-id and its config; writes no file;
+# dials nothing; and runs only the configured ffmpeg.
 # Installed, never enabled by install.sh.
 #
 # Keep IPAddressAllow= equal to `allow` in /etc/llama-bored/cast.toml plus

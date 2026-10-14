@@ -1248,11 +1248,12 @@ is readable by group `llama-view` only; do not widen that, and do not point
 
 ## Watch tty11 on a TV
 
-`llama-cast` shows the tty11 dashboard as a live video on DLNA/UPnP players
-on your LAN. Tested with Roku Media Player on TCL Roku TVs. It announces a
-media server over SSDP and streams 1920x1080 H.264 in MPEG-TS, rendered from
-tty11 at 2 frames per second. Each viewer gets its own `ffmpeg`, two at a
-time by default. ffmpeg is a program you install; llama-bored does not
+`llama-cast` shows the dashboard as a live video on DLNA/UPnP players on
+your LAN. Tested with Roku Media Player on TCL Roku TVs. It announces a
+media server over SSDP and streams 1920x1080 H.264 in MPEG-TS at 2 frames
+per second. `source` is `tty` (tty11, the default) or `grid` (the grid
+file, each cell in its own RGB). Each viewer gets its own `ffmpeg`, two at
+a time by default. ffmpeg is a program you install; llama-bored does not
 bundle it ([THIRD-PARTY.md](THIRD-PARTY.md)).
 
 `encoder` defaults to `auto`. At start llama-cast runs that ffmpeg once
@@ -1262,7 +1263,9 @@ x264 is the one to keep: best text at 2 fps, plays everywhere, and it does
 not use a GPU that is busy with inference. With libx264 the stream is the
 same as before. The choice is made once, at start: after installing or
 upgrading ffmpeg, restart llama-cast. The shipped unit allows only
-`/dev/vcsa11`, so a hardware encoder usually cannot open a GPU device.
+`/dev/vcsa11`, so a hardware encoder usually cannot open a GPU device. Grid
+mode needs no new access: the unit is already in the `llama-view` group,
+which can read the grid directory.
 
 The stream is tuned to start fast on a TV (#20). Each viewer's stream
 begins with PAT, PMT and a keyframe, and is encoded for low latency (no
@@ -1274,18 +1277,35 @@ B-frames, no lookahead). The defaults below are in `cast.toml`:
 | `keyframe_s` | `1` | Seconds between keyframes, 1..=10. |
 | `preroll_s` | `3` | Seconds of the first frame each new viewer gets at once, 0..=10. The picture then runs this far behind tty11. |
 | `encoder` | `auto` | H.264 encoder to ask ffmpeg for. `auto` probes once and picks `libx264`, then `libopenh264`, then `h264_nvenc`, `h264_qsv`, `h264_vaapi`, `h264_amf` or `h264_v4l2m2m` only when neither software encoder exists. Pin one of those names to require it. |
+| `source` | `tty` | `tty` reads `/dev/vcsa11`. `grid` reads the grid file and paints each cell's own RGB. |
+| `grid` | `/run/llama-watch-grid/grid` | Absolute path of that file. Opened only when `source` is `grid`. |
+| `font` | `12x24` | `12x24`, `12x22`, `10x18` or `9x18`. In tty mode it must match `[tty] font` (`9x18` is not a tty11 font). Omit it in grid mode and the cast picks the largest shipped font whose cells fit in 1920x1080, or the smallest, cropped from the top-left, when none fits. A 213x60 grid at 9x18 is 1917x1080. A set value is used as written. |
 
 Each viewer uses `bitrate_kbps` of LAN bandwidth. If the TV still waits,
 raise `preroll_s` or `bitrate_kbps`.
 
-It is LAN-exposed by design: any host in `allow` can watch whatever tty11
-shows. It reads tty11's screen read-only, writes no file, and connects to
-nothing. The installer installs it but never enables it.
+The stream stays 4:2:0: brightness keeps full detail and colour has half
+the detail in each direction, because TV players do not play 4:4:4.
+ffmpeg's default RGB-to-YUV conversion for this 1920x1080 path is BT.601.
+llama-cast converts with the BT.709 matrix in limited range and tags the
+stream (primaries, transfer, matrix and range), so a 1080p player, which
+assumes BT.709, shows the colours that were sent.
+
+A missing, unreadable, refused or stale grid (no update for over 5 seconds)
+keeps the last good frame and draws `waiting for grid - no update for 17 s`
+in grey on that frame's last row. Before any good frame the picture is
+black with that notice centred. `palette` is ignored in grid mode.
+
+It is LAN-exposed by design: any host in `allow` can watch whatever the
+picture shows. In tty mode it reads tty11's screen read-only. In grid mode
+it reads the grid file. It writes no file, and connects to nothing. The
+installer installs it but never enables it.
 
 1. Edit `/etc/llama-bored/cast.toml`: set `listen` and `interface_addr` to
-   this host's LAN address, narrow `allow` to your LAN or to the TVs, and
-   set `font` and `palette` to the same values as `[tty] font` and
-   `[tty] palette` in `watch.toml`.
+   this host's LAN address and narrow `allow` to your LAN or to the TVs. For
+   tty mode, set `font` and `palette` to the same values as `[tty] font` and
+   `[tty] palette` in `watch.toml`. For the grid, set `source = "grid"`
+   and leave `font` unset unless you want one size.
 2. Keep `llama-cast.service` in step with the config. `IPAddressAllow=`
    must be `allow` plus `239.255.255.250/32`, and `SocketBindAllow=` must be
    `tcp:<listen port>` and `udp:1900`. Use a drop-in, as the unit's comments

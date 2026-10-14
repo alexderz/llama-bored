@@ -24,6 +24,7 @@ with llama-bored has to follow ffmpeg's terms for that distribution.
 ## Hack
 
 The console fonts `packaging/fonts/llama-hack-12x24.psfu`,
-`packaging/fonts/llama-hack-12x22.psfu` and
-`packaging/fonts/llama-hack-10x18.psfu` are rendered from Hack Regular.
+`packaging/fonts/llama-hack-12x22.psfu`,
+`packaging/fonts/llama-hack-10x18.psfu` and
+`packaging/fonts/llama-hack-9x18.psfu` are rendered from Hack Regular.
 Their licence is [packaging/fonts/LICENSE.Hack](packaging/fonts/LICENSE.Hack).

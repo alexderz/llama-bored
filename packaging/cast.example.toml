@@ -6,9 +6,11 @@
 # what tty11 shows: model names, rates, context use, host load. It carries
 # no prompt or output text; the dashboard shows none.
 #
-# It reads /dev/vcsa11 (read-only), the console font below, /etc/machine-id
-# (hashed into the device id) and this file. It opens no other device,
-# writes no file, dials nothing, and runs only `ffmpeg` (one per viewer).
+# tty mode reads /dev/vcsa11 (read-only). grid mode reads the grid file
+# (the llama-view group can already read that directory). It also reads the
+# console font below, /etc/machine-id (hashed into the device id) and this
+# file. It opens no other device, writes no file, dials nothing, and runs
+# only `ffmpeg` (one per viewer).
 #
 # On the TV (Roku Media Player): Media type Video -> "llama-bored (HOST)" ->
 # "tty11 on HOST", HOST being this machine's host name.
@@ -90,10 +92,24 @@ ffmpeg = "/usr/bin/ffmpeg"
 # An unknown name is a config error.
 # encoder = "auto"
 
-# tty11's console font: "12x24" (default), "12x22" or "10x18". Must match
-# `[tty] font` in watch.toml, or the picture is garbled.
+# Picture source: "tty" (default, /dev/vcsa11) or "grid" (the grid file,
+# each cell in its own RGB). "tty" is today's stream.
+# source = "tty"
+
+# Grid file, an absolute path of at most 255 bytes. Opened only when
+# source is "grid". The default is the path llama-view uses. A value that
+# is set is checked in tty mode too, and still not opened there.
+# grid = "/run/llama-watch-grid/grid"
+
+# Console font: "12x24" (default), "12x22", "10x18" or "9x18". In tty mode
+# this must match `[tty] font` in watch.toml, or the picture is garbled.
+# "9x18" is a cast font; tty11 is not switched to it. In grid mode, omit
+# this key and the cast picks the largest shipped font whose cells fit in
+# 1920x1080, or the smallest (cropped from the top-left) when none fits.
+# A 213x60 grid at 9x18 is 1917x1080.
 font = "12x24"
 
 # tty11's colours: "llama" (default) or "vga". Match `[tty] palette` in
-# watch.toml, so the TV shows the colours tty11 shows.
+# watch.toml, so the TV shows the colours tty11 shows. Ignored when source
+# is "grid": the file carries each cell's RGB.
 palette = "llama"

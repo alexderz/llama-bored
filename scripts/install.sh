@@ -178,6 +178,10 @@ freeze_staging() {
     rm -rf -- "$dir"
     return 1
   }
+  copy_regular "$repo/packaging/fonts/llama-hack-9x18.psfu" "$dir/llama-hack-9x18.psfu" || {
+    rm -rf -- "$dir"
+    return 1
+  }
   copy_regular "$repo/packaging/user/kraken-lcd-halt.path" "$dir/kraken-lcd-halt.path" || {
     rm -rf -- "$dir"
     return 1
@@ -362,6 +366,7 @@ show_staging_hashes() {
     "$staging/llama-hack-12x24.psfu"
     "$staging/llama-hack-12x22.psfu"
     "$staging/llama-hack-10x18.psfu"
+    "$staging/llama-hack-9x18.psfu"
     "$staging/config.toml"
     "$staging/light.toml"
     "$staging/metrics.toml"
@@ -435,6 +440,7 @@ verify_staged_matches_disk() {
     llama-hack-12x24.psfu:packaging/fonts/llama-hack-12x24.psfu
     llama-hack-12x22.psfu:packaging/fonts/llama-hack-12x22.psfu
     llama-hack-10x18.psfu:packaging/fonts/llama-hack-10x18.psfu
+    llama-hack-9x18.psfu:packaging/fonts/llama-hack-9x18.psfu
     kraken-lcd-halt.path:packaging/user/kraken-lcd-halt.path
     kraken-lcd-halt-notify.service:packaging/user/kraken-lcd-halt-notify.service
     check-provenance.txt:target/check-provenance.txt
@@ -1690,7 +1696,7 @@ apply_from_staging() {
   local staging=$1 dest_root=$2 sys_root=$3 head=$4
   local config_dest min_interval unit watch_unit sysusers tmpfiles rule71 rule93
   local binary_dest watch_binary view_binary view_rule watch_mode watch_dest user_dir font_dest
-  local font22_dest font18_dest
+  local font22_dest font18_dest font9_dest
   local node hidraw_name mode_group pin sha_dest prev interval_src config_bak
   local light_binary light_unit light_rule light_mode light_dest aura_node aura_pin aura_mode
   local kbd_node kbd_pin kbd_mode
@@ -1795,11 +1801,13 @@ apply_from_staging() {
   watch_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-watch)"
   view_binary="$(dest_path "$dest_root" /usr/local/bin/llama-view)"
   view_rule="$(dest_path "$dest_root" /etc/udev/rules.d/72-llama-view.rules)"
-  # tty11 console fonts. The watcher unit's root pre-step
-  # (llama-watch tty-setup) loads the one `[tty] font` names.
+  # tty11 console fonts, plus the cast's 9x18 grid font. The watcher unit's
+  # root pre-step (llama-watch tty-setup) loads the one `[tty] font` names.
+  # 9x18 is not a `[tty] font` value.
   font_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-12x24.psfu)"
   font22_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-12x22.psfu)"
   font18_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-10x18.psfu)"
+  font9_dest="$(dest_path "$dest_root" /usr/local/share/llama-bored/llama-hack-9x18.psfu)"
   watch_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-watch.service)"
   light_binary="$(dest_path "$dest_root" /usr/local/libexec/llama-bored/llama-light)"
   light_unit="$(dest_path "$dest_root" /etc/systemd/system/llama-light.service)"
@@ -1852,6 +1860,8 @@ apply_from_staging() {
     "staged llama-hack-12x22.psfu.new" || return 1
   must stage_new_file 0644 "$staging/llama-hack-10x18.psfu" "$font18_dest" \
     "staged llama-hack-10x18.psfu.new" || return 1
+  must stage_new_file 0644 "$staging/llama-hack-9x18.psfu" "$font9_dest" \
+    "staged llama-hack-9x18.psfu.new" || return 1
 
   unit="$(dest_path "$dest_root" /etc/systemd/system/kraken-lcd.service)"
   if [[ "$INSTALL_KRAKEN" == 1 ]]; then
@@ -2024,6 +2034,7 @@ apply_from_staging() {
   must commit_new_file "$font_dest" || return 1
   must commit_new_file "$font22_dest" || return 1
   must commit_new_file "$font18_dest" || return 1
+  must commit_new_file "$font9_dest" || return 1
   if [[ "$INSTALL_KRAKEN" == 1 ]]; then
     must commit_new_file "$unit" || return 1
   fi
@@ -2665,6 +2676,7 @@ self_test() {
   cp -- "$ROOT/packaging/fonts/llama-hack-12x24.psfu" "$repo/packaging/fonts/llama-hack-12x24.psfu"
   cp -- "$ROOT/packaging/fonts/llama-hack-12x22.psfu" "$repo/packaging/fonts/llama-hack-12x22.psfu"
   cp -- "$ROOT/packaging/fonts/llama-hack-10x18.psfu" "$repo/packaging/fonts/llama-hack-10x18.psfu"
+  cp -- "$ROOT/packaging/fonts/llama-hack-9x18.psfu" "$repo/packaging/fonts/llama-hack-9x18.psfu"
   cp -- "$ROOT/packaging/config.example.toml" "$repo/packaging/config.example.toml"
   cp -- "$ROOT/packaging/watch.example.toml" "$repo/packaging/watch.example.toml"
   cp -- "$ROOT/packaging/llama-watch.service" "$repo/packaging/llama-watch.service"
@@ -2812,6 +2824,13 @@ self_test() {
     echo "install self-test: staged 10x18 font hash was not shown" >&2
     exit 1
   }
+  printf 'x' >>"$repo/packaging/fonts/llama-hack-9x18.psfu"
+  run_expect_fail verify_staged_matches_disk "$staging" "$repo" "$dest"
+  cp -- "$ROOT/packaging/fonts/llama-hack-9x18.psfu" "$repo/packaging/fonts/llama-hack-9x18.psfu"
+  [[ "$(show_staging_hashes "$staging")" == *"$(sha256sum -- "$ROOT/packaging/fonts/llama-hack-9x18.psfu" | awk '{ print $1 }')  $staging/llama-hack-9x18.psfu"* ]] || {
+    echo "install self-test: staged 9x18 font hash was not shown" >&2
+    exit 1
+  }
   out="$(apply_from_staging "$staging" "$dest" "$sys" "$head")"
   assert_eq "$(cat -- "$(dest_path "$dest" /usr/local/libexec/llama-bored/kraken-lcd)")" \
     "fake-binary" "installed the staged binary"
@@ -2833,7 +2852,7 @@ self_test() {
   cmp -s "$ROOT/packaging/user/kraken-lcd-halt.path" \
     "$(dest_path "$dest" /etc/systemd/user/kraken-lcd-halt.path)"
   local font_installed font_name
-  for font_name in llama-hack-12x24.psfu llama-hack-12x22.psfu llama-hack-10x18.psfu; do
+  for font_name in llama-hack-12x24.psfu llama-hack-12x22.psfu llama-hack-10x18.psfu llama-hack-9x18.psfu; do
     font_installed="$(dest_path "$dest" "/usr/local/share/llama-bored/$font_name")"
     cmp -s -- "$ROOT/packaging/fonts/$font_name" "$font_installed" || {
       echo "install self-test: console font $font_name was not installed from staging" >&2
@@ -4713,6 +4732,7 @@ self_test() {
     /usr/local/libexec/llama-bored/INSTALLED_SHA \
     /usr/local/share/llama-bored/llama-hack-12x24.psfu \
     /usr/local/share/llama-bored/llama-hack-10x18.psfu \
+    /usr/local/share/llama-bored/llama-hack-9x18.psfu \
     /etc/systemd/system/llama-watch.service \
     /etc/systemd/system/llama-light.service \
     /etc/systemd/system/llama-metrics.service \
