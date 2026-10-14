@@ -236,3 +236,74 @@ fn guard_reads_do_not_require_the_real_sys_tree() {
     let _ = ack(proto::expected_prefix(&Cmd::ShowLiquid));
     let _ = Arc::new(0);
 }
+
+/// Writes the pump rpm and both duties, keeping both modes at firmware control.
+fn set_pump(tree: &Tree, rpm: u32, duty: u32) {
+    fixture::write_hwmon(tree, rpm, duty, duty, 0, 0);
+}
+
+#[test]
+fn firmware_duty_step_with_the_pump_following_does_not_halt() {
+    // The values a real Kraken Z53 logged when it latched under #147.
+    let mut opened = show_ready("duty-up");
+    set_pump(&opened.tree, 1127, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1298, 89));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("duty step after the op");
+    opened.lcd.tick().expect("duty step at the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+
+    let mut opened = show_ready("duty-up-tick");
+    set_pump(&opened.tree, 1127, 77);
+    opened.lcd.show(&Frame::new()).expect("show");
+    set_pump(&opened.tree, 1298, 89);
+    opened.lcd.tick().expect("duty step at the next tick");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn pump_still_ramping_after_a_duty_step_does_not_halt() {
+    let mut opened = show_ready("ramping");
+    mutate_after_baseline(&opened, |tree| set_pump(tree, fixture::PUMP_RPM, 77));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("pump not caught up yet");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn stopped_pump_after_a_duty_step_halts() {
+    let mut opened = show_ready("duty-up-stall");
+    set_pump(&opened.tree, 1127, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 0, 89));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "stall after a duty rise");
+
+    let mut opened = show_ready("duty-down-stall-tick");
+    opened.lcd.show(&Frame::new()).expect("show");
+    set_pump(&opened.tree, 600, 77);
+    assert_eq!(opened.lcd.tick(), Err(SinkError::Halted));
+    assert_halted(&mut opened, "pump far under a lowered duty");
+}
+
+#[test]
+fn pump_change_the_duty_does_not_explain_halts() {
+    let mut opened = show_ready("duty-up-overshoot");
+    set_pump(&opened.tree, 1127, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1700, 89));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "pump far over a raised duty");
+
+    // Same rpm jump with the duty held: the band does not move.
+    let mut opened = show_ready("held-duty-jump");
+    set_pump(&opened.tree, 1127, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1298, 77));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "jump with the duty held");
+}

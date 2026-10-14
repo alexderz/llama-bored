@@ -140,6 +140,7 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("device/guard.rs", "fn", "format_halt"),
     ("device/guard.rs", "fn", "log_halt"),
     ("device/guard.rs", "fn", "pump_band_rpm"),
+    ("device/guard.rs", "fn", "pump_in_band"),
     // exception: W_OK probe for show-image pre-flight; path is the state dir.
     // Call sites are fenced to device/ (state_dir_writable_hits).
     ("device/guard.rs", "fn", "state_dir_writable"),
