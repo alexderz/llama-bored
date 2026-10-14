@@ -1,15 +1,24 @@
-//! GPU utilisation and temperature.
+//! GPU utilisation, temperature, and the compute processes on the card.
 //!
 //! [`GpuSource`] owns a [`GpuBackend`]. It initialises the backend once.
 //! An init failure waits 1, 2, 4, … reads (capped at 60) before trying again,
 //! and a successful init resets that wait. Any later read error drops the
 //! session so the next read initialises immediately, and clears both fields.
 //! [`NvidiaGpu`] loads the host library; unit tests use a fake and do not.
+//!
+//! Compute processes are a separate read. It runs at most once a second,
+//! only while the session is up, and a failure there clears the list without
+//! dropping the session. A tick inside that second returns [`ProcessRead::Cached`]
+//! and does not call the backend or open `/proc`.
 
 use super::{SourceError, SourceId};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use nvml_wrapper::enums::device::UsedGpuMemory;
+use nvml_wrapper::struct_wrappers::device::ProcessInfo;
 use nvml_wrapper::{Device, Nvml};
 use std::ffi::OsStr;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Failure from a [`GpuBackend`] call, before it is tagged with [`SourceId::Gpu`].
 #[derive(Debug)]
@@ -83,8 +92,106 @@ pub trait GpuBackend {
         Err(GpuError::new("enforced_power_limit unsupported"))
     }
 
+    /// Running compute processes: pid and used GPU memory in bytes.
+    ///
+    /// `running_compute_processes` on the host. Memory NVML reports as
+    /// unavailable is left out by [`NvidiaGpu`]. The default is an empty
+    /// list, so a fake that does not care stays quiet and logs nothing.
+    fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
+        Ok(Vec::new())
+    }
+
     /// Drop the live library handle. Safe to call when nothing is loaded.
     fn disconnect(&mut self);
+}
+
+/// One compute process on the GPU. Memory is bytes, or absent when NVML
+/// does not report it (those are dropped before this struct is built).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct ComputeProcess {
+    pub pid: u32,
+    /// Used GPU memory, bytes.
+    pub memory_bytes: u64,
+}
+
+/// How often [`GpuSource::read_processes`] calls the backend.
+const PROCESS_EVERY: Duration = Duration::from_secs(1);
+
+/// One process-list attempt. A tick inside [`PROCESS_EVERY`] is [`Self::Cached`]
+/// and does not call the backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum ProcessRead {
+    /// The last attempt is still inside the second. The caller keeps its list.
+    Cached,
+    /// The session is down, so NVML was not called. The caller drops its list.
+    /// This is not a process-read failure: util or temperature already logged.
+    Unavailable,
+    /// A fresh read. The caller replaces its list.
+    Ready(Vec<ComputeProcess>),
+    /// A fresh read failed. The caller drops its list.
+    Failed(String),
+}
+
+/// Longest `/proc/<pid>/comm` read. The kernel's comm is 15 bytes plus a
+/// newline; the cap only bounds a stand-in file.
+const COMM_READ_MAX: usize = 64;
+/// Characters kept from a process name. The header cuts here.
+const PROCESS_NAME_MAX: usize = 24;
+
+/// Keep only printable ASCII `[A-Za-z0-9._+-]`, at most [`PROCESS_NAME_MAX`].
+/// Anything else, including a newline from `comm`, is dropped.
+#[must_use]
+pub(crate) fn sanitize_process_name(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if out.len() == PROCESS_NAME_MAX {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-') {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// `{proc_root}/<pid>/comm`, sanitised. Empty when the file cannot be read
+/// or nothing allowed remains.
+///
+/// The installed unit sets `ProtectProc=invisible`, which hides another
+/// user's `/proc/<pid>`. That read fails and the header shows `pid N`.
+/// A process of the llama-watch user still yields its comm.
+pub(crate) fn read_process_name(proc_root: &Path, pid: u32) -> String {
+    let path = proc_root.join(pid.to_string()).join("comm");
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let mut buf = [0u8; COMM_READ_MAX];
+    let n = match std::io::Read::read(&mut file, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return String::new(),
+    };
+    let Ok(text) = std::str::from_utf8(&buf[..n]) else {
+        return String::new();
+    };
+    sanitize_process_name(text)
+}
+
+/// Drop processes whose memory NVML did not report.
+fn retain_compute(listed: Vec<ProcessInfo>) -> Vec<ComputeProcess> {
+    let mut processes = Vec::new();
+    for info in listed {
+        let UsedGpuMemory::Used(memory_bytes) = info.used_gpu_memory else {
+            continue;
+        };
+        processes.push(ComputeProcess {
+            pid: info.pid,
+            memory_bytes,
+        });
+    }
+    processes
 }
 
 /// VRAM and power from one extra read. Independent of util and temperature.
@@ -125,6 +232,9 @@ pub struct GpuSource<B> {
     /// Backoff, in reads, applied after the next init failure.
     init_backoff: u32,
     init_error: String,
+    /// When the last process attempt finished. Cleared with the session,
+    /// so the next live tick reads at once instead of waiting out the second.
+    processes_at: Option<Instant>,
 }
 
 impl<B: GpuBackend> GpuSource<B> {
@@ -136,6 +246,7 @@ impl<B: GpuBackend> GpuSource<B> {
             init_wait: 0,
             init_backoff: 1,
             init_error: String::new(),
+            processes_at: None,
         }
     }
 
@@ -199,6 +310,29 @@ impl<B: GpuBackend> GpuSource<B> {
             memory: self.backend.memory_info(),
             power_mw: self.backend.power_usage(),
             power_limit_mw: self.backend.enforced_power_limit(),
+        }
+    }
+
+    /// Compute processes, at most once a second.
+    ///
+    /// Inside the second this returns [`ProcessRead::Cached`] and does not
+    /// call the backend. A down session returns [`ProcessRead::Unavailable`]
+    /// without a call. An NVML error returns [`ProcessRead::Failed`] and does
+    /// not drop the session: the next util read still uses it.
+    pub fn read_processes(&mut self, now: Instant) -> ProcessRead {
+        if !self.ready {
+            self.processes_at = None;
+            return ProcessRead::Unavailable;
+        }
+        if let Some(at) = self.processes_at
+            && now.saturating_duration_since(at) < PROCESS_EVERY
+        {
+            return ProcessRead::Cached;
+        }
+        self.processes_at = Some(now);
+        match self.backend.compute_processes() {
+            Ok(list) => ProcessRead::Ready(list),
+            Err(err) => ProcessRead::Failed(err.to_string()),
         }
     }
 
@@ -299,6 +433,10 @@ impl GpuBackend for NvidiaGpu {
         Ok(mw)
     }
 
+    fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
+        Ok(retain_compute(self.device()?.running_compute_processes()?))
+    }
+
     fn disconnect(&mut self) {
         self.library = None;
     }
@@ -307,6 +445,8 @@ impl GpuBackend for NvidiaGpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nvml_wrapper::enums::device::UsedGpuMemory;
+    use nvml_wrapper::struct_wrappers::device::ProcessInfo;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -790,6 +930,13 @@ mod tests {
                 .to_string(),
             "GPU library is not initialised"
         );
+        assert_eq!(
+            backend
+                .compute_processes()
+                .expect_err("no session")
+                .to_string(),
+            "GPU library is not initialised"
+        );
         backend.disconnect();
         let after = backend
             .util_pct()
@@ -828,6 +975,194 @@ mod tests {
             .expect_err("no library");
         let text = err.to_string();
         assert!(text.contains("/a") && text.contains("/b"), "{text}");
+    }
+
+    struct ProcFake {
+        calls: Arc<AtomicUsize>,
+        script: VecDeque<Result<Vec<ComputeProcess>, &'static str>>,
+        util_fail: bool,
+    }
+
+    impl GpuBackend for ProcFake {
+        fn init(&mut self) -> Result<(), GpuError> {
+            Ok(())
+        }
+
+        fn util_pct(&mut self) -> Result<f32, GpuError> {
+            if self.util_fail {
+                Err(GpuError::new("util lost"))
+            } else {
+                Ok(1.0)
+            }
+        }
+
+        fn temp_c(&mut self) -> Result<f32, GpuError> {
+            Ok(40.0)
+        }
+
+        fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.script.pop_front() {
+                Some(Ok(list)) => Ok(list),
+                Some(Err(message)) => Err(GpuError::new(message)),
+                None => Err(GpuError::new("unscripted processes")),
+            }
+        }
+
+        fn disconnect(&mut self) {}
+    }
+
+    fn proc_source(
+        script: Vec<Result<Vec<ComputeProcess>, &'static str>>,
+    ) -> (GpuSource<ProcFake>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = GpuSource::new(ProcFake {
+            calls: Arc::clone(&calls),
+            script: script.into(),
+            util_fail: false,
+        });
+        (source, calls)
+    }
+
+    fn one_proc(pid: u32, memory_bytes: u64) -> ComputeProcess {
+        ComputeProcess { pid, memory_bytes }
+    }
+
+    #[test]
+    fn process_read_is_at_most_once_a_second_and_an_error_clears_it() {
+        let listed = vec![one_proc(4, 100), one_proc(9, 200)];
+        let (mut source, calls) = proc_source(vec![
+            Ok(listed.clone()),
+            Err("nvml busy"),
+            Ok(vec![one_proc(4, 100)]),
+        ]);
+        let t0 = Instant::now();
+        // No session yet: no backend call.
+        assert_eq!(source.read_processes(t0), ProcessRead::Unavailable);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        assert!(source.read().error.is_none());
+        assert_eq!(source.read_processes(t0), ProcessRead::Ready(listed));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            source.read_processes(t0 + Duration::from_millis(999)),
+            ProcessRead::Cached,
+            "a tick inside the second does not call NVML"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let at = t0 + PROCESS_EVERY;
+        assert_eq!(
+            source.read_processes(at),
+            ProcessRead::Failed("nvml busy".to_owned())
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            source.read_processes(at + Duration::from_millis(500)),
+            ProcessRead::Cached
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // The error did not drop the session: util is still the first init.
+        let again = source.read();
+        assert_eq!(again.gpu_pct, Some(1.0));
+        assert!(again.error.is_none());
+        assert_eq!(
+            source.read_processes(at + PROCESS_EVERY),
+            ProcessRead::Ready(vec![one_proc(4, 100)])
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_dropped_session_forgets_the_process_interval() {
+        let (mut source, calls) =
+            proc_source(vec![Ok(vec![one_proc(1, 5)]), Ok(vec![one_proc(2, 6)])]);
+        let t0 = Instant::now();
+        assert!(source.read().error.is_none());
+        assert!(matches!(source.read_processes(t0), ProcessRead::Ready(_)));
+        source.backend.util_fail = true;
+        let lost = source.read();
+        assert!(lost.error.is_some());
+        assert_eq!(
+            source.read_processes(t0 + Duration::from_millis(10)),
+            ProcessRead::Unavailable
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "a down session does not query"
+        );
+
+        source.backend.util_fail = false;
+        assert!(source.read().error.is_none(), "the next tick inits again");
+        assert_eq!(
+            source.read_processes(t0 + Duration::from_millis(20)),
+            ProcessRead::Ready(vec![one_proc(2, 6)]),
+            "the interval does not survive the dropped session"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_fake_that_omits_processes_reports_an_empty_list() {
+        let (mut source, _probe) = scripted(&[Ok(())], &[Ok(3.0)], &[Ok(30.0)]);
+        assert!(source.read().error.is_none());
+        assert_eq!(
+            source.read_processes(Instant::now()),
+            ProcessRead::Ready(Vec::new())
+        );
+    }
+
+    #[test]
+    fn unavailable_process_memory_is_dropped() {
+        let kept = retain_compute(vec![
+            ProcessInfo {
+                pid: 1,
+                used_gpu_memory: UsedGpuMemory::Unavailable,
+                gpu_instance_id: None,
+                compute_instance_id: None,
+            },
+            ProcessInfo {
+                pid: 2,
+                used_gpu_memory: UsedGpuMemory::Used(50),
+                gpu_instance_id: None,
+                compute_instance_id: None,
+            },
+        ]);
+        assert_eq!(kept, vec![one_proc(2, 50)]);
+    }
+
+    #[test]
+    fn process_names_keep_only_the_allowed_characters() {
+        assert_eq!(sanitize_process_name("llama-server\n"), "llama-server");
+        assert_eq!(sanitize_process_name("ok.name+v2_1-b"), "ok.name+v2_1-b");
+        assert_eq!(sanitize_process_name("../weird name!"), "..weirdname");
+        assert_eq!(sanitize_process_name("!!!"), "");
+        assert_eq!(
+            sanitize_process_name(&"a".repeat(40)).len(),
+            PROCESS_NAME_MAX
+        );
+        assert_eq!(
+            sanitize_process_name("has a space"),
+            "hasaspace",
+            "spaces are not in the allowed set"
+        );
+    }
+
+    #[test]
+    fn process_name_reads_comm_and_falls_back_to_empty() {
+        let root = std::env::temp_dir().join(format!("gpu-comm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("4242")).expect("pid dir");
+        std::fs::write(root.join("4242").join("comm"), "example-bench\n").expect("comm");
+        assert_eq!(read_process_name(&root, 4242), "example-bench");
+        assert_eq!(read_process_name(&root, 7), "", "a missing comm is empty");
+        std::fs::write(root.join("4242").join("comm"), "bad/name!\n").expect("comm");
+        assert_eq!(read_process_name(&root, 4242), "badname");
+        std::fs::write(root.join("4242").join("comm"), "a".repeat(200)).expect("long");
+        assert_eq!(read_process_name(&root, 4242).len(), PROCESS_NAME_MAX);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Manual, on a host with an NVIDIA GPU, as a normal user. Not part of `scripts/check.sh`.
