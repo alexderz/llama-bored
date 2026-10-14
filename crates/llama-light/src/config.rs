@@ -1229,22 +1229,32 @@ fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigEr
                 .parse::<usize>()
                 .map_err(|_| ConfigError(format!("{at}: \"{part}\" is not a fan index")))
         };
+        // The fan after an inclusive bound. `usize::MAX` has no successor,
+        // so that fan is named with the usual missing-fan error.
+        let end_after = |fan: usize| -> Result<usize, ConfigError> {
+            fan.checked_add(1).ok_or_else(|| {
+                ConfigError(format!(
+                    "{at}: the chain has {fans} fans (indexes 0..{}), so fan {fan} does not exist",
+                    fans - 1
+                ))
+            })
+        };
         // A descending bound is the same fans, last LED first. [4..2] is
         // fans 2 and 3; [4..=2] is fans 2, 3 and 4. [N] and [N..=N] stay
         // forward. [N..N] is empty.
         let (start, end, reversed) = if let Some((a, b)) = inner.split_once("..=") {
             let (a, b) = (parse_index(a)?, parse_index(b)?);
             if a <= b {
-                (a, b + 1, false)
+                (a, end_after(b)?, false)
             } else {
-                (b, a + 1, true)
+                (b, end_after(a)?, true)
             }
         } else if let Some((a, b)) = inner.split_once("..") {
             let (a, b) = (parse_index(a)?, parse_index(b)?);
             if a <= b { (a, b, false) } else { (b, a, true) }
         } else {
             let index = parse_index(inner)?;
-            (index, index + 1, false)
+            (index, end_after(index)?, false)
         };
         if start >= end {
             return err(format!("{at}: the range is empty"));

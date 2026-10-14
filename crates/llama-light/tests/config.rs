@@ -191,6 +191,23 @@ fn a_descending_chain_range_lists_the_same_fans_from_the_far_led() {
 }
 
 #[test]
+fn an_inclusive_bound_of_usize_max_names_the_missing_fan() {
+    let fan = usize::MAX;
+    for target in [
+        format!("aura.chain[2..={fan}]"),
+        format!("aura.chain[{fan}..=2]"),
+        format!("aura.chain[{fan}]"),
+    ] {
+        let err = chain_target(4, &target).expect_err(&target);
+        assert!(
+            err.contains(&format!("fan {fan} does not exist")),
+            "{target}: {err}"
+        );
+        assert!(err.contains("the chain has 4 fans"), "{target}: {err}");
+    }
+}
+
+#[test]
 fn the_chain_shorthand_is_one_entry_per_fan() {
     let config = parse(
         "[aura]\nchain = [ { metric = \"gpu\" }, { metric = \"cpu\", style = \"ring\" }, { metric = \"tokens_rate\" } ]\n",
