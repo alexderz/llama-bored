@@ -2,7 +2,8 @@
 //!
 //! `pwm1` and `pwm2` are copied into the snapshot for the log. They are not
 //! compared: the firmware curve moves them while the enable files stay put.
-//! The pump band is fixed here and is not configuration.
+//! The pump band is fixed here and is not configuration. When the firmware
+//! moves the pump duty (`pwm1`), the band follows it (see [`pump_in_band`]).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,35 @@ fn num(value: Option<u32>) -> String {
 pub fn pump_band_rpm(baseline: u32) -> u32 {
     let percent = baseline.saturating_mul(PUMP_BAND_PERCENT) / 100;
     percent.max(PUMP_BAND_FLOOR_RPM)
+}
+
+/// `true` when the pump speed `now` is explained by `before` and the duty.
+///
+/// With the duty unchanged, unknown or zero on either side, `now` must be
+/// within [`pump_band_rpm`] of `before`. When the firmware's curve moved the
+/// duty (`pwm1`) between the two reads, the pump is expected anywhere between
+/// `before` (still ramping) and `before` scaled by the duty ratio (arrived),
+/// and the band is applied at each end of that range. A stopped or slowing
+/// pump under a held or rising duty, or a speed the duty does not explain,
+/// is still out of band.
+#[must_use]
+pub fn pump_in_band(
+    before: u32,
+    now: u32,
+    duty_before: Option<u32>,
+    duty_now: Option<u32>,
+) -> bool {
+    let scaled = match (duty_before, duty_now) {
+        (Some(from), Some(to)) if from != 0 && to != 0 && from != to => {
+            let scaled =
+                (u64::from(before) * u64::from(to) + u64::from(from) / 2) / u64::from(from);
+            u32::try_from(scaled).unwrap_or(u32::MAX)
+        }
+        _ => before,
+    };
+    let low = before.min(scaled);
+    let high = before.max(scaled);
+    now >= low.saturating_sub(pump_band_rpm(low)) && now <= high.saturating_add(pump_band_rpm(high))
 }
 
 /// Sysfs root, the Kraken device directory, and the directory that holds `halted`.
@@ -248,7 +278,7 @@ fn compare(baseline: &CoolingSnapshot, current: &CoolingSnapshot) -> Option<Devi
     let (Some(before), Some(now)) = (baseline.fan1_rpm, current.fan1_rpm) else {
         return Some(Deviation::Pump);
     };
-    if now.abs_diff(before) > pump_band_rpm(before) {
+    if !pump_in_band(before, now, baseline.pwm1, current.pwm1) {
         return Some(Deviation::Pump);
     }
     if current.devnum != baseline.devnum {
