@@ -585,7 +585,7 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
     }
     state
         .chart
-        .ingest(mono, state.detail.gen_tps, state.detail.prompt_tps);
+        .ingest(mono, state.llama.decoded_total, state.detail.prompt_tps);
     let running: Vec<String> = state
         .llama
         .models
