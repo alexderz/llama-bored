@@ -1293,8 +1293,10 @@ assumes BT.709, shows the colours that were sent.
 
 A missing, unreadable, refused or stale grid (no update for over 5 seconds)
 keeps the last good frame and draws `waiting for grid - no update for 17 s`
-in grey on that frame's last row. Before any good frame the picture is
-black with that notice centred. `palette` is ignored in grid mode.
+in grey on the last row of that frame that fits in the picture. A FIFO or
+any other non-regular file at the grid path is unreadable and does not stall
+the stream. Before any good frame the picture is black with that notice
+centred. `palette` is ignored in grid mode.
 
 It is LAN-exposed by design: any host in `allow` can watch whatever the
 picture shows. In tty mode it reads tty11's screen read-only. In grid mode
