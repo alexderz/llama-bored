@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::sources::fans::{FanPanel, FanSource};
-use crate::sources::gpu::{GpuBackend, GpuSource};
+use crate::sources::gpu::{GpuBackend, GpuSource, ProcessRead};
 use crate::sources::proc::{self, CpuSample};
 use crate::sources::temps::{TempReading, TempSource};
 use crate::sources::{self, Roots, SourceId};
@@ -40,6 +40,29 @@ pub struct GpuExtra {
     pub power_mw: Option<u32>,
     /// Enforced power limit, milliwatts.
     pub power_limit_mw: Option<u32>,
+}
+
+/// One compute process on the GPU, named from `/proc/<pid>/comm`.
+///
+/// Absent from [`Snapshot`]. The header uses it; metrics and the LCD do not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuProcess {
+    pub pid: u32,
+    /// Used GPU memory, bytes.
+    pub memory_bytes: u64,
+    /// Sanitised executable name. Empty when `comm` could not be read.
+    pub name: String,
+}
+
+/// Compute processes from the last NVML attempt.
+///
+/// `failed` stays true for the whole second after an error, including ticks
+/// that reuse the cached failure. A down GPU session clears `list` and does
+/// not set `failed`: util or temperature already logged that.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GpuProcesses {
+    pub list: Vec<GpuProcess>,
+    pub failed: bool,
 }
 
 /// What set [`Snapshot::activity`] on this tick.
@@ -85,6 +108,9 @@ pub struct WatchSample {
     /// Every shown temperature, GPU included, most important first (#74).
     /// `None` when `[temps]` is off. Read at most once a second.
     pub temps: Option<Vec<TempReading>>,
+    /// Compute processes on the GPU. Read at most once a second. Absent
+    /// from [`Snapshot`].
+    pub gpu_processes: GpuProcesses,
 }
 
 /// 10 Hz collector. [`Self::sample`] takes the clock and a llama view.
@@ -175,6 +201,9 @@ pub(crate) struct Collector<'a, B, L> {
     vram_failed: bool,
     power_failed: bool,
     limit_failed: bool,
+    /// Last process list. Cleared when the read fails or the session drops.
+    gpu_processes: Vec<GpuProcess>,
+    processes_failed: bool,
     llama: Option<LlamaSeen>,
     /// `[llama] enabled`. When false every view is ignored.
     llama_enabled: bool,
@@ -314,6 +343,8 @@ where
             vram_failed: false,
             power_failed: false,
             limit_failed: false,
+            gpu_processes: Vec::new(),
+            processes_failed: false,
             llama: None,
             llama_enabled: config.llama.enabled,
             fans: FanSource::new(&config.fans),
@@ -348,6 +379,9 @@ where
         } else {
             self.read_gpu_extra()
         };
+        // After the util read, so a session that just dropped clears the list
+        // and the one-second stamp on this same tick.
+        self.poll_processes(mono);
         let (ai, models) = self.apply_view(llama, &mut errors);
         let activity = self.activity_load(mono, gpu_pct, cpu_pct, &gpu);
         WatchSample {
@@ -374,6 +408,39 @@ where
             load_source: activity.source,
             fans,
             temps,
+            gpu_processes: GpuProcesses {
+                list: self.gpu_processes.clone(),
+                failed: self.processes_failed,
+            },
+        }
+    }
+
+    /// At most one NVML process read a second. Names are read from
+    /// `{proc}/<pid>/comm` only on a fresh success.
+    fn poll_processes(&mut self, now: Instant) {
+        match self.gpu.read_processes(now) {
+            ProcessRead::Cached => {}
+            ProcessRead::Unavailable => {
+                self.gpu_processes.clear();
+            }
+            ProcessRead::Ready(list) => {
+                self.processes_failed = self.note_part(self.processes_failed, "processes", None);
+                self.gpu_processes.clear();
+                for process in list {
+                    let name =
+                        crate::sources::gpu::read_process_name(&self.roots.proc, process.pid);
+                    self.gpu_processes.push(GpuProcess {
+                        pid: process.pid,
+                        memory_bytes: process.memory_bytes,
+                        name,
+                    });
+                }
+            }
+            ProcessRead::Failed(message) => {
+                self.processes_failed =
+                    self.note_part(self.processes_failed, "processes", Some(&message));
+                self.gpu_processes.clear();
+            }
         }
     }
 

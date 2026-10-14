@@ -1553,6 +1553,7 @@ fn blank_sample(mono: Instant, wall: SystemTime) -> WatchSample {
         load_source: llama_watch::collector::LoadSource::Util,
         fans: None,
         temps: None,
+        gpu_processes: llama_watch::collector::GpuProcesses::default(),
     }
 }
 
