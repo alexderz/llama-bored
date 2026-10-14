@@ -206,6 +206,10 @@ pub struct TtyModel {
     pub model_loading: bool,
     /// The header model is llama-swap `stopping`: the state word is `STOPPING`.
     pub model_stopping: bool,
+    /// A compute process outside llama-swap holds at least 256 MiB, no model
+    /// is listed, and no job view is up: the state word is `GPU BUSY`.
+    /// The rest of the frame stays on [`Self::state`].
+    pub gpu_busy: bool,
     pub slots_line: String,
     pub swap_line: String,
     pub cool_c: Option<i32>,
@@ -536,14 +540,16 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
             .map(|kind| kind.to_ascii_uppercase())
             .unwrap_or_else(|| "JOB".to_owned())
     });
-    // A job word wins, as before. LOADING and STOPPING are yellow text on
-    // black (the pip the same colour), not the black-on-yellow AI DOWN badge.
+    // A job word wins, as before. LOADING, STOPPING and GPU BUSY are yellow
+    // text on black (the pip the same colour), not the black-on-yellow AI DOWN badge.
     let (pip_fg, word, word_fg, word_bg) = if let Some(word) = job_word.as_deref() {
         (C16::BrightRed, word, C16::BrightRed, C16::Black)
     } else if model.model_loading {
         (C16::Yellow, "LOADING", C16::Yellow, C16::Black)
     } else if model.model_stopping {
         (C16::Yellow, "STOPPING", C16::Yellow, C16::Black)
+    } else if model.gpu_busy {
+        (C16::Yellow, "GPU BUSY", C16::Yellow, C16::Black)
     } else {
         match model.state {
             WatchState::Generating => (C16::BrightRed, "GENERATING", C16::BrightRed, C16::Black),

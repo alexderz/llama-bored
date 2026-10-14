@@ -866,6 +866,7 @@ fn busy_frame() -> TtyModel {
         model_stuck: false,
         model_loading: false,
         model_stopping: false,
+        gpu_busy: false,
         slots_line: "2/3 busy".to_owned(),
         swap_line: "none".to_owned(),
         cool_c: Some(34),

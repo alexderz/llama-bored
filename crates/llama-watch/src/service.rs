@@ -17,7 +17,7 @@ use sd_notify::NotifyState;
 use thiserror::Error;
 
 use crate::activity::ActivityRow;
-use crate::collector::{WatchCollector, WatchSample};
+use crate::collector::{GpuProcess, GpuProcesses, WatchCollector, WatchSample};
 use crate::config::{ChartGlyphs, Config, ConfigError, ValidWatchConfig};
 use crate::grid_out::{GridTap, GridWriter};
 use crate::localtime::{HostZone, Zone, format_local, local_request_time};
@@ -1011,29 +1011,45 @@ fn tty_model(
         ctx.jobs_stale_s,
         wall,
     );
+    let outside = outside_engine(
+        &sample.snapshot.models,
+        job_and_note.0.is_some(),
+        &sample.gpu_processes,
+    );
+    let gpu_busy = outside.is_some();
     TtyModel {
         state: watch,
         host: ctx.host.clone(),
-        model_name: model_name(sample, watch),
-        model_detail: model_detail(sample, watch),
+        model_name: if gpu_busy {
+            OUTSIDE_MODEL.to_owned()
+        } else {
+            model_name(sample, watch)
+        },
+        model_detail: outside.unwrap_or_else(|| model_detail(sample, watch)),
         model_stuck: model_stuck(sample, watch, &tick.stopping_since, mono),
         model_loading,
         model_stopping,
-        slots_line: if (model_loading || model_stopping) && header_up {
-            // No slots to count while the header model is still swapping.
+        gpu_busy,
+        slots_line: if gpu_busy || ((model_loading || model_stopping) && header_up) {
+            // No slots to count while the header model is still swapping,
+            // or while the card is busy outside llama-swap.
             "--".to_owned()
         } else if no_slots && tick.detail.slots.is_empty() {
             "--".to_owned()
         } else {
             slots_line(&tick.detail, watch)
         },
-        swap_line: swap_line(
-            watch,
-            &sample.snapshot.models,
-            &tick.starting_since,
-            &tick.stopping_since,
-            mono,
-        ),
+        swap_line: if gpu_busy {
+            "--".to_owned()
+        } else {
+            swap_line(
+                watch,
+                &sample.snapshot.models,
+                &tick.starting_since,
+                &tick.stopping_since,
+                mono,
+            )
+        },
         cool_c: temp_i(sample.snapshot.coolant_c),
         cpu_c: temp_i(sample.snapshot.cpu_c),
         gpu_c: temp_i(sample.snapshot.gpu_c),
@@ -1400,6 +1416,10 @@ fn model_detail(sample: &WatchSample, state: WatchState) -> String {
 
 /// The header's engine item with no model shown (#33).
 const NO_ENGINE: &str = "engine --";
+/// A compute process at least this large makes the header `GPU BUSY` (#139).
+const GPU_BUSY_MIN_BYTES: u64 = 256 * 1024 * 1024;
+/// Model field while that header is up.
+const OUTSIDE_MODEL: &str = "outside llama-swap";
 /// IN and OUT while the header model has no `/slots` to take text from.
 const NO_SLOTS_TEXT: &str = "text needs llama.cpp /slots";
 /// How long a model may sit in `stopping` before the header calls it stuck.
@@ -1442,6 +1462,59 @@ fn note_stopping(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now
 /// Track when each model entered `starting`; forget the rest.
 fn note_starting(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now: Instant) {
     note_phase(since, models, "starting", now);
+}
+
+/// Engine field when the card is busy outside llama-swap, or `None` when
+/// the header stays as it is.
+///
+/// `None` when a job view is up, when llama-swap lists any model, when the
+/// process read failed, or when no process holds [`GPU_BUSY_MIN_BYTES`].
+/// The clock is not an argument: the collector already rate-limits the list
+/// this receives. A failure suppresses the header even if `list` is stale.
+fn outside_engine(models: &[ModelInfo], job_up: bool, processes: &GpuProcesses) -> Option<String> {
+    if job_up || !models.is_empty() || processes.failed {
+        return None;
+    }
+    busiest(&processes.list).map(process_field)
+}
+
+/// Largest process at or above [`GPU_BUSY_MIN_BYTES`]. Equal memory keeps
+/// the lower pid.
+fn busiest(list: &[GpuProcess]) -> Option<&GpuProcess> {
+    let mut best: Option<&GpuProcess> = None;
+    for process in list {
+        if process.memory_bytes < GPU_BUSY_MIN_BYTES {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some(kept) => {
+                process.memory_bytes > kept.memory_bytes
+                    || (process.memory_bytes == kept.memory_bytes && process.pid < kept.pid)
+            }
+        };
+        if replace {
+            best = Some(process);
+        }
+    }
+    best
+}
+
+/// `name 22.4 GB`, or `pid N 22.4 GB` when the name sanitises to nothing.
+/// The name is untrusted and is cut again here.
+fn process_field(process: &GpuProcess) -> String {
+    let name = crate::sources::gpu::sanitize_process_name(&process.name);
+    let who = if name.is_empty() {
+        format!("pid {}", process.pid)
+    } else {
+        name
+    };
+    format!("{who} {}", format_gb(process.memory_bytes))
+}
+
+/// `{n:.1} GB`. Same unit and precision as one side of the VRAM meter.
+fn format_gb(bytes: u64) -> String {
+    format!("{:.1} GB", gib(bytes))
 }
 
 /// The header (first) model is llama-swap `starting` or `stopping`.
@@ -4804,6 +4877,190 @@ mod tests {
             !header.contains("READY") && !header.contains("GENERATING"),
             "{header}"
         );
+    }
+
+    fn gpu_proc(pid: u32, memory_bytes: u64, name: &str) -> GpuProcess {
+        GpuProcess {
+            pid,
+            memory_bytes,
+            name: name.to_owned(),
+        }
+    }
+
+    fn gpu_seen(list: &[GpuProcess]) -> GpuProcesses {
+        GpuProcesses {
+            list: list.to_vec(),
+            failed: false,
+        }
+    }
+
+    /// #139: the outside-engine field. A listed model, a job view, a read
+    /// error, or a process under 256 MiB leaves it unset. The largest
+    /// process wins; equal memory keeps the lower pid.
+    #[test]
+    fn gpu_busy_names_the_largest_process_outside_llama_swap() {
+        let min = 256 * 1024 * 1024;
+        let big = gpu_proc(9, 24_051_816_858, "example-bench");
+        let mid = gpu_proc(2, 2 * 1_073_741_824, "smaller");
+        let under = gpu_proc(3, min - 1, "small");
+        let listed = gpu_seen(&[big.clone(), mid.clone(), under.clone()]);
+        for state in ["ready", "starting", "stopping", "stopped", "other"] {
+            let models = vec![served("cedar-70b", state, None)];
+            assert!(outside_engine(&models, false, &listed).is_none(), "{state}");
+        }
+        assert!(outside_engine(&[], true, &listed).is_none(), "job view");
+        let failed = GpuProcesses {
+            list: vec![big.clone()],
+            failed: true,
+        };
+        assert!(
+            outside_engine(&[], false, &failed).is_none(),
+            "a read error is not busy, even with a stale list"
+        );
+        assert!(outside_engine(&[], false, &gpu_seen(&[])).is_none());
+        assert!(outside_engine(&[], false, &gpu_seen(&[under])).is_none());
+        let edge = gpu_seen(&[gpu_proc(1, min, "edge")]);
+        assert_eq!(
+            outside_engine(&[], false, &edge).as_deref(),
+            Some("edge 0.2 GB"),
+            "256 MiB is 0.2 GB in the VRAM meter's precision"
+        );
+        assert_eq!(
+            outside_engine(&[], false, &listed).as_deref(),
+            Some("example-bench 22.4 GB")
+        );
+        let tied = gpu_seen(&[gpu_proc(10, min, "alpha"), gpu_proc(4, min, "beta")]);
+        assert_eq!(
+            outside_engine(&[], false, &tied).as_deref(),
+            Some("beta 0.2 GB"),
+            "equal memory keeps the lower pid"
+        );
+        let dirty = gpu_seen(&[gpu_proc(8, min, "../weird name!")]);
+        assert_eq!(
+            outside_engine(&[], false, &dirty).as_deref(),
+            Some("..weirdname 0.2 GB")
+        );
+        let unnamed = gpu_seen(&[gpu_proc(42, min, "!!!")]);
+        assert_eq!(
+            outside_engine(&[], false, &unnamed).as_deref(),
+            Some("pid 42 0.2 GB")
+        );
+        let long = gpu_seen(&[gpu_proc(1, min, &"a".repeat(40))]);
+        let cut = format!("{} 0.2 GB", "a".repeat(24));
+        assert_eq!(
+            outside_engine(&[], false, &long).as_deref(),
+            Some(cut.as_str())
+        );
+    }
+
+    /// #139: the header word, fields, and the states that still say busy
+    /// when llama-swap has listed nothing. A live job keeps its view.
+    #[test]
+    fn gpu_busy_header_replaces_an_idle_header_and_yields_to_a_job() {
+        use crate::tty::C16;
+        let min = 256 * 1024 * 1024;
+        let processes = GpuProcesses {
+            list: vec![gpu_proc(9, 24_051_816_858, "example-bench")],
+            failed: false,
+        };
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let ctx = frame_ctx(None, true);
+        let mono = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH;
+
+        let mut idle = backend_sample(Vec::new());
+        idle.gpu_processes = processes;
+        let model = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(model.gpu_busy);
+        assert!(!model.model_loading && !model.model_stopping);
+        assert_eq!(model.state, WatchState::Ready);
+        assert_eq!(model.model_name, "outside llama-swap");
+        assert_eq!(model.model_detail, "example-bench 22.4 GB");
+        assert_eq!(model.slots_line, "--");
+        assert_eq!(model.swap_line, "--");
+        let (header, grid) = header_of(&model);
+        assert_word(&grid, &header, "GPU BUSY", C16::Yellow, C16::Black);
+        assert!(header.contains("outside llama-swap"), "{header}");
+        assert!(header.contains("example-bench 22.4 GB"), "{header}");
+        assert!(header.contains("slots --"), "{header}");
+        assert!(header.contains("swap --"), "{header}");
+        assert!(!header.contains("READY"), "{header}");
+
+        // A failed read, even with a large process still in the list, does not.
+        idle.gpu_processes.failed = true;
+        let quiet = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(!quiet.gpu_busy);
+        assert_eq!(quiet.model_name, "--");
+        assert_eq!(quiet.model_detail, "engine --");
+        assert_eq!(quiet.slots_line, "0/0 idle");
+        assert_eq!(quiet.swap_line, "none");
+
+        // Not yet heard, llama down, and llama disabled: the word changes
+        // and the body state does not.
+        tick.heard = false;
+        idle.gpu_processes.failed = false;
+        let starting = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(starting.gpu_busy);
+        assert_eq!(starting.state, WatchState::Starting);
+        assert_eq!(starting.slots_line, "--");
+        assert_eq!(starting.swap_line, "--");
+        let (header, grid) = header_of(&starting);
+        assert_word(&grid, &header, "GPU BUSY", C16::Yellow, C16::Black);
+
+        tick.heard = true;
+        idle.snapshot.ai = AiState::Down;
+        let down = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(down.gpu_busy);
+        assert_eq!(down.state, WatchState::AiDown);
+        let (header, _) = header_of(&down);
+        assert!(header.contains("GPU BUSY"), "{header}");
+        assert!(!header.contains("AI DOWN"), "{header}");
+
+        let off = frame_ctx(None, false);
+        let no_llama = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &off);
+        assert!(no_llama.gpu_busy);
+        assert_eq!(no_llama.state, WatchState::NoLlama);
+
+        // A listed model wins, including one that is only starting.
+        let mut listed = backend_sample(vec![named("cedar-70b", "starting")]);
+        listed.gpu_processes = GpuProcesses {
+            list: vec![gpu_proc(9, min, "example-bench")],
+            failed: false,
+        };
+        let model = tty_model(&listed, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(!model.gpu_busy);
+        assert!(model.model_loading);
+        assert_eq!(model.model_name, "Full cedar-70b");
+
+        // A live job view wins. A finished job is a note, so the busy header stays.
+        // The file's mtime is one second before the clock passed into the frame.
+        let fresh = wall + Duration::from_secs(10);
+        tick.detail.jobs = vec![job_at("run", JobState::Running, fresh)];
+        let model = tty_model(
+            &idle,
+            &mut tick,
+            mono,
+            fresh + Duration::from_secs(1),
+            Zone::utc(),
+            &ctx,
+        );
+        assert!(model.job.is_some(), "idle live job is the job view");
+        assert!(!model.gpu_busy);
+        assert_ne!(model.model_name, "outside llama-swap");
+
+        tick.detail.jobs = vec![job_at("wrap", JobState::Done, fresh)];
+        let model = tty_model(
+            &idle,
+            &mut tick,
+            mono,
+            fresh + Duration::from_secs(1),
+            Zone::utc(),
+            &ctx,
+        );
+        assert!(model.job.is_none(), "a finished job is not a view");
+        assert!(model.gpu_busy);
+        assert!(model.job_note.is_some());
     }
 
     /// #135: the swap clock starts when the state is first seen, restarts

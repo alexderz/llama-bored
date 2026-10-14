@@ -649,6 +649,7 @@ mod tests {
             model_stuck: false,
             model_loading: false,
             model_stopping: false,
+            gpu_busy: false,
             slots_line: String::new(),
             swap_line: String::new(),
             cool_c: None,
