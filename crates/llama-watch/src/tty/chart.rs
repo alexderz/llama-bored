@@ -142,7 +142,8 @@ impl TokenChart {
     }
 
     /// Attribute `tokens` across ring columns whose spans overlap
-    /// `(prev_at, obs_at]`.
+    /// `(prev_at, obs_at]`. A gap longer than [`MAX_BUCKETS`] columns loses
+    /// the tokens that fall outside the ring.
     fn credit(&mut self, prev_at: Instant, obs_at: Instant, tokens: f64) {
         if tokens == 0.0 {
             return;
@@ -152,6 +153,10 @@ impl TokenChart {
         };
         let width = self.bucket_s;
         let span = obs_at.saturating_duration_since(prev_at).as_secs_f64();
+        debug_assert!(
+            span > 0.0,
+            "apply_decoded returns on a repeated instant; observation instants only advance"
+        );
         let n = self.buckets.len();
         for i in 0..n {
             let age = (n - 1 - i) as f64;
@@ -159,13 +164,7 @@ impl TokenChart {
                 continue;
             };
             let b_end = b_start + Duration::from_secs_f64(width);
-            let part = if span > 0.0 {
-                tokens * overlap_s(prev_at, obs_at, b_start, b_end) / span
-            } else if i + 1 == n {
-                tokens
-            } else {
-                0.0
-            };
+            let part = tokens * overlap_s(prev_at, obs_at, b_start, b_end) / span;
             if part == 0.0 {
                 continue;
             }
