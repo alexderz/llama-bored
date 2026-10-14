@@ -59,12 +59,13 @@ while any model is `starting`, otherwise `stopping M:SS` while any is
 `stopping`, otherwise `none`, counted from when llama-watch first saw that
 state (`H:MM:SS` past an hour; the longest when several models are in it).
 A `ready` header shows that swap, not `none`, while another model is
-starting or stopping. When llama-swap lists no model and no job view is
-up, a compute process holding 256 MiB or more makes the word `GPU BUSY`
-(yellow on black): the model field reads `outside llama-swap`, and the
-engine field names the largest such process and its memory
-(`llama-server 22.4 GB`, or `pid N 22.4 GB` when the name cannot be
-read). `slots` and `swap` are `--`. A process under 256 MiB is ignored.
+starting or stopping. `GPU BUSY` shows only when llama-swap has answered
+and lists no model, and no job view is up: a compute process holding
+256 MiB or more makes the word `GPU BUSY` (yellow on black). The model
+field reads `outside llama-swap`, and the engine field names the largest
+such process and its memory (`llama-server 22.4 GB`, or `pid N 22.4 GB`
+when the name cannot be read). `slots` and `swap` are `--`. A process
+under 256 MiB is ignored.
 A harness can write a job status file
 ([`docs/job-status.md`](docs/job-status.md)) to get the job view with its
 own progress instead of this one-line header. After `slots` and `swap`, a
