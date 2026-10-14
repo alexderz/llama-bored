@@ -370,7 +370,7 @@ fn the_layout_receives_a_capped_tail() {
 }
 
 #[test]
-fn tick_loop_keeps_a_chart_ring_from_the_live_rates() {
+fn tick_loop_keeps_a_chart_ring_from_the_decoded_counter() {
     let fx = Fixture::new("chart-ring");
     let models = Arc::new(Mutex::new(Vec::new()));
     let mut feed = Queue::default();
@@ -395,7 +395,7 @@ fn tick_loop_keeps_a_chart_ring_from_the_live_rates() {
     assert_eq!(
         models[0].chart,
         vec![ChartBucket {
-            gen_tps: Some(20.0),
+            gen_tps: Some(0.0),
             prompt_tps: Some(400.0),
         }]
     );
@@ -403,7 +403,7 @@ fn tick_loop_keeps_a_chart_ring_from_the_live_rates() {
     assert_eq!(last.len(), 2, "{last:?}");
     assert!(
         last.iter()
-            .all(|b| b.gen_tps == Some(20.0) && b.prompt_tps == Some(400.0)),
+            .all(|b| b.gen_tps == Some(0.0) && b.prompt_tps == Some(400.0)),
         "{last:?}"
     );
 }

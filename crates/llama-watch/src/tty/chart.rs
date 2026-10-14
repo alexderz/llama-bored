@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 /// Widest terminal the layout will draw (`term::MAX_COLS`).
 pub const MAX_BUCKETS: usize = 1024;
 
-/// Mean rates over one `chart_bucket_s` column.
+/// Rates over one `chart_bucket_s` column.
 ///
-/// `None` is no data (llama down, or a gap). `Some(0.0)` is a measured zero.
+/// Generation is tokens decoded in the column divided by the column width.
+/// Prompt is the mean of the per-tick values. `None` is no data (llama down,
+/// or a gap). `Some(0.0)` is a measured zero.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChartBucket {
-    /// Mean generation tok/s in this bucket.
+    /// Generation tok/s in this bucket (tokens in the span / `chart_bucket_s`).
     pub gen_tps: Option<f64>,
     /// Mean prompt tok/s in this bucket.
     pub prompt_tps: Option<f64>,
@@ -22,9 +24,13 @@ pub struct TokenChart {
     buckets: VecDeque<ChartBucket>,
     bucket_s: f64,
     start: Option<Instant>,
-    gen_sum: f64,
+    /// Tokens attributed to the in-progress column.
+    gen_tokens: f64,
+    /// A decoded-token counter was observed in the in-progress column.
+    gen_seen: bool,
+    last_decoded: Option<u64>,
+    last_at: Option<Instant>,
     prompt_sum: f64,
-    gen_n: u32,
     prompt_n: u32,
 }
 
@@ -37,25 +43,42 @@ impl TokenChart {
             buckets: VecDeque::new(),
             bucket_s: (bucket_s.max(1) as f64),
             start: None,
-            gen_sum: 0.0,
+            gen_tokens: 0.0,
+            gen_seen: false,
+            last_decoded: None,
+            last_at: None,
             prompt_sum: 0.0,
-            gen_n: 0,
             prompt_n: 0,
         }
     }
 
-    /// Fold the live rates into the bucket that contains `now`.
-    pub fn ingest(&mut self, now: Instant, gen_tps: Option<f64>, prompt_tps: Option<f64>) {
+    /// Fold the decoded-token counter and the prompt rate into the column that
+    /// contains `now`.
+    ///
+    /// A counter increase covers `(previous observation, now]` and is split
+    /// across column boundaries in proportion to time. The first observation
+    /// after start or after `None`, and a step down, set the base and count
+    /// nothing. Prompt is still the mean of the per-tick values.
+    pub fn ingest(&mut self, now: Instant, decoded: Option<u64>, prompt_tps: Option<f64>) {
         let Some(start) = self.start else {
             self.start = Some(now);
-            self.add_sample(gen_tps, prompt_tps);
+            self.remember(decoded, now);
+            self.add_prompt(prompt_tps);
             self.publish_current();
             return;
         };
         let elapsed = now.saturating_duration_since(start).as_secs_f64();
         let width = self.bucket_s;
+        let step = match (self.last_decoded, decoded) {
+            (Some(prev), Some(next)) if next >= prev => Some((next - prev) as f64),
+            _ => None,
+        };
         if elapsed < width {
-            self.add_sample(gen_tps, prompt_tps);
+            if let Some(tokens) = step {
+                self.gen_tokens += tokens;
+            }
+            self.remember(decoded, now);
+            self.add_prompt(prompt_tps);
             self.publish_current();
             return;
         }
@@ -65,16 +88,21 @@ impl TokenChart {
         } else {
             MAX_BUCKETS as u64
         };
-        self.commit();
-        for _ in 1..skipped {
-            self.push(ChartBucket {
-                gen_tps: None,
-                prompt_tps: None,
-            });
+        if let Some(tokens) = step {
+            self.spread(start, now, skipped, tokens);
+        } else {
+            self.commit();
+            for _ in 1..skipped {
+                self.push(ChartBucket {
+                    gen_tps: None,
+                    prompt_tps: None,
+                });
+            }
+            let advance = Duration::from_secs_f64(skipped as f64 * width);
+            self.start = Some(start + advance);
         }
-        let advance = Duration::from_secs_f64(skipped as f64 * width);
-        self.start = Some(start + advance);
-        self.add_sample(gen_tps, prompt_tps);
+        self.remember(decoded, now);
+        self.add_prompt(prompt_tps);
         self.publish_current();
     }
 
@@ -84,20 +112,63 @@ impl TokenChart {
         self.buckets.iter().copied().collect()
     }
 
-    fn add_sample(&mut self, gen_tps: Option<f64>, prompt_tps: Option<f64>) {
-        if let Some(v) = gen_tps.filter(|v| v.is_finite()) {
-            self.gen_sum += v;
-            self.gen_n = self.gen_n.saturating_add(1);
-        }
+    fn add_prompt(&mut self, prompt_tps: Option<f64>) {
         if let Some(v) = prompt_tps.filter(|v| v.is_finite()) {
             self.prompt_sum += v;
             self.prompt_n = self.prompt_n.saturating_add(1);
         }
     }
 
+    fn remember(&mut self, decoded: Option<u64>, now: Instant) {
+        if let Some(v) = decoded {
+            self.last_decoded = Some(v);
+            self.last_at = Some(now);
+            self.gen_seen = true;
+        } else {
+            self.last_decoded = None;
+            self.last_at = None;
+        }
+    }
+
+    fn spread(&mut self, start: Instant, now: Instant, skipped: u64, tokens: f64) {
+        let width = self.bucket_s;
+        let prev_at = self.last_at.unwrap_or(start);
+        let span = now.saturating_duration_since(prev_at).as_secs_f64();
+        let share = |i: u64| -> f64 {
+            let b_start = start + Duration::from_secs_f64(i as f64 * width);
+            let b_end = start + Duration::from_secs_f64((i + 1) as f64 * width);
+            let ov = overlap_s(prev_at, now, b_start, b_end);
+            if span > 0.0 {
+                tokens * ov / span
+            } else if i == skipped {
+                tokens
+            } else {
+                0.0
+            }
+        };
+        self.gen_tokens += share(0);
+        self.gen_seen = true;
+        self.commit();
+        for i in 1..skipped {
+            if let Some(last) = self.buckets.back_mut() {
+                *last = ChartBucket {
+                    gen_tps: Some(share(i) / width),
+                    prompt_tps: None,
+                };
+            }
+            self.push(ChartBucket {
+                gen_tps: None,
+                prompt_tps: None,
+            });
+        }
+        self.start = Some(start + Duration::from_secs_f64(skipped as f64 * width));
+        self.gen_tokens = share(skipped);
+        self.gen_seen = true;
+    }
+
     fn current(&self) -> ChartBucket {
         ChartBucket {
-            gen_tps: mean(self.gen_sum, self.gen_n),
+            gen_tps: self.gen_seen.then_some(self.gen_tokens / self.bucket_s),
             prompt_tps: mean(self.prompt_sum, self.prompt_n),
         }
     }
@@ -115,9 +186,9 @@ impl TokenChart {
 
     fn commit(&mut self) {
         self.publish_current();
-        self.gen_sum = 0.0;
+        self.gen_tokens = 0.0;
+        self.gen_seen = false;
         self.prompt_sum = 0.0;
-        self.gen_n = 0;
         self.prompt_n = 0;
         self.push(ChartBucket {
             gen_tps: None,
@@ -135,6 +206,15 @@ impl TokenChart {
 
 fn mean(sum: f64, n: u32) -> Option<f64> {
     (n > 0).then_some(sum / f64::from(n))
+}
+
+/// Length of `(prev, now]` ∩ `[b_start, b_end)`.
+fn overlap_s(prev: Instant, now: Instant, b_start: Instant, b_end: Instant) -> f64 {
+    let span = now.saturating_duration_since(prev).as_secs_f64();
+    let start_off = b_start.saturating_duration_since(prev).as_secs_f64();
+    let end_off = b_end.saturating_duration_since(prev).as_secs_f64();
+    let hi = span.min(end_off);
+    (hi - start_off).max(0.0)
 }
 
 /// Map `frac` in 0..=1 onto `rows × 2` half-block levels.
@@ -253,4 +333,73 @@ fn column_glyphs(level: u32, rows: u16, half: char, rise: bool) -> Vec<char> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+
+    fn at(origin: Instant, ms: u64) -> Instant {
+        origin + Duration::from_millis(ms)
+    }
+
+    fn gens(chart: &TokenChart) -> Vec<Option<f64>> {
+        chart.buckets().into_iter().map(|b| b.gen_tps).collect()
+    }
+
+    #[test]
+    fn fixed_rate_decoding_fills_full_columns_and_climbs_in_progress() {
+        let mut chart = TokenChart::new(2);
+        let origin = t0();
+        chart.ingest(origin, Some(0), None);
+        chart.ingest(at(origin, 500), Some(10), None);
+        assert_eq!(gens(&chart), vec![Some(5.0)]);
+        chart.ingest(at(origin, 1000), Some(20), None);
+        assert_eq!(gens(&chart), vec![Some(10.0)]);
+        chart.ingest(at(origin, 1500), Some(30), None);
+        assert_eq!(gens(&chart), vec![Some(15.0)]);
+        chart.ingest(at(origin, 2000), Some(40), None);
+        assert_eq!(gens(&chart), vec![Some(20.0), Some(0.0)]);
+        chart.ingest(at(origin, 2500), Some(50), None);
+        assert_eq!(gens(&chart), vec![Some(20.0), Some(5.0)]);
+        chart.ingest(at(origin, 4000), Some(80), None);
+        assert_eq!(gens(&chart), vec![Some(20.0), Some(20.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn a_burst_that_ends_mid_column_puts_nothing_into_the_next() {
+        let mut chart = TokenChart::new(2);
+        let origin = t0();
+        chart.ingest(origin, Some(0), None);
+        chart.ingest(at(origin, 400), Some(80), None);
+        assert_eq!(gens(&chart), vec![Some(40.0)]);
+        chart.ingest(at(origin, 2000), Some(80), None);
+        assert_eq!(gens(&chart), vec![Some(40.0), Some(0.0)]);
+        chart.ingest(at(origin, 3500), Some(80), None);
+        assert_eq!(gens(&chart), vec![Some(40.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn a_boundary_increase_is_split_and_a_reset_counts_nothing_negative() {
+        let mut chart = TokenChart::new(2);
+        let origin = t0();
+        chart.ingest(origin, Some(0), None);
+        chart.ingest(at(origin, 1500), Some(0), None);
+        chart.ingest(at(origin, 2500), Some(40), None);
+        assert_eq!(gens(&chart), vec![Some(10.0), Some(10.0)]);
+
+        let mut reset = TokenChart::new(2);
+        let origin = t0();
+        reset.ingest(origin, Some(100), None);
+        reset.ingest(at(origin, 500), Some(140), None);
+        assert_eq!(gens(&reset), vec![Some(20.0)]);
+        reset.ingest(at(origin, 1000), Some(10), None);
+        assert_eq!(gens(&reset), vec![Some(20.0)]);
+        reset.ingest(at(origin, 1500), Some(30), None);
+        assert_eq!(gens(&reset), vec![Some(30.0)]);
+    }
 }
