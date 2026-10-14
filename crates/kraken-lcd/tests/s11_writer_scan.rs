@@ -120,6 +120,7 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("device/guard.rs", "const", "FOLLOW_UP_AFTER"),
     ("device/guard.rs", "const", "PUMP_BAND_FLOOR_RPM"),
     ("device/guard.rs", "const", "PUMP_BAND_PERCENT"),
+    ("device/guard.rs", "const", "PUMP_DUTY_STEP_PERCENT"),
     ("device/guard.rs", "enum", "Deviation"),
     ("device/guard.rs", "field", "CoolingSnapshot.bootloader"),
     ("device/guard.rs", "field", "CoolingSnapshot.devnum"),
