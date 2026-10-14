@@ -5026,6 +5026,7 @@ mod tests {
                 load_source: crate::collector::LoadSource::Util,
                 fans: None,
                 temps: None,
+                gpu_processes: crate::collector::GpuProcesses::default(),
             }
         }
     }

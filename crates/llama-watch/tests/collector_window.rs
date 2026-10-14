@@ -5,14 +5,14 @@
 //! here opens a device node or calls llama-swap.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use llama_core::sample::{AiState, LlamaView, ModelInfo};
-use llama_watch::collector::{GpuExtra, WatchCollector, WatchSample};
+use llama_watch::collector::{GpuExtra, GpuProcess, WatchCollector, WatchSample};
 use llama_watch::config::{Config, ValidWatchConfig};
-use llama_watch::sources::gpu::{GpuBackend, GpuError};
+use llama_watch::sources::gpu::{ComputeProcess, GpuBackend, GpuError};
 use llama_watch::sources::{Roots, SourceId};
 
 fn fixtures() -> PathBuf {
@@ -794,6 +794,173 @@ fn gpu_util_failure_and_recovery_are_logged_once() {
     collector.sample(now, wall, &view);
     let recovered = lines_containing(&log, "gpu recovered");
     assert_eq!(recovered, vec!["<6>gpu recovered".to_owned()]);
+}
+
+/// `compute_processes` fails while `fail` is set. Util fails while `util_ok` is clear.
+struct ProcGpu {
+    calls: Arc<AtomicUsize>,
+    inits: Arc<AtomicUsize>,
+    fail: Arc<AtomicBool>,
+    util_ok: Arc<AtomicBool>,
+}
+
+impl GpuBackend for ProcGpu {
+    fn init(&mut self) -> Result<(), GpuError> {
+        self.inits.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn util_pct(&mut self) -> Result<f32, GpuError> {
+        if self.util_ok.load(Ordering::Relaxed) {
+            Ok(12.0)
+        } else {
+            Err(GpuError::new("util lost"))
+        }
+    }
+
+    fn temp_c(&mut self) -> Result<f32, GpuError> {
+        Ok(40.0)
+    }
+
+    fn memory_info(&mut self) -> Result<(u64, u64), GpuError> {
+        Ok((1, 2))
+    }
+
+    fn power_usage(&mut self) -> Result<u32, GpuError> {
+        Ok(3)
+    }
+
+    fn enforced_power_limit(&mut self) -> Result<u32, GpuError> {
+        Ok(4)
+    }
+
+    fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail.load(Ordering::Relaxed) {
+            Err(GpuError::new("nvml busy"))
+        } else {
+            Ok(vec![
+                ComputeProcess {
+                    pid: 4242,
+                    memory_bytes: 24_051_816_858,
+                },
+                ComputeProcess {
+                    pid: 7,
+                    memory_bytes: 100,
+                },
+            ])
+        }
+    }
+
+    fn disconnect(&mut self) {}
+}
+
+#[test]
+fn process_list_is_named_once_a_second_and_an_error_is_logged_once() {
+    let scratch = Scratch::new("gpu-proc");
+    let proc_dir = ProcDir::new(&scratch);
+    std::fs::create_dir_all(proc_dir.dir.join("4242")).expect("pid dir");
+    std::fs::write(proc_dir.dir.join("4242").join("comm"), "example-bench\n").expect("comm");
+    let config = watch_config(scratch.path(), 1, 1.0);
+    let log = Capture::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inits = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    let util_ok = Arc::new(AtomicBool::new(true));
+    let mut collector = WatchCollector::new(
+        proc_dir.roots(),
+        ProcGpu {
+            calls: Arc::clone(&calls),
+            inits: Arc::clone(&inits),
+            fail: Arc::clone(&fail),
+            util_ok: Arc::clone(&util_ok),
+        },
+        &config,
+        log.clone(),
+    );
+    proc_dir.set_stat(&one_cpu(0, 100));
+    let t0 = Instant::now();
+    let wall = SystemTime::UNIX_EPOCH;
+    let view = idle_view();
+    let first = collector.sample(t0, wall, &view);
+    assert_eq!(
+        first.gpu_processes.list,
+        vec![
+            GpuProcess {
+                pid: 4242,
+                memory_bytes: 24_051_816_858,
+                name: "example-bench".to_owned(),
+            },
+            GpuProcess {
+                pid: 7,
+                memory_bytes: 100,
+                name: String::new(),
+            },
+        ]
+    );
+    assert!(!first.gpu_processes.failed);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(inits.load(Ordering::Relaxed), 1);
+
+    // A tick inside the second keeps the name it already read.
+    std::fs::write(proc_dir.dir.join("4242").join("comm"), "other-name\n").expect("comm");
+    let cached = collector.sample(t0 + Duration::from_millis(500), wall, &view);
+    assert_eq!(cached.gpu_processes.list[0].name, "example-bench");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(inits.load(Ordering::Relaxed), 1);
+
+    fail.store(true, Ordering::Relaxed);
+    let lost = collector.sample(t0 + Duration::from_secs(1), wall, &view);
+    assert!(lost.gpu_processes.list.is_empty());
+    assert!(lost.gpu_processes.failed);
+    assert_eq!(lost.snapshot.gpu_pct, Some(12.0), "the session stays up");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(inits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        lines_containing(&log, "processes"),
+        vec!["<3>gpu failed: processes: nvml busy".to_owned()]
+    );
+
+    let still = collector.sample(t0 + Duration::from_millis(1500), wall, &view);
+    assert!(still.gpu_processes.failed);
+    assert!(still.gpu_processes.list.is_empty());
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "the failure is cached");
+    assert_eq!(lines_containing(&log, "processes").len(), 1);
+
+    let again = collector.sample(t0 + Duration::from_secs(2), wall, &view);
+    assert!(again.gpu_processes.failed);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        lines_containing(&log, "processes"),
+        vec!["<3>gpu failed: processes: nvml busy".to_owned()],
+        "a repeated process error stays quiet"
+    );
+
+    fail.store(false, Ordering::Relaxed);
+    let back = collector.sample(t0 + Duration::from_secs(3), wall, &view);
+    assert_eq!(back.gpu_processes.list[0].name, "other-name");
+    assert!(!back.gpu_processes.failed);
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        lines_containing(&log, "processes"),
+        vec![
+            "<3>gpu failed: processes: nvml busy".to_owned(),
+            "<6>gpu processes recovered".to_owned(),
+        ]
+    );
+
+    // A dropped session clears the list and does not log a process error.
+    util_ok.store(false, Ordering::Relaxed);
+    let down = collector.sample(t0 + Duration::from_millis(3100), wall, &view);
+    assert!(down.snapshot.gpu_pct.is_none());
+    assert!(down.gpu_processes.list.is_empty());
+    assert!(!down.gpu_processes.failed);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        4,
+        "a down session does not query"
+    );
+    assert_eq!(lines_containing(&log, "processes").len(), 2);
 }
 
 fn copy_tree(src: &Path, dst: &Path) {
