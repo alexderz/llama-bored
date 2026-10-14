@@ -470,6 +470,8 @@ struct TickState {
     /// Monotonic time of the last publish that replaced the snapshot file.
     published_at: Option<Instant>,
     chart: TokenChart,
+    /// Tick `mono` of the last poll that replaced `llama`.
+    llama_at: Option<Instant>,
     /// Per-slot context history for the SLOTS sparklines (T53).
     ctx_history: CtxBook,
     /// When each model (by name) entered llama-swap `stopping`.
@@ -516,6 +518,7 @@ impl TickState {
             down_since: None,
             published_at: None,
             chart: TokenChart::new(chart_bucket_s),
+            llama_at: None,
             ctx_history: CtxBook::new(ctx_history_h),
             stopping_since: HashMap::new(),
             starting_since: HashMap::new(),
@@ -569,6 +572,7 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         state.llama = view;
         state.detail = detail;
         state.heard = true;
+        state.llama_at = Some(mono);
         note_poll(state, mono, wall);
     }
     state.flights.retire(mono);
@@ -583,9 +587,11 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         }
         AiState::Idle | AiState::Loaded => state.down_since = None,
     }
-    state
-        .chart
-        .ingest(mono, state.llama.decoded_total, state.detail.prompt_tps);
+    let decoded = match (state.llama_at, state.llama.decoded_total) {
+        (Some(at), Some(count)) => Some((at, count)),
+        _ => None,
+    };
+    state.chart.ingest(mono, decoded, state.detail.prompt_tps);
     let running: Vec<String> = state
         .llama
         .models
