@@ -144,6 +144,9 @@ llama-swap's own speeds.
 - Prompt and generation tok/s, and a token chart in eighth-block bars
   (generation up, prompt down, newest on the left), log-scaled to
   `gen_ceiling_tps` and `prompt_ceiling_tps`.
+  Each column is `tty.chart_bucket_s` seconds (default 2): generation is
+  the tokens decoded in that span, prompt the mean of the per-tick rates.
+  The chart sits after RECENT (above IN/OUT when text is on).
 - **SLOTS:** per-slot context fill and a context-history sparkline (6 h by
   default) with a marker where a context dropped, labelled by best-guess
   reason from token counts: `c` compacted (same conversation, mostly
