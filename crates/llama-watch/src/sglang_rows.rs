@@ -1124,7 +1124,12 @@ fn duration_agrees(duration_ms: u64, e2e_s: f64) -> bool {
     if !e2e_ms.is_finite() || !(0.0..=i64::MAX as f64).contains(&e2e_ms) {
         return false;
     }
-    let delta_ms = duration_ms as i64 - e2e_ms as i64;
+    // `duration_ms` is a `u64` from llama-swap. Casting it to `i64` wraps
+    // a value past `i64::MAX`, and the subtraction then overflows.
+    let Ok(duration_ms) = i64::try_from(duration_ms) else {
+        return false;
+    };
+    let delta_ms = duration_ms - e2e_ms as i64;
     let over_ms = ((e2e_s * 0.02).max(0.5) * 1000.0).round() as i64;
     delta_ms >= -100 && delta_ms <= over_ms
 }
@@ -3187,10 +3192,24 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
 
         model.queue_anchor = true;
         model.queue_obs.push_back(Some(0.01));
-        let jumped = model.queue_take(u64::MAX / 2);
-        assert!(matches!(jumped, QueueTie::Unknown));
-        assert!(!model.queue_anchor, "a jump empties the chain");
-        assert!(model.queue_obs.is_empty());
+        // Without the cap guard this walk is `u64::MAX / 2` steps and the
+        // test hangs. A deadline makes that failure return.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let jumped = model.queue_take(u64::MAX / 2);
+            let _ = tx.send((
+                matches!(jumped, QueueTie::Unknown),
+                !model.queue_anchor,
+                model.queue_obs.is_empty(),
+            ));
+        });
+        let (unknown, dropped, empty) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("a jump past the cap returns at once");
+        handle.join().expect("queue_take");
+        assert!(unknown, "a jump is not a burst of finishes");
+        assert!(dropped, "a jump empties the chain");
+        assert!(empty);
     }
 
     #[test]
@@ -3742,5 +3761,13 @@ sglang:time_to_first_token_seconds_count{model_name=\"flash\",is_streaming=\"tru
             "a wall delta of exactly 3 s is covered"
         );
         assert_eq!(wall(43_001), None, "a wall delta of 3.001 s is a hole");
+    }
+
+    #[test]
+    fn a_duration_past_i64_does_not_overflow() {
+        assert!(duration_agrees(10_000, 10.0));
+        assert!(!duration_agrees(i64::MAX as u64, 10.0));
+        assert!(!duration_agrees((i64::MAX as u64).saturating_add(1), 10.0));
+        assert!(!duration_agrees(u64::MAX, 10.0));
     }
 }
