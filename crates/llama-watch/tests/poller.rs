@@ -2848,8 +2848,8 @@ sglang:cached_tokens_total{{cache_source=\"device\",model_name=\"flash\"}} {devi
 sglang:cached_tokens_total{{cache_source=\"host\",model_name=\"flash\"}} {host}.0\n\
 sglang:e2e_request_latency_seconds_sum{{model_name=\"flash\"}} {e2e_sum}\n\
 sglang:e2e_request_latency_seconds_count{{model_name=\"flash\"}} {e2e_count}\n\
-sglang:time_to_first_token_seconds_sum{{model_name=\"flash\"}} {ttft_sum}\n\
-sglang:time_to_first_token_seconds_count{{model_name=\"flash\"}} {ttft_count}\n\
+sglang:time_to_first_token_seconds_sum{{model_name=\"flash\",is_streaming=\"true\"}} {ttft_sum}\n\
+sglang:time_to_first_token_seconds_count{{model_name=\"flash\",is_streaming=\"true\"}} {ttft_count}\n\
 sglang:num_running_reqs{{model_name=\"flash\"}} {running}.0\n",
         true_n = requests.0,
         false_n = requests.1,
@@ -2926,7 +2926,10 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             })
         })
     });
-    thread::sleep(Duration::from_millis(500));
+    // Idle scrapes, so the watcher's start is outside the first row's
+    // isolation window. A row is filled only after a scrape stamped
+    // more than six seconds past its end.
+    thread::sleep(Duration::from_secs(6));
 
     // Prompt 1,000 (600 cached), TTFT 2 s, 401 generated, e2e 10 s.
     let stamp1 = sglang_stamp();
@@ -2940,7 +2943,7 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             std::slice::from_ref(&stamp1),
         );
     });
-    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(12), |_, detail| {
         detail
             .activity
             .iter()
@@ -2952,11 +2955,12 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     assert!((row.engine_gen_tps.expect("gen") - 50.0).abs() < 1e-6);
     assert_eq!((row.prompt_tps, row.gen_tps), (None, None));
 
-    thread::sleep(Duration::from_millis(500));
-    // A second request whose row already has a cached count and a prompt
-    // rate. The window is clean (prompt 500, cached 300, TTFT 2 s, 100
-    // generated, e2e 4 s). Those reported values stay. The generation
-    // rate was not reported, so it is filled: (100 − 1) / (4 − 2) = 49.5.
+    // A second request, only after the first row is decided, so this
+    // finish sits outside that row's window. The row already has a cached
+    // count and a prompt rate. The window is clean (prompt 500, cached
+    // 300, TTFT 2 s, 100 generated, e2e 4 s). Those reported values stay.
+    // The generation rate was not reported, so it is filled:
+    // (100 − 1) / (4 − 2) = 49.5.
     let stamp2 = sglang_stamp();
     server.update(|world| {
         world.metrics.insert(
@@ -2971,11 +2975,12 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             &[stamp2.clone(), stamp1.clone()],
         );
     });
-    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
-        detail.activity.iter().any(|row| row.id == 2)
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(12), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 2 && row.engine_gen_tps.is_some())
     });
-    thread::sleep(Duration::from_millis(800));
-    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, _| true);
     let reported = detail.activity.iter().find(|row| row.id == 2).expect("row");
     assert_eq!(reported.cached_tokens, Some(0));
     assert_eq!(reported.prompt_tps, Some(12.5));
@@ -2987,9 +2992,8 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
     assert!((kept.engine_prompt_tps.expect("kept") - 200.0).abs() < 1e-6);
     assert!((kept.engine_gen_tps.expect("kept") - 50.0).abs() < 1e-6);
 
-    thread::sleep(Duration::from_millis(500));
-    // A rate was reported and the cached count was not. The count is
-    // filled (100); the prompt rate stays 8.
+    // A rate was reported and the cached count was not, after the second
+    // row is decided. The count is filled (100); the prompt rate stays 8.
     server.update(|world| {
         world.metrics.insert(
             "flash".to_owned(),
@@ -3004,7 +3008,7 @@ fn sglang_one_request_fills_its_row_and_a_reported_row_is_left_alone() {
             &[sglang_stamp(), stamp2, stamp1],
         );
     });
-    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(12), |_, detail| {
         detail
             .activity
             .iter()

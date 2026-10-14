@@ -709,6 +709,32 @@ fn cache_capacity(line: &str) -> Option<u64> {
     get(CACHE_KEYS[3]).or_else(|| get(CACHE_KEYS[4])?.checked_mul(get(CACHE_KEYS[1])?))
 }
 
+/// `sglang:time_to_first_token_seconds` carries an `is_streaming` label on
+/// every sum and count line. Without it a streaming finish and a batch
+/// finish cannot be told apart (#133).
+#[must_use]
+pub fn sglang_ttft_labeled(body: &str) -> bool {
+    let mut saw = false;
+    let mut labeled = true;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name = line.split(['{', ' ']).next().unwrap_or("");
+        if name != "sglang:time_to_first_token_seconds_sum"
+            && name != "sglang:time_to_first_token_seconds_count"
+        {
+            continue;
+        }
+        saw = true;
+        if label_value(line, "is_streaming").is_none() {
+            labeled = false;
+        }
+    }
+    saw && labeled
+}
+
 /// The value of label `key` on a series line, under [`labels_of`]'s rules.
 fn label_value(line: &str, key: &str) -> Option<String> {
     labels_of(line)

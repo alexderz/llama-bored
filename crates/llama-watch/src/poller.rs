@@ -1152,6 +1152,10 @@ impl<L: Sink> State<L> {
         let started = Instant::now();
         let mut failure: Option<&'static str> = None;
         for listed in &ready {
+            // The engine reads its counters during the request. The stamp
+            // below is after the parse, so a finish in between can be absent
+            // from this scrape and still have a stamp later than it.
+            let before = SystemTime::now();
             let (model, read) = match self.upstream_read(
                 &listed.id,
                 "metrics",
@@ -1162,11 +1166,16 @@ impl<L: Sink> State<L> {
                 Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => continue,
             };
             let model = &model;
+            let mut ttft_labeled = true;
             let read = exact(read)
                 .map_err(TapError::label)
                 .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"))
-                .map(|text| parse_metrics_full(model.backend, &text));
+                .map(|text| {
+                    ttft_labeled = crate::metrics::sglang_ttft_labeled(&text);
+                    parse_metrics_full(model.backend, &text)
+                });
             let now = Instant::now();
+            let wall = SystemTime::now();
             let mut live = None;
             let read = read.map(|(sample, facts)| {
                 if let Some(mut facts) = facts {
@@ -1200,11 +1209,13 @@ impl<L: Sink> State<L> {
                 let engine = self.engines.observe(&model.id, sample);
                 self.speeds.observe(&model.id, now, sample.speeds);
                 if model.backend == Backend::SgLang {
-                    self.sglang.observe(
+                    self.sglang.observe_scrape(
                         &model.id,
                         now,
-                        SystemTime::now(),
+                        before,
+                        wall,
                         Totals::from_sample(sample),
+                        ttft_labeled,
                     );
                 }
                 self.gauges
