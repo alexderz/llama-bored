@@ -61,8 +61,7 @@ impl TokenChart {
     /// alone. Rollover, the in-progress column and prompt still run every
     /// tick. A counter increase covers `(previous observation instant, this
     /// observation instant]` and is split across column boundaries in
-    /// proportion to time, including columns already committed. A poll held
-    /// across a rollover credits only up to the new column's start. The first
+    /// proportion to time, including columns already committed. The first
     /// observation after start or after `None`, and a step down, set the base
     /// and count nothing. Prompt is still the mean of the per-tick values.
     pub fn ingest(
@@ -73,13 +72,13 @@ impl TokenChart {
     ) {
         if self.start.is_none() {
             self.start = Some(now);
-            self.apply_decoded(decoded, false);
+            self.apply_decoded(decoded);
             self.add_prompt(prompt_tps);
             self.publish_current();
             return;
         }
-        let rolled = self.roll_to(now);
-        self.apply_decoded(decoded, rolled);
+        self.roll_to(now);
+        self.apply_decoded(decoded);
         self.add_prompt(prompt_tps);
         self.publish_current();
     }
@@ -97,14 +96,14 @@ impl TokenChart {
         }
     }
 
-    fn roll_to(&mut self, now: Instant) -> bool {
+    fn roll_to(&mut self, now: Instant) {
         let Some(start) = self.start else {
-            return false;
+            return;
         };
         let elapsed = now.saturating_duration_since(start).as_secs_f64();
         let width = self.bucket_s;
         if elapsed < width {
-            return false;
+            return;
         }
         let skipped = (elapsed / width).floor();
         let skipped = if skipped.is_finite() {
@@ -121,10 +120,9 @@ impl TokenChart {
         }
         let advance = Duration::from_secs_f64(skipped as f64 * width);
         self.start = Some(start + advance);
-        true
     }
 
-    fn apply_decoded(&mut self, decoded: Option<(Instant, u64)>, rolled: bool) {
+    fn apply_decoded(&mut self, decoded: Option<(Instant, u64)>) {
         let Some((at, count)) = decoded else {
             self.last_decoded = None;
             self.last_at = None;
@@ -137,13 +135,7 @@ impl TokenChart {
         if let (Some(prev_count), Some(prev_at)) = (self.last_decoded, self.last_at)
             && count >= prev_count
         {
-            // A poll held across a rollover already filled later columns
-            // as measured zero. The step is news about `(prev_at, start]`.
-            let end = match self.start {
-                Some(start) if !rolled && prev_at < start && at > start => start,
-                _ => at,
-            };
-            self.credit(prev_at, end, (count - prev_count) as f64);
+            self.credit(prev_at, at, (count - prev_count) as f64);
         }
         self.last_decoded = Some(count);
         self.last_at = Some(at);
@@ -411,10 +403,9 @@ mod tests {
     fn a_held_poll_spreads_a_step_over_the_poll_interval() {
         // Ticks every 100 ms; the counter refreshes every 250 ms with a 50 ms
         // phase. 200 tok/s until t = 1.9 s, 2 s columns. A held poll is not a
-        // new observation. The 20 tokens first seen at 2.1 s arrive after a
-        // rollover that already treated column 1 as measured zero, so they
-        // credit (1.8 s, 2.0 s] and column 0 is 190 tok/s. Moving last_at
-        // every tick dumps them into column 1 (180 / 10 / 0).
+        // new observation. The 20 tokens first seen at 2.1 s cover (1.8 s, 2.1 s]
+        // and split 2:1 across the boundary. Moving last_at every tick dumps
+        // them into column 1 (180 / 10 / 0).
         let mut chart = TokenChart::new(2);
         let origin = t0();
         chart.ingest(origin, obs(origin, 0), None);
@@ -433,7 +424,19 @@ mod tests {
             }
             chart.ingest(at(origin, ms), obs(llama_at, count), None);
         }
-        assert_eq!(gens(&chart), vec![Some(190.0), Some(0.0), Some(0.0)]);
+        let got = gens(&chart);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[2], Some(0.0), "{got:?}");
+        let col0 = got[0].expect("column 0");
+        let col1 = got[1].expect("column 1");
+        assert!(
+            (col0 - 186.67).abs() < 0.01 && (col1 - 3.33).abs() < 0.01,
+            "uniform split of (1.8 s, 2.1 s], got {got:?}"
+        );
+        assert!(
+            (col0 - 180.0).abs() >= 0.01 || (col1 - 10.0).abs() >= 0.01,
+            "old per-tick last_at, got {got:?}"
+        );
     }
 
     #[test]
