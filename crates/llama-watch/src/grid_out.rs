@@ -647,6 +647,8 @@ mod tests {
             model_name: "Model".to_owned(),
             model_detail: String::new(),
             model_stuck: false,
+            model_loading: false,
+            model_stopping: false,
             slots_line: String::new(),
             swap_line: String::new(),
             cool_c: None,

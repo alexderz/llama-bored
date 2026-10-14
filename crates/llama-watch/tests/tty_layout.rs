@@ -1920,6 +1920,8 @@ fn sample(state: WatchState) -> TtyModel {
         }
         .to_string(),
         model_stuck: false,
+        model_loading: false,
+        model_stopping: false,
         slots_line: slots_line.to_string(),
         swap_line: swap_line.to_string(),
         cool_c: cool,
@@ -3771,6 +3773,114 @@ fn a_model_stuck_stopping_is_tagged_in_the_header() {
         let at = col_of(&grid, 0, "stopping (stuck?)");
         assert_eq!(grid.get(at, 0).unwrap().fg, C16::Yellow);
     }
+}
+
+/// #135: STOPPING keeps the stuck tag, and a job word still wins.
+#[test]
+fn stopping_keeps_the_stuck_tag_and_a_job_word_wins() {
+    let mut model = sample(WatchState::Ready);
+    model.model_stopping = true;
+    model.model_stuck = true;
+    model.slots_line = "--".to_owned();
+    model.swap_line = "stopping 1:01".to_owned();
+    let grid = draw(&model, 240, 67);
+    let header = row_string(&grid, 0);
+    assert!(header.contains("STOPPING"), "{header}");
+    assert!(header.contains("Qwen 35B  stopping (stuck?)"), "{header}");
+    assert!(header.contains("slots --"), "{header}");
+    assert!(header.contains("swap stopping 1:01"), "{header}");
+    assert!(!header.contains("READY"), "{header}");
+    let word = col_of(&grid, 0, "STOPPING");
+    assert_eq!(grid.get(word, 0).unwrap().fg, C16::Yellow);
+    assert_eq!(grid.get(word, 0).unwrap().bg, C16::Black);
+    let pip = grid.get(24, 0).unwrap();
+    assert_eq!((pip.ch, pip.fg, pip.bg), ('█', C16::Yellow, C16::Black));
+
+    model.job = Some(JobView {
+        job: example_job(),
+        more: 0,
+    });
+    let header = row_string(&draw(&model, 240, 67), 0);
+    assert!(header.contains("TRAINING"), "{header}");
+    assert!(
+        !header.contains("STOPPING") && !header.contains("LOADING"),
+        "{header}"
+    );
+}
+
+/// #135: a live job's word wins over LOADING.
+#[test]
+fn a_job_word_beats_loading() {
+    let mut model = sample(WatchState::Ready);
+    model.model_loading = true;
+    model.slots_line = "--".to_owned();
+    model.swap_line = "loading 1:42".to_owned();
+    model.job = Some(JobView {
+        job: example_job(),
+        more: 0,
+    });
+    let header = row_string(&draw(&model, 240, 67), 0);
+    assert!(header.contains("TRAINING"), "{header}");
+    assert!(!header.contains("LOADING"), "{header}");
+}
+
+/// #135: `loading M:SS` is one field value. It sheds whole, the same way
+/// `none` does, and is never cut down to a fragment.
+#[test]
+fn loading_swap_sheds_as_one_field() {
+    let mut loading = sample(WatchState::Ready);
+    loading.model_loading = true;
+    loading.model_name = "N".repeat(48);
+    // A full detail puts `swap` against the clock on a real header. At 160
+    // a 48-wide name alone still leaves room for `loading 1:42`, and below
+    // 160 the frame is the too-small banner, which sheds nothing.
+    loading.model_detail = "d".repeat(48);
+    loading.slots_line = "--".to_owned();
+    loading.swap_line = "loading 1:42".to_owned();
+    let mut plain = loading.clone();
+    plain.model_loading = false;
+    plain.swap_line = "none".to_owned();
+    let mut saw_whole = false;
+    let mut saw_none_without_longer = false;
+    for cols in 100u16..=240 {
+        let header = header_line(&loading, cols);
+        let shown = header.contains("swap loading 1:42");
+        // Whole or nothing. A cut such as `loading` or `1:42` fails this.
+        assert!(
+            shown
+                || (!header.contains("swap")
+                    && !header.contains("loading")
+                    && !header.contains("1:42")),
+            "{cols}: swap was cut: {header}"
+        );
+        if shown {
+            saw_whole = true;
+            assert!(
+                header.contains("slots --"),
+                "{cols}: slots went with the swap field: {header}"
+            );
+        }
+        let none = header_line(&plain, cols);
+        let none_shown = none.contains("swap none");
+        assert!(
+            none_shown || (!none.contains("swap") && !none.contains("none")),
+            "{cols}: `none` was cut: {none}"
+        );
+        // Widths where `none` fits and the longer value does not: nothing
+        // of the longer value remains.
+        if none_shown && !shown {
+            saw_none_without_longer = true;
+            assert!(
+                !header.contains("swap") && !header.contains("loading") && !header.contains("1:42"),
+                "{cols}: longer swap was cut where none still fits: {header}"
+            );
+        }
+    }
+    assert!(saw_whole, "the sweep must show the field");
+    assert!(
+        saw_none_without_longer,
+        "the sweep must pass widths where none fits and the longer value does not"
+    );
 }
 
 // #7: short screens. Below 48 rows the dashboard drops panels in order
@@ -7065,5 +7175,64 @@ fn dump_job_goldens() {
     for (name, cols, rows) in JOB_GOLDENS {
         let grid = draw(&job_model(example_job(), 0), cols, rows);
         std::fs::write(dir.join(name), dump_grid(&grid)).expect("write job golden");
+    }
+}
+
+/// A ready frame whose header model is still loading. Names are invented.
+fn loading_model() -> TtyModel {
+    let mut model = sample(WatchState::Ready);
+    model.model_name = "cedar-70b".to_owned();
+    model.model_loading = true;
+    model.slots_line = "--".to_owned();
+    model.swap_line = "loading 1:42".to_owned();
+    model.slots.clear();
+    if let Some(setup) = model.setup.as_mut() {
+        setup.id = "cedar-70b".to_owned();
+        setup.name = "Cedar 70B".to_owned();
+    }
+    for row in &mut model.requests {
+        row.model = if row.model == "Gemma 4B" {
+            "birch-4b".to_owned()
+        } else {
+            "cedar-70b".to_owned()
+        };
+    }
+    model
+}
+
+/// #135: the loading header at the default 12x24 console (160x45) and on
+/// a wider grid (240x67).
+const LOADING_GOLDENS: [(&str, u16, u16); 2] = [
+    ("loading-160x45.json", 160, 45),
+    ("loading-240.json", 240, 67),
+];
+
+#[test]
+fn loading_header_goldens_match() {
+    let model = loading_model();
+    for (name, cols, rows) in LOADING_GOLDENS {
+        let fix = load(name);
+        assert_eq!((fix.w, fix.h), (cols, rows), "{name}");
+        let header = row_string(&draw(&model, cols, rows), 0);
+        assert!(header.contains("LOADING"), "{name}: {header}");
+        assert!(header.contains("cedar-70b  llama.cpp"), "{name}: {header}");
+        assert!(header.contains("slots --"), "{name}: {header}");
+        assert!(header.contains("swap loading 1:42"), "{name}: {header}");
+        assert!(!header.contains("READY"), "{name}: {header}");
+        let word = col_of(&draw(&model, cols, rows), 0, "LOADING");
+        let grid = draw(&model, cols, rows);
+        assert_eq!(grid.get(word, 0).unwrap().fg, C16::Yellow);
+        assert_eq!(grid.get(word, 0).unwrap().bg, C16::Black);
+        assert_frame(name, &fix, &model);
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #135 loading goldens"]
+fn dump_loading_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in LOADING_GOLDENS {
+        let grid = draw(&loading_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write loading golden");
     }
 }

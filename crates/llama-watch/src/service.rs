@@ -474,6 +474,8 @@ struct TickState {
     ctx_history: CtxBook,
     /// When each model (by name) entered llama-swap `stopping`.
     stopping_since: HashMap<String, Instant>,
+    /// When each model (by name) entered llama-swap `starting`.
+    starting_since: HashMap<String, Instant>,
     /// Requests still running, for RECENT (#75).
     flights: crate::inflight::Tracker,
     /// Each model's context size by llama-swap key, kept after it unloads
@@ -516,6 +518,7 @@ impl TickState {
             chart: TokenChart::new(chart_bucket_s),
             ctx_history: CtxBook::new(ctx_history_h),
             stopping_since: HashMap::new(),
+            starting_since: HashMap::new(),
             flights: crate::inflight::Tracker::default(),
             ctx_sizes: BTreeMap::new(),
         }
@@ -592,7 +595,6 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
     let mut held = state.detail.slots.clone();
     held.extend(strata_views(&state.detail.engine_live));
     state.ctx_history.record(mono, &running, &held);
-    note_stopping(&mut state.stopping_since, &sample.snapshot.models, mono);
     let zone = input.clock.zone(mono);
     let model = tty_model(&sample, state, mono, wall, zone, ctx);
     note_draw(input, state, &model, mono);
@@ -971,7 +973,10 @@ fn tty_model(
     zone: &Zone,
     ctx: &FrameCtx,
 ) -> TtyModel {
+    note_stopping(&mut tick.stopping_since, &sample.snapshot.models, mono);
+    note_starting(&mut tick.starting_since, &sample.snapshot.models, mono);
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
+    let (model_loading, model_stopping) = header_swap(sample, watch);
     let no_slots = first_without_slots(sample, watch);
     // The header model has no `/slots`, or `/slots` without text (#66): IN
     // and OUT from its last capture (#5).
@@ -1012,12 +1017,23 @@ fn tty_model(
         model_name: model_name(sample, watch),
         model_detail: model_detail(sample, watch),
         model_stuck: model_stuck(sample, watch, &tick.stopping_since, mono),
-        slots_line: if no_slots && tick.detail.slots.is_empty() {
+        model_loading,
+        model_stopping,
+        slots_line: if (model_loading || model_stopping) && header_up {
+            // No slots to count while the header model is still swapping.
+            "--".to_owned()
+        } else if no_slots && tick.detail.slots.is_empty() {
             "--".to_owned()
         } else {
             slots_line(&tick.detail, watch)
         },
-        swap_line: swap_line(watch),
+        swap_line: swap_line(
+            watch,
+            &sample.snapshot.models,
+            &tick.starting_since,
+            &tick.stopping_since,
+            mono,
+        ),
         cool_c: temp_i(sample.snapshot.coolant_c),
         cpu_c: temp_i(sample.snapshot.cpu_c),
         gpu_c: temp_i(sample.snapshot.gpu_c),
@@ -1400,15 +1416,49 @@ fn first_without_slots(sample: &WatchSample, state: WatchState) -> bool {
             .is_some_and(|info| !info.kind.has_slots())
 }
 
-/// Track when each model entered `stopping`; forget the rest.
-fn note_stopping(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now: Instant) {
+/// Remember `now` the first time a model is seen in `phase`, and forget a
+/// model that has left it. The clock is the caller's.
+fn note_phase(
+    since: &mut HashMap<String, Instant>,
+    models: &[ModelInfo],
+    phase: &str,
+    now: Instant,
+) {
     since.retain(|name, _| {
         models
             .iter()
-            .any(|model| model.name == *name && model.state == "stopping")
+            .any(|model| model.name == *name && model.state == phase)
     });
-    for model in models.iter().filter(|model| model.state == "stopping") {
+    for model in models.iter().filter(|model| model.state == phase) {
         since.entry(model.name.clone()).or_insert(now);
+    }
+}
+
+/// Track when each model entered `stopping`; forget the rest.
+fn note_stopping(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now: Instant) {
+    note_phase(since, models, "stopping", now);
+}
+
+/// Track when each model entered `starting`; forget the rest.
+fn note_starting(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now: Instant) {
+    note_phase(since, models, "starting", now);
+}
+
+/// The header (first) model is llama-swap `starting` or `stopping`.
+/// False while the header is not up, so `AI DOWN` and the rest keep their words.
+fn header_swap(sample: &WatchSample, state: WatchState) -> (bool, bool) {
+    if !matches!(state, WatchState::Generating | WatchState::Ready) {
+        return (false, false);
+    }
+    match sample
+        .snapshot
+        .models
+        .first()
+        .map(|model| model.state.as_str())
+    {
+        Some("starting") => (true, false),
+        Some("stopping") => (false, true),
+        _ => (false, false),
     }
 }
 
@@ -1663,11 +1713,63 @@ fn slots_line(detail: &LlamaDetail, state: WatchState) -> String {
     }
 }
 
-fn swap_line(state: WatchState) -> String {
+/// Swap-field word for llama-swap `stopping`.
+const STOPPING_SWAP: &str = "stopping";
+
+/// `loading M:SS` while any model is `starting`, else `stopping M:SS`
+/// while any is `stopping`, else `none`. The time is how long the one
+/// seen longest has been in that state: `M:SS` under an hour, `H:MM:SS`
+/// from an hour on. `...` and `--` stay for a header that is not up.
+fn swap_line(
+    state: WatchState,
+    models: &[ModelInfo],
+    starting_since: &HashMap<String, Instant>,
+    stopping_since: &HashMap<String, Instant>,
+    now: Instant,
+) -> String {
     match state {
         WatchState::Starting => "...".to_owned(),
         WatchState::AiDown | WatchState::NoLlama => "--".to_owned(),
-        WatchState::Generating | WatchState::Ready => "none".to_owned(),
+        WatchState::Generating | WatchState::Ready => {
+            if let Some(age) = phase_age(models, "starting", starting_since, now) {
+                format!("loading {}", format_phase_age(age))
+            } else if let Some(age) = phase_age(models, "stopping", stopping_since, now) {
+                format!("{STOPPING_SWAP} {}", format_phase_age(age))
+            } else {
+                "none".to_owned()
+            }
+        }
+    }
+}
+
+/// How long the model in `phase` that was seen first has been there.
+/// One not yet in `since` counts as just seen (`now`).
+fn phase_age(
+    models: &[ModelInfo],
+    phase: &str,
+    since: &HashMap<String, Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    models
+        .iter()
+        .filter(|model| model.state == phase)
+        .map(|model| {
+            let at = since.get(&model.name).copied().unwrap_or(now);
+            now.saturating_duration_since(at)
+        })
+        .max()
+}
+
+/// `M:SS` under an hour, `H:MM:SS` from an hour on. Hours are not padded.
+fn format_phase_age(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem = secs % 60;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{rem:02}")
+    } else {
+        format!("{mins}:{rem:02}")
     }
 }
 
@@ -4424,6 +4526,339 @@ mod tests {
             &since,
             at + Duration::from_secs(10)
         ));
+    }
+
+    fn named(name: &str, state: &str) -> ModelInfo {
+        let mut model = served(name, state, Some(BackendInfo::default()));
+        model.full_name = Some(format!("Full {name}"));
+        model
+    }
+
+    /// One frame. `tick` keeps the phase clocks across calls.
+    fn phase_frame(models: Vec<ModelInfo>, tick: &mut TickState, now: Instant) -> TtyModel {
+        let sample = backend_sample(models);
+        tty_model(
+            &sample,
+            tick,
+            now,
+            SystemTime::UNIX_EPOCH,
+            Zone::utc(),
+            &frame_ctx(None, true),
+        )
+    }
+
+    fn header_of(model: &TtyModel) -> (String, crate::tty::grid::Grid) {
+        let grid = layout::layout(model, 240, 67);
+        let text: String = (0..grid.cols())
+            .map(|col| grid.get(col, 0).expect("cell").ch)
+            .collect();
+        (text, grid)
+    }
+
+    fn assert_word(
+        grid: &crate::tty::grid::Grid,
+        header: &str,
+        word: &str,
+        fg: crate::tty::C16,
+        bg: crate::tty::C16,
+    ) {
+        let at = header
+            .find(word)
+            .unwrap_or_else(|| panic!("missing {word}: {header}"));
+        // `█` is three bytes and one column.
+        let col = u16::try_from(header[..at].chars().count()).expect("column");
+        let pip = grid.get(24, 0).expect("pip");
+        assert_eq!(pip.ch, '█', "{header}");
+        assert_eq!((pip.fg, pip.bg), (fg, bg), "pip of {word}");
+        for (i, ch) in word.chars().enumerate() {
+            let cell = grid
+                .get(col + u16::try_from(i).expect("offset"), 0)
+                .expect("word");
+            assert_eq!(cell.ch, ch);
+            assert_eq!((cell.fg, cell.bg), (fg, bg), "{word} cell {i}");
+        }
+    }
+
+    /// #135: the word and the two fields for starting, stopping, ready and
+    /// an unknown state. The name and the engine stay.
+    #[test]
+    fn header_word_and_fields_follow_the_swap_state() {
+        use crate::tty::C16;
+        let t0 = Instant::now();
+        let cases = [
+            (
+                "starting",
+                true,
+                false,
+                "LOADING",
+                "--",
+                "loading 0:00",
+                C16::Yellow,
+                C16::Black,
+            ),
+            (
+                "stopping",
+                false,
+                true,
+                "STOPPING",
+                "--",
+                "stopping 0:00",
+                C16::Yellow,
+                C16::Black,
+            ),
+            (
+                "ready",
+                false,
+                false,
+                "READY",
+                "0/0 idle",
+                "none",
+                C16::Green,
+                C16::Black,
+            ),
+            (
+                "other",
+                false,
+                false,
+                "READY",
+                "0/0 idle",
+                "none",
+                C16::Green,
+                C16::Black,
+            ),
+        ];
+        for (state, loading, stopping, word, slots, swap, fg, bg) in cases {
+            let mut tick = TickState::new(2, 6);
+            tick.heard = true;
+            let model = phase_frame(vec![named("cedar-70b", state)], &mut tick, t0);
+            assert_eq!(model.model_loading, loading, "{state}");
+            assert_eq!(model.model_stopping, stopping, "{state}");
+            assert_eq!(model.slots_line, slots, "{state}");
+            assert_eq!(model.swap_line, swap, "{state}");
+            assert_eq!(model.model_name, "Full cedar-70b", "{state}");
+            assert_eq!(model.model_detail, "llama.cpp", "{state}");
+            assert_eq!(model.state, WatchState::Ready, "{state}");
+            let (header, grid) = header_of(&model);
+            assert_word(&grid, &header, word, fg, bg);
+            assert!(header.contains("Full cedar-70b"), "{state}: {header}");
+            assert!(header.contains("llama.cpp"), "{state}: {header}");
+            assert!(
+                header.contains(&format!("slots {slots}")),
+                "{state}: {header}"
+            );
+            assert!(
+                header.contains(&format!("swap {swap}")),
+                "{state}: {header}"
+            );
+        }
+        // A busy slot does not bring the count back while the header model
+        // is still starting, and the word stays LOADING.
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.slots = vec![slot(0, 1, true, "", "")];
+        let model = phase_frame(vec![named("cedar-70b", "starting")], &mut tick, t0);
+        assert_eq!(model.state, WatchState::Generating);
+        assert!(model.model_loading);
+        assert_eq!(model.slots_line, "--");
+        assert_eq!(model.swap_line, "loading 0:00");
+        let (header, grid) = header_of(&model);
+        assert_word(&grid, &header, "LOADING", C16::Yellow, C16::Black);
+        assert!(
+            !header.contains("READY") && !header.contains("GENERATING"),
+            "{header}"
+        );
+    }
+
+    /// #135: the swap clock starts when the state is first seen, restarts
+    /// when a model leaves and comes back, takes the longest of several,
+    /// and prefers `starting` over `stopping`.
+    #[test]
+    fn swap_time_counts_from_first_seen() {
+        let t0 = Instant::now();
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let cedar = |state: &str| named("cedar-70b", state);
+
+        let first = phase_frame(vec![cedar("starting")], &mut tick, t0);
+        assert_eq!(first.swap_line, "loading 0:00");
+        let later = phase_frame(
+            vec![cedar("starting")],
+            &mut tick,
+            t0 + Duration::from_secs(102),
+        );
+        assert_eq!(later.swap_line, "loading 1:42");
+        assert_eq!(later.slots_line, "--");
+        assert!(later.model_loading);
+
+        // Ready clears the clock. Starting again counts from the new sight.
+        let ready = phase_frame(
+            vec![cedar("ready")],
+            &mut tick,
+            t0 + Duration::from_secs(102),
+        );
+        assert_eq!(ready.swap_line, "none");
+        assert_eq!(ready.slots_line, "0/0 idle");
+        assert!(!ready.model_loading);
+        let back = phase_frame(
+            vec![cedar("starting")],
+            &mut tick,
+            t0 + Duration::from_secs(130),
+        );
+        assert_eq!(back.swap_line, "loading 0:00");
+        let again = phase_frame(
+            vec![cedar("starting")],
+            &mut tick,
+            t0 + Duration::from_secs(140),
+        );
+        assert_eq!(again.swap_line, "loading 0:10");
+
+        // The hour edge, and a second model seen later: the longer one.
+        let mut since = HashMap::new();
+        let stopping = HashMap::new();
+        let one = vec![served("cedar-70b", "starting", None)];
+        note_starting(&mut since, &one, t0);
+        let at_hour = t0 + Duration::from_secs(3599);
+        assert_eq!(
+            swap_line(WatchState::Ready, &one, &since, &stopping, at_hour),
+            "loading 59:59"
+        );
+        let hour = t0 + Duration::from_secs(3600);
+        note_starting(&mut since, &one, hour);
+        assert_eq!(
+            swap_line(WatchState::Ready, &one, &since, &stopping, hour),
+            "loading 1:00:00"
+        );
+        let past = t0 + Duration::from_secs(3600 + 62);
+        assert_eq!(
+            swap_line(WatchState::Ready, &one, &since, &stopping, past),
+            "loading 1:01:02"
+        );
+        let long = t0 + Duration::from_secs(10 * 3600 + 12 * 60 + 9);
+        assert_eq!(
+            swap_line(WatchState::Ready, &one, &since, &stopping, long),
+            "loading 10:12:09"
+        );
+        let both = vec![
+            served("cedar-70b", "starting", None),
+            served("birch-4b", "starting", None),
+        ];
+        note_starting(&mut since, &both, t0 + Duration::from_secs(90));
+        // cedar from t0 (90s), birch from 90s (0s).
+        assert_eq!(
+            swap_line(
+                WatchState::Ready,
+                &both,
+                &since,
+                &stopping,
+                t0 + Duration::from_secs(90)
+            ),
+            "loading 1:30"
+        );
+        // The one seen longest is not listed first.
+        let later_first = vec![
+            served("birch-4b", "starting", None),
+            served("cedar-70b", "starting", None),
+        ];
+        assert_eq!(
+            swap_line(
+                WatchState::Ready,
+                &later_first,
+                &since,
+                &stopping,
+                t0 + Duration::from_secs(90)
+            ),
+            "loading 1:30"
+        );
+        // birch leaves. cedar's clock keeps going.
+        let only = vec![served("cedar-70b", "starting", None)];
+        note_starting(&mut since, &only, t0 + Duration::from_secs(100));
+        assert_eq!(
+            swap_line(
+                WatchState::Ready,
+                &only,
+                &since,
+                &stopping,
+                t0 + Duration::from_secs(100)
+            ),
+            "loading 1:40"
+        );
+
+        // A later `starting` model wins the swap line over a longer `stopping`.
+        // The header word follows the first model.
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mixed_at = t0 + Duration::from_secs(5);
+        let _ = phase_frame(vec![named("birch-4b", "stopping")], &mut tick, t0);
+        let mixed = phase_frame(
+            vec![
+                named("birch-4b", "stopping"),
+                named("cedar-70b", "starting"),
+            ],
+            &mut tick,
+            mixed_at,
+        );
+        assert!(mixed.model_stopping && !mixed.model_loading);
+        assert_eq!(mixed.slots_line, "--");
+        assert_eq!(mixed.swap_line, "loading 0:00");
+        let (header, _) = header_of(&mixed);
+        assert!(header.contains("STOPPING"), "{header}");
+        assert!(header.contains("swap loading 0:00"), "{header}");
+        assert!(!header.contains("READY"), "{header}");
+
+        // Header ready, another model starting: the word stays READY and
+        // the swap line says loading.
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let _ = phase_frame(vec![named("cedar-70b", "starting")], &mut tick, t0);
+        let ready_header = phase_frame(
+            vec![named("birch-4b", "ready"), named("cedar-70b", "starting")],
+            &mut tick,
+            t0 + Duration::from_secs(75),
+        );
+        assert!(!ready_header.model_loading && !ready_header.model_stopping);
+        assert_eq!(ready_header.model_name, "Full birch-4b");
+        assert_eq!(ready_header.slots_line, "0/0 idle");
+        assert_eq!(ready_header.swap_line, "loading 1:15");
+
+        // Stopping for over a minute is still stuck, and the word is STOPPING.
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let _ = phase_frame(vec![cedar("stopping")], &mut tick, t0);
+        let early = phase_frame(
+            vec![cedar("stopping")],
+            &mut tick,
+            t0 + Duration::from_secs(30),
+        );
+        assert!(!early.model_stuck);
+        assert_eq!(early.swap_line, "stopping 0:30");
+        let stuck = phase_frame(
+            vec![cedar("stopping")],
+            &mut tick,
+            t0 + Duration::from_secs(61),
+        );
+        assert!(stuck.model_stuck && stuck.model_stopping);
+        assert_eq!(stuck.slots_line, "--");
+        assert_eq!(stuck.swap_line, "stopping 1:01");
+
+        // Two `stopping` models: the one seen longest is listed second.
+        let mut stop_since = HashMap::new();
+        let cedar_stopping = vec![served("cedar-70b", "stopping", None)];
+        note_stopping(&mut stop_since, &cedar_stopping, t0);
+        let birch_first = vec![
+            served("birch-4b", "stopping", None),
+            served("cedar-70b", "stopping", None),
+        ];
+        note_stopping(&mut stop_since, &birch_first, t0 + Duration::from_secs(25));
+        assert_eq!(
+            swap_line(
+                WatchState::Ready,
+                &birch_first,
+                &since,
+                &stop_since,
+                t0 + Duration::from_secs(25)
+            ),
+            "stopping 0:25"
+        );
     }
 
     struct FixedCpu;
