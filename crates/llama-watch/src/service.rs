@@ -1015,6 +1015,9 @@ fn tty_model(
         &sample.snapshot.models,
         job_and_note.0.is_some(),
         &sample.gpu_processes,
+        ctx.llama_enabled,
+        tick.heard,
+        sample.snapshot.ai,
     );
     let gpu_busy = outside.is_some();
     TtyModel {
@@ -1467,12 +1470,26 @@ fn note_starting(since: &mut HashMap<String, Instant>, models: &[ModelInfo], now
 /// Engine field when the card is busy outside llama-swap, or `None` when
 /// the header stays as it is.
 ///
-/// `None` when a job view is up, when llama-swap lists any model, when the
-/// process read failed, or when no process holds [`GPU_BUSY_MIN_BYTES`].
-/// The clock is not an argument: the collector already rate-limits the list
-/// this receives. A failure suppresses the header even if `list` is stale.
-fn outside_engine(models: &[ModelInfo], job_up: bool, processes: &GpuProcesses) -> Option<String> {
+/// Llama-swap must have answered with an empty list: it is enabled, this
+/// tick has heard it, and `ai` is [`AiState::Idle`] (the same `Idle` that
+/// [`watch_state`] turns into `Ready`). Not-yet-heard, down, no-data and
+/// disabled keep today's header. Also `None` when a job view is up, when
+/// any model is listed, when the process read failed, or when no process
+/// holds [`GPU_BUSY_MIN_BYTES`]. The clock is not an argument: the collector
+/// already rate-limits the list this receives. A failure suppresses the
+/// header even if `list` is stale.
+fn outside_engine(
+    models: &[ModelInfo],
+    job_up: bool,
+    processes: &GpuProcesses,
+    llama_enabled: bool,
+    heard: bool,
+    ai: AiState,
+) -> Option<String> {
     if job_up || !models.is_empty() || processes.failed {
+        return None;
+    }
+    if !llama_enabled || !heard || ai != AiState::Idle {
         return None;
     }
     busiest(&processes.list).map(process_field)
@@ -4789,6 +4806,26 @@ mod tests {
         }
     }
 
+    /// `AI DOWN` is a black-on-yellow badge. Its pip stays yellow on black,
+    /// so [`assert_word`] (pip and word the same colour) does not fit.
+    fn assert_ai_down(grid: &crate::tty::grid::Grid, header: &str) {
+        use crate::tty::C16;
+        let word = " AI DOWN ";
+        let at = header
+            .find(word)
+            .unwrap_or_else(|| panic!("missing {word}: {header}"));
+        let col = u16::try_from(header[..at].chars().count()).expect("column");
+        let pip = grid.get(24, 0).expect("pip");
+        assert_eq!((pip.ch, pip.fg, pip.bg), ('█', C16::Yellow, C16::Black));
+        for (i, ch) in word.chars().enumerate() {
+            let cell = grid
+                .get(col + u16::try_from(i).expect("offset"), 0)
+                .expect("badge");
+            assert_eq!(cell.ch, ch);
+            assert_eq!((cell.fg, cell.bg), (C16::Black, C16::Yellow));
+        }
+    }
+
     /// #135: the word and the two fields for starting, stopping, ready and
     /// an unknown state. The name and the engine stay.
     #[test]
@@ -4906,55 +4943,89 @@ mod tests {
         let listed = gpu_seen(&[big.clone(), mid.clone(), under.clone()]);
         for state in ["ready", "starting", "stopping", "stopped", "other"] {
             let models = vec![served("cedar-70b", state, None)];
-            assert!(outside_engine(&models, false, &listed).is_none(), "{state}");
+            assert!(
+                outside_when_idle(&models, false, &listed).is_none(),
+                "{state}"
+            );
         }
-        assert!(outside_engine(&[], true, &listed).is_none(), "job view");
+        assert!(outside_when_idle(&[], true, &listed).is_none(), "job view");
         let failed = GpuProcesses {
             list: vec![big.clone()],
             failed: true,
         };
         assert!(
-            outside_engine(&[], false, &failed).is_none(),
+            outside_when_idle(&[], false, &failed).is_none(),
             "a read error is not busy, even with a stale list"
         );
-        assert!(outside_engine(&[], false, &gpu_seen(&[])).is_none());
-        assert!(outside_engine(&[], false, &gpu_seen(&[under])).is_none());
+        assert!(outside_when_idle(&[], false, &gpu_seen(&[])).is_none());
+        assert!(outside_when_idle(&[], false, &gpu_seen(&[under])).is_none());
         let edge = gpu_seen(&[gpu_proc(1, min, "edge")]);
         assert_eq!(
-            outside_engine(&[], false, &edge).as_deref(),
+            outside_when_idle(&[], false, &edge).as_deref(),
             Some("edge 0.2 GB"),
             "256 MiB is 0.2 GB in the VRAM meter's precision"
         );
         assert_eq!(
-            outside_engine(&[], false, &listed).as_deref(),
+            outside_when_idle(&[], false, &listed).as_deref(),
             Some("example-bench 22.4 GB")
         );
         let tied = gpu_seen(&[gpu_proc(10, min, "alpha"), gpu_proc(4, min, "beta")]);
         assert_eq!(
-            outside_engine(&[], false, &tied).as_deref(),
+            outside_when_idle(&[], false, &tied).as_deref(),
             Some("beta 0.2 GB"),
             "equal memory keeps the lower pid"
         );
         let dirty = gpu_seen(&[gpu_proc(8, min, "../weird name!")]);
         assert_eq!(
-            outside_engine(&[], false, &dirty).as_deref(),
+            outside_when_idle(&[], false, &dirty).as_deref(),
             Some("..weirdname 0.2 GB")
         );
         let unnamed = gpu_seen(&[gpu_proc(42, min, "!!!")]);
         assert_eq!(
-            outside_engine(&[], false, &unnamed).as_deref(),
+            outside_when_idle(&[], false, &unnamed).as_deref(),
             Some("pid 42 0.2 GB")
         );
         let long = gpu_seen(&[gpu_proc(1, min, &"a".repeat(40))]);
         let cut = format!("{} 0.2 GB", "a".repeat(24));
         assert_eq!(
-            outside_engine(&[], false, &long).as_deref(),
+            outside_when_idle(&[], false, &long).as_deref(),
             Some(cut.as_str())
         );
     }
 
-    /// #139: the header word, fields, and the states that still say busy
-    /// when llama-swap has listed nothing. A live job keeps its view.
+    /// The process-selection cases above are an answered idle list.
+    fn outside_when_idle(
+        models: &[ModelInfo],
+        job_up: bool,
+        processes: &GpuProcesses,
+    ) -> Option<String> {
+        outside_engine(models, job_up, processes, true, true, AiState::Idle)
+    }
+
+    /// #139: each input of "llama-swap answered with an empty list". Dropping
+    /// llama-enabled, heard, or `ai == Idle` makes one of these fail.
+    #[test]
+    fn gpu_busy_only_after_llama_swap_answers_idle() {
+        let big = gpu_seen(&[gpu_proc(9, 24_051_816_858, "example-bench")]);
+        let show = |enabled, heard, ai| outside_engine(&[], false, &big, enabled, heard, ai);
+        assert!(show(true, false, AiState::Idle).is_none(), "not heard");
+        assert!(show(true, true, AiState::Down).is_none(), "down");
+        assert!(show(true, true, AiState::NoData).is_none(), "no data");
+        assert!(show(false, true, AiState::Idle).is_none(), "llama disabled");
+        assert!(
+            show(true, true, AiState::Loaded).is_none(),
+            "loaded is not idle"
+        );
+        assert_eq!(
+            show(true, true, AiState::Idle).as_deref(),
+            Some("example-bench 22.4 GB"),
+            "enabled, heard, and idle"
+        );
+    }
+
+    /// #139: the header word and fields when llama-swap answered idle.
+    /// Not heard, down, no-data and llama disabled keep their own words.
+    /// A live job keeps its view.
     #[test]
     fn gpu_busy_header_replaces_an_idle_header_and_yields_to_a_job() {
         use crate::tty::C16;
@@ -4969,7 +5040,9 @@ mod tests {
         let mono = Instant::now();
         let wall = SystemTime::UNIX_EPOCH;
 
+        // `backend_sample` marks the view loaded. An answered empty list is Idle.
         let mut idle = backend_sample(Vec::new());
+        idle.snapshot.ai = AiState::Idle;
         idle.gpu_processes = processes;
         let model = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
         assert!(model.gpu_busy);
@@ -4996,33 +5069,59 @@ mod tests {
         assert_eq!(quiet.slots_line, "0/0 idle");
         assert_eq!(quiet.swap_line, "none");
 
-        // Not yet heard, llama down, and llama disabled: the word changes
-        // and the body state does not.
+        // Before the first answer the word stays STARTING, including its fields.
         tick.heard = false;
         idle.gpu_processes.failed = false;
         let starting = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
-        assert!(starting.gpu_busy);
+        assert!(!starting.gpu_busy);
         assert_eq!(starting.state, WatchState::Starting);
-        assert_eq!(starting.slots_line, "--");
-        assert_eq!(starting.swap_line, "--");
+        assert_eq!(starting.model_name, "...");
+        assert_eq!(starting.model_detail, "engine --");
+        assert_eq!(starting.slots_line, "...");
+        assert_eq!(starting.swap_line, "...");
         let (header, grid) = header_of(&starting);
-        assert_word(&grid, &header, "GPU BUSY", C16::Yellow, C16::Black);
+        assert_word(&grid, &header, "STARTING", C16::BrightBlack, C16::Black);
+        assert!(!header.contains("GPU BUSY"), "{header}");
 
         tick.heard = true;
         idle.snapshot.ai = AiState::Down;
         let down = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
-        assert!(down.gpu_busy);
+        assert!(!down.gpu_busy);
         assert_eq!(down.state, WatchState::AiDown);
-        let (header, _) = header_of(&down);
-        assert!(header.contains("GPU BUSY"), "{header}");
-        assert!(!header.contains("AI DOWN"), "{header}");
+        assert_eq!(down.model_name, "--");
+        assert_eq!(down.model_detail, "engine --");
+        assert_eq!(down.slots_line, "--");
+        assert_eq!(down.swap_line, "--");
+        let (header, grid) = header_of(&down);
+        assert_ai_down(&grid, &header);
+        assert!(!header.contains("GPU BUSY"), "{header}");
 
+        idle.snapshot.ai = AiState::NoData;
+        let no_data = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &ctx);
+        assert!(!no_data.gpu_busy);
+        assert_eq!(no_data.state, WatchState::AiDown);
+        assert_eq!(no_data.model_name, "--");
+        assert_eq!(no_data.model_detail, "engine --");
+        let (header, grid) = header_of(&no_data);
+        assert_ai_down(&grid, &header);
+        assert!(!header.contains("GPU BUSY"), "{header}");
+
+        // Heard and idle, so only the disabled flag keeps today's word.
+        idle.snapshot.ai = AiState::Idle;
         let off = frame_ctx(None, false);
         let no_llama = tty_model(&idle, &mut tick, mono, wall, Zone::utc(), &off);
-        assert!(no_llama.gpu_busy);
+        assert!(!no_llama.gpu_busy);
         assert_eq!(no_llama.state, WatchState::NoLlama);
+        assert_eq!(no_llama.model_name, "--");
+        assert_eq!(no_llama.model_detail, "engine --");
+        assert_eq!(no_llama.slots_line, "--");
+        assert_eq!(no_llama.swap_line, "--");
+        let (header, grid) = header_of(&no_llama);
+        assert_word(&grid, &header, "NO LLAMA", C16::BrightBlack, C16::Black);
+        assert!(!header.contains("GPU BUSY"), "{header}");
 
         // A listed model wins, including one that is only starting.
+        idle.snapshot.ai = AiState::Idle;
         let mut listed = backend_sample(vec![named("cedar-70b", "starting")]);
         listed.gpu_processes = GpuProcesses {
             list: vec![gpu_proc(9, min, "example-bench")],
