@@ -2153,6 +2153,7 @@ fn sample(state: WatchState) -> TtyModel {
         model_stuck: false,
         model_loading: false,
         model_stopping: false,
+        gpu_busy: false,
         slots_line: slots_line.to_string(),
         swap_line: swap_line.to_string(),
         cool_c: cool,
@@ -4037,6 +4038,36 @@ fn stopping_keeps_the_stuck_tag_and_a_job_word_wins() {
         !header.contains("STOPPING") && !header.contains("LOADING"),
         "{header}"
     );
+}
+
+/// #139: a live job's word wins over GPU BUSY, and so do LOADING and STOPPING.
+#[test]
+fn a_job_word_beats_gpu_busy() {
+    let mut model = sample(WatchState::Ready);
+    model.gpu_busy = true;
+    model.model_name = "outside llama-swap".to_owned();
+    model.model_detail = "example-bench 22.4 GB".to_owned();
+    model.slots_line = "--".to_owned();
+    model.swap_line = "--".to_owned();
+    model.job = Some(JobView {
+        job: example_job(),
+        more: 0,
+    });
+    let header = row_string(&draw(&model, 240, 67), 0);
+    assert!(header.contains("TRAINING"), "{header}");
+    assert!(!header.contains("GPU BUSY"), "{header}");
+
+    model.job = None;
+    model.model_loading = true;
+    let header = row_string(&draw(&model, 240, 67), 0);
+    assert!(header.contains("LOADING"), "{header}");
+    assert!(!header.contains("GPU BUSY"), "{header}");
+
+    model.model_loading = false;
+    model.model_stopping = true;
+    let header = row_string(&draw(&model, 240, 67), 0);
+    assert!(header.contains("STOPPING"), "{header}");
+    assert!(!header.contains("GPU BUSY"), "{header}");
 }
 
 /// #135: a live job's word wins over LOADING.
@@ -7452,6 +7483,56 @@ fn dump_job_goldens() {
     for (name, cols, rows) in JOB_GOLDENS {
         let grid = draw(&job_model(example_job(), 0), cols, rows);
         std::fs::write(dir.join(name), dump_grid(&grid)).expect("write job golden");
+    }
+}
+
+/// A ready frame whose header says the card is busy outside llama-swap.
+/// The process name is invented. The body stays the idle ready frame.
+fn gpu_busy_model() -> TtyModel {
+    let mut model = sample(WatchState::Ready);
+    model.gpu_busy = true;
+    model.model_name = "outside llama-swap".to_owned();
+    model.model_detail = "example-bench 22.4 GB".to_owned();
+    model.slots_line = "--".to_owned();
+    model.swap_line = "--".to_owned();
+    model
+}
+
+/// #139: the busy header at the default 12x24 console (160x45).
+const GPU_BUSY_GOLDENS: [(&str, u16, u16); 1] = [("gpu-busy-160x45.json", 160, 45)];
+
+#[test]
+fn gpu_busy_header_golden_matches() {
+    let model = gpu_busy_model();
+    for (name, cols, rows) in GPU_BUSY_GOLDENS {
+        let fix = load(name);
+        assert_eq!((fix.w, fix.h), (cols, rows), "{name}");
+        let grid = draw(&model, cols, rows);
+        let header = row_string(&grid, 0);
+        assert!(header.contains("GPU BUSY"), "{name}: {header}");
+        assert!(header.contains("outside llama-swap"), "{name}: {header}");
+        assert!(header.contains("example-bench 22.4 GB"), "{name}: {header}");
+        assert!(header.contains("slots --"), "{name}: {header}");
+        assert!(header.contains("swap --"), "{name}: {header}");
+        assert!(!header.contains("READY"), "{name}: {header}");
+        let word = col_of(&grid, 0, "GPU BUSY");
+        assert_eq!(grid.get(word, 0).unwrap().fg, C16::Yellow);
+        assert_eq!(grid.get(word, 0).unwrap().bg, C16::Black);
+        let pip = grid.get(24, 0).unwrap();
+        assert_eq!((pip.ch, pip.fg, pip.bg), ('█', C16::Yellow, C16::Black));
+        let detail = col_of(&grid, 0, "example-bench");
+        assert_eq!(grid.get(detail, 0).unwrap().fg, C16::BrightBlack);
+        assert_frame(name, &fix, &model);
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #139 busy-header golden"]
+fn dump_gpu_busy_golden() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in GPU_BUSY_GOLDENS {
+        let grid = draw(&gpu_busy_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write gpu busy golden");
     }
 }
 
