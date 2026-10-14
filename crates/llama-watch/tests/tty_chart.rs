@@ -19,7 +19,7 @@ fn at(origin: Instant, ms: u64) -> Instant {
 fn first_counter_opens_a_bucket_at_measured_zero() {
     let mut chart = TokenChart::new(2);
     let origin = t0();
-    chart.ingest(origin, Some(54), Some(1200.0));
+    chart.ingest(origin, Some((origin, 54)), Some(1200.0));
     assert_eq!(
         chart.buckets(),
         vec![ChartBucket {
@@ -33,9 +33,9 @@ fn first_counter_opens_a_bucket_at_measured_zero() {
 fn prompt_samples_in_the_same_bucket_are_the_mean() {
     let mut chart = TokenChart::new(2);
     let origin = t0();
-    chart.ingest(at(origin, 0), Some(0), Some(100.0));
-    chart.ingest(at(origin, 100), Some(0), Some(300.0));
-    chart.ingest(at(origin, 1999), Some(0), None);
+    chart.ingest(at(origin, 0), Some((at(origin, 0), 0)), Some(100.0));
+    chart.ingest(at(origin, 100), Some((at(origin, 100), 0)), Some(300.0));
+    chart.ingest(at(origin, 1999), Some((at(origin, 1999), 0)), None);
     assert_eq!(
         chart.buckets(),
         vec![ChartBucket {
@@ -49,8 +49,8 @@ fn prompt_samples_in_the_same_bucket_are_the_mean() {
 fn crossing_the_bucket_width_commits_and_starts_a_new_column() {
     let mut chart = TokenChart::new(2);
     let origin = t0();
-    chart.ingest(origin, Some(0), Some(0.0));
-    chart.ingest(at(origin, 2000), Some(20), Some(80.0));
+    chart.ingest(origin, Some((origin, 0)), Some(0.0));
+    chart.ingest(at(origin, 2000), Some((at(origin, 2000), 20)), Some(80.0));
     assert_eq!(
         chart.buckets(),
         vec![
@@ -84,7 +84,8 @@ fn a_bucket_of_only_none_is_no_data() {
 #[test]
 fn measured_zero_stays_some_zero() {
     let mut chart = TokenChart::new(2);
-    chart.ingest(t0(), Some(0), Some(0.0));
+    let origin = t0();
+    chart.ingest(origin, Some((origin, 0)), Some(0.0));
     assert_eq!(
         chart.buckets(),
         vec![ChartBucket {
@@ -98,8 +99,12 @@ fn measured_zero_stays_some_zero() {
 fn a_time_jump_spreads_generation_and_leaves_prompt_gaps() {
     let mut chart = TokenChart::new(2);
     let origin = t0();
-    chart.ingest(origin, Some(0), Some(6.0));
-    chart.ingest(at(origin, 10_000), Some(100), Some(8.0));
+    chart.ingest(origin, Some((origin, 0)), Some(6.0));
+    chart.ingest(
+        at(origin, 10_000),
+        Some((at(origin, 10_000), 100)),
+        Some(8.0),
+    );
     let buckets = chart.buckets();
     assert_eq!(buckets.len(), 6, "{buckets:?}");
     assert_eq!(
@@ -165,7 +170,8 @@ fn ring_drops_the_oldest_past_the_widest_terminal() {
     let mut chart = TokenChart::new(1);
     let origin = t0();
     for i in 0..=MAX_BUCKETS {
-        chart.ingest(at(origin, i as u64 * 1000), Some(i as u64), Some(0.0));
+        let t = at(origin, i as u64 * 1000);
+        chart.ingest(t, Some((t, i as u64)), Some(0.0));
     }
     let buckets = chart.buckets();
     assert_eq!(buckets.len(), MAX_BUCKETS);
@@ -177,8 +183,12 @@ fn ring_drops_the_oldest_past_the_widest_terminal() {
 fn a_huge_time_jump_fills_at_most_the_ring() {
     let mut chart = TokenChart::new(1);
     let origin = t0();
-    chart.ingest(origin, Some(1), None);
-    chart.ingest(at(origin, 1_000_000_000), Some(2), None);
+    chart.ingest(origin, Some((origin, 1)), None);
+    chart.ingest(
+        at(origin, 1_000_000_000),
+        Some((at(origin, 1_000_000_000), 2)),
+        None,
+    );
     let buckets = chart.buckets();
     assert_eq!(buckets.len(), MAX_BUCKETS);
     assert!(

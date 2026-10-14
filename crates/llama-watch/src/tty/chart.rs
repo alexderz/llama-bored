@@ -55,53 +55,31 @@ impl TokenChart {
     /// Fold the decoded-token counter and the prompt rate into the column that
     /// contains `now`.
     ///
-    /// A counter increase covers `(previous observation, now]` and is split
-    /// across column boundaries in proportion to time. The first observation
-    /// after start or after `None`, and a step down, set the base and count
-    /// nothing. Prompt is still the mean of the per-tick values.
-    pub fn ingest(&mut self, now: Instant, decoded: Option<u64>, prompt_tps: Option<f64>) {
-        let Some(start) = self.start else {
+    /// `decoded` is the counter together with the instant that view arrived
+    /// (the tick `take_latest` returned it). The same instant again is not a
+    /// new observation: it adds nothing and leaves the base and `last_at`
+    /// alone. Rollover, the in-progress column and prompt still run every
+    /// tick. A counter increase covers `(previous observation instant, this
+    /// observation instant]` and is split across column boundaries in
+    /// proportion to time, including columns already committed. A poll held
+    /// across a rollover credits only up to the new column's start. The first
+    /// observation after start or after `None`, and a step down, set the base
+    /// and count nothing. Prompt is still the mean of the per-tick values.
+    pub fn ingest(
+        &mut self,
+        now: Instant,
+        decoded: Option<(Instant, u64)>,
+        prompt_tps: Option<f64>,
+    ) {
+        if self.start.is_none() {
             self.start = Some(now);
-            self.remember(decoded, now);
-            self.add_prompt(prompt_tps);
-            self.publish_current();
-            return;
-        };
-        let elapsed = now.saturating_duration_since(start).as_secs_f64();
-        let width = self.bucket_s;
-        let step = match (self.last_decoded, decoded) {
-            (Some(prev), Some(next)) if next >= prev => Some((next - prev) as f64),
-            _ => None,
-        };
-        if elapsed < width {
-            if let Some(tokens) = step {
-                self.gen_tokens += tokens;
-            }
-            self.remember(decoded, now);
+            self.apply_decoded(decoded, false);
             self.add_prompt(prompt_tps);
             self.publish_current();
             return;
         }
-        let skipped = (elapsed / width).floor();
-        let skipped = if skipped.is_finite() {
-            (skipped as u64).min(MAX_BUCKETS as u64)
-        } else {
-            MAX_BUCKETS as u64
-        };
-        if let Some(tokens) = step {
-            self.spread(start, now, skipped, tokens);
-        } else {
-            self.commit();
-            for _ in 1..skipped {
-                self.push(ChartBucket {
-                    gen_tps: None,
-                    prompt_tps: None,
-                });
-            }
-            let advance = Duration::from_secs_f64(skipped as f64 * width);
-            self.start = Some(start + advance);
-        }
-        self.remember(decoded, now);
+        let rolled = self.roll_to(now);
+        self.apply_decoded(decoded, rolled);
         self.add_prompt(prompt_tps);
         self.publish_current();
     }
@@ -119,51 +97,92 @@ impl TokenChart {
         }
     }
 
-    fn remember(&mut self, decoded: Option<u64>, now: Instant) {
-        if let Some(v) = decoded {
-            self.last_decoded = Some(v);
-            self.last_at = Some(now);
-            self.gen_seen = true;
-        } else {
-            self.last_decoded = None;
-            self.last_at = None;
-        }
-    }
-
-    fn spread(&mut self, start: Instant, now: Instant, skipped: u64, tokens: f64) {
-        let width = self.bucket_s;
-        let prev_at = self.last_at.unwrap_or(start);
-        let span = now.saturating_duration_since(prev_at).as_secs_f64();
-        let share = |i: u64| -> f64 {
-            let b_start = start + Duration::from_secs_f64(i as f64 * width);
-            let b_end = start + Duration::from_secs_f64((i + 1) as f64 * width);
-            let ov = overlap_s(prev_at, now, b_start, b_end);
-            if span > 0.0 {
-                tokens * ov / span
-            } else if i == skipped {
-                tokens
-            } else {
-                0.0
-            }
+    fn roll_to(&mut self, now: Instant) -> bool {
+        let Some(start) = self.start else {
+            return false;
         };
-        self.gen_tokens += share(0);
-        self.gen_seen = true;
+        let elapsed = now.saturating_duration_since(start).as_secs_f64();
+        let width = self.bucket_s;
+        if elapsed < width {
+            return false;
+        }
+        let skipped = (elapsed / width).floor();
+        let skipped = if skipped.is_finite() {
+            (skipped as u64).min(MAX_BUCKETS as u64)
+        } else {
+            MAX_BUCKETS as u64
+        };
         self.commit();
-        for i in 1..skipped {
-            if let Some(last) = self.buckets.back_mut() {
-                *last = ChartBucket {
-                    gen_tps: Some(share(i) / width),
-                    prompt_tps: None,
-                };
-            }
+        for _ in 1..skipped {
             self.push(ChartBucket {
                 gen_tps: None,
                 prompt_tps: None,
             });
         }
-        self.start = Some(start + Duration::from_secs_f64(skipped as f64 * width));
-        self.gen_tokens = share(skipped);
+        let advance = Duration::from_secs_f64(skipped as f64 * width);
+        self.start = Some(start + advance);
+        true
+    }
+
+    fn apply_decoded(&mut self, decoded: Option<(Instant, u64)>, rolled: bool) {
+        let Some((at, count)) = decoded else {
+            self.last_decoded = None;
+            self.last_at = None;
+            return;
+        };
         self.gen_seen = true;
+        if self.last_at == Some(at) {
+            return;
+        }
+        if let (Some(prev_count), Some(prev_at)) = (self.last_decoded, self.last_at) {
+            if count >= prev_count {
+                // A poll held across a rollover already filled later columns
+                // as measured zero. The step is news about `(prev_at, start]`.
+                let end = match self.start {
+                    Some(start) if !rolled && prev_at < start && at > start => start,
+                    _ => at,
+                };
+                self.credit(prev_at, end, (count - prev_count) as f64);
+            }
+        }
+        self.last_decoded = Some(count);
+        self.last_at = Some(at);
+    }
+
+    /// Attribute `tokens` across ring columns whose spans overlap
+    /// `(prev_at, obs_at]`.
+    fn credit(&mut self, prev_at: Instant, obs_at: Instant, tokens: f64) {
+        if tokens == 0.0 {
+            return;
+        }
+        let Some(start) = self.start else {
+            return;
+        };
+        let width = self.bucket_s;
+        let span = obs_at.saturating_duration_since(prev_at).as_secs_f64();
+        let n = self.buckets.len();
+        for i in 0..n {
+            let age = (n - 1 - i) as f64;
+            let Some(b_start) = start.checked_sub(Duration::from_secs_f64(age * width)) else {
+                continue;
+            };
+            let b_end = b_start + Duration::from_secs_f64(width);
+            let part = if span > 0.0 {
+                tokens * overlap_s(prev_at, obs_at, b_start, b_end) / span
+            } else if i + 1 == n {
+                tokens
+            } else {
+                0.0
+            };
+            if part == 0.0 {
+                continue;
+            }
+            if i + 1 == n {
+                self.gen_tokens += part;
+            } else if let Some(bucket) = self.buckets.get_mut(i) {
+                bucket.gen_tps = Some(bucket.gen_tps.unwrap_or(0.0) + part / width);
+            }
+        }
     }
 
     fn current(&self) -> ChartBucket {
@@ -351,22 +370,26 @@ mod tests {
         chart.buckets().into_iter().map(|b| b.gen_tps).collect()
     }
 
+    fn obs(at: Instant, count: u64) -> Option<(Instant, u64)> {
+        Some((at, count))
+    }
+
     #[test]
     fn fixed_rate_decoding_fills_full_columns_and_climbs_in_progress() {
         let mut chart = TokenChart::new(2);
         let origin = t0();
-        chart.ingest(origin, Some(0), None);
-        chart.ingest(at(origin, 500), Some(10), None);
+        chart.ingest(origin, obs(origin, 0), None);
+        chart.ingest(at(origin, 500), obs(at(origin, 500), 10), None);
         assert_eq!(gens(&chart), vec![Some(5.0)]);
-        chart.ingest(at(origin, 1000), Some(20), None);
+        chart.ingest(at(origin, 1000), obs(at(origin, 1000), 20), None);
         assert_eq!(gens(&chart), vec![Some(10.0)]);
-        chart.ingest(at(origin, 1500), Some(30), None);
+        chart.ingest(at(origin, 1500), obs(at(origin, 1500), 30), None);
         assert_eq!(gens(&chart), vec![Some(15.0)]);
-        chart.ingest(at(origin, 2000), Some(40), None);
+        chart.ingest(at(origin, 2000), obs(at(origin, 2000), 40), None);
         assert_eq!(gens(&chart), vec![Some(20.0), Some(0.0)]);
-        chart.ingest(at(origin, 2500), Some(50), None);
+        chart.ingest(at(origin, 2500), obs(at(origin, 2500), 50), None);
         assert_eq!(gens(&chart), vec![Some(20.0), Some(5.0)]);
-        chart.ingest(at(origin, 4000), Some(80), None);
+        chart.ingest(at(origin, 4000), obs(at(origin, 4000), 80), None);
         assert_eq!(gens(&chart), vec![Some(20.0), Some(20.0), Some(0.0)]);
     }
 
@@ -374,32 +397,62 @@ mod tests {
     fn a_burst_that_ends_mid_column_puts_nothing_into_the_next() {
         let mut chart = TokenChart::new(2);
         let origin = t0();
-        chart.ingest(origin, Some(0), None);
-        chart.ingest(at(origin, 400), Some(80), None);
+        chart.ingest(origin, obs(origin, 0), None);
+        let burst_at = at(origin, 400);
+        chart.ingest(burst_at, obs(burst_at, 80), None);
         assert_eq!(gens(&chart), vec![Some(40.0)]);
-        chart.ingest(at(origin, 2000), Some(80), None);
+        for ms in (500..=3500).step_by(100) {
+            chart.ingest(at(origin, ms), obs(burst_at, 80), None);
+        }
         assert_eq!(gens(&chart), vec![Some(40.0), Some(0.0)]);
-        chart.ingest(at(origin, 3500), Some(80), None);
-        assert_eq!(gens(&chart), vec![Some(40.0), Some(0.0)]);
+    }
+
+    #[test]
+    fn a_held_poll_spreads_a_step_over_the_poll_interval() {
+        // Ticks every 100 ms; the counter refreshes every 250 ms with a 50 ms
+        // phase. 200 tok/s until t = 1.9 s, 2 s columns. A held poll is not a
+        // new observation. The 20 tokens first seen at 2.1 s arrive after a
+        // rollover that already treated column 1 as measured zero, so they
+        // credit (1.8 s, 2.0 s] and column 0 is 190 tok/s. Moving last_at
+        // every tick dumps them into column 1 (180 / 10 / 0).
+        let mut chart = TokenChart::new(2);
+        let origin = t0();
+        chart.ingest(origin, obs(origin, 0), None);
+        let mut llama_at = origin;
+        let mut count = 0_u64;
+        for ms in (100..=4000).step_by(100) {
+            let tick_open = ms - 100;
+            let mut poll = 50_u64;
+            while poll <= ms {
+                if poll > tick_open {
+                    llama_at = at(origin, ms);
+                    let t_s = (poll as f64 / 1000.0).min(1.9);
+                    count = (200.0 * t_s).round() as u64;
+                }
+                poll += 250;
+            }
+            chart.ingest(at(origin, ms), obs(llama_at, count), None);
+        }
+        assert_eq!(gens(&chart), vec![Some(190.0), Some(0.0), Some(0.0)]);
     }
 
     #[test]
     fn a_boundary_increase_is_split_and_a_reset_counts_nothing_negative() {
         let mut chart = TokenChart::new(2);
         let origin = t0();
-        chart.ingest(origin, Some(0), None);
-        chart.ingest(at(origin, 1500), Some(0), None);
-        chart.ingest(at(origin, 2500), Some(40), None);
+        chart.ingest(origin, obs(origin, 0), None);
+        chart.ingest(at(origin, 1500), obs(at(origin, 1500), 0), None);
+        chart.ingest(at(origin, 2500), obs(at(origin, 2500), 40), None);
         assert_eq!(gens(&chart), vec![Some(10.0), Some(10.0)]);
 
         let mut reset = TokenChart::new(2);
         let origin = t0();
-        reset.ingest(origin, Some(100), None);
-        reset.ingest(at(origin, 500), Some(140), None);
+        reset.ingest(origin, obs(origin, 100), None);
+        reset.ingest(at(origin, 500), obs(at(origin, 500), 140), None);
         assert_eq!(gens(&reset), vec![Some(20.0)]);
-        reset.ingest(at(origin, 1000), Some(10), None);
+        reset.ingest(at(origin, 1000), obs(at(origin, 1000), 10), None);
         assert_eq!(gens(&reset), vec![Some(20.0)]);
-        reset.ingest(at(origin, 1500), Some(30), None);
+        reset.ingest(at(origin, 1500), obs(at(origin, 1500), 30), None);
         assert_eq!(gens(&reset), vec![Some(30.0)]);
     }
 }
