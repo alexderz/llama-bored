@@ -88,12 +88,12 @@ under it, and at most the larger of 0.5 s and two percent over it.
 The timestamp is the end time truncated to the second. That second
 fits a finish when it is after one second before the scrape that
 preceded the finish, and at most 0.5 s after the scrape that showed
-it. Only one row and one clean finish may fit. Another scrape that
-stepped the finished count blocks the fill when the second fits it
-and the lengths do: one finish must equal the row's prompt and
-output, and two or more must have increased by at least that many
-tokens. After a gap, a reset or a restart the increases are not
-known, so the second alone is enough. The fill is the cached tokens,
+it. Only one row and one clean finish may fit. A row is filled only
+when its request was the only one the engine finished within a few
+seconds, and it is filled a few seconds after it ends. llama-swap and
+llama-watch run on one host, so the two clocks agree. A row for which
+the engine has no request, matching another request alone in that
+window in lengths and duration, cannot be told apart. The fill is the cached tokens,
 prompt tok/s of the tokens that were not cached over the time to the
 first token, and generation tok/s of the tokens after the first over
 the rest of the request. The rates are marked `~`,
@@ -500,7 +500,8 @@ only gauges) and OpenAI-compatible servers. SGLang's request counter
 (the `is_streaming="false"` series as well as the sum), prompt,
 generation and cached counters, its end-to-end and
 time-to-first-token histograms, and its queue-time histogram are still
-read to fill one RECENT row when one streaming request was alone and
+read to fill one RECENT row when one streaming request was alone,
+that finish was the only one within a few seconds of the row, and
 the row matches its prompt, output, duration and end time. A non-streaming
 request contributes its cached count only. None of these fill the
 prefill or decode seconds.
