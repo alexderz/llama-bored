@@ -227,8 +227,19 @@ pub fn spans(target: &Target, aura: &AuraCfg) -> Vec<Vec<usize>> {
         (Target::AuraFans, Layout::Chain(fans)) => {
             (0..fans).map(|k| (k * n..(k + 1) * n).collect()).collect()
         }
-        (Target::AuraChain { start, end }, Layout::Chain(fans)) if *end <= fans => {
-            vec![(start * n..end * n).collect()]
+        (
+            Target::AuraChain {
+                start,
+                end,
+                reversed,
+            },
+            Layout::Chain(fans),
+        ) if *end <= fans => {
+            let mut leds: Vec<usize> = (start * n..end * n).collect();
+            if *reversed {
+                leds.reverse();
+            }
+            vec![leds]
         }
         (Target::KeyboardKeys(keys), _) => vec![keys.clone()],
         (Target::KeyboardAll, _) => vec![(0..KEYS.len()).collect()],

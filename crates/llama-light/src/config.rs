@@ -98,7 +98,12 @@ pub enum Target {
     /// Every fan. Each fan is its own span.
     AuraFans,
     /// Chain fans `start..end` (end exclusive) as one span.
-    AuraChain { start: usize, end: usize },
+    /// `reversed` lists those LEDs from the last back to the first.
+    AuraChain {
+        start: usize,
+        end: usize,
+        reversed: bool,
+    },
     /// Keyboard keys as one span, in the order given: indexes into
     /// [`crate::keyboard::keymap::KEYS`]. A gauge lights them in this order.
     KeyboardKeys(Vec<usize>),
@@ -536,6 +541,7 @@ fn validate(raw: RawFile) -> Result<LightConfig, ConfigError> {
         let target = Target::AuraChain {
             start: index,
             end: index + 1,
+            reversed: false,
         };
         layers.push(validate_light(
             &key,
@@ -1106,7 +1112,11 @@ fn validate_light(
 fn span_len(target: &Target, aura: &AuraCfg) -> usize {
     match target {
         Target::AuraFans => aura.leds_per_fan,
-        Target::AuraChain { start, end } => (end - start) * aura.leds_per_fan,
+        Target::AuraChain {
+            start,
+            end,
+            reversed: _,
+        } => (end - start) * aura.leds_per_fan,
         Target::KeyboardKeys(keys) => keys.len(),
         Target::KeyboardAll => KEYS.len(),
     }
@@ -1219,13 +1229,22 @@ fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigEr
                 .parse::<usize>()
                 .map_err(|_| ConfigError(format!("{at}: \"{part}\" is not a fan index")))
         };
-        let (start, end) = if let Some((a, b)) = inner.split_once("..=") {
-            (parse_index(a)?, parse_index(b)? + 1)
+        // A descending bound is the same fans, last LED first. [4..2] is
+        // fans 2 and 3; [4..=2] is fans 2, 3 and 4. [N] and [N..=N] stay
+        // forward. [N..N] is empty.
+        let (start, end, reversed) = if let Some((a, b)) = inner.split_once("..=") {
+            let (a, b) = (parse_index(a)?, parse_index(b)?);
+            if a <= b {
+                (a, b + 1, false)
+            } else {
+                (b, a + 1, true)
+            }
         } else if let Some((a, b)) = inner.split_once("..") {
-            (parse_index(a)?, parse_index(b)?)
+            let (a, b) = (parse_index(a)?, parse_index(b)?);
+            if a <= b { (a, b, false) } else { (b, a, true) }
         } else {
             let index = parse_index(inner)?;
-            (index, index + 1)
+            (index, index + 1, false)
         };
         if start >= end {
             return err(format!("{at}: the range is empty"));
@@ -1237,7 +1256,11 @@ fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigEr
                 end - 1
             ));
         }
-        return Ok(Target::AuraChain { start, end });
+        return Ok(Target::AuraChain {
+            start,
+            end,
+            reversed,
+        });
     }
     if text == "keyboard.all" || text.starts_with("keyboard.") {
         if !keyboard_enabled {
@@ -1264,7 +1287,7 @@ fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigEr
         return one_key(&at, text).map(|index| Target::KeyboardKeys(vec![index]));
     }
     err(format!(
-        "{at} is not a target; use aura.fans, aura.chain[N], aura.chain[A..B], keyboard.all, keyboard.keys[\"F1\"..\"F12\"], a key name such as \"Number Pad +\", or led:N"
+        "{at} is not a target; use aura.fans, aura.chain[N], aura.chain[A..B], aura.chain[B..A], keyboard.all, keyboard.keys[\"F1\"..\"F12\"], a key name such as \"Number Pad +\", or led:N"
     ))
 }
 
