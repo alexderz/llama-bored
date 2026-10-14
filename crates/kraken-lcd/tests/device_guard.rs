@@ -307,3 +307,33 @@ fn pump_change_the_duty_does_not_explain_halts() {
     assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
     assert_halted(&mut opened, "jump with the duty held");
 }
+
+#[test]
+fn firmware_duty_step_down_with_the_pump_following_does_not_halt() {
+    // Outside the fixed band (1304 - 195 = 1109), inside the followed one.
+    let mut opened = show_ready("duty-down");
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1000, 77));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("duty step down after the op");
+    opened.lcd.tick().expect("duty step down at the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn duty_jump_beyond_the_step_limit_halts() {
+    let mut opened = show_ready("duty-collapse");
+    set_pump(&opened.tree, 1127, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 0, 10));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "duty down to 4 % with the pump stopped");
+
+    let mut opened = show_ready("duty-full-tick");
+    set_pump(&opened.tree, 1127, 77);
+    opened.lcd.show(&Frame::new()).expect("show");
+    set_pump(&opened.tree, 2800, 255);
+    assert_eq!(opened.lcd.tick(), Err(SinkError::Halted));
+    assert_halted(&mut opened, "duty jump to full speed");
+}

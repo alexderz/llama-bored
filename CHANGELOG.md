@@ -12,7 +12,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Changed
 
-- kraken-lcd's cooling guard lets the pump band follow the duty the firmware reports in `pwm1`: when the firmware's curve steps the pump duty, a pump speed between the old speed and the old speed scaled by the duty ratio (plus the usual band) no longer halts and latches. A pump that stops, or a speed the duty does not explain, still halts (#147).
+- kraken-lcd's cooling guard lets the pump band follow the duty the firmware reports in `pwm1`: when the firmware's curve makes a small duty step (at most 20 % of the old duty), a pump speed between the old speed and the old speed scaled by the duty ratio (plus the usual band) no longer halts and latches. A stopped pump, a speed the duty does not explain, or a bigger duty jump still halts (#147).
 - tty11's token chart draws each generation column from the tokens decoded in that column's `tty.chart_bucket_s` span, not from the trailing one-second rate; a step seen late is spread over the time since the previous poll (#144).
 
 ## 0.6.0 — 2026-10-14

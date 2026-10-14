@@ -1,9 +1,10 @@
 //! Read-only cooling baseline. A deviation latches and stops device I/O.
 //!
-//! `pwm1` and `pwm2` are copied into the snapshot for the log. They are not
-//! compared: the firmware curve moves them while the enable files stay put.
-//! The pump band is fixed here and is not configuration. When the firmware
-//! moves the pump duty (`pwm1`), the band follows it (see [`pump_in_band`]).
+//! `pwm1` and `pwm2` are copied into the snapshot for the log. Neither is
+//! compared on its own: the firmware curve moves them while the enable files
+//! stay put. `pwm1` (the pump duty) only steers the pump band: a small duty
+//! step lets the expected pump speed follow it (see [`pump_in_band`]). The
+//! band and the step limit are fixed here and are not configuration.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,14 @@ pub const PUMP_BAND_PERCENT: u32 = 15;
 
 /// Absolute floor of the pump band, in rpm.
 pub const PUMP_BAND_FLOOR_RPM: u32 = 150;
+
+/// Largest pump duty step, in percent of the old duty, that the band follows.
+///
+/// The firmware curve moves the duty in small steps as the coolant warms or
+/// cools (77 -> 89 was 16 %). A bigger step between two reads about 2 s apart
+/// is not that curve, so the fixed band applies and a pump that does not keep
+/// its speed halts.
+pub const PUMP_DUTY_STEP_PERCENT: u32 = 20;
 
 /// Why a later snapshot does not match the baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,13 +117,13 @@ pub fn pump_band_rpm(baseline: u32) -> u32 {
 
 /// `true` when the pump speed `now` is explained by `before` and the duty.
 ///
-/// With the duty unchanged, unknown or zero on either side, `now` must be
-/// within [`pump_band_rpm`] of `before`. When the firmware's curve moved the
-/// duty (`pwm1`) between the two reads, the pump is expected anywhere between
+/// With the duty unchanged, unknown or zero on either side, or moved by more
+/// than [`PUMP_DUTY_STEP_PERCENT`] of the old duty, `now` must be within
+/// [`pump_band_rpm`] of `before`. When the firmware's curve made a small duty
+/// (`pwm1`) step between the two reads, the pump is expected anywhere between
 /// `before` (still ramping) and `before` scaled by the duty ratio (arrived),
-/// and the band is applied at each end of that range. A stopped or slowing
-/// pump under a held or rising duty, or a speed the duty does not explain,
-/// is still out of band.
+/// and the band is applied at each end of that range. A stopped pump, a
+/// speed the duty does not explain, or a duty jump is still out of band.
 #[must_use]
 pub fn pump_in_band(
     before: u32,
@@ -123,7 +132,13 @@ pub fn pump_in_band(
     duty_now: Option<u32>,
 ) -> bool {
     let scaled = match (duty_before, duty_now) {
-        (Some(from), Some(to)) if from != 0 && to != 0 && from != to => {
+        (Some(from), Some(to))
+            if from != 0
+                && to != 0
+                && from != to
+                && u64::from(from.abs_diff(to)) * 100
+                    <= u64::from(from) * u64::from(PUMP_DUTY_STEP_PERCENT) =>
+        {
             let scaled =
                 (u64::from(before) * u64::from(to) + u64::from(from) / 2) / u64::from(from);
             u32::try_from(scaled).unwrap_or(u32::MAX)
