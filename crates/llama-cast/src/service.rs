@@ -144,6 +144,67 @@ fn font_summary(config: &Config) -> &'static str {
     }
 }
 
+/// Grid mode with no `font` picks one per frame. A set font, and tty mode,
+/// do not.
+#[must_use]
+pub fn font_is_auto(config: &Config) -> bool {
+    config.source == Source::Grid && config.font.is_none()
+}
+
+/// What `check` prints, and the status it returns. `encoder` is the probe
+/// result; `None` is a failure and adds no encoder line (the caller logs
+/// the reason).
+#[must_use]
+pub fn check_output(
+    config: &Config,
+    host: &str,
+    fonts: &[(Font, Psf2)],
+    encoder: Option<Codec>,
+) -> CheckOutput {
+    let mut lines = vec![
+        format!("config ok: {}", summary(config)),
+        format!("friendly name: {:?}", config.friendly_name(host)),
+        format!("item title: {:?}", config.item_title(host)),
+        format!(
+            "stream url: {}{}",
+            config.base_url(),
+            crate::dlna::STREAM_PATH
+        ),
+    ];
+    if config.source == Source::Grid {
+        match source::inspect_grid(&config.grid, fonts, font_is_auto(config)) {
+            source::GridInspect::Ready { cols, rows, font } => {
+                lines.push(format!("grid {cols}x{rows} font {font}"));
+            }
+            source::GridInspect::Note(text) => lines.push(format!("note: {text}")),
+        }
+    }
+    let status = if let Some(codec) = encoder {
+        lines.push(format!("encoder: {codec}"));
+        0
+    } else {
+        1
+    };
+    CheckOutput { lines, status }
+}
+
+/// The lines from [`check_output`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckOutput {
+    pub lines: Vec<String>,
+    pub status: i32,
+}
+
+/// The start-up line. Tty mode names tty11. Grid mode names the grid file.
+#[must_use]
+pub fn cast_banner(config: &Config, device_name: &str) -> String {
+    let picture = match config.source {
+        Source::Tty => "tty11".to_owned(),
+        Source::Grid => format!("grid {}", config.grid.display()),
+    };
+    format!("casting {picture} as {device_name:?}: {}", summary(config))
+}
+
 fn load_fonts(config: &Config) -> Result<Vec<(Font, Psf2)>, (PathBuf, io::Error)> {
     let mut out = Vec::with_capacity(config.fonts_to_load().len());
     for font in config.fonts_to_load() {
@@ -191,32 +252,18 @@ fn check(config: &Config) -> i32 {
             return 1;
         }
     };
-    println!("config ok: {}", summary(config));
-    println!("friendly name: {:?}", config.friendly_name(&host));
-    println!("item title: {:?}", config.item_title(&host));
-    println!(
-        "stream url: {}{}",
-        config.base_url(),
-        crate::dlna::STREAM_PATH
-    );
-    if config.source == Source::Grid {
-        match source::inspect_grid(&config.grid, &fonts, config.font.is_none()) {
-            source::GridInspect::Ready { cols, rows, font } => {
-                println!("grid {cols}x{rows} font {font}");
-            }
-            source::GridInspect::Note(text) => println!("note: {text}"),
-        }
+    let (encoder, failed) = match encoder::resolve(&config.ffmpeg, config.encoder) {
+        Ok(codec) => (Some(codec), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let output = check_output(config, &host, &fonts, encoder);
+    for line in &output.lines {
+        println!("{line}");
     }
-    match encoder::resolve(&config.ffmpeg, config.encoder) {
-        Ok(codec) => {
-            println!("encoder: {codec}");
-            0
-        }
-        Err(e) => {
-            err(&format!("encoder: {e}"));
-            1
-        }
+    if let Some(message) = failed {
+        err(&format!("encoder: {message}"));
     }
+    output.status
 }
 
 /// Probe once. The choice is logged here; a failure is logged here and
@@ -301,7 +348,7 @@ fn run(config: &Config) -> i32 {
         (screen, source::VCSA_PATH.to_owned())
     } else {
         // A missing grid is a notice on the picture, not a failed start.
-        let auto = config.font.is_none();
+        let auto = font_is_auto(config);
         let psfs = fonts.into_iter().map(|(_, psf)| psf).collect();
         let origin = config.grid.display().to_string();
         (
@@ -351,12 +398,7 @@ fn run(config: &Config) -> i32 {
     log::emit(
         &mut log::Stderr,
         Priority::Info,
-        &format!(
-            "casting {} as {:?}: {}",
-            config.source.label(),
-            device.name,
-            summary(config)
-        ),
+        &cast_banner(config, &device.name),
     );
     let app = Arc::new(App {
         device,
