@@ -33,13 +33,15 @@ pub const PUMP_BAND_PERCENT: u32 = 15;
 /// Absolute floor of the pump band, in rpm.
 pub const PUMP_BAND_FLOOR_RPM: u32 = 150;
 
-/// Largest pump duty step, in percent of the old duty, that the band follows.
+/// Largest pump duty step, in `pwm1` counts, that the band follows.
 ///
-/// The firmware curve moves the duty in small steps as the coolant warms or
-/// cools (77 -> 89 was 16 %). A bigger step between two reads about 2 s apart
-/// is not that curve, so the fixed band applies and a pump that does not keep
-/// its speed halts.
-pub const PUMP_DUTY_STEP_PERCENT: u32 = 20;
+/// The firmware reports the pump duty as a whole percent, which the driver
+/// scales to 0..=255, and its curve has moved it one 5-point step at a time
+/// as the coolant warms or cools (30 -> 35 %, pwm 77 -> 89, under #147). A
+/// 5-point step is at most 13 counts anywhere on the scale. A bigger step
+/// between two reads about 2 s apart is not that curve, so the fixed band
+/// applies and a pump that does not keep its speed halts.
+pub const PUMP_DUTY_STEP_MAX: u32 = 13;
 
 /// Why a later snapshot does not match the baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,7 +120,7 @@ pub fn pump_band_rpm(baseline: u32) -> u32 {
 /// `true` when the pump speed `now` is explained by `before` and the duty.
 ///
 /// With the duty unchanged, unknown or zero on either side, or moved by more
-/// than [`PUMP_DUTY_STEP_PERCENT`] of the old duty, `now` must be within
+/// than [`PUMP_DUTY_STEP_MAX`] counts, `now` must be within
 /// [`pump_band_rpm`] of `before`. When the firmware's curve made a small duty
 /// (`pwm1`) step between the two reads, the pump is expected anywhere between
 /// `before` (still ramping) and `before` scaled by the duty ratio (arrived),
@@ -133,11 +135,7 @@ pub fn pump_in_band(
 ) -> bool {
     let scaled = match (duty_before, duty_now) {
         (Some(from), Some(to))
-            if from != 0
-                && to != 0
-                && from != to
-                && u64::from(from.abs_diff(to)) * 100
-                    <= u64::from(from) * u64::from(PUMP_DUTY_STEP_PERCENT) =>
+            if from != 0 && to != 0 && from != to && from.abs_diff(to) <= PUMP_DUTY_STEP_MAX =>
         {
             let scaled =
                 (u64::from(before) * u64::from(to) + u64::from(from) / 2) / u64::from(from);

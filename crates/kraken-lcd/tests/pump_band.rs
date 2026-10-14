@@ -1,6 +1,6 @@
 //! #147: the pump band follows the duty the firmware reports in `pwm1`.
 
-use kraken_lcd::device::{PUMP_DUTY_STEP_PERCENT, pump_band_rpm, pump_in_band};
+use kraken_lcd::device::{PUMP_DUTY_STEP_MAX, pump_band_rpm, pump_in_band};
 
 #[test]
 fn held_duty_keeps_the_fixed_band() {
@@ -48,10 +48,14 @@ fn unknown_or_zero_duty_on_either_side_keeps_the_fixed_band() {
 
 #[test]
 fn extreme_values_do_not_overflow() {
-    assert!(pump_in_band(u32::MAX, u32::MAX, Some(1), Some(u32::MAX)));
-    assert!(!pump_in_band(u32::MAX, 0, Some(1), Some(u32::MAX)));
-    assert!(pump_in_band(0, 150, Some(255), Some(1)));
-    assert!(!pump_in_band(0, 151, Some(255), Some(1)));
+    // 242 -> 255 is inside the step limit, so the multiply runs and the scaled
+    // speed is above u32::MAX: it must saturate, not wrap to a small number.
+    assert!(pump_in_band(u32::MAX, u32::MAX, Some(242), Some(255)));
+    assert!(!pump_in_band(u32::MAX, 0, Some(242), Some(255)));
+    // A wrapped scaled speed (about 2.3e8) would accept this.
+    assert!(!pump_in_band(u32::MAX, 1_000_000_000, Some(242), Some(255)));
+    assert!(pump_in_band(0, 150, Some(64), Some(51)));
+    assert!(!pump_in_band(0, 151, Some(64), Some(51)));
 }
 
 #[test]
@@ -66,16 +70,41 @@ fn a_duty_drop_widens_the_band_downward() {
 
 #[test]
 fn duty_jumps_beyond_the_step_limit_keep_the_fixed_band() {
-    assert_eq!(PUMP_DUTY_STEP_PERCENT, 20);
-    // Down to a few percent with the pump stopped: the review's case.
+    assert_eq!(PUMP_DUTY_STEP_MAX, 13);
+    // Down to a few percent with the pump stopped.
     assert!(!pump_in_band(1127, 0, Some(77), Some(10)));
     // A drop of a third with the pump slowing to match.
     assert!(!pump_in_band(1127, 600, Some(77), Some(51)));
-    // A jump to full duty with the pump following it.
+    // A jump to full duty with the pump following it, from low or from 84 %.
     assert!(!pump_in_band(1127, 2800, Some(77), Some(255)));
-    // Exactly 20 % follows; one count more does not (100 -> 120 / 121).
-    assert!(pump_in_band(1000, 1350, Some(100), Some(120)));
-    assert!(!pump_in_band(1000, 1350, Some(100), Some(121)));
-    assert!(pump_in_band(1000, 650, Some(100), Some(80)));
-    assert!(!pump_in_band(1000, 650, Some(100), Some(79)));
+    assert!(!pump_in_band(2400, 2860, Some(214), Some(255)));
+    // 13 counts follow; 14 do not (77 -> 90 / 91, 77 -> 64 / 63).
+    assert!(pump_in_band(1127, 1450, Some(77), Some(90)));
+    assert!(!pump_in_band(1127, 1450, Some(77), Some(91)));
+    // 1127 * 64 / 77 = 937, low edge 787; the fixed band stops at 958.
+    assert!(pump_in_band(1127, 790, Some(77), Some(64)));
+    assert!(!pump_in_band(1127, 790, Some(77), Some(63)));
+}
+
+#[test]
+fn every_five_point_firmware_step_follows() {
+    // DIV_ROUND_CLOSEST(percent * 255, 100) for 20, 25, ... 100 %.
+    let pwm: Vec<u32> = (4..=20).map(|step| (step * 5 * 255 + 50) / 100).collect();
+    for pair in pwm.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        assert!(to - from <= PUMP_DUTY_STEP_MAX, "{from} -> {to}");
+        let up = (1127 * to + from / 2) / from;
+        assert!(
+            pump_in_band(1127, up, Some(from), Some(to)),
+            "{from} -> {to}"
+        );
+        let down = (1127 * from + to / 2) / to;
+        assert!(
+            pump_in_band(1127, down, Some(to), Some(from)),
+            "{to} -> {from}"
+        );
+    }
+    // The step one quantum below #147: 25 -> 30 %, pump about 937 -> 1127.
+    assert!(!pump_in_band(937, 1127, Some(64), Some(64)));
+    assert!(pump_in_band(937, 1127, Some(64), Some(77)));
 }
