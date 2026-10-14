@@ -335,14 +335,13 @@ if [[ -n "$paths" || -n "$crates" || -n "$binaries" ]]; then
   exit 1
 fi
 
-# The new vector matches crates/llama-cast/src/encoder.rs for libx264 at the
-# default settings (1920x1080, fps 2, 4000 kbit/s, keyframe 1 s, output 10 fps).
-# The old vector is that command without -vf and without -bsf:v. Decode assumes
-# a 1080p player (BT.709, limited range, back to full-range RGB). A plain decode
-# of the untagged stream would pass the old vector, because ffmpeg's default
-# matrix for this size is BT.601. Patches are 32x32 (4:2:0) and are the ramp
-# stops in llama_core::color (ACT_STOPS, then the BB_STOPS that are not L6).
-# Tolerance is 4 levels per channel on the inner 16x16 of each patch.
+# The round-trip builds its libx264 vector with encoder::ffmpeg_args
+# (crates/llama-cast/tests/color_roundtrip.rs) and encodes that vector, then
+# the same vector with -vf and -bsf:v removed. Decode assumes a 1080p player
+# (BT.709, limited range, back to full-range RGB). A plain decode of the
+# untagged stream would pass the old vector, because ffmpeg's default matrix
+# for this size is BT.601. The test prints the worst error and fails unless
+# the new vector is within 4 per channel and the old one is not.
 s19_color_roundtrip() {
   local ffmpeg encoders
   if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -357,134 +356,7 @@ s19_color_roundtrip() {
     echo "S19: this ffmpeg has no libx264; skipping the colour round-trip"
     return 0
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "S19: python3 is not installed; skipping the colour round-trip"
-    return 0
-  fi
-  # The encode and decode run in a subshell so a failure still removes the
-  # frames. The trap is this subshell's EXIT, not the caller's.
-  (
-    set -euo pipefail
-    tmp="$(mktemp -d)"
-    trap 'rm -rf -- "$tmp"' EXIT
-  cat >"$tmp/roundtrip.py" <<'PY'
-import sys
-
-W, H = 1920, 1080
-# llama_core::color ACT_STOPS, then BB_STOPS after the shared L6 stop.
-STOPS = (
-    (0x14, 0x28, 0xD8),
-    (0x3A, 0x1E, 0xF0),
-    (0x7A, 0x1F, 0xE8),
-    (0xC2, 0x1C, 0xC8),
-    (0xF2, 0x1E, 0x5A),
-    (0xFF, 0x2A, 0x14),
-    (0xFF, 0x5A, 0x12),
-    (0xFF, 0x8A, 0x1E),
-    (0xFF, 0xB0, 0x30),
-    (0xFF, 0xD0, 0x50),
-)
-PATCH = 32
-GAP = 64
-ORIGIN = 64
-INNER = 8
-
-def paint():
-    frame = bytearray(W * H * 3)
-    for i, (r, g, b) in enumerate(STOPS):
-        x0 = ORIGIN + i * GAP
-        px = bytes((r, g, b))
-        for y in range(ORIGIN, ORIGIN + PATCH):
-            row = (y * W + x0) * 3
-            frame[row : row + PATCH * 3] = px * PATCH
-    return frame
-
-def worst(blob):
-    if len(blob) != W * H * 3:
-        sys.stderr.write(f"decoded frame is {len(blob)} bytes, want {W * H * 3}\n")
-        return None
-    worst_err = 0
-    for i, (r, g, b) in enumerate(STOPS):
-        x0 = ORIGIN + i * GAP + INNER
-        y0 = ORIGIN + INNER
-        for y in range(y0, y0 + PATCH - 2 * INNER):
-            for x in range(x0, x0 + PATCH - 2 * INNER):
-                o = (y * W + x) * 3
-                worst_err = max(
-                    worst_err,
-                    abs(blob[o] - r),
-                    abs(blob[o + 1] - g),
-                    abs(blob[o + 2] - b),
-                )
-    return worst_err
-
-mode = sys.argv[1]
-if mode == "write":
-    with open(sys.argv[2], "wb") as out:
-        out.write(paint())
-elif mode == "score":
-    with open(sys.argv[2], "rb") as f:
-        new = worst(f.read())
-    with open(sys.argv[3], "rb") as f:
-        old = worst(f.read())
-    if new is None or old is None:
-        sys.exit(1)
-    print(f"{new} {old}")
-else:
-    sys.stderr.write(f"unknown mode {mode}\n")
-    sys.exit(2)
-PY
-  python3 "$tmp/roundtrip.py" write "$tmp/frame.rgb"
-  # New: BT.709 limited, then the VUI tags. -pix_fmt matches the filter output.
-  "$ffmpeg" -y -hide_banner -loglevel error \
-    -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i "$tmp/frame.rgb" \
-    -vf 'scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p' \
-    -c:v libx264 -preset veryfast -tune stillimage,zerolatency -pix_fmt yuv420p \
-    -r 10 -g 10 -bf 0 \
-    -b:v 4000k -minrate 4000k -maxrate 4000k -bufsize 4000k -x264-params nal-hrd=cbr \
-    -bsf:v 'h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1:video_full_range_flag=0' \
-    -frames:v 1 -flush_packets 1 -pat_period 0.1 -f mpegts "$tmp/new.ts"
-  # Old: the same command with neither the matrix filter nor the tags.
-  "$ffmpeg" -y -hide_banner -loglevel error \
-    -f rawvideo -pix_fmt rgb24 -s 1920x1080 -r 2 -i "$tmp/frame.rgb" \
-    -c:v libx264 -preset veryfast -tune stillimage,zerolatency -pix_fmt yuv420p \
-    -r 10 -g 10 -bf 0 \
-    -b:v 4000k -minrate 4000k -maxrate 4000k -bufsize 4000k -x264-params nal-hrd=cbr \
-    -frames:v 1 -flush_packets 1 -pat_period 0.1 -f mpegts "$tmp/old.ts"
-    # -i before the output filter: a 1080p player reads the stream as BT.709
-    # limited and expands it to full-range RGB.
-    "$ffmpeg" -y -hide_banner -loglevel error -i "$tmp/new.ts" \
-      -vf 'scale=in_color_matrix=bt709:in_range=tv:out_range=pc,format=rgb24' \
-      -frames:v 1 -f rawvideo -pix_fmt rgb24 "$tmp/new.rgb"
-    "$ffmpeg" -y -hide_banner -loglevel error -i "$tmp/old.ts" \
-      -vf 'scale=in_color_matrix=bt709:in_range=tv:out_range=pc,format=rgb24' \
-      -frames:v 1 -f rawvideo -pix_fmt rgb24 "$tmp/old.rgb"
-    read -r new_worst old_worst < <(python3 "$tmp/roundtrip.py" score "$tmp/new.rgb" "$tmp/old.rgb")
-    tol=4
-    echo "S19: colour round-trip new worst ${new_worst} (tolerance ${tol} per channel), old worst ${old_worst}"
-    if (( new_worst > tol )); then
-      echo "S19: the BT.709 vector round-trips worse than ${tol}" >&2
-      exit 1
-    fi
-    if (( old_worst <= tol )); then
-      echo "S19: the old argument vector still round-trips within ${tol}" >&2
-      exit 1
-    fi
-    if command -v ffprobe >/dev/null 2>&1; then
-      tags="$(ffprobe -v error -select_streams v:0 \
-        -show_entries stream=color_range,color_space,color_transfer,color_primaries \
-        -of default=noprint_wrappers=1 "$tmp/new.ts")"
-      for want in color_range=tv color_space=bt709 color_transfer=bt709 color_primaries=bt709; do
-        if ! grep -F -x -q -- "$want" <<<"$tags"; then
-          echo "S19: new stream is missing ${want}" >&2
-          printf '%s\n' "$tags" >&2
-          exit 1
-        fi
-      done
-    else
-      echo "S19: ffprobe is not installed; skipping the tag check"
-    fi
-  )
+  cargo test -p llama-cast --locked --test color_roundtrip -- --ignored --nocapture
 }
 
 s19_color_roundtrip
