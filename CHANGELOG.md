@@ -12,7 +12,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Changed
 
-- tty11's token chart draws each generation column from the tokens decoded in that column's `tty.chart_bucket_s` span, not from the trailing one-second rate (#144).
+- tty11's token chart draws each generation column from the tokens decoded in that column's `tty.chart_bucket_s` span, not from the trailing one-second rate; a step seen late is spread over the time since the previous poll (#144).
 
 ## 0.6.0 — 2026-10-14
 
