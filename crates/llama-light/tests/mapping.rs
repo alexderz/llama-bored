@@ -202,6 +202,36 @@ fn a_bar_over_a_chain_range_is_one_gauge_across_the_fans() {
 }
 
 #[test]
+fn a_reversed_two_fan_span_fills_from_the_far_led() {
+    // aura.chain[4..2] is fans 2 and 3. Two LEDs each: 4,5 then 6,7,
+    // listed 7,6,5,4. Three of four lit reaches the last LED of fan 2.
+    let head = "[aura]\nbrightness_max = 100\nleds_per_fan = 2\nfans = \"chain\"\nchain_len = 4\n";
+    let gauge = format!(
+        "{head}[[light]]\ntarget = \"aura.chain[4..2]\"\nstyle = \"bar\"\n\
+         edge = \"round\"\ngradient = \"position\"\n"
+    );
+    let got = frame(&gauge, 75.0);
+    let at = |index: usize| Palette::Act.color((index as f32 + 0.5) / 4.0 * 100.0);
+    assert_eq!(got.len(), 8);
+    assert_eq!(got[7], at(0), "the fill starts at the last LED of fan 3");
+    assert_eq!(got[6], at(1));
+    assert_eq!(got[5], at(2), "then the last LED of fan 2");
+    assert_eq!(got[4], Rgb::default());
+    assert!(got[..4].iter().all(|led| *led == Rgb::default()));
+
+    let ladder = format!(
+        "{head}[[light]]\ntarget = \"aura.chain[4..2]\"\nstyle = \"ladder\"\n\
+         edge = \"round\"\ngradient = \"position\"\nthresholds = [20, 40, 60, 80]\n"
+    );
+    let got = frame(&ladder, 70.0);
+    assert_eq!(got[7], Palette::Act.color(20.0));
+    assert_eq!(got[6], Palette::Act.color(40.0));
+    assert_eq!(got[5], Palette::Act.color(60.0));
+    assert_eq!(got[4], Rgb::default());
+    assert!(got[..4].iter().all(|led| *led == Rgb::default()));
+}
+
+#[test]
 fn pulse_breathes_faster_with_the_value() {
     assert!((pulse_level(0.0) - 1.0).abs() < 1e-6);
     assert!((pulse_level(0.5) - 0.35).abs() < 1e-6);

@@ -91,16 +91,103 @@ fn chain_layout_and_targets() {
     assert_eq!(config.aura.frame_len(), 24);
     assert_eq!(
         config.layers[0].target,
-        Target::AuraChain { start: 0, end: 1 }
+        Target::AuraChain {
+            start: 0,
+            end: 1,
+            reversed: false
+        }
     );
     assert_eq!(
         config.layers[1].target,
-        Target::AuraChain { start: 1, end: 3 }
+        Target::AuraChain {
+            start: 1,
+            end: 3,
+            reversed: false
+        }
     );
     assert_eq!(
         config.layers[2].target,
-        Target::AuraChain { start: 2, end: 4 }
+        Target::AuraChain {
+            start: 2,
+            end: 4,
+            reversed: false
+        }
     );
+}
+
+#[test]
+fn a_descending_chain_range_lists_the_same_fans_from_the_far_led() {
+    let forward = chain_target(4, "aura.chain[2..4]").expect("forward");
+    let reversed = chain_target(4, "aura.chain[4..2]").expect("reversed exclusive");
+    assert_eq!(
+        forward,
+        Target::AuraChain {
+            start: 2,
+            end: 4,
+            reversed: false
+        }
+    );
+    assert_eq!(
+        reversed,
+        Target::AuraChain {
+            start: 2,
+            end: 4,
+            reversed: true
+        }
+    );
+    assert_eq!(
+        chain_target(5, "aura.chain[2..=4]").expect("inclusive forward"),
+        Target::AuraChain {
+            start: 2,
+            end: 5,
+            reversed: false
+        }
+    );
+    assert_eq!(
+        chain_target(5, "aura.chain[4..=2]").expect("inclusive reversed"),
+        Target::AuraChain {
+            start: 2,
+            end: 5,
+            reversed: true
+        }
+    );
+    let one = Target::AuraChain {
+        start: 2,
+        end: 3,
+        reversed: false,
+    };
+    assert_eq!(chain_target(4, "aura.chain[2]").expect("one fan"), one);
+    assert_eq!(
+        chain_target(4, "aura.chain[2..=2]").expect("one inclusive"),
+        one
+    );
+
+    let empty = chain_target(4, "aura.chain[2..2]").expect_err("empty");
+    assert!(empty.contains("the range is empty"), "{empty}");
+    assert_eq!(
+        chain_reason(4, "aura.chain[2..5]"),
+        chain_reason(4, "aura.chain[5..2]"),
+        "a reversed exclusive range names the same missing fan"
+    );
+    assert!(
+        chain_reason(4, "aura.chain[5..2]").contains("fan 4 does not exist"),
+        "{}",
+        chain_reason(4, "aura.chain[5..2]")
+    );
+    assert_eq!(
+        chain_reason(4, "aura.chain[2..=5]"),
+        chain_reason(4, "aura.chain[5..=2]")
+    );
+    assert!(
+        chain_reason(4, "aura.chain[5..=2]").contains("fan 5 does not exist"),
+        "{}",
+        chain_reason(4, "aura.chain[5..=2]")
+    );
+    assert_eq!(
+        chain_reason(4, "aura.chain[2..=4]"),
+        chain_reason(4, "aura.chain[4..=2]")
+    );
+    assert!(chain_reason(4, "aura.chain[4..=2]").contains("fan 4 does not exist"));
 }
 
 #[test]
@@ -113,7 +200,11 @@ fn the_chain_shorthand_is_one_entry_per_fan() {
     assert_eq!(config.layers.len(), 3);
     assert_eq!(
         config.layers[1].target,
-        Target::AuraChain { start: 1, end: 2 }
+        Target::AuraChain {
+            start: 1,
+            end: 2,
+            reversed: false
+        }
     );
     assert_eq!(config.layers[1].style, Style::Gauge);
     assert_eq!(config.layers[2].metric, Metric::TokensRate);
@@ -132,6 +223,7 @@ fn targets_must_exist() {
     assert!(err.contains("empty"), "{err}");
     let err = error("[[light]]\ntarget = \"aura.ring\"\n");
     assert!(err.contains("is not a target"), "{err}");
+    assert!(err.contains("aura.chain[B..A]"), "{err}");
     let err = error("[[light]]\ntarget = 'keyboard.keys[\"F1\"..\"F12\"]'\n");
     assert!(err.contains("[keyboard] enabled = true"), "{err}");
     let err = error("[keyboard]\nenabled = true\n[[light]]\ntarget = 'keyboard.keys[\"F13\"]'\n");
@@ -312,6 +404,24 @@ fn every_commented_example_in_the_shipped_file_is_valid() {
             panic!("example {name} does not parse: {err}\n{body}");
         }
     }
+}
+
+fn chain_target(chain_len: usize, target: &str) -> Result<Target, String> {
+    let text = format!(
+        "[aura]\nfans = \"chain\"\nchain_len = {chain_len}\n[[light]]\ntarget = \"{target}\"\n"
+    );
+    parse(&text)
+        .map(|config| config.layers[0].target.clone())
+        .map_err(|err| err.0)
+}
+
+/// The explanation after the quoted target, so a forward range and its
+/// reverse can be compared without the spelling of the target.
+fn chain_reason(chain_len: usize, target: &str) -> String {
+    let err = chain_target(chain_len, target).expect_err(target);
+    err.split_once(": ")
+        .map(|(_, reason)| reason.to_owned())
+        .unwrap_or(err)
 }
 
 fn kb_target(target: &str) -> Result<Target, String> {
