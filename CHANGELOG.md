@@ -10,6 +10,10 @@ All notable changes to llama-bored. Versions follow
 
 - llama-light: a descending Aura chain span (`aura.chain[B..A]` or `aura.chain[B..=A]`) runs backwards, LED by LED. `aura.chain[4..2]` is fans 2 and 3 from the last LED of fan 3 back to the first LED of fan 2, so two strips can grow toward where they meet (#143).
 
+### Changed
+
+- tty11's token chart draws each generation column from the tokens decoded in that column's `tty.chart_bucket_s` span, not from the trailing one-second rate (#144).
+
 ## 0.6.0 — 2026-10-14
 
 The TV stream in exact colour from the grid file, model claims and a job view on the dashboard, a GPU BUSY header for work outside llama-swap, and cached tokens and rates on SGLang rows.
