@@ -241,6 +241,7 @@ fn targets_must_exist() {
     let err = error("[[light]]\ntarget = \"aura.ring\"\n");
     assert!(err.contains("is not a target"), "{err}");
     assert!(err.contains("aura.chain[B..A]"), "{err}");
+    assert!(err.contains("aura.chain[B..=A]"), "{err}");
     let err = error("[[light]]\ntarget = 'keyboard.keys[\"F1\"..\"F12\"]'\n");
     assert!(err.contains("[keyboard] enabled = true"), "{err}");
     let err = error("[keyboard]\nenabled = true\n[[light]]\ntarget = 'keyboard.keys[\"F13\"]'\n");

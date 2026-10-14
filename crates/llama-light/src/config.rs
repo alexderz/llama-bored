@@ -1297,7 +1297,7 @@ fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigEr
         return one_key(&at, text).map(|index| Target::KeyboardKeys(vec![index]));
     }
     err(format!(
-        "{at} is not a target; use aura.fans, aura.chain[N], aura.chain[A..B], aura.chain[B..A], keyboard.all, keyboard.keys[\"F1\"..\"F12\"], a key name such as \"Number Pad +\", or led:N"
+        "{at} is not a target; use aura.fans, aura.chain[N], aura.chain[A..B], aura.chain[B..A], aura.chain[B..=A], keyboard.all, keyboard.keys[\"F1\"..\"F12\"], a key name such as \"Number Pad +\", or led:N"
     ))
 }
 
