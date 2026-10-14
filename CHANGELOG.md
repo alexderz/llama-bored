@@ -8,11 +8,13 @@ All notable changes to llama-bored. Versions follow
 
 ### Added
 
+- llama-cast can take its picture from the grid file (`source = "grid"`, default path `/run/llama-watch-grid/grid`) and draw each cell in that cell's RGB. `font` may be omitted in that mode; the cast then picks the largest shipped font that fits the grid in 1920x1080, or the smallest when none fits. `llama-hack-9x18.psfu` is that smallest font, so a 213x60 grid fills 1917x1080. A missing, unreadable, refused or stale grid keeps the last good frame and draws a one-line notice. Tty mode is unchanged apart from the colour tags below (#137).
 - llama-watch shows a model claim from a llama-swap build with model claims (#128). The `/api/events` stream already read for in-flight requests now also opens when only llama.cpp models are ready, and keeps the latest `claims` list (at most 16; forgotten on reconnect). The header names the holder after `swap`: `claim <holder> · in use` or `· M:SS left`, and `hold <holder> · until HH:MM` with the reason when it is an explicit hold. A llama-swap that never sends a `claims` frame leaves today's frame unchanged. The list does not enter the snapshot, the LCD or the metrics.
 - llama-watch shows a job view for a training run or other batch job when no model is serving (#129). `[jobs] dir` names an absolute directory of `<name>.json` status files; unset, nothing is opened and every frame is unchanged. `stale_s` (default 180) hides a file whose mtime is older.
 
 ### Fixed
 
+- llama-cast converts the RGB frame to YUV with the BT.709 matrix in limited range and tags the stream (primaries, transfer, matrix, range) for every encoder and both sources. ffmpeg's default for this 1920x1080 path is BT.601, and a 1080p player assumes BT.709, so an untagged stream shifted colour (#137).
 - A short exact-colour run reaches both end stops (#130). Cells of a bar, a rate scale and a chart column are sampled at the ends, so the first cell is the first stop and the last cell of a full run is the top of its scale; before, a cell was sampled at its centre, and a chart column of two to four rows and the last cell of a rate scale stopped short of the stops. A positive-infinite rate is the end of the blackbody tail. The console and `exact_colors = false` are unchanged.
 - tty11's header shows `LOADING` or `STOPPING` (yellow on black) while the shown model is llama-swap `starting` or `stopping`, with `slots --`. `swap` is `loading M:SS` while any model is `starting`, otherwise `stopping M:SS` while any is `stopping` (from when that state was first seen, `H:MM:SS` past an hour; the longest of several), including beside a `ready` header. The stuck mark after a minute of `stopping` stays (#135).
 
