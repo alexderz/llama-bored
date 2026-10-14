@@ -99,12 +99,16 @@ first token, and generation tok/s of the tokens after the first over
 the rest of the request. The rates are marked `~`,
 the same way as vLLM. The cached count is not: the column is a fixed
 width and a prefix would be clipped. A non-streaming request gets the
-cached count only; both rates stay `--`. The prompt rate stays `--`
-unless that request's own queue time is known and is at most five
-percent of its time to the first token. The queue histogram steps when
-a request leaves the queue, so the step is kept from then and matched
-to the finish in order from the last idle scrape; a step that was not a
-single departure, or that cannot be tied to this finish, is not used.
+cached count only; both rates stay `--`. Without an `is_streaming`
+label on the first-token series, only the cached count is filled. The
+prompt rate stays `--` unless that request's own queue time is known
+and is at most five percent of its time to the first token. The queue
+histogram steps when a request leaves the queue, so the step is kept
+from then and matched to the finish in order from the last idle scrape;
+a step that was not a single departure, or that cannot be tied to this
+finish, is not used. The prompt rate is shown only while the engine's
+queue count and request count agree at an idle point, so on an engine
+whose queue count runs ahead of its request count it stays `--`.
 The cached count and the generation rate stay. A value llama-swap
 already reported is never replaced.
 A missing cached count is still filled, and so is a rate the row did
@@ -503,7 +507,11 @@ time-to-first-token histograms, and its queue-time histogram are still
 read to fill one RECENT row when one streaming request was alone,
 that finish was the only one within a few seconds of the row, and
 the row matches its prompt, output, duration and end time. A non-streaming
-request contributes its cached count only. None of these fill the
+request contributes its cached count only. Without an `is_streaming`
+label on the first-token series, only the cached count is filled. The
+prompt rate is shown only while the engine's queue count and request
+count agree at an idle point, so on an engine whose queue count runs
+ahead of its request count it stays `--`. None of these fill the
 prefill or decode seconds.
 
 Host and exporter:

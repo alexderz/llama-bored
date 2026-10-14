@@ -29,11 +29,16 @@
 //!
 //! A non-streaming finish (`is_streaming="false"` on `num_requests_total`)
 //! fills the cached count only: its time to first token is the whole
-//! request, so neither rate is a measurement. The prompt rate also stays
-//! unset unless that request's own queue time is known — the k-th finish
-//! after an idle scrape owns the k-th queue-histogram step after it, and
-//! the step was a single +1 — and that wait is at most five percent of its
-//! time to the first token. The cached count and the generation rate stay.
+//! request, so neither rate is a measurement. Without an `is_streaming`
+//! label on the first-token series, only the cached count is filled. The
+//! prompt rate also stays unset unless that request's own queue time is
+//! known — the k-th finish after an idle scrape owns the k-th
+//! queue-histogram step after it, and the step was a single +1 — and that
+//! wait is at most five percent of its time to the first token. The prompt
+//! rate is shown only while the engine's queue count and request count
+//! agree at an idle point, so on an engine whose queue count runs ahead of
+//! its request count it stays unset. The cached count and the generation
+//! rate stay.
 //! A value llama-swap already reported is never replaced. A missing cached
 //! count is still filled.
 
