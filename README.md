@@ -442,7 +442,7 @@ falls back to utilisation.
 
 - Maps any snapshot metric (activity, gpu, cpu, cpu_topk (the busiest
   cores), load, mem, tokens_rate, coolant, gpu_temp, cpu_temp) to colour,
-  with `[[light]]` layers: solid, ring, bar or pulse styles, palettes or your own colour stops, smoothing,
+  with `[[light]]` layers: solid, ring, bar, pulse or heat styles, palettes or your own colour stops, smoothing,
   brightness caps and an idle colour.
 - Fans on a splitter (mirrored) or a daisy chain (per-fan values).
 - Per-key keyboard gauges: bars two key rows tall, a tokens/s dial on the
@@ -835,7 +835,7 @@ brightness_max = 100
 target = "aura.fans"      # or "aura.chain[2]", 'keyboard.keys["F1".."F12"]', "led:110"
 metric = "activity"       # gpu, cpu, cpu_topk, load, mem, tokens_rate, coolant, gpu_temp, cpu_temp
 range = [0, 100]
-style = "solid"           # solid | ring | bar | pulse | ladder | gate | peak
+style = "solid"           # solid | ring | bar | pulse | ladder | gate | peak | heat
 palette = "act"           # act | thermal | mono, or stops = [[0, "#4A55C8"], [100, "#FF3A22"]]
 smooth_s = 1.5
 idle_color = "#101830"
@@ -849,6 +849,47 @@ With no `[[light]]` entries every fan shows activity on the LCD's colour ramp.
 such as `"Number Pad +"`, and `led:N`. `aura.chain[4..2]` is fans 2 and 3 from
 the far end, the last LED of fan 3 back to the first LED of fan 2, so two
 strips mounted end to end grow toward the point where they meet.
+
+`style = "heat"` treats an Aura span as a metal bar. The first LED is a
+cold sink at the bottom and the last is the heater; the metric drives the
+heater (`attack_s` while it rises, `smooth_s` while it falls), and heat
+flows down to the foot in `transit_s` seconds. A burst travels as a warm
+band, a steady load fills from the top, and an unknown value feeds the
+heater 0 % so the bar cools and keeps drawing. Below `range.min` the idle
+colour replaces the bar and `follow`, while the bar keeps stepping; a
+missing value cools the bar instead. `follow` paints a second Aura target
+in the top LED's colour. When the entry covers several spans, `follow`
+uses the last span that drew.
+
+| key | default | |
+|---|---|---|
+| `transit_s` | 60 | seconds from the top LED to the foot; above 0, at most 3600 |
+| `foot_leds` | 5 | bottom LEDs that conduct into the sink; at least 1 and fewer than the span |
+| `conduction_s` | 20000 | diffusion time above the foot, in seconds; at least 1, at most 1000000. Smaller spreads a band |
+| `follow` | | an Aura target drawn solid in the top LED's colour; it must share no LED with this entry |
+
+A one-LED span cannot hold a foot, so check rejects it. Two LEDs work
+with `foot_leds = 1`. `thresholds`, `edge`, `fill_to` and
+`gradient = "position"` are rejected. The keyboard has no heat style.
+
+```toml
+[aura]
+fans = "chain"
+chain_len = 2
+leds_per_fan = 14
+
+[[light]]
+target = "aura.chain[0]"
+metric = "activity"
+style = "heat"
+attack_s = 0.7
+smooth_s = 0.7
+follow = "aura.chain[1]"
+```
+
+The front strip is the bar: its first LED is the sink and its last is the
+heater. The top strip follows that heater LED.
+
 **Mirrored vs chained:** on a splitter every fan receives the same data, so
 all fans always show the same thing. Per-fan metrics (`aura.chain[N]`) need
 the fans daisy-chained on one data line (fan N is LEDs `N × leds_per_fan` on).
