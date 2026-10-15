@@ -12,9 +12,9 @@
 # After the files are in place, llama-watch is enabled for boot.
 # kraken-lcd is never started, restarted, or enabled. The next step is
 # printed for the operator. The NZXT Kraken Z is optional (GitHub #6): with
-# none attached, kraken-lcd's unit, udev rules, alert units, hidraw checks
-# and state dir are skipped (its binary is still installed, inert) and the
-# output says how to add it later; more than one refuses. llama-light (RGB
+# none attached, kraken-lcd's unit, udev rules, hidraw checks and state dir
+# are skipped (its binary is still installed, inert) and the output says how
+# to add it later; more than one refuses. llama-light (RGB
 # lighting) is installed but enabled for boot only with --enable-light; it
 # is never started here.
 # llama-metrics (the LAN Prometheus exporter) and llama-cast (tty11 as a
@@ -179,15 +179,6 @@ freeze_staging() {
     return 1
   }
   copy_regular "$repo/packaging/fonts/llama-hack-9x18.psfu" "$dir/llama-hack-9x18.psfu" || {
-    rm -rf -- "$dir"
-    return 1
-  }
-  copy_regular "$repo/packaging/user/kraken-lcd-halt.path" "$dir/kraken-lcd-halt.path" || {
-    rm -rf -- "$dir"
-    return 1
-  }
-  copy_regular "$repo/packaging/user/kraken-lcd-halt-notify.service" \
-    "$dir/kraken-lcd-halt-notify.service" || {
     rm -rf -- "$dir"
     return 1
   }
@@ -376,10 +367,6 @@ show_staging_hashes() {
   # when he prepared one, so the hashes cover the bytes that will be installed.
   [[ -f "$staging/watch.toml" ]] && files+=("$staging/watch.toml")
   [[ -f "$staging/config.toml.new" ]] && files+=("$staging/config.toml.new")
-  files+=(
-    "$staging/kraken-lcd-halt.path"
-    "$staging/kraken-lcd-halt-notify.service"
-  )
   sha256sum -- "${files[@]}" || return 1
 }
 
@@ -441,8 +428,6 @@ verify_staged_matches_disk() {
     llama-hack-12x22.psfu:packaging/fonts/llama-hack-12x22.psfu
     llama-hack-10x18.psfu:packaging/fonts/llama-hack-10x18.psfu
     llama-hack-9x18.psfu:packaging/fonts/llama-hack-9x18.psfu
-    kraken-lcd-halt.path:packaging/user/kraken-lcd-halt.path
-    kraken-lcd-halt-notify.service:packaging/user/kraken-lcd-halt-notify.service
     check-provenance.txt:target/check-provenance.txt
   )
   for pair in "${pairs[@]}"; do
@@ -852,9 +837,9 @@ display_path() {
   fi
 }
 
-# One line in this run's record. `kind` is created, created-dir or replaced.
-# A replaced file names the backup this run would restore; a created file or
-# directory has no backup.
+# One line in this run's record. `kind` is created, created-dir, replaced
+# or removed. A replaced or removed file names the backup this run would
+# restore; a created file or directory has no backup.
 rollback_record() {
   local kind=$1 path=$2 bak=${3:-}
   local shown
@@ -864,6 +849,8 @@ rollback_record() {
   shown="$(display_path "$path")"
   if [[ "$kind" == "replaced" ]]; then
     mark_write "replaced ${shown} (backup at $(display_path "$bak"))"
+  elif [[ "$kind" == "removed" ]]; then
+    mark_write "removed ${shown} (backup at $(display_path "$bak"))"
   elif [[ "$kind" == "created-dir" ]]; then
     mark_write "created directory ${shown}"
   else
@@ -1006,12 +993,12 @@ print_rollback() {
   for ((i = n - 1; i >= 0; i--)); do
     path="${ROLLBACK_PATH[$i]}"
     shown="$(display_path "$path")"
-    if [[ "${ROLLBACK_KIND[$i]}" == "replaced" ]]; then
+    if [[ "${ROLLBACK_KIND[$i]}" == "replaced" || "${ROLLBACK_KIND[$i]}" == "removed" ]]; then
       bak="${ROLLBACK_BAK[$i]}"
       shown_bak="$(display_path "$bak")"
       # Keep the migrated writer config. This runs before the backup is moved
       # back over config.toml, so the bytes are the ones just installed.
-      if [[ "$(basename -- "$path")" == "config.toml" ]]; then
+      if [[ "${ROLLBACK_KIND[$i]}" == "replaced" && "$(basename -- "$path")" == "config.toml" ]]; then
         shown_new="$(display_path "${path}.new")"
         printf '  cp -p -- %q %q\n' "$shown" "$shown_new"
       fi
@@ -1072,7 +1059,6 @@ unit stays stopped and nothing is enabled:
   systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics llama-cast
 
 Optional:
-  systemctl --global enable kraken-lcd-halt.path   # desktop alert on HALTED
   usermod -aG llama-view $SUDO_USER   # mirror tty11 with llama-view; log in again
 EOF
   print_light_steps
@@ -1103,7 +1089,7 @@ Optional:
   usermod -aG llama-view $SUDO_USER   # mirror tty11 with llama-view; log in again
 
 Kraken Z LCD (kraken-lcd): its binary is installed, but not its unit, udev
-rules, desktop alert or state directory. To add it later:
+rules or state directory. To add it later:
   attach the cooler and run sudo scripts/install.sh again
 The installer then sets it up and prints the LCD steps; it never starts it.
 EOF
@@ -1646,6 +1632,95 @@ commit_new_file() {
   rollback_note_cast "$dest"
 }
 
+# Stage removal of an obsolete path. `kind` is file (a regular file) or
+# link (a symlink). The bytes are copied to dest.remove.new and the original
+# stays until commit_obsolete_path, so a failure before that commit leaves
+# the original and the EXIT hook deletes the copy. Anything else at the path
+# is left in place and reported. Absent is a no-op.
+# shellcheck disable=SC2329 # called as `must stage_obsolete_path`
+stage_obsolete_path() {
+  local kind=$1 dest=$2
+  local parent staged
+  parent="$(dirname -- "$dest")"
+  if [[ -L "$parent" ]]; then
+    echo "install.sh: refusing to follow a symlink at $dest" >&2
+    return 1
+  fi
+  if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+    return 0
+  fi
+  if [[ "$kind" == "file" ]]; then
+    if [[ -L "$dest" || ! -f "$dest" ]]; then
+      echo "install.sh: leaving $(display_path "$dest") in place (not a regular file)"
+      return 0
+    fi
+  elif [[ ! -L "$dest" ]]; then
+    echo "install.sh: leaving $(display_path "$dest") in place (not a symlink)"
+    return 0
+  fi
+  staged="$dest.remove.new"
+  if [[ -e "$staged" || -L "$staged" ]]; then
+    echo "install.sh: $staged already exists" >&2
+    return 1
+  fi
+  cp -a -- "$dest" "$staged" || {
+    rm -f -- "$staged"
+    return 1
+  }
+  INSTALL_NEW_PATHS+=("$staged")
+  mark_write "staged removal of $(display_path "$dest")"
+}
+
+# Finish a staged removal. The copy becomes dest.bak-<previous sha> (never
+# overwriting a different existing backup) and the original is unlinked.
+# Rollback moves the backup back, the same way a replaced file is restored.
+# One line is printed per path actually removed.
+# shellcheck disable=SC2329 # called as `must commit_obsolete_path`
+commit_obsolete_path() {
+  local dest=$1
+  local prev="${INSTALL_PREV_SHA:-none}"
+  local staged="$dest.remove.new" bak="${dest}.bak-${prev}"
+  local parent
+  if [[ ! -e "$staged" && ! -L "$staged" ]]; then
+    return 0
+  fi
+  parent="$(dirname -- "$dest")"
+  if [[ -L "$parent" ]]; then
+    echo "install.sh: refusing to follow a symlink at $dest" >&2
+    return 1
+  fi
+  if [[ -L "$staged" ]]; then
+    if [[ ! -L "$dest" ]]; then
+      echo "install.sh: leaving $(display_path "$dest") in place (not a symlink)"
+      rm -f -- "$staged" || return 1
+      return 0
+    fi
+  elif [[ -L "$dest" || ! -f "$dest" ]]; then
+    echo "install.sh: leaving $(display_path "$dest") in place (not a regular file)"
+    rm -f -- "$staged" || return 1
+    return 0
+  fi
+  if [[ -e "$bak" || -L "$bak" ]]; then
+    # Same bytes as the file this run would remove. A different backup is
+    # left alone: overwriting it would make rollback restore the wrong file.
+    if [[ -L "$staged" && -L "$bak" && "$(readlink -- "$bak")" == "$(readlink -- "$staged")" ]]; then
+      rm -f -- "$staged" || return 1
+    elif [[ ! -L "$staged" && ! -L "$bak" && -f "$bak" ]] && cmp -s -- "$bak" "$staged"; then
+      rm -f -- "$staged" || return 1
+    else
+      echo "install.sh: $bak exists and differs; refusing to remove $(display_path "$dest")" >&2
+      rm -f -- "$staged" || return 1
+      return 1
+    fi
+  else
+    mv -f -- "$staged" "$bak" || return 1
+  fi
+  rm -f -- "$dest" || return 1
+  INSTALL_BACKUP_DESTS+=("$dest")
+  rollback_record removed "$dest" "$bak"
+  echo "install.sh: removed $(display_path "$dest")"
+}
+
 # shellcheck disable=SC2329 # called as `must commit_installed_sha`
 commit_installed_sha() {
   local dest=$1 head=$2
@@ -1744,10 +1819,9 @@ apply_from_staging() {
   fi
 
   # The Kraken Z is optional (GitHub #6). None attached: kraken-lcd's unit,
-  # its udev rules (71-, 93-), its desktop-alert user units, the hidraw
-  # checks and its state dir are skipped; its binary is still installed with
-  # the others (inert without a unit). More than one still refuses. Both
-  # decisions come before any write.
+  # its udev rules (71-, 93-), the hidraw checks and its state dir are
+  # skipped; its binary is still installed with the others (inert without a
+  # unit). More than one still refuses. Both decisions come before any write.
   kraken_count="$(kraken_device_count "$sys_root")" || return 1
   if [[ "$kraken_count" -gt 1 ]]; then
     echo "install.sh: expected one 1e71:3008 device, found $kraken_count" >&2
@@ -1875,13 +1949,14 @@ apply_from_staging() {
     must stage_new_file 0644 "$staging/watch.toml" "$watch_dest" "staged watch.toml.new" || return 1
   fi
 
+  # GitHub #152: the desktop halt notifier is not shipped. A regular file at
+  # either unit path, and the global enable symlink, are removed. A symlink
+  # or directory at a unit path is left in place and reported.
   user_dir="$(dest_path "$dest_root" /etc/systemd/user)"
-  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
-    must stage_new_file 0644 "$staging/kraken-lcd-halt.path" \
-      "$user_dir/kraken-lcd-halt.path" "staged halt.path.new" || return 1
-    must stage_new_file 0644 "$staging/kraken-lcd-halt-notify.service" \
-      "$user_dir/kraken-lcd-halt-notify.service" "staged halt-notify.service.new" || return 1
-  fi
+  must stage_obsolete_path file "$user_dir/kraken-lcd-halt.path" || return 1
+  must stage_obsolete_path file "$user_dir/kraken-lcd-halt-notify.service" || return 1
+  must stage_obsolete_path link \
+    "$user_dir/default.target.wants/kraken-lcd-halt.path" || return 1
 
   # udev, sysusers and the grid directory's tmpfiles entry are in place
   # before the hidraw check. systemd-tmpfiles runs immediately after
@@ -2042,10 +2117,10 @@ apply_from_staging() {
   if [[ "$watch_mode" == "install" ]]; then
     must commit_new_file "$watch_dest" || return 1
   fi
-  if [[ "$INSTALL_KRAKEN" == 1 ]]; then
-    must commit_new_file "$user_dir/kraken-lcd-halt.path" || return 1
-    must commit_new_file "$user_dir/kraken-lcd-halt-notify.service" || return 1
-  fi
+  must commit_obsolete_path "$user_dir/kraken-lcd-halt.path" || return 1
+  must commit_obsolete_path "$user_dir/kraken-lcd-halt-notify.service" || return 1
+  must commit_obsolete_path \
+    "$user_dir/default.target.wants/kraken-lcd-halt.path" || return 1
 
   config_dest="$(dest_path "$dest_root" /etc/llama-bored/config.toml)"
   config_bak="$(dest_path "$dest_root" "/etc/llama-bored/config.toml.bak-$prev")"
@@ -2659,7 +2734,7 @@ self_test() {
   dest="$tmp/dest"
   sys="$tmp/sys"
   head="0123456789abcdef0123456789abcdef01234567"
-  mkdir -p "$repo/packaging/user" "$repo/packaging/fonts" "$repo/target/release"
+  mkdir -p "$repo/packaging/fonts" "$repo/target/release"
   cp -- "$ROOT/packaging/kraken-lcd.service" "$repo/packaging/kraken-lcd.service"
   cp -- "$ROOT/packaging/llama-bored.sysusers" "$repo/packaging/llama-bored.sysusers"
   cp -- "$ROOT/packaging/llama-bored.tmpfiles" "$repo/packaging/llama-bored.tmpfiles"
@@ -2680,9 +2755,6 @@ self_test() {
   cp -- "$ROOT/packaging/config.example.toml" "$repo/packaging/config.example.toml"
   cp -- "$ROOT/packaging/watch.example.toml" "$repo/packaging/watch.example.toml"
   cp -- "$ROOT/packaging/llama-watch.service" "$repo/packaging/llama-watch.service"
-  cp -- "$ROOT/packaging/user/kraken-lcd-halt.path" "$repo/packaging/user/kraken-lcd-halt.path"
-  cp -- "$ROOT/packaging/user/kraken-lcd-halt-notify.service" \
-    "$repo/packaging/user/kraken-lcd-halt-notify.service"
   printf 'fake-binary\n' >"$repo/target/release/kraken-lcd"
   printf 'fake-watch\n' >"$repo/target/release/llama-watch"
   printf 'fake-view\n' >"$repo/target/release/llama-view"
@@ -2849,8 +2921,6 @@ self_test() {
   grep -q '^RestartSec=45$' "$(dest_path "$dest" /etc/systemd/system/kraken-lcd.service)"
   cmp -s "$ROOT/packaging/93-kraken-lcd-hidraw.rules" \
     "$(dest_path "$dest" /etc/udev/rules.d/93-kraken-lcd-hidraw.rules)"
-  cmp -s "$ROOT/packaging/user/kraken-lcd-halt.path" \
-    "$(dest_path "$dest" /etc/systemd/user/kraken-lcd-halt.path)"
   local font_installed font_name
   for font_name in llama-hack-12x24.psfu llama-hack-12x22.psfu llama-hack-10x18.psfu llama-hack-9x18.psfu; do
     font_installed="$(dest_path "$dest" "/usr/local/share/llama-bored/$font_name")"
@@ -2865,8 +2935,15 @@ self_test() {
       exit 1
     }
   done
-  cmp -s "$ROOT/packaging/user/kraken-lcd-halt-notify.service" \
-    "$(dest_path "$dest" /etc/systemd/user/kraken-lcd-halt-notify.service)"
+  local halt_rel
+  for halt_rel in /etc/systemd/user/kraken-lcd-halt.path \
+    /etc/systemd/user/kraken-lcd-halt-notify.service \
+    /etc/systemd/user/default.target.wants/kraken-lcd-halt.path; do
+    if [[ -e "$(dest_path "$dest" "$halt_rel")" || -L "$(dest_path "$dest" "$halt_rel")" ]]; then
+      echo "install self-test: fresh install created $halt_rel" >&2
+      exit 1
+    fi
+  done
   # Generic, public next steps. install.sh prints them and runs none of them
   # (the log checks below and log_mentions_writer_lifecycle).
   local step
@@ -2879,7 +2956,6 @@ self_test() {
     "runuser -u kraken-lcd -- /usr/local/libexec/llama-bored/kraken-lcd show-image --view <test-card>" \
     "systemctl enable --now kraken-lcd" \
     "systemctl try-restart llama-watch kraken-lcd llama-light llama-metrics llama-cast" \
-    "systemctl --global enable kraken-lcd-halt.path" \
     'usermod -aG llama-view $SUDO_USER' \
     "how to roll back"; do
     [[ "$out" == *"$step"* ]] || {
@@ -2889,6 +2965,11 @@ self_test() {
   done
   if printf '%s\n' "${out%%how to roll back*}" | grep -E -q 'RR-?[A-Z0-9]|\bT[0-9]+\b|Phase B|--trace-hid|was restarted'; then
     echo "install self-test: next steps use internal ticket jargon or claim a restart" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [[ "$out" == *"kraken-lcd-halt"* || "$out" == *"systemctl --global enable"* ]]; then
+    echo "install self-test: next steps still mention the halt notifier" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
@@ -2948,6 +3029,96 @@ self_test() {
     exit 1
   fi
   rm -rf -- "$staging"
+
+  # GitHub #152: an upgrade that already has both notifier units and the
+  # global enable link removes all three. The printed rollback restores them.
+  local halt_up halt_stage halt_out halt_section old_sha halt_user
+  local halt_path halt_svc halt_link
+  old_sha="fedcba9876543210fedcba9876543210fedcba98"
+  halt_up="$tmp/halt-upgrade"
+  halt_user="$(dest_path "$halt_up" /etc/systemd/user)"
+  mkdir -p "$halt_user/default.target.wants" \
+    "$(dest_path "$halt_up" /usr/local/libexec/llama-bored)"
+  printf '%s\n' "$old_sha" \
+    >"$(dest_path "$halt_up" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  halt_path="$halt_user/kraken-lcd-halt.path"
+  halt_svc="$halt_user/kraken-lcd-halt-notify.service"
+  halt_link="$halt_user/default.target.wants/kraken-lcd-halt.path"
+  printf 'path-unit\n' >"$halt_path"
+  printf 'notify-unit\n' >"$halt_svc"
+  ln -s ../kraken-lcd-halt.path "$halt_link"
+  snapshot_tree "$halt_up" "$tmp/snap-halt-upgrade"
+  : >"$INSTALL_LOG"
+  halt_stage="$(freeze_staging "$repo" "$halt_up")"
+  halt_out="$(apply_from_staging "$halt_stage" "$halt_up" "$sys" "$head")"
+  if [[ -e "$halt_path" || -L "$halt_path" || -e "$halt_svc" || -L "$halt_svc" \
+    || -e "$halt_link" || -L "$halt_link" ]]; then
+    echo "install self-test: upgrade left a halt notifier path in place" >&2
+    exit 1
+  fi
+  assert_eq "$(cat -- "$halt_path.bak-$old_sha")" "path-unit" "halt.path backup"
+  assert_eq "$(cat -- "$halt_svc.bak-$old_sha")" "notify-unit" "halt-notify backup"
+  assert_eq "$(readlink -- "$halt_link.bak-$old_sha")" "../kraken-lcd-halt.path" \
+    "global enable link backup"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt.path' <<<"$halt_out" || true)" \
+    "1" "one removal line for halt.path"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt-notify.service' <<<"$halt_out" || true)" \
+    "1" "one removal line for halt-notify.service"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/default.target.wants/kraken-lcd-halt.path' <<<"$halt_out" || true)" \
+    "1" "one removal line for the global enable link"
+  halt_section="$(rollback_section "$halt_out")"
+  [[ "$halt_section" == *"mv -f -- /etc/systemd/user/kraken-lcd-halt.path.bak-${old_sha} /etc/systemd/user/kraken-lcd-halt.path"* \
+    && "$halt_section" == *"mv -f -- /etc/systemd/user/kraken-lcd-halt-notify.service.bak-${old_sha} /etc/systemd/user/kraken-lcd-halt-notify.service"* \
+    && "$halt_section" == *"mv -f -- /etc/systemd/user/default.target.wants/kraken-lcd-halt.path.bak-${old_sha} /etc/systemd/user/default.target.wants/kraken-lcd-halt.path"* ]] || {
+    echo "install self-test: rollback does not restore the halt notifier" >&2
+    printf '%s\n' "$halt_section" >&2
+    exit 1
+  }
+  assert_rollback_order "$halt_out"
+  assert_no_new "$halt_up"
+  execute_printed_rollback "$halt_out" "$halt_up"
+  assert_same_tree "$halt_up" "$tmp/snap-halt-upgrade" "halt notifier upgrade rollback"
+  assert_eq "$(readlink -- "$halt_link")" "../kraken-lcd-halt.path" \
+    "rollback restored the global enable link"
+  assert_eq "$(cat -- "$halt_path")" "path-unit" "rollback restored halt.path"
+  assert_eq "$(cat -- "$halt_svc")" "notify-unit" "rollback restored halt-notify.service"
+  rm -rf -- "$halt_stage"
+
+  # A symlink or a directory at a unit path is left untouched and reported.
+  # Anything other than a symlink at the global-link path is left too.
+  local halt_odd halt_odd_stage halt_odd_out halt_odd_user halt_sentinel
+  halt_odd="$tmp/halt-odd"
+  halt_sentinel="$tmp/halt-sentinel"
+  printf 'sentinel\n' >"$halt_sentinel"
+  halt_odd_user="$(dest_path "$halt_odd" /etc/systemd/user)"
+  mkdir -p "$halt_odd_user/default.target.wants" \
+    "$halt_odd_user/kraken-lcd-halt-notify.service"
+  printf 'inside\n' >"$halt_odd_user/kraken-lcd-halt-notify.service/keep"
+  ln -s "$halt_sentinel" "$halt_odd_user/kraken-lcd-halt.path"
+  printf 'not-a-link\n' >"$halt_odd_user/default.target.wants/kraken-lcd-halt.path"
+  : >"$INSTALL_LOG"
+  halt_odd_stage="$(freeze_staging "$repo" "$halt_odd")"
+  halt_odd_out="$(apply_from_staging "$halt_odd_stage" "$halt_odd" "$sys" "$head")"
+  assert_eq "$(readlink -- "$halt_odd_user/kraken-lcd-halt.path")" "$halt_sentinel" \
+    "symlink unit path kept"
+  assert_eq "$(cat -- "$halt_sentinel")" "sentinel" "symlink target kept"
+  assert_eq "$(cat -- "$halt_odd_user/kraken-lcd-halt-notify.service/keep")" "inside" \
+    "directory unit path kept"
+  assert_eq "$(cat -- "$halt_odd_user/default.target.wants/kraken-lcd-halt.path")" \
+    "not-a-link" "non-symlink global link kept"
+  assert_eq "$(grep -c -x -F -- 'install.sh: leaving /etc/systemd/user/kraken-lcd-halt.path in place (not a regular file)' <<<"$halt_odd_out" || true)" \
+    "1" "symlink unit path reported"
+  assert_eq "$(grep -c -x -F -- 'install.sh: leaving /etc/systemd/user/kraken-lcd-halt-notify.service in place (not a regular file)' <<<"$halt_odd_out" || true)" \
+    "1" "directory unit path reported"
+  assert_eq "$(grep -c -x -F -- 'install.sh: leaving /etc/systemd/user/default.target.wants/kraken-lcd-halt.path in place (not a symlink)' <<<"$halt_odd_out" || true)" \
+    "1" "non-symlink global link reported"
+  if grep -x -F -q -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt.path' <<<"$halt_odd_out" \
+    || grep -x -F -q -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt-notify.service' <<<"$halt_odd_out" \
+    || grep -x -F -q -- 'install.sh: removed /etc/systemd/user/default.target.wants/kraken-lcd-halt.path' <<<"$halt_odd_out"; then
+    echo "install self-test: odd halt paths were removed" >&2
+    exit 1
+  fi
+  rm -rf -- "$halt_odd_stage"
 
   local low="$tmp/low-dest" low_stage
   mkdir -p "$(dest_path "$low" /etc/llama-bored)"
@@ -4686,8 +4857,8 @@ self_test() {
   rm -rf -- "$cast_stage"
 
   # GitHub #6: no Kraken Z attached. Everything but kraken-lcd's unit, its
-  # udev rules (71-, 93-), its desktop-alert user units and its state dir is
-  # installed; no Kraken hidraw check runs; the next steps never tell the
+  # udev rules (71-, 93-) and its state dir is installed; no Kraken hidraw
+  # check runs; the next steps never tell the
   # operator to start kraken-lcd; the rollback is byte-for-byte. A cooler
   # attached later is added by re-running the installer. Two Krakens, or a
   # kraken-lcd install whose cooler has gone missing, refuse before any write.
@@ -4755,8 +4926,9 @@ self_test() {
     /etc/udev/rules.d/93-kraken-lcd-hidraw.rules \
     /etc/systemd/user/kraken-lcd-halt.path \
     /etc/systemd/user/kraken-lcd-halt-notify.service \
+    /etc/systemd/user/default.target.wants/kraken-lcd-halt.path \
     /var/lib/kraken-lcd; do
-    if [[ -e "$(dest_path "$nok" "$p")" ]]; then
+    if [[ -e "$(dest_path "$nok" "$p")" || -L "$(dest_path "$nok" "$p")" ]]; then
       echo "install self-test: no-Kraken install created $p" >&2
       exit 1
     fi
@@ -4850,13 +5022,19 @@ self_test() {
   for p in /etc/systemd/system/kraken-lcd.service \
     /etc/udev/rules.d/71-kraken-lcd.rules \
     /etc/udev/rules.d/93-kraken-lcd-hidraw.rules \
-    /etc/systemd/user/kraken-lcd-halt.path \
-    /etc/systemd/user/kraken-lcd-halt-notify.service \
     /var/lib/kraken-lcd; do
     [[ -e "$(dest_path "$nok_later" "$p")" ]] || {
       echo "install self-test: re-run with the Kraken attached did not add $p" >&2
       exit 1
     }
+  done
+  for p in /etc/systemd/user/kraken-lcd-halt.path \
+    /etc/systemd/user/kraken-lcd-halt-notify.service \
+    /etc/systemd/user/default.target.wants/kraken-lcd-halt.path; do
+    if [[ -e "$(dest_path "$nok_later" "$p")" || -L "$(dest_path "$nok_later" "$p")" ]]; then
+      echo "install self-test: re-run with the Kraken attached created $p" >&2
+      exit 1
+    fi
   done
   log_has 'setfacl -b -- /dev/hidraw0'
   [[ "$nok_later_out" == *"systemctl enable --now kraken-lcd"* \
