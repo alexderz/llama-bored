@@ -27,9 +27,9 @@ pub const MAX_GAP_S: f64 = 60.0;
 pub const MAX_SUBSTEP_S: f64 = 0.5;
 
 /// Shortest `conduction_s`, in seconds. The config accepts this same floor.
-/// A smaller diffusion time makes the implicit step overflow; below about
-/// 1e-11 s the cells stop being finite and stay that way.
-const MIN_CONDUCTION_S: f64 = 1.0;
+/// The conduction step can overflow below about 1e-11 s and then stays
+/// non-finite; 1 s is a safety margin far above that.
+pub const MIN_CONDUCTION_S: f64 = 1.0;
 
 /// The bar's numbers. Times are seconds; `foot_leds` is a count of LEDs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,9 +64,10 @@ pub enum HeatError {
     /// `foot_leds` must be at least 1 and fewer than `leds`, and `leds`
     /// must be at least 2.
     Span { leds: usize, foot_leds: usize },
-    /// `transit_s` is not a finite number above 0, `conduction_s` is not a
-    /// finite number of at least 1 second, or a heater time constant is
-    /// negative or non-finite. Below 1 s the conduction step can overflow.
+    /// `transit_s` is not a finite number above 0, `conduction_s` is below
+    /// [`MIN_CONDUCTION_S`] or non-finite, or a heater time constant is
+    /// negative or non-finite. The 1 s floor is a safety margin; the step
+    /// can overflow below about 1e-11 s.
     Time,
 }
 
@@ -559,8 +560,9 @@ mod tests {
     fn a_huge_gap_matches_a_sixty_second_step() {
         let mut huge = HeatBar::new(28, HeatParams::default()).expect("bar");
         let mut capped = HeatBar::new(28, HeatParams::default()).expect("bar");
+        assert_eq!(MAX_GAP_S, 60.0);
         huge.step(40.0, 1.0e6);
-        capped.step(40.0, MAX_GAP_S);
+        capped.step(40.0, 60.0);
         assert_eq!(huge.heater(), capped.heater());
         assert_eq!(huge.leds(), capped.leds());
     }
@@ -593,15 +595,17 @@ mod tests {
 
     #[test]
     fn a_non_finite_input_leaves_the_bar_unchanged() {
-        let mut bar = HeatBar::new(14, HeatParams::default()).expect("bar");
-        bar.step(40.0, 0.5);
-        let mut twin = bar.clone();
-        bar.step(f64::NAN, 0.5);
-        assert_eq!(bar.heater(), twin.heater());
-        assert_eq!(bar.leds(), twin.leds());
-        bar.step(10.0, 0.5);
-        twin.step(10.0, 0.5);
-        assert_eq!(bar.heater(), twin.heater());
-        assert_eq!(bar.leds(), twin.leds());
+        for input in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut bar = HeatBar::new(14, HeatParams::default()).expect("bar");
+            bar.step(40.0, 0.5);
+            let mut twin = bar.clone();
+            bar.step(input, 0.5);
+            assert_eq!(bar.heater(), twin.heater(), "{input}");
+            assert_eq!(bar.leds(), twin.leds(), "{input}");
+            bar.step(10.0, 0.5);
+            twin.step(10.0, 0.5);
+            assert_eq!(bar.heater(), twin.heater(), "{input}");
+            assert_eq!(bar.leds(), twin.leds(), "{input}");
+        }
     }
 }
