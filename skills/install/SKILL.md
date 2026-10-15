@@ -406,9 +406,7 @@ Only then start the writer:
 systemctl enable --now kraken-lcd
 ```
 
-Within a minute the LCD shows the live dashboard. Offer the desktop alert for
-a HALTED latch: `systemctl --global enable kraken-lcd-halt.path` (needs
-`notify-send` in the user's session).
+Within a minute the LCD shows the live dashboard.
 
 ## 5b. RGB and the exporter (only what the human chose)
 
