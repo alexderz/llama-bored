@@ -1635,8 +1635,10 @@ commit_new_file() {
 # Stage removal of an obsolete path. `kind` is file (a regular file) or
 # link (a symlink). The bytes are copied to dest.remove.new and the original
 # stays until commit_obsolete_path, so a failure before that commit leaves
-# the original and the EXIT hook deletes the copy. Anything else at the path
-# is left in place and reported. Absent is a no-op.
+# the original and the EXIT hook deletes the copy. A leftover dest.remove.new
+# (only after SIGKILL or power loss) is replaced, the same way a stale
+# dest.new is replaced. Anything else at the path is left in place and
+# reported. Absent is a no-op.
 # shellcheck disable=SC2329 # called as `must stage_obsolete_path`
 stage_obsolete_path() {
   local kind=$1 dest=$2
@@ -1659,9 +1661,10 @@ stage_obsolete_path() {
     return 0
   fi
   staged="$dest.remove.new"
+  # Unlink first. The copy of the global enable link is itself a symlink,
+  # and cp would follow a leftover one.
   if [[ -e "$staged" || -L "$staged" ]]; then
-    echo "install.sh: $staged already exists" >&2
-    return 1
+    rm -f -- "$staged" || return 1
   fi
   cp -a -- "$dest" "$staged" || {
     rm -f -- "$staged"
@@ -3119,6 +3122,230 @@ self_test() {
     exit 1
   fi
   rm -rf -- "$halt_odd_stage"
+
+  # GitHub #152: failing before the removal commit leaves all three paths.
+  # The staged copies are deleted with the other .new files; no backup is written.
+  local halt_fail halt_fail_stage halt_fail_err halt_fail_status halt_fail_user
+  local halt_fail_path halt_fail_svc halt_fail_link
+  halt_fail="$tmp/halt-fail"
+  halt_fail_user="$(dest_path "$halt_fail" /etc/systemd/user)"
+  mkdir -p "$halt_fail_user/default.target.wants" \
+    "$(dest_path "$halt_fail" /usr/local/libexec/llama-bored)"
+  printf '%s\n' "$old_sha" \
+    >"$(dest_path "$halt_fail" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  halt_fail_path="$halt_fail_user/kraken-lcd-halt.path"
+  halt_fail_svc="$halt_fail_user/kraken-lcd-halt-notify.service"
+  halt_fail_link="$halt_fail_user/default.target.wants/kraken-lcd-halt.path"
+  printf 'path-unit\n' >"$halt_fail_path"
+  printf 'notify-unit\n' >"$halt_fail_svc"
+  ln -s ../kraken-lcd-halt.path "$halt_fail_link"
+  : >"$INSTALL_LOG"
+  halt_fail_stage="$(freeze_staging "$repo" "$halt_fail")"
+  INSTALL_FAIL_AT=commit:llama-watch.service
+  set +e
+  halt_fail_err="$(apply_from_staging "$halt_fail_stage" "$halt_fail" "$sys" "$head" 2>&1 >/dev/null)"
+  halt_fail_status=$?
+  set -e
+  unset INSTALL_FAIL_AT
+  if [[ "$halt_fail_status" -eq 0 ]]; then
+    echo "install self-test: halt removal ran despite a failure before its commit" >&2
+    exit 1
+  fi
+  [[ "$halt_fail_err" == *"injected failure at commit:llama-watch.service"* ]] || {
+    echo "install self-test: halt failure was not the watcher-unit commit" >&2
+    printf '%s\n' "$halt_fail_err" >&2
+    exit 1
+  }
+  assert_eq "$(cat -- "$halt_fail_path")" "path-unit" \
+    "halt.path kept when commit is not reached"
+  assert_eq "$(cat -- "$halt_fail_svc")" "notify-unit" \
+    "halt-notify.service kept when commit is not reached"
+  assert_eq "$(readlink -- "$halt_fail_link")" "../kraken-lcd-halt.path" \
+    "global enable link kept when commit is not reached"
+  if [[ -e "$halt_fail_path.remove.new" || -L "$halt_fail_path.remove.new" \
+    || -e "$halt_fail_svc.remove.new" || -L "$halt_fail_svc.remove.new" \
+    || -e "$halt_fail_link.remove.new" || -L "$halt_fail_link.remove.new" \
+    || -e "$halt_fail_path.bak-$old_sha" || -L "$halt_fail_path.bak-$old_sha" \
+    || -e "$halt_fail_svc.bak-$old_sha" || -L "$halt_fail_svc.bak-$old_sha" \
+    || -e "$halt_fail_link.bak-$old_sha" || -L "$halt_fail_link.bak-$old_sha" \
+    || -e "$halt_fail_path.bak-none" || -L "$halt_fail_path.bak-none" \
+    || -e "$halt_fail_svc.bak-none" || -L "$halt_fail_svc.bak-none" \
+    || -e "$halt_fail_link.bak-none" || -L "$halt_fail_link.bak-none" ]]; then
+    echo "install self-test: failure before the halt commit left a .remove.new or .bak" >&2
+    exit 1
+  fi
+  assert_no_new "$halt_fail"
+  rm -rf -- "$halt_fail_stage"
+
+  # GitHub #152: no Kraken attached still removes a leftover notifier.
+  # The Kraken unit and the 71-/93- rules are absent, so the install proceeds.
+  local halt_nok halt_nok_sys halt_nok_stage halt_nok_out halt_nok_err halt_nok_user
+  local halt_nok_path halt_nok_svc halt_nok_link
+  halt_nok_sys="$tmp/sys-halt-no-kraken"
+  mkdir -p "$halt_nok_sys/bus/usb/devices"
+  assert_eq "$(kraken_device_count "$halt_nok_sys")" "0" "halt removal sysfs has no Kraken"
+  halt_nok="$tmp/halt-no-kraken"
+  halt_nok_user="$(dest_path "$halt_nok" /etc/systemd/user)"
+  mkdir -p "$halt_nok_user/default.target.wants" \
+    "$(dest_path "$halt_nok" /usr/local/libexec/llama-bored)"
+  printf '%s\n' "$old_sha" \
+    >"$(dest_path "$halt_nok" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  halt_nok_path="$halt_nok_user/kraken-lcd-halt.path"
+  halt_nok_svc="$halt_nok_user/kraken-lcd-halt-notify.service"
+  halt_nok_link="$halt_nok_user/default.target.wants/kraken-lcd-halt.path"
+  printf 'path-unit\n' >"$halt_nok_path"
+  printf 'notify-unit\n' >"$halt_nok_svc"
+  ln -s ../kraken-lcd-halt.path "$halt_nok_link"
+  : >"$INSTALL_LOG"
+  halt_nok_stage="$(freeze_staging "$repo" "$halt_nok")"
+  halt_nok_err="$tmp/halt-no-kraken.err"
+  halt_nok_out="$(apply_from_staging "$halt_nok_stage" "$halt_nok" "$halt_nok_sys" "$head" 2>"$halt_nok_err")"
+  grep -F -q 'no NZXT Kraken Z (1e71:3008) is attached' "$halt_nok_err" || {
+    echo "install self-test: halt removal without a Kraken did not skip kraken-lcd" >&2
+    cat -- "$halt_nok_err" >&2
+    exit 1
+  }
+  if [[ -e "$halt_nok_path" || -L "$halt_nok_path" || -e "$halt_nok_svc" || -L "$halt_nok_svc" \
+    || -e "$halt_nok_link" || -L "$halt_nok_link" ]]; then
+    echo "install self-test: no-Kraken upgrade left a halt notifier path in place" >&2
+    exit 1
+  fi
+  if [[ -e "$(dest_path "$halt_nok" /etc/systemd/system/kraken-lcd.service)" \
+    || -L "$(dest_path "$halt_nok" /etc/systemd/system/kraken-lcd.service)" \
+    || -e "$(dest_path "$halt_nok" /etc/udev/rules.d/71-kraken-lcd.rules)" \
+    || -e "$(dest_path "$halt_nok" /etc/udev/rules.d/93-kraken-lcd-hidraw.rules)" ]]; then
+    echo "install self-test: no-Kraken halt removal installed kraken-lcd" >&2
+    exit 1
+  fi
+  assert_eq "$(cat -- "$halt_nok_path.bak-$old_sha")" "path-unit" "no-Kraken halt.path backup"
+  assert_eq "$(cat -- "$halt_nok_svc.bak-$old_sha")" "notify-unit" "no-Kraken halt-notify backup"
+  assert_eq "$(readlink -- "$halt_nok_link.bak-$old_sha")" "../kraken-lcd-halt.path" \
+    "no-Kraken global enable link backup"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt.path' <<<"$halt_nok_out" || true)" \
+    "1" "no-Kraken removal line for halt.path"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt-notify.service' <<<"$halt_nok_out" || true)" \
+    "1" "no-Kraken removal line for halt-notify.service"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/default.target.wants/kraken-lcd-halt.path' <<<"$halt_nok_out" || true)" \
+    "1" "no-Kraken removal line for the global enable link"
+  assert_no_new "$halt_nok"
+  rm -rf -- "$halt_nok_stage"
+
+  # GitHub #152: a differing dest.bak-<sha> is never overwritten. Removal of
+  # that path is refused, and the later notifier paths are left in place.
+  local halt_bak halt_bak_stage halt_bak_err halt_bak_status halt_bak_user
+  local halt_bak_path halt_bak_svc halt_bak_link
+  halt_bak="$tmp/halt-bak"
+  halt_bak_user="$(dest_path "$halt_bak" /etc/systemd/user)"
+  mkdir -p "$halt_bak_user/default.target.wants" \
+    "$(dest_path "$halt_bak" /usr/local/libexec/llama-bored)"
+  printf '%s\n' "$old_sha" \
+    >"$(dest_path "$halt_bak" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  halt_bak_path="$halt_bak_user/kraken-lcd-halt.path"
+  halt_bak_svc="$halt_bak_user/kraken-lcd-halt-notify.service"
+  halt_bak_link="$halt_bak_user/default.target.wants/kraken-lcd-halt.path"
+  printf 'path-unit\n' >"$halt_bak_path"
+  printf 'notify-unit\n' >"$halt_bak_svc"
+  ln -s ../kraken-lcd-halt.path "$halt_bak_link"
+  printf 'older-path\n' >"$halt_bak_path.bak-$old_sha"
+  : >"$INSTALL_LOG"
+  halt_bak_stage="$(freeze_staging "$repo" "$halt_bak")"
+  set +e
+  halt_bak_err="$(apply_from_staging "$halt_bak_stage" "$halt_bak" "$sys" "$head" 2>&1 >/dev/null)"
+  halt_bak_status=$?
+  set -e
+  if [[ "$halt_bak_status" -eq 0 ]]; then
+    echo "install self-test: a differing halt backup was accepted" >&2
+    exit 1
+  fi
+  [[ "$halt_bak_err" == *"exists and differs; refusing to remove /etc/systemd/user/kraken-lcd-halt.path"* ]] || {
+    echo "install self-test: differing halt backup was not refused" >&2
+    printf '%s\n' "$halt_bak_err" >&2
+    exit 1
+  }
+  assert_eq "$(cat -- "$halt_bak_path.bak-$old_sha")" "older-path" "differing halt backup kept"
+  assert_eq "$(cat -- "$halt_bak_path")" "path-unit" \
+    "halt.path kept when its backup differs"
+  assert_eq "$(cat -- "$halt_bak_svc")" "notify-unit" \
+    "halt-notify.service kept when an earlier backup differs"
+  assert_eq "$(readlink -- "$halt_bak_link")" "../kraken-lcd-halt.path" \
+    "global enable link kept when an earlier backup differs"
+  if [[ -e "$halt_bak_svc.bak-$old_sha" || -L "$halt_bak_svc.bak-$old_sha" \
+    || -e "$halt_bak_link.bak-$old_sha" || -L "$halt_bak_link.bak-$old_sha" ]]; then
+    echo "install self-test: a later halt path was backed up after an earlier refusal" >&2
+    exit 1
+  fi
+  assert_no_new "$halt_bak"
+  rm -rf -- "$halt_bak_stage"
+
+  # GitHub #152: a leftover dest.remove.new is replaced (the backup is the
+  # live file, and a leftover symlink is not followed). The next run, with
+  # the notifier already gone, prints nothing about it.
+  local halt_again halt_again_stage halt_again_out halt_again_out2 halt_again_err2
+  local halt_again_user halt_again_path halt_again_svc halt_again_link halt_again_sentinel
+  halt_again="$tmp/halt-again"
+  halt_again_sentinel="$tmp/halt-again-sentinel"
+  printf 'do-not-touch\n' >"$halt_again_sentinel"
+  halt_again_user="$(dest_path "$halt_again" /etc/systemd/user)"
+  mkdir -p "$halt_again_user/default.target.wants" \
+    "$(dest_path "$halt_again" /usr/local/libexec/llama-bored)"
+  printf '%s\n' "$old_sha" \
+    >"$(dest_path "$halt_again" /usr/local/libexec/llama-bored/INSTALLED_SHA)"
+  halt_again_path="$halt_again_user/kraken-lcd-halt.path"
+  halt_again_svc="$halt_again_user/kraken-lcd-halt-notify.service"
+  halt_again_link="$halt_again_user/default.target.wants/kraken-lcd-halt.path"
+  printf 'path-unit\n' >"$halt_again_path"
+  printf 'notify-unit\n' >"$halt_again_svc"
+  ln -s ../kraken-lcd-halt.path "$halt_again_link"
+  printf 'stale-path\n' >"$halt_again_path.remove.new"
+  printf 'stale-svc\n' >"$halt_again_svc.remove.new"
+  ln -s "$halt_again_sentinel" "$halt_again_link.remove.new"
+  : >"$INSTALL_LOG"
+  halt_again_stage="$(freeze_staging "$repo" "$halt_again")"
+  halt_again_out="$(apply_from_staging "$halt_again_stage" "$halt_again" "$sys" "$head" 2>/dev/null)"
+  if [[ -e "$halt_again_path" || -L "$halt_again_path" || -e "$halt_again_svc" || -L "$halt_again_svc" \
+    || -e "$halt_again_link" || -L "$halt_again_link" ]]; then
+    echo "install self-test: stale .remove.new blocked halt removal" >&2
+    exit 1
+  fi
+  assert_eq "$(cat -- "$halt_again_path.bak-$old_sha")" "path-unit" \
+    "stale .remove.new was not kept as the halt.path backup"
+  assert_eq "$(cat -- "$halt_again_svc.bak-$old_sha")" "notify-unit" \
+    "stale .remove.new was not kept as the halt-notify backup"
+  assert_eq "$(readlink -- "$halt_again_link.bak-$old_sha")" "../kraken-lcd-halt.path" \
+    "stale .remove.new was not kept as the global enable link backup"
+  assert_eq "$(cat -- "$halt_again_sentinel")" "do-not-touch" \
+    "replacing a stale link copy did not write through it"
+  assert_eq "$(grep -c -x -F -- 'install.sh: removed /etc/systemd/user/kraken-lcd-halt.path' <<<"$halt_again_out" || true)" \
+    "1" "stale .remove.new still removed halt.path"
+  assert_no_new "$halt_again"
+  rm -rf -- "$halt_again_stage"
+  halt_again_stage="$(freeze_staging "$repo" "$halt_again")"
+  : >"$INSTALL_LOG"
+  halt_again_err2="$tmp/halt-again.err"
+  halt_again_out2="$(apply_from_staging "$halt_again_stage" "$halt_again" "$sys" "$head" 2>"$halt_again_err2")"
+  if grep -F -q -- 'kraken-lcd-halt' <<<"$halt_again_out2" \
+    || grep -F -q -- 'kraken-lcd-halt' "$halt_again_err2"; then
+    echo "install self-test: second run after halt removal still mentioned the notifier" >&2
+    printf '%s\n' "$halt_again_out2" >&2
+    cat -- "$halt_again_err2" >&2
+    exit 1
+  fi
+  if [[ -e "$halt_again_path" || -L "$halt_again_path" || -e "$halt_again_svc" || -L "$halt_again_svc" \
+    || -e "$halt_again_link" || -L "$halt_again_link" \
+    || -e "$halt_again_path.remove.new" || -L "$halt_again_path.remove.new" \
+    || -e "$halt_again_svc.remove.new" || -L "$halt_again_svc.remove.new" \
+    || -e "$halt_again_link.remove.new" || -L "$halt_again_link.remove.new" ]]; then
+    echo "install self-test: second run recreated a halt notifier path" >&2
+    exit 1
+  fi
+  assert_eq "$(cat -- "$halt_again_path.bak-$old_sha")" "path-unit" \
+    "second run left the halt.path backup"
+  assert_eq "$(cat -- "$halt_again_svc.bak-$old_sha")" "notify-unit" \
+    "second run left the halt-notify backup"
+  assert_eq "$(readlink -- "$halt_again_link.bak-$old_sha")" "../kraken-lcd-halt.path" \
+    "second run left the global enable link backup"
+  assert_no_new "$halt_again"
+  rm -rf -- "$halt_again_stage"
 
   local low="$tmp/low-dest" low_stage
   mkdir -p "$(dest_path "$low" /etc/llama-bored)"
