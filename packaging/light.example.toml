@@ -120,10 +120,12 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #   foot_leds   heat: LEDs at the bottom that conduct into the sink. At least
 #               1 and fewer than the span (default 5)
 #   conduction_s heat: diffusion time of the bar above the foot, in seconds.
-#               Above 0, at most 1000000 (default 20000). Smaller spreads a
-#               band out
+#               At least 1, at most 1000000 (default 20000). Smaller spreads
+#               a band out. Below 1 the conduction step can overflow.
 #   follow      heat: an Aura target painted solid in the top LED's colour
-#               ("aura.fans" or "aura.chain[...]"; not a keyboard target)
+#               ("aura.fans" or "aura.chain[...]"; not a keyboard target,
+#               and not a target that shares an LED with this entry).
+#               Several spans: the colour is the last span that drew.
 #   palette     "act" (default: the LCD ramp) | "thermal" | "mono"
 #   stops       instead of palette: [[position, "#RRGGBB"], ...], ascending.
 #               A number is in metric units; a string "60%" is percent of
@@ -134,8 +136,11 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #   smooth_s    0..=60 s exponential smoothing (default 0, off); with
 #               attack_s it is the fall (release) time
 #   attack_s    0..=60 s smoothing while the value rises (default smooth_s)
-#   idle_color  "#RRGGBB" shown below range min and when the metric is missing
-#               (without it a missing metric shows a dim grey)
+#   idle_color  "#RRGGBB" shown below range min. For every style but heat,
+#               also when the metric is missing (without it a missing metric
+#               shows a dim grey). Heat keeps drawing a missing value: the
+#               heater is fed 0 % and the bar cools. idle_color replaces a
+#               heat bar, and its follow target, only below range min.
 #   color       "#RRGGBB" a fixed colour instead of a metric (with brightness
 #               only: no metric, range, palette, stops or style)
 #
@@ -207,6 +212,8 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # # Two strips on one chain. The front strip is a heated bar: its first LED
 # # is the sink at the bottom, its last LED is the heater. The top strip
 # # follows the heater's colour. A burst of load travels down the front strip.
+# # Below range.min the idle colour replaces the bar and follow, while the
+# # bar keeps stepping; a missing value cools the bar instead.
 # [aura]
 # fans = "chain"
 # chain_len = 2
