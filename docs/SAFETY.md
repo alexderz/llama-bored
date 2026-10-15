@@ -47,12 +47,13 @@ nothing while the latch below is present.
 
 - the `z53` hwmon directory exists (found by name, not by number);
 - `pwm1_enable` and `pwm2_enable` (the pump and fan **mode**);
-- `fan1_input` (pump rpm);
+- `fan1_input` (pump rpm) and `pwm1` (pump duty);
 - the cooler's USB device number;
 - no `1e71:3011` (bootloader) device present.
 
-`pwm1`/`pwm2` **values** are logged but not compared. The firmware's own curve
-moves them all the time, and comparing them would cause false halts.
+`pwm1`/`pwm2` **values** are logged but not compared on their own. The
+firmware's own curve moves them all the time, and comparing them would cause
+false halts. `pwm1` only steers the pump band below.
 
 **Checks**, right after the operation (success or failure) and again about 2 s
 later:
@@ -60,7 +61,12 @@ later:
 - `z53` still present;
 - `pwm*_enable` identical;
 - pump rpm within **max(15 %, 150 rpm)** of the baseline. This band is a
-  constant, not a config value;
+  constant, not a config value. When the firmware's curve made one duty step
+  between the two reads (`pwm1` moved by at most 13 counts, one 5-point step
+  of its whole-percent duty, also a constant), the pump is expected anywhere
+  from the baseline rpm (still ramping) to the baseline scaled by the duty
+  ratio (arrived), with the band applied at each end (#147). A stopped pump,
+  a speed the duty does not explain, or a bigger duty jump still halts;
 - the same USB device number;
 - still no bootloader device.
 
