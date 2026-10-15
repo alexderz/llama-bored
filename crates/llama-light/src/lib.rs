@@ -9,6 +9,7 @@
 pub mod aura;
 pub mod backend;
 pub mod config;
+pub mod heat;
 pub mod hidraw;
 pub mod keyboard;
 pub mod mapping;

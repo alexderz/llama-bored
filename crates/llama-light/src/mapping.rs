@@ -6,6 +6,7 @@ use llama_core::wire::SnapshotV1;
 use crate::config::{
     AuraCfg, Edge, Gradient, KeyboardCfg, Layer, Layout, LightConfig, Shimmer, Style, Target,
 };
+use crate::heat::{HeatBar, HeatParams};
 use crate::keyboard::keymap::KEYS;
 use crate::metric::TokenRate;
 use crate::palette::dim;
@@ -35,6 +36,17 @@ struct LayerState {
     peak_age: f32,
     /// Seconds this layer has run (the shimmer's clock).
     clock: f32,
+    /// Heat: one bar per span, in span order. Built on the first tick and
+    /// again when a span's length changes. `None` when the span cannot hold
+    /// the foot; that span is skipped, not panicked.
+    heat: Vec<HeatSlot>,
+}
+
+/// A heat bar tied to the span length it was built for.
+#[derive(Clone, Debug)]
+struct HeatSlot {
+    len: usize,
+    bar: Option<HeatBar>,
 }
 
 /// Renders frames for one config. Build a new one when the config changes.
@@ -108,8 +120,9 @@ impl Renderer {
     pub fn frames(&mut self, snapshot: &SnapshotV1, dt_s: f32) -> Frames {
         let dt_s = if dt_s.is_finite() { dt_s.max(0.0) } else { 0.0 };
         self.tokens.update(snapshot);
+        let aura = &self.config.aura;
         for (layer, state) in self.config.layers.iter().zip(self.states.iter_mut()) {
-            advance(layer, state, snapshot, &self.tokens, dt_s);
+            advance(layer, state, snapshot, &self.tokens, aura, dt_s);
         }
         let engine = &self.config.engine;
         let period = engine.target_period_s;
@@ -157,7 +170,7 @@ impl Renderer {
             } else {
                 &mut aura_frame
             };
-            draw(layer, state, &spans, frame);
+            draw(layer, state, &spans, frame, aura);
         }
         Frames {
             aura: aura_frame,
@@ -249,6 +262,10 @@ pub fn spans(target: &Target, aura: &AuraCfg) -> Vec<Vec<usize>> {
 
 /// One step of the asymmetric EMA: `attack_s` while `value` is above the
 /// state, `release_s` otherwise. A time constant of 0 jumps.
+///
+/// The heat bar's heater uses this same step in `f64` ([`crate::heat`]):
+/// `prev + (value - prev) * (1 - exp(-dt / tau))`. This copy stays `f32`
+/// for the other styles.
 #[must_use]
 pub fn ema(prev: f32, value: f32, attack_s: f32, release_s: f32, dt_s: f32) -> f32 {
     let tau = if value > prev { attack_s } else { release_s };
@@ -260,11 +277,16 @@ pub fn ema(prev: f32, value: f32, attack_s: f32, release_s: f32, dt_s: f32) -> f
 }
 
 /// Sample and advance one layer by `dt_s`.
+///
+/// `advance` runs on every tick, including ticks that only tween toward the
+/// last LED target. Heat steps here with that tick's `dt`, so a slower
+/// `target_hz` does not skip simulation time.
 fn advance(
     layer: &Layer,
     state: &mut LayerState,
     snapshot: &SnapshotV1,
     tokens: &TokenRate,
+    aura: &AuraCfg,
     dt_s: f32,
 ) {
     state.clock += dt_s;
@@ -276,6 +298,17 @@ fn advance(
     } else {
         layer.metric.read(snapshot, None)
     };
+    if layer.style == Style::Heat {
+        // `attack_s` / `smooth_s` are the heater's lag, inside the bar, so
+        // the value is not smoothed again here. Unknown input is 0 %: the
+        // bar cools and keeps its state.
+        state.smoothed = raw;
+        let input = raw.map_or(0.0, |value| {
+            f64::from(layer.scale.percent(value, layer.range))
+        });
+        advance_heat(layer, state, aura, input, f64::from(dt_s));
+        return;
+    }
     if layer.style == Style::Gate {
         let above = raw.is_some_and(|v| v > layer.threshold.unwrap_or(0.0));
         state.since_on = if above {
@@ -352,7 +385,13 @@ pub fn shimmer_factor(shimmer: Option<Shimmer>, clock_s: f32) -> f32 {
     }
 }
 
-fn draw(layer: &Layer, state: &LayerState, spans: &[Vec<usize>], frame: &mut [Rgb]) {
+fn draw(
+    layer: &Layer,
+    state: &LayerState,
+    spans: &[Vec<usize>],
+    frame: &mut [Rgb],
+    aura: &AuraCfg,
+) {
     if let Some(color) = layer.fixed {
         let color = dim(color, layer.brightness);
         for span in spans {
@@ -372,6 +411,10 @@ fn draw(layer: &Layer, state: &LayerState, spans: &[Vec<usize>], frame: &mut [Rg
         for span in spans {
             blend(frame, span, color, state.level);
         }
+        return;
+    }
+    if layer.style == Style::Heat {
+        draw_heat(layer, state, spans, frame, aura);
         return;
     }
     let value = state.smoothed;
@@ -482,7 +525,97 @@ fn draw(layer: &Layer, state: &LayerState, spans: &[Vec<usize>], frame: &mut [Rg
                 paint(frame, span, color);
             }
         }
-        Style::Gate => {}
+        // Gate and heat are drawn above; both return before this match.
+        Style::Gate | Style::Heat => {}
+    }
+}
+
+fn heat_params(layer: &Layer) -> HeatParams {
+    HeatParams {
+        transit_s: f64::from(layer.transit_s),
+        foot_leds: layer.foot_leds,
+        conduction_s: f64::from(layer.conduction_s),
+        attack_s: f64::from(layer.attack_s),
+        smooth_s: f64::from(layer.smooth_s),
+    }
+}
+
+/// Step each span's bar by `dt` seconds. A span whose length changed is
+/// built again from cold. A span the foot does not fit is left empty.
+fn advance_heat(layer: &Layer, state: &mut LayerState, aura: &AuraCfg, input: f64, dt: f64) {
+    let spans = spans(&layer.target, aura);
+    let same = state.heat.len() == spans.len()
+        && state
+            .heat
+            .iter()
+            .zip(&spans)
+            .all(|(slot, span)| slot.len == span.len());
+    if !same {
+        let params = heat_params(layer);
+        state.heat = spans
+            .iter()
+            .map(|span| HeatSlot {
+                len: span.len(),
+                bar: HeatBar::new(span.len(), params).ok(),
+            })
+            .collect();
+    }
+    for slot in &mut state.heat {
+        if let Some(bar) = &mut slot.bar {
+            bar.step(input, dt);
+        }
+    }
+}
+
+/// Heat LEDs, then `follow` in the top LED's colour (after brightness).
+///
+/// The last LED of a span is the heater. With more than one span, `follow`
+/// takes the last span's top LED. Below `range.min`, `idle_color` still
+/// replaces the entry; a missing value does not — the bar keeps drawing.
+fn draw_heat(
+    layer: &Layer,
+    state: &LayerState,
+    spans: &[Vec<usize>],
+    frame: &mut [Rgb],
+    aura: &AuraCfg,
+) {
+    if let Some(value) = state.smoothed
+        && value < layer.range.0
+        && let Some(color) = layer.idle_color
+    {
+        let color = dim(color, layer.brightness);
+        for span in spans {
+            paint(frame, span, color);
+        }
+        paint_follow(layer, aura, frame, color);
+        return;
+    }
+    let mut top = None;
+    for (span, slot) in spans.iter().zip(&state.heat) {
+        let Some(bar) = &slot.bar else {
+            continue;
+        };
+        let mut color = None;
+        for (index, value) in span.iter().zip(bar.leds()) {
+            let led = dim(layer.palette.color(value as f32), layer.brightness);
+            paint(frame, &[*index], led);
+            color = Some(led);
+        }
+        if let Some(color) = color {
+            top = Some(color);
+        }
+    }
+    if let Some(color) = top {
+        paint_follow(layer, aura, frame, color);
+    }
+}
+
+fn paint_follow(layer: &Layer, aura: &AuraCfg, frame: &mut [Rgb], color: Rgb) {
+    let Some(follow) = &layer.follow else {
+        return;
+    };
+    for span in spans(follow, aura) {
+        paint(frame, &span, color);
     }
 }
 
