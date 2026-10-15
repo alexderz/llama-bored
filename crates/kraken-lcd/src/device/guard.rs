@@ -475,6 +475,7 @@ fn note_pwm1(mem: Pwm1Memory, duty: Option<u32>, now: Instant) -> Pwm1Memory {
 fn prior_from_change(change: Option<DutyChange>, duty: Option<u32>, now: Instant) -> Option<u32> {
     let change = change?;
     let duty = duty?;
+    // Defence in depth: note_pwm1 always makes `to` the latest readable pwm1.
     if duty != change.to {
         return None;
     }
@@ -600,6 +601,25 @@ mod tests {
         let baseline = snap(77, 953, None);
         let current = snap(77, 1121, None);
         assert_eq!(compare(&baseline, &current), Some(Deviation::Pump));
+    }
+
+    #[test]
+    fn same_duty_reads_do_not_refresh_the_change_window() {
+        let t0 = Instant::now();
+        let mut mem = Pwm1Memory {
+            last: None,
+            change: None,
+        };
+        mem = note_pwm1(mem, Some(64), t0);
+        mem = note_pwm1(mem, Some(77), t0);
+        mem = note_pwm1(mem, Some(77), t0 + Duration::from_secs(2));
+        mem = note_pwm1(mem, Some(77), t0 + Duration::from_secs(4));
+        mem = note_pwm1(mem, Some(77), t0 + Duration::from_secs(6));
+        assert_eq!(
+            prior_from_change(mem.change, Some(77), t0 + Duration::from_secs(6)),
+            None,
+            "the window counts from the first sight of 64 -> 77, not later 77 reads"
+        );
     }
 
     #[test]
