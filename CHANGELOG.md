@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.6.1 — 2026-10-14
+
+A heat style that draws an Aura strip as a heated bar, descending chain spans, a token chart that counts each column's own tokens, and a cooling guard that follows the firmware's pump duty steps.
+
 ### Added
 
 - llama-light: `style = "heat"` draws an Aura span as a metal bar, cold sink at the first LED and heater at the last. The metric drives the heater (`attack_s` while it rises, `smooth_s` while it falls); heat flows down in `transit_s`, the bottom `foot_leds` conduct it into the sink (`conduction_s` at least 1 s), and `follow` paints another Aura target in the top LED's colour (#149).
