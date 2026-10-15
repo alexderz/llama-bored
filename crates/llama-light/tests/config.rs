@@ -1,7 +1,7 @@
 //! light.toml: defaults, bounds, every validation error, and the shipped example.
 
 use llama_core::color::hex;
-use llama_light::config::{Layout, Style, Target, parse};
+use llama_light::config::{Gradient, Layout, Style, Target, parse};
 use llama_light::metric::Metric;
 use llama_light::palette::{Palette, Scale};
 
@@ -532,4 +532,176 @@ fn keyboard_brightness_cap_and_fixed_colour() {
     assert!(err.contains("light[0].color = \"blue\""), "{err}");
     let err = error("[keyboard]\nenabled = true\nleds = 3\n");
     assert!(err.contains("unknown field"), "{err}");
+}
+
+#[test]
+fn heat_parses_its_keys_and_the_defaults_fit_a_six_led_fan() {
+    let config = parse(
+        "[aura]\nfans = \"chain\"\nchain_len = 2\nleds_per_fan = 14\n\
+         [[light]]\n\
+         target = \"aura.chain[0]\"\n\
+         style = \"heat\"\n\
+         transit_s = 30\n\
+         foot_leds = 3\n\
+         conduction_s = 5000\n\
+         attack_s = 0.7\n\
+         smooth_s = 0.4\n\
+         gradient = \"value\"\n\
+         follow = \"aura.chain[1]\"\n",
+    )
+    .expect("heat");
+    let layer = &config.layers[0];
+    assert_eq!(layer.style, Style::Heat);
+    assert_eq!(layer.transit_s, 30.0);
+    assert_eq!(layer.foot_leds, 3);
+    assert_eq!(layer.conduction_s, 5_000.0);
+    assert_eq!(layer.attack_s, 0.7);
+    assert_eq!(layer.smooth_s, 0.4);
+    assert_eq!(layer.gradient, Gradient::Value);
+    assert_eq!(
+        layer.follow,
+        Some(Target::AuraChain {
+            start: 1,
+            end: 2,
+            reversed: false
+        })
+    );
+
+    let defaults = parse("[[light]]\nstyle = \"heat\"\n").expect("defaults");
+    let layer = &defaults.layers[0];
+    assert_eq!(layer.style, Style::Heat);
+    assert_eq!(layer.transit_s, 60.0);
+    assert_eq!(layer.foot_leds, 5);
+    assert_eq!(layer.conduction_s, 20_000.0);
+    assert_eq!(layer.attack_s, 0.0);
+    assert_eq!(layer.smooth_s, 0.0);
+    assert_eq!(layer.gradient, Gradient::Value);
+    assert_eq!(layer.follow, None);
+
+    let edges = parse(
+        "[aura]\nleds_per_fan = 14\n\
+         [[light]]\nstyle = \"heat\"\ntransit_s = 3600\n\
+         conduction_s = 1000000\nfoot_leds = 13\n",
+    )
+    .expect("upper bounds");
+    assert_eq!(edges.layers[0].transit_s, 3_600.0);
+    assert_eq!(edges.layers[0].conduction_s, 1_000_000.0);
+    assert_eq!(edges.layers[0].foot_leds, 13);
+
+    let two = parse("[aura]\nleds_per_fan = 2\n[[light]]\nstyle = \"heat\"\nfoot_leds = 1\n")
+        .expect("two LEDs, foot of 1");
+    assert_eq!(two.layers[0].foot_leds, 1);
+
+    let fans = parse(
+        "[aura]\nfans = \"chain\"\nchain_len = 2\nleds_per_fan = 14\n\
+         [[light]]\ntarget = \"aura.chain[0]\"\nstyle = \"heat\"\n\
+         follow = \"aura.fans\"\n",
+    )
+    .expect("follow the fans");
+    assert_eq!(fans.layers[0].follow, Some(Target::AuraFans));
+}
+
+#[test]
+fn heat_rejects_keys_that_do_not_apply_and_a_foot_the_span_cannot_hold() {
+    let cases = [
+        (
+            "[[light]]\nstyle = \"heat\"\nedge = \"fractional\"\n",
+            "light[0].edge is for style = \"bar\" or \"ladder\" (this entry is \"heat\")",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nfill_to = 125\n",
+            "light[0].fill_to is for style = \"bar\" (this entry is \"heat\")",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nthresholds = [50, 100]\n",
+            "light[0].thresholds is for style = \"ladder\" (this entry is \"heat\")",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\ngradient = \"position\"\n",
+            "light[0].gradient = \"position\" does not apply to style = \"heat\"; each LED takes the colour of its own value",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\ngradient = \"rainbow\"\n",
+            "light[0].gradient = \"rainbow\" is not \"value\" or \"position\"",
+        ),
+        (
+            "[[light]]\nstyle = \"bar\"\ntransit_s = 30\n",
+            "light[0].transit_s is for style = \"heat\" (this entry is \"bar\")",
+        ),
+        (
+            "[[light]]\nstyle = \"bar\"\nfoot_leds = 2\n",
+            "light[0].foot_leds is for style = \"heat\" (this entry is \"bar\")",
+        ),
+        (
+            "[[light]]\nstyle = \"bar\"\nconduction_s = 1000\n",
+            "light[0].conduction_s is for style = \"heat\" (this entry is \"bar\")",
+        ),
+        (
+            "[[light]]\nstyle = \"bar\"\nfollow = \"aura.fans\"\n",
+            "light[0].follow is for style = \"heat\" (this entry is \"bar\")",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\ntransit_s = 0\n",
+            "light[0].transit_s = 0 is out of range; allowed above 0 up to 3600",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\ntransit_s = -1\n",
+            "out of range; allowed above 0",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\ntransit_s = 3601\n",
+            "light[0].transit_s = 3601 is out of range; allowed above 0 up to 3600",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nconduction_s = 0\n",
+            "light[0].conduction_s = 0 is out of range; allowed above 0 up to 1000000",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nconduction_s = 1000001\n",
+            "out of range; allowed above 0 up to 1000000",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nfoot_leds = 0\n",
+            "light[0].foot_leds = 0 must be a whole number of LEDs, at least 1 and fewer than the span",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nfoot_leds = -3\n",
+            "whole number of LEDs, at least 1",
+        ),
+        (
+            "[aura]\nleds_per_fan = 6\n[[light]]\nstyle = \"heat\"\nfoot_leds = 6\n",
+            "light[0].foot_leds = 6 must be at least 1 and fewer than the span's 6 LEDs",
+        ),
+        (
+            "[aura]\nleds_per_fan = 2\n[[light]]\nstyle = \"heat\"\n",
+            "light[0].foot_leds = 5 must be at least 1 and fewer than the span's 2 LEDs",
+        ),
+        (
+            "[aura]\nleds_per_fan = 1\n[[light]]\nstyle = \"heat\"\n",
+            "light[0]: style = \"heat\" needs at least 2 LEDs so the foot can be fewer than the span (this span has 1)",
+        ),
+        (
+            "[keyboard]\nenabled = true\n[[light]]\ntarget = \"keyboard.all\"\nstyle = \"heat\"\n",
+            "light[0]: style = \"heat\" is for an Aura span",
+        ),
+        (
+            "[keyboard]\nenabled = true\n[[light]]\nstyle = \"heat\"\nfollow = \"keyboard.all\"\n",
+            "light[0].follow = \"keyboard.all\" is on the keyboard; heat follow is an Aura target",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nfollow = \"not-a-target\"\n",
+            "light[0].follow = \"not-a-target\" is not a target",
+        ),
+        (
+            "[aura]\nstyle = \"heat\"\n",
+            "aura.style = \"heat\": the default entry is solid, ring, bar or pulse; write a [[light]] entry for style = \"heat\"",
+        ),
+    ];
+    for (text, needle) in cases {
+        let err = error(text);
+        assert!(
+            err.contains(needle),
+            "{text}\nwanted: {needle}\ngot:    {err}"
+        );
+    }
 }

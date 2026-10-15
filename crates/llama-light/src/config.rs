@@ -134,6 +134,9 @@ pub enum Style {
     Gate,
     /// The highest value of the last `peak_s`, then a linear decay.
     Peak,
+    /// An Aura span as a metal bar: cold sink at the first LED, heater at
+    /// the last. The metric drives the heater.
+    Heat,
 }
 
 impl Style {
@@ -147,6 +150,7 @@ impl Style {
             Style::Ladder => "ladder",
             Style::Gate => "gate",
             Style::Peak => "peak",
+            Style::Heat => "heat",
         }
     }
 }
@@ -220,6 +224,15 @@ pub struct Layer {
     /// Peak: seconds the peak is held before it decays, and the decay time
     /// across the whole range.
     pub peak_s: f32,
+    /// Heat: seconds for heat to flow from the top LED to the foot.
+    pub transit_s: f32,
+    /// Heat: LEDs at the bottom that conduct into the sink. At least 1 and
+    /// fewer than the span.
+    pub foot_leds: usize,
+    /// Heat: diffusion time of the bar above the foot, seconds.
+    pub conduction_s: f32,
+    /// Heat: an Aura target painted solid in the top LED's colour.
+    pub follow: Option<Target>,
     /// Shown below `range.min` and when the metric is missing.
     pub idle_color: Option<Rgb>,
     /// `color`: a fixed colour on every LED of the target; the metric is
@@ -381,6 +394,10 @@ struct RawLight {
     hold_s: Option<f64>,
     shimmer: Option<RawShimmer>,
     peak_s: Option<f64>,
+    transit_s: Option<f64>,
+    foot_leds: Option<i64>,
+    conduction_s: Option<f64>,
+    follow: Option<String>,
     idle_color: Option<String>,
     color: Option<String>,
 }
@@ -602,6 +619,10 @@ impl Layer {
             hold_s: DEFAULT_HOLD_S,
             shimmer: None,
             peak_s: DEFAULT_PEAK_S,
+            transit_s: DEFAULT_TRANSIT_S,
+            foot_leds: DEFAULT_FOOT_LEDS,
+            conduction_s: DEFAULT_CONDUCTION_S,
+            follow: None,
             idle_color: None,
             fixed: None,
             gate_color: None,
@@ -613,8 +634,18 @@ impl Layer {
 pub const DEFAULT_HOLD_S: f32 = 1.0;
 /// Peak: default `peak_s`.
 pub const DEFAULT_PEAK_S: f32 = 30.0;
+/// Heat: default `transit_s`.
+pub const DEFAULT_TRANSIT_S: f32 = 60.0;
+/// Heat: default `foot_leds`.
+pub const DEFAULT_FOOT_LEDS: usize = 5;
+/// Heat: default `conduction_s`.
+pub const DEFAULT_CONDUCTION_S: f32 = 20_000.0;
 /// Most seconds for any time constant, hold, window or peak.
 pub const MAX_SECONDS: f32 = 60.0;
+/// Heat: longest `transit_s`.
+pub const MAX_TRANSIT_S: f32 = 3_600.0;
+/// Heat: longest `conduction_s`.
+pub const MAX_CONDUCTION_S: f32 = 1_000_000.0;
 
 struct Ctx<'a> {
     aura: &'a AuraCfg,
@@ -715,6 +746,17 @@ fn seconds(key: &str, value: f64, max: f32) -> Result<f32, ConfigError> {
     Ok(value)
 }
 
+/// Seconds, finite, above 0 and at most `max`.
+fn positive_seconds(key: &str, value: f64, max: f32) -> Result<f32, ConfigError> {
+    let value = finite_f32(key, value)?;
+    if value <= 0.0 || value > max {
+        return err(format!(
+            "{key} = {value} is out of range; allowed above 0 up to {max}"
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_metric(key: &str, name: &str) -> Result<Metric, ConfigError> {
     if let Some(metric) = Metric::from_name(name) {
         return Ok(metric);
@@ -739,8 +781,9 @@ fn parse_style(key: &str, name: &str) -> Result<Style, ConfigError> {
         "ladder" => Ok(Style::Ladder),
         "gate" => Ok(Style::Gate),
         "peak" => Ok(Style::Peak),
+        "heat" => Ok(Style::Heat),
         other => err(format!(
-            "{key} = \"{other}\" is not a style; use solid, ring, bar, pulse, ladder, gate or peak"
+            "{key} = \"{other}\" is not a style; use solid, ring, bar, pulse, ladder, gate, peak or heat"
         )),
     }
 }
@@ -783,9 +826,28 @@ fn validate_light(
         Ok(())
     };
     only("edge", raw.edge.is_some(), &[Style::Gauge, Style::Ladder])?;
+    // Heat colours each LED by its own value, which is `gradient = "value"`.
+    // A position gradient does not apply.
+    if style == Style::Heat
+        && let Some(name) = raw.gradient.as_deref()
+    {
+        match name {
+            "value" => {}
+            "position" => {
+                return err(format!(
+                    "{key}.gradient = \"position\" does not apply to style = \"heat\"; each LED takes the colour of its own value"
+                ));
+            }
+            other => {
+                return err(format!(
+                    "{key}.gradient = \"{other}\" is not \"value\" or \"position\""
+                ));
+            }
+        }
+    }
     only(
         "gradient",
-        raw.gradient.is_some(),
+        raw.gradient.is_some() && style != Style::Heat,
         &[Style::Gauge, Style::Ladder],
     )?;
     only("fill_to", raw.fill_to.is_some(), &[Style::Gauge])?;
@@ -793,6 +855,10 @@ fn validate_light(
     only("hold_s", raw.hold_s.is_some(), &[Style::Gate])?;
     only("shimmer", raw.shimmer.is_some(), &[Style::Gate])?;
     only("peak_s", raw.peak_s.is_some(), &[Style::Peak])?;
+    only("transit_s", raw.transit_s.is_some(), &[Style::Heat])?;
+    only("foot_leds", raw.foot_leds.is_some(), &[Style::Heat])?;
+    only("conduction_s", raw.conduction_s.is_some(), &[Style::Heat])?;
+    only("follow", raw.follow.is_some(), &[Style::Heat])?;
     only(
         "threshold",
         raw.threshold.is_some(),
@@ -1038,6 +1104,54 @@ fn validate_light(
     } else {
         Vec::new()
     };
+    let transit_s = match raw.transit_s {
+        None => DEFAULT_TRANSIT_S,
+        Some(value) => positive_seconds(&format!("{key}.transit_s"), value, MAX_TRANSIT_S)?,
+    };
+    let foot_leds = match raw.foot_leds {
+        None => DEFAULT_FOOT_LEDS,
+        Some(value) if value >= 1 => usize::try_from(value).unwrap_or(usize::MAX),
+        Some(value) => {
+            return err(format!(
+                "{key}.foot_leds = {value} must be a whole number of LEDs, at least 1 and fewer than the span"
+            ));
+        }
+    };
+    let conduction_s = match raw.conduction_s {
+        None => DEFAULT_CONDUCTION_S,
+        Some(value) => positive_seconds(&format!("{key}.conduction_s"), value, MAX_CONDUCTION_S)?,
+    };
+    let follow = match raw.follow.as_deref() {
+        None => None,
+        Some(text) => {
+            let follow = parse_named_target(&format!("{key}.follow"), text, ctx)?;
+            if follow.is_keyboard() {
+                return err(format!(
+                    "{key}.follow = \"{text}\" is on the keyboard; heat follow is an Aura target"
+                ));
+            }
+            Some(follow)
+        }
+    };
+    if style == Style::Heat {
+        if target.is_keyboard() {
+            return err(format!("{key}: style = \"heat\" is for an Aura span"));
+        }
+        // One LED cannot hold a foot (at least 1, and fewer than the span).
+        // Two LEDs work with foot_leds = 1. The same rule is applied again
+        // when the bar is built, so a span that does not fit is skipped
+        // rather than panicking.
+        if span < 2 {
+            return err(format!(
+                "{key}: style = \"heat\" needs at least 2 LEDs so the foot can be fewer than the span (this span has {span})"
+            ));
+        }
+        if foot_leds >= span {
+            return err(format!(
+                "{key}.foot_leds = {foot_leds} must be at least 1 and fewer than the span's {span} LEDs"
+            ));
+        }
+    }
     let threshold = match raw.threshold {
         None => None,
         Some(value) => Some(finite_f32(&format!("{key}.threshold"), value)?),
@@ -1102,6 +1216,10 @@ fn validate_light(
         hold_s,
         shimmer,
         peak_s,
+        transit_s,
+        foot_leds,
+        conduction_s,
+        follow,
         idle_color,
         fixed,
         gate_color,
@@ -1209,9 +1327,13 @@ fn raw_percent(value: f32, range: (f32, f32), scale: Scale) -> f32 {
 }
 
 fn parse_target(key: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigError> {
+    parse_named_target(&format!("{key}.target"), text, ctx)
+}
+
+fn parse_named_target(label: &str, text: &str, ctx: &Ctx<'_>) -> Result<Target, ConfigError> {
     let aura = ctx.aura;
     let keyboard_enabled = ctx.keyboard_enabled;
-    let at = format!("{key}.target = \"{text}\"");
+    let at = format!("{label} = \"{text}\"");
     if text == "aura.fans" {
         return Ok(Target::AuraFans);
     }

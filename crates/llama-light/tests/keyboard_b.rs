@@ -773,7 +773,7 @@ fn validation_errors_name_the_key_and_the_problem() {
         ),
         (
             "[[light]]\nstyle = \"sparkle\"\n",
-            "use solid, ring, bar, pulse, ladder, gate or peak",
+            "use solid, ring, bar, pulse, ladder, gate, peak or heat",
         ),
         (
             "[aura]\nstyle = \"ladder\"\n",
