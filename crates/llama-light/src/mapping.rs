@@ -655,3 +655,85 @@ fn paint(frame: &mut [Rgb], leds: &[usize], color: Rgb) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{HeatSlot, LayerState, draw_heat};
+    use crate::config::{Target, parse};
+    use crate::heat::{HeatBar, HeatParams};
+    use llama_core::color::BLACK;
+
+    #[test]
+    fn follow_takes_the_last_span_that_drew() {
+        let mut config = parse(
+            "[aura]\nbrightness_max = 100\nfans = \"chain\"\nchain_len = 3\nleds_per_fan = 6\n\
+             [[light]]\nstyle = \"heat\"\nfoot_leds = 1\nattack_s = 0\n",
+        )
+        .expect("config");
+        // The entry's target is every fan. Follow is only the third fan, and
+        // the spans drawn here are the first two, so the colour under test is
+        // follow's and not a heat LED.
+        config.layers[0].follow = Some(Target::AuraChain {
+            start: 2,
+            end: 3,
+            reversed: false,
+        });
+        let params = HeatParams {
+            foot_leds: 1,
+            attack_s: 0.0,
+            smooth_s: 0.0,
+            ..HeatParams::default()
+        };
+        let mut hot = HeatBar::new(6, params).expect("hot");
+        for _ in 0..40 {
+            hot.step(125.0, 0.5);
+        }
+        let cold = HeatBar::new(6, params).expect("cold");
+        let spans = vec![(0..6).collect::<Vec<_>>(), (6..12).collect()];
+        let both = LayerState {
+            smoothed: Some(80.0),
+            heat: vec![
+                HeatSlot {
+                    len: 6,
+                    bar: Some(hot.clone()),
+                },
+                HeatSlot {
+                    len: 6,
+                    bar: Some(cold),
+                },
+            ],
+            ..LayerState::default()
+        };
+        let mut frame = vec![BLACK; 18];
+        draw_heat(&config.layers[0], &both, &spans, &mut frame, &config.aura);
+        let first_top = frame[5];
+        let last_top = frame[11];
+        assert_ne!(first_top, last_top, "the two spans must look different");
+        assert!(frame[12..].iter().all(|led| *led == last_top));
+
+        let earlier_only = LayerState {
+            smoothed: Some(80.0),
+            heat: vec![
+                HeatSlot {
+                    len: 6,
+                    bar: Some(hot),
+                },
+                HeatSlot { len: 6, bar: None },
+            ],
+            ..LayerState::default()
+        };
+        let mut frame = vec![BLACK; 18];
+        draw_heat(
+            &config.layers[0],
+            &earlier_only,
+            &spans,
+            &mut frame,
+            &config.aura,
+        );
+        assert!(frame[6..12].iter().all(|led| *led == BLACK));
+        assert!(
+            frame[12..].iter().all(|led| *led == first_top),
+            "with the later span undrawn, follow keeps the earlier top"
+        );
+    }
+}

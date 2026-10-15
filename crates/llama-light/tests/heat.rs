@@ -129,15 +129,15 @@ fn matches(name: &str, transit_s: f64, conduction_s: f64) {
             row.load_pct
         );
         assert!(
-            (heater - row.heater_pct).abs() <= 0.05,
-            "{name} t {}: heater {heater} vs {} (tolerance 0.05)",
+            (heater - row.heater_pct).abs() <= 1e-3,
+            "{name} t {}: heater {heater} vs {} (tolerance 1e-3)",
             row.t_s,
             row.heater_pct
         );
         for (led, (got, want)) in leds.iter().zip(&row.leds).enumerate() {
             assert!(
-                (got - want).abs() <= 0.5,
-                "{name} t {} led{led}: {got} vs {want} (tolerance 0.5)",
+                (got - want).abs() <= 1e-3,
+                "{name} t {} led{led}: {got} vs {want} (tolerance 1e-3)",
                 row.t_s
             );
         }
@@ -389,5 +389,128 @@ smooth_s = 0\n";
         frame[13],
         hex(0xFF0000),
         "a 90 s gap is capped and simulated, not skipped"
+    );
+}
+
+fn bar_params(attack_s: f64, smooth_s: f64) -> HeatParams {
+    HeatParams {
+        transit_s: 60.0,
+        foot_leds: 3,
+        conduction_s: 20_000.0,
+        attack_s,
+        smooth_s,
+    }
+}
+
+/// Colours a direct bar would paint at full brightness, bottom LED first.
+fn bar_colours(bar: &HeatBar) -> Vec<Rgb> {
+    bar.leds()
+        .iter()
+        .map(|value| Palette::Act.color(*value as f32))
+        .collect()
+}
+
+#[test]
+fn attack_s_rises_and_smooth_s_falls_through_the_renderer() {
+    let config = chain(
+        "chain_len = 1\nleds_per_fan = 14\n\
+         [[light]]\nstyle = \"heat\"\nfoot_leds = 3\n\
+         attack_s = 2\nsmooth_s = 10\nrange = [0, 100]\n",
+    );
+    let mut renderer = Renderer::new(parse(&config).expect("config"));
+    let frame = renderer.aura_frame(&activity(Some(100.0), 1), 2.0);
+    let mut rise = HeatBar::new(14, bar_params(2.0, 10.0)).expect("bar");
+    rise.step(100.0, 2.0);
+    let mut swapped = HeatBar::new(14, bar_params(10.0, 2.0)).expect("bar");
+    swapped.step(100.0, 2.0);
+    let risen = bar_colours(&rise);
+    let backwards = bar_colours(&swapped);
+    assert_ne!(
+        risen, backwards,
+        "swapping attack_s and smooth_s must change the bar"
+    );
+    assert_eq!(frame, risen);
+}
+
+#[test]
+fn the_renderer_feeds_the_bar_percent_of_range() {
+    // 200 on [0, 100] is 125 % of range, then clamped, not the metric 200.
+    let config = chain(
+        "chain_len = 1\nleds_per_fan = 14\n\
+         [[light]]\nstyle = \"heat\"\nfoot_leds = 3\n\
+         attack_s = 0\nsmooth_s = 0\nrange = [0, 100]\n",
+    );
+    let mut renderer = Renderer::new(parse(&config).expect("config"));
+    let frame = renderer.aura_frame(&activity(Some(200.0), 1), 1.0);
+    let mut percent = HeatBar::new(14, bar_params(0.0, 0.0)).expect("bar");
+    percent.step(125.0, 1.0);
+    let mut raw = HeatBar::new(14, bar_params(0.0, 0.0)).expect("bar");
+    raw.step(200.0, 1.0);
+    let as_percent = bar_colours(&percent);
+    assert_ne!(as_percent, bar_colours(&raw));
+    assert_eq!(frame, as_percent);
+}
+
+#[test]
+fn an_unknown_value_cools_like_an_input_of_zero() {
+    let config = chain(
+        "chain_len = 1\nleds_per_fan = 14\n\
+         [[light]]\nstyle = \"heat\"\nfoot_leds = 3\n\
+         attack_s = 0\nsmooth_s = 0\nrange = [0, 100]\n",
+    );
+    let mut unknown = Renderer::new(parse(&config).expect("config"));
+    let mut zero = Renderer::new(parse(&config).expect("config"));
+    let mut bar = HeatBar::new(14, bar_params(0.0, 0.0)).expect("bar");
+    let dt = 0.5_f32;
+    let mut hot = Vec::new();
+    for step in 0..4_u64 {
+        let snapshot = activity(Some(100.0), step + 1);
+        hot = unknown.aura_frame(&snapshot, dt);
+        zero.aura_frame(&snapshot, dt);
+        bar.step(100.0, f64::from(dt));
+    }
+    assert_eq!(hot, bar_colours(&bar));
+    let mut cooled = Vec::new();
+    for step in 0..6_u64 {
+        // Activity falls back to load_pct. Both have to be absent, or the
+        // bar is driven by the snapshot's load instead of cooling at 0 %.
+        let mut missing = activity(None, 10 + step);
+        missing.host.load_pct = None;
+        cooled = unknown.aura_frame(&missing, dt);
+        let zero_frame = zero.aura_frame(&activity(Some(0.0), 10 + step), dt);
+        bar.step(0.0, f64::from(dt));
+        let want = bar_colours(&bar);
+        assert_eq!(cooled, want, "unknown step {step}");
+        assert_eq!(zero_frame, want, "zero step {step}");
+    }
+    assert_ne!(cooled, hot, "the bar did not cool");
+}
+
+#[test]
+fn idle_colour_is_dimmed_by_the_entry_brightness() {
+    let config = chain(
+        "chain_len = 2\nleds_per_fan = 14\n\
+         [[light]]\n\
+         target = \"aura.chain[0]\"\n\
+         style = \"heat\"\n\
+         brightness = 50\n\
+         range = [0, 100]\n\
+         idle_color = \"#FFFFFF\"\n\
+         follow = \"aura.chain[1]\"\n",
+    );
+    let frame = paint(&config, Some(-1.0), 0.5, 1);
+    let idle = dim(hex(0xFFFFFF), 50.0);
+    assert_eq!(
+        idle,
+        Rgb {
+            r: 128,
+            g: 128,
+            b: 128
+        }
+    );
+    assert_eq!(frame.len(), 28);
+    assert!(
+        frame.iter().all(|led| *led == idle),
+        "the bar and follow are the dimmed idle colour, got {frame:?}"
     );
 }
