@@ -4,7 +4,7 @@
 //! compared on its own: the firmware curve moves them while the enable files
 //! stay put. `pwm1` (the pump duty) only steers the pump band: a small duty
 //! step lets the expected pump speed follow it (see [`pump_in_band`]). The
-//! band, the step limit, and how long a previous duty is remembered are
+//! band, the step limit, and how long a last duty change is remembered are
 //! fixed here and are not configuration.
 
 use std::cell::Cell;
@@ -43,23 +43,50 @@ pub const PUMP_BAND_FLOOR_RPM: u32 = 150;
 /// 5-point step is at most 13 counts anywhere on the scale. A bigger step
 /// between two reads about 2 s apart is not that curve, so the fixed band
 /// applies and a pump that does not keep its speed halts. The same limit
-/// applies to a step that landed just before the baseline (see
-/// [`PUMP_DUTY_PRIOR_MAX`]).
+/// applies to a step that landed before the baseline (see
+/// [`PUMP_DUTY_CHANGE_MAX`]).
 pub const PUMP_DUTY_STEP_MAX: u32 = 13;
 
-/// How long a previous `pwm1` read may steer the next baseline's pump band.
+/// How long a last observed `pwm1` *change* may steer the next baseline's
+/// pump band.
 ///
 /// #147 follows a small duty step between the baseline and the check. The
-/// firmware can also step *before* the baseline, while the pump is still at
+/// firmware can also step before the baseline, while the pump is still at
 /// the old speed (#154: pwm1 already 77, fan1 still 953, then 1121 two
-/// seconds later). Capture keeps the previous read's duty on that baseline
-/// when the previous read is at most this old, and the check uses it as
-/// the "from" duty when the two compared duties are equal. Stream checks
-/// run every 1 s and the follow-up at 2 s, so 3 s covers those cadences. The
-/// prior lives only on that baseline (the immediate check and the follow-up),
-/// and an older read is forgotten, so a pump that slowly fails at a constant
-/// duty cannot keep borrowing an old step.
-pub const PUMP_DUTY_PRIOR_MAX: Duration = Duration::from_secs(3);
+/// seconds later). The pump takes a few seconds to change speed, so the
+/// read just before the baseline often already shows the new duty. Capture
+/// therefore keeps the last observed change (`from` → `to`, `seen_at`), not
+/// the last read, and stamps `from` onto the baseline when `pwm1 == to` and
+/// `seen_at` is at most this old. The 01:24 latch on titan reached the new
+/// speed within about 2 s of the baseline; 5 s covers that ramp.
+///
+/// Cadence, so the window can be checked against how often the guard reads:
+///
+/// - Stream (titan: `upload.mode = "stream"`, 10 fps). Idle (pixels
+///   unchanged) calls `pace_guard` every 1 s (`STREAM_GUARD`): a check then
+///   a new baseline. Active (a new frame) also captures on every
+///   `show_slot`, about 100 ms apart. A duty change is seen within one
+///   second idle, or one frame when uploading. The 01:24 sequence is this
+///   mode: if the change was already visible on the previous 1 s read,
+///   `seen_at` is at most 1 s before capture and the 5 s window still
+///   covers the follow-up ramp.
+/// - Change / rotation. Cooling is read on open, on each upload (capture
+///   and the post-op check), and once more [`FOLLOW_UP_AFTER`] (2 s) later.
+///   The loop ticks every `writer.tick_s` (default 0.5 s) but does not read
+///   cooling while idle. After the follow-up there is no read until the
+///   next upload (`min_interval_s` default 60 s, and longer when the view
+///   is still). A duty change in that gap is unseen; the next capture
+///   records `seen_at = now`, so the 5 s window runs from that capture,
+///   not from the real firmware step. If the pump had already arrived, the
+///   same-speed check still passes. A drop in that follow-up that matches
+///   the old duty's speed can be explained. This mode does not see ramps
+///   that finish between two uploads.
+///
+/// The prior lives only on that baseline (the immediate check and the
+/// follow-up). A change older than this, or a newer change, replaces it, so
+/// a pump that slowly fails at a constant duty cannot keep borrowing an
+/// old step.
+pub const PUMP_DUTY_CHANGE_MAX: Duration = Duration::from_secs(5);
 
 /// Why a later snapshot does not match the baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,8 +122,9 @@ pub struct CoolingSnapshot {
     pub pwm1_enable: Option<u32>,
     pub pwm2_enable: Option<u32>,
     pub pwm1: Option<u32>,
-    /// Duty from the previous read, if that read was within
-    /// [`PUMP_DUTY_PRIOR_MAX`]. Not logged; it only steers [`pump_in_band`].
+    /// `from` of the last observed `pwm1` change, if that change still
+    /// matches this snapshot's duty and is within [`PUMP_DUTY_CHANGE_MAX`].
+    /// Not logged; it only steers [`pump_in_band`].
     pwm1_prior: Option<u32>,
     pub pwm2: Option<u32>,
     pub fan1_rpm: Option<u32>,
@@ -148,8 +176,9 @@ pub fn pump_band_rpm(baseline: u32) -> u32 {
 /// and the band is applied at each end of that range. A caller that saw the
 /// same duty on both reads may pass an earlier recent duty as `duty_before`
 /// so a step that landed just before the first read is followed the same
-/// way. A stopped pump, a speed the duty does not explain, or a duty jump is
-/// still out of band.
+/// way (the last observed change, not merely the previous read). A stopped
+/// pump, a speed the duty does not explain, or a duty jump is still out of
+/// band.
 #[must_use]
 pub fn pump_in_band(
     before: u32,
@@ -178,9 +207,22 @@ pub struct CoolingGuard {
     sys_root: PathBuf,
     device_dir: PathBuf,
     state_dir: PathBuf,
-    /// Last readable `pwm1` and when it was read. Capture may copy it onto
-    /// the baseline as `pwm1_prior` when it is still fresh.
-    last_pwm1: Cell<Option<(u32, Instant)>>,
+    /// Last readable `pwm1` and the last observed change of it. Capture may
+    /// copy the change's `from` onto the baseline as `pwm1_prior`.
+    pwm1_mem: Cell<Pwm1Memory>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pwm1Memory {
+    last: Option<u32>,
+    change: Option<DutyChange>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DutyChange {
+    from: u32,
+    to: u32,
+    seen_at: Instant,
 }
 
 impl CoolingGuard {
@@ -189,7 +231,10 @@ impl CoolingGuard {
             sys_root: sys_root.to_path_buf(),
             device_dir: device_dir.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
-            last_pwm1: Cell::new(None),
+            pwm1_mem: Cell::new(Pwm1Memory {
+                last: None,
+                change: None,
+            }),
         }
     }
 
@@ -204,8 +249,8 @@ impl CoolingGuard {
 
     /// Baseline taken immediately before a device operation.
     ///
-    /// If a previous read still has a fresh `pwm1`, it is stored on the
-    /// snapshot as `pwm1_prior` and then replaced by this read's duty.
+    /// If a last observed `pwm1` change is still fresh and matches this
+    /// read's duty, its `from` is stored on the snapshot as `pwm1_prior`.
     pub(crate) fn capture(&self) -> Result<CoolingSnapshot, Deviation> {
         let snap = self.read_and_remember(true);
         if let Some(dev) = required(&snap) {
@@ -231,11 +276,10 @@ impl CoolingGuard {
     fn read_and_remember(&self, keep_prior: bool) -> CoolingSnapshot {
         let mut snap = self.read_sysfs();
         let now = Instant::now();
+        let mem = note_pwm1(self.pwm1_mem.get(), snap.pwm1, now);
+        self.pwm1_mem.set(mem);
         if keep_prior {
-            snap.pwm1_prior = remembered_duty(self.last_pwm1.get(), now);
-        }
-        if let Some(duty) = snap.pwm1 {
-            self.last_pwm1.set(Some((duty, now)));
+            snap.pwm1_prior = prior_from_change(mem.change, snap.pwm1, now);
         }
         snap
     }
@@ -407,10 +451,34 @@ fn pump_duty_from(
     }
 }
 
-/// `Some(duty)` when `last` was read at most [`PUMP_DUTY_PRIOR_MAX`] ago.
-fn remembered_duty(last: Option<(u32, Instant)>, now: Instant) -> Option<u32> {
-    let (duty, at) = last?;
-    (now.saturating_duration_since(at) <= PUMP_DUTY_PRIOR_MAX).then_some(duty)
+fn note_pwm1(mem: Pwm1Memory, duty: Option<u32>, now: Instant) -> Pwm1Memory {
+    let Some(duty) = duty else {
+        return mem;
+    };
+    let change = match mem.last {
+        Some(prev) if prev != duty => Some(DutyChange {
+            from: prev,
+            to: duty,
+            seen_at: now,
+        }),
+        _ => mem.change,
+    };
+    Pwm1Memory {
+        last: Some(duty),
+        change,
+    }
+}
+
+/// `Some(from)` when `duty` is this change's `to` and `seen_at` is at most
+/// [`PUMP_DUTY_CHANGE_MAX`] ago. [`pump_in_band`] still applies
+/// [`PUMP_DUTY_STEP_MAX`].
+fn prior_from_change(change: Option<DutyChange>, duty: Option<u32>, now: Instant) -> Option<u32> {
+    let change = change?;
+    let duty = duty?;
+    if duty != change.to {
+        return None;
+    }
+    (now.saturating_duration_since(change.seen_at) <= PUMP_DUTY_CHANGE_MAX).then_some(change.from)
 }
 
 #[cfg(test)]
@@ -486,22 +554,74 @@ mod tests {
         );
     }
 
+    fn change(from: u32, to: u32, seen_at: Instant) -> DutyChange {
+        DutyChange { from, to, seen_at }
+    }
+
+    #[test]
+    fn change_seen_two_reads_before_baseline_is_in_band() {
+        // Firmware stepped 64 -> 77; the next read already shows 77; a later
+        // baseline is still 77 / 953. The last *change* is 64, not the last
+        // read.
+        let now = Instant::now();
+        let mut mem = Pwm1Memory {
+            last: None,
+            change: None,
+        };
+        mem = note_pwm1(mem, Some(64), now);
+        mem = note_pwm1(mem, Some(77), now);
+        mem = note_pwm1(mem, Some(77), now);
+        assert_eq!(prior_from_change(mem.change, Some(77), now), Some(64));
+        let baseline = snap(77, 953, Some(64));
+        let current = snap(77, 1121, None);
+        assert_eq!(compare(&baseline, &current), None);
+    }
+
     #[test]
     fn stale_prior_duty_is_forgotten() {
         let now = Instant::now();
-        assert_eq!(remembered_duty(Some((64, now)), now), Some(64));
+        let fresh = change(64, 77, now);
+        assert_eq!(prior_from_change(Some(fresh), Some(77), now), Some(64));
         let fresh_at = now
-            .checked_sub(PUMP_DUTY_PRIOR_MAX)
-            .expect("clock is past the prior window");
-        assert_eq!(remembered_duty(Some((64, fresh_at)), now), Some(64));
+            .checked_sub(PUMP_DUTY_CHANGE_MAX)
+            .expect("clock is past the change window");
+        assert_eq!(
+            prior_from_change(Some(change(64, 77, fresh_at)), Some(77), now),
+            Some(64)
+        );
         let stale_at = now
-            .checked_sub(PUMP_DUTY_PRIOR_MAX + Duration::from_nanos(1))
-            .expect("clock is past the prior window");
-        assert_eq!(remembered_duty(Some((64, stale_at)), now), None);
+            .checked_sub(PUMP_DUTY_CHANGE_MAX + Duration::from_nanos(1))
+            .expect("clock is past the change window");
+        assert_eq!(
+            prior_from_change(Some(change(64, 77, stale_at)), Some(77), now),
+            None
+        );
         // A forgotten 64 -> 77 step does not explain 953 -> 1121.
         let baseline = snap(77, 953, None);
         let current = snap(77, 1121, None);
         assert_eq!(compare(&baseline, &current), Some(Deviation::Pump));
+    }
+
+    #[test]
+    fn two_changes_in_a_row_use_only_the_latest() {
+        let now = Instant::now();
+        let mut mem = Pwm1Memory {
+            last: None,
+            change: None,
+        };
+        mem = note_pwm1(mem, Some(64), now);
+        mem = note_pwm1(mem, Some(77), now);
+        mem = note_pwm1(mem, Some(89), now);
+        assert_eq!(prior_from_change(mem.change, Some(89), now), Some(77));
+        assert_eq!(prior_from_change(mem.change, Some(77), now), None);
+        // 1127 -> 1298 at pwm1 89 is the #147 step from 77, not from 64
+        // (64 -> 89 is 25 counts and would keep the fixed band, which
+        // 1298 exceeds: 1127 + 169 = 1296).
+        let baseline = snap(89, 1127, Some(77));
+        let current = snap(89, 1298, None);
+        assert_eq!(compare(&baseline, &current), None);
+        let from_64 = snap(89, 1127, Some(64));
+        assert_eq!(compare(&from_64, &current), Some(Deviation::Pump));
     }
 
     #[test]

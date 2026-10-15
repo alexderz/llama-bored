@@ -8,7 +8,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Fixed
 
-- kraken-lcd's cooling guard no longer latches when the pump is still ramping to a small firmware duty step that landed just before the baseline. Capture keeps the previous read's `pwm1` with that baseline for 3 s and, when the two compared duties are equal, uses it as the step's "from" side. A stopped pump, a speed no recent small step explains, a duty jump larger than 13 counts, and a stale earlier duty still halt (#154).
+- kraken-lcd's cooling guard no longer latches when the pump is still ramping to a small firmware duty step that landed before the baseline. The guard remembers the last observed `pwm1` change (not the last read) for 5 s and, when the two compared duties equal that change's new duty, uses the old duty as the step's "from" side. A stopped pump, a speed no recent small step explains, a duty jump larger than 13 counts, and a change older than 5 s still halt (#154).
 
 ### Removed
 

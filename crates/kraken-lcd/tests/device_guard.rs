@@ -324,8 +324,9 @@ fn firmware_duty_step_down_with_the_pump_following_does_not_halt() {
 
 #[test]
 fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
-    // #154: firmware stepped 64 -> 77 just before the baseline; the pump was
-    // still at 953 rpm, then 1121 at the follow-up, with pwm1 held at 77.
+    // #154: firmware stepped 64 -> 77; the next read already shows 77 while
+    // the pump is still at 953, then a later baseline is still 77 / 953,
+    // then 1121 at the follow-up. The last *change* is 64, not the last read.
     let mut opened = show_ready("prior-up");
     set_pump(&opened.tree, 1127, 77);
     opened
@@ -340,13 +341,51 @@ fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
     set_pump(&opened.tree, 953, 77);
     opened
         .lcd
+        .pace_guard()
+        .expect("the change is seen; pwm1 is already 77");
+    opened
+        .lcd
+        .pace_guard()
+        .expect("a later read still at 77, pump still at 25 %");
+    opened
+        .lcd
         .show(&Frame::new())
-        .expect("baseline after the rise, pump still at 25 %");
+        .expect("baseline after two reads at the new duty");
     set_pump(&opened.tree, 1121, 77);
     opened
         .lcd
         .tick()
         .expect("pump arrived at 30 % by the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn two_duty_changes_use_only_the_latest() {
+    // 64 -> 77 -> 89: only 77 -> 89 steers. 1127 -> 1298 at pwm1 89 is that
+    // step; 64 -> 89 is 25 counts and would keep the fixed band (1298 is 2
+    // rpm past 1127 + 169).
+    let mut opened = show_ready("two-changes");
+    set_pump(&opened.tree, 1127, 77);
+    opened.lcd.pace_guard().expect("89 -> 77");
+    set_pump(&opened.tree, 953, 64);
+    opened.lcd.pace_guard().expect("77 -> 64");
+    set_pump(&opened.tree, 1127, 77);
+    opened.lcd.pace_guard().expect("64 -> 77");
+    set_pump(&opened.tree, 1127, 89);
+    opened
+        .lcd
+        .pace_guard()
+        .expect("77 -> 89; a later read already at 89");
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("baseline at 89, pump still at 30 %");
+    set_pump(&opened.tree, 1298, 89);
+    opened
+        .lcd
+        .tick()
+        .expect("pump arrived at 35 % from the latest step");
     assert!(!opened.lcd.is_halted());
     assert!(!opened.tree.latch().exists());
 }
