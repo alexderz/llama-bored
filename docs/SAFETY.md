@@ -65,8 +65,12 @@ later:
   between the two reads (`pwm1` moved by at most 13 counts, one 5-point step
   of its whole-percent duty, also a constant), the pump is expected anywhere
   from the baseline rpm (still ramping) to the baseline scaled by the duty
-  ratio (arrived), with the band applied at each end (#147). A stopped pump,
-  a speed the duty does not explain, or a bigger duty jump still halts;
+  ratio (arrived), with the band applied at each end (#147). The same
+  applies when the step landed just before the baseline and the pump is
+  still ramping: the guard remembers the last `pwm1` change it saw for 5 s
+  and uses its old duty as the start of the step (#154). A stopped pump,
+  a speed the duty does not explain, a bigger duty jump, or a change older
+  than 5 s still halts;
 - the same USB device number;
 - still no bootloader device.
 
