@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use llama_core::color::Rgb;
 use serde::Deserialize;
 
+use crate::heat::MIN_CONDUCTION_S;
 use crate::keyboard::keymap::{KEYS, key_index, suggest};
 use crate::metric::Metric;
 use crate::palette::{MAX_PCT, Palette, Scale, dim, parse_hex};
@@ -646,8 +647,6 @@ pub const MAX_SECONDS: f32 = 60.0;
 pub const MAX_TRANSIT_S: f32 = 3_600.0;
 /// Heat: longest `conduction_s`.
 pub const MAX_CONDUCTION_S: f32 = 1_000_000.0;
-/// Heat: shortest `conduction_s`. Below 1 s the conduction step can overflow.
-pub const MIN_CONDUCTION_S: f32 = 1.0;
 
 struct Ctx<'a> {
     aura: &'a AuraCfg,
@@ -760,10 +759,12 @@ fn positive_seconds(key: &str, value: f64, max: f32) -> Result<f32, ConfigError>
 }
 
 /// `conduction_s`: finite, at least [`MIN_CONDUCTION_S`] and at most
-/// [`MAX_CONDUCTION_S`]. A shorter time makes the conduction step overflow.
+/// [`MAX_CONDUCTION_S`]. The floor is a safety margin far above the
+/// diffusion time where the conduction step can overflow (about 1e-11 s).
 fn conduction_seconds(key: &str, value: f64) -> Result<f32, ConfigError> {
     let value = finite_f32(key, value)?;
-    if !(MIN_CONDUCTION_S..=MAX_CONDUCTION_S).contains(&value) {
+    let seconds = f64::from(value);
+    if !(MIN_CONDUCTION_S..=f64::from(MAX_CONDUCTION_S)).contains(&seconds) {
         return err(format!(
             "{key} = {value} is out of range; allowed {MIN_CONDUCTION_S} up to {MAX_CONDUCTION_S}"
         ));

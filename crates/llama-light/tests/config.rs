@@ -594,6 +594,35 @@ fn heat_parses_its_keys_and_the_defaults_fit_a_six_led_fan() {
 
     let floor = parse("[[light]]\nstyle = \"heat\"\nconduction_s = 1\n").expect("floor");
     assert_eq!(floor.layers[0].conduction_s, 1.0);
+
+    let adjacent = parse(
+        "[aura]\nfans = \"chain\"\nchain_len = 4\nleds_per_fan = 8\n\
+         [[light]]\ntarget = \"aura.chain[0..2]\"\nstyle = \"heat\"\n\
+         follow = \"aura.chain[2..4]\"\n",
+    )
+    .expect("adjacent follow");
+    assert_eq!(
+        adjacent.layers[0].follow,
+        Some(Target::AuraChain {
+            start: 2,
+            end: 4,
+            reversed: false,
+        })
+    );
+    let reversed = parse(
+        "[aura]\nfans = \"chain\"\nchain_len = 4\nleds_per_fan = 8\n\
+         [[light]]\ntarget = \"aura.chain[0..2]\"\nstyle = \"heat\"\n\
+         follow = \"aura.chain[4..2]\"\n",
+    )
+    .expect("reversed adjacent follow");
+    assert_eq!(
+        reversed.layers[0].follow,
+        Some(Target::AuraChain {
+            start: 2,
+            end: 4,
+            reversed: true,
+        })
+    );
 }
 
 #[test]
@@ -682,6 +711,11 @@ fn heat_rejects_keys_that_do_not_apply_and_a_foot_the_span_cannot_hold() {
              [[light]]\ntarget = \"aura.chain[1]\"\nstyle = \"heat\"\n\
              foot_leds = 1\nfollow = \"aura.fans\"\n",
             "share no LED",
+        ),
+        (
+            "[aura]\nfans = \"mirrored\"\n\
+             [[light]]\nstyle = \"heat\"\nfollow = \"aura.fans\"\n",
+            "light[0].follow = \"aura.fans\" shares LEDs with this entry",
         ),
         (
             "[[light]]\nstyle = \"heat\"\nfoot_leds = 0\n",
