@@ -570,7 +570,9 @@ fn advance_heat(layer: &Layer, state: &mut LayerState, aura: &AuraCfg, input: f6
 /// Heat LEDs, then `follow` in the top LED's colour (after brightness).
 ///
 /// The last LED of a span is the heater. With more than one span, `follow`
-/// takes the last span's top LED. Below `range.min`, `idle_color` still
+/// takes the last span's top LED. Only `aura.fans` has several spans, and
+/// config validation rejects an Aura `follow` on that target, so a config
+/// never reaches this tie-break. Below `range.min`, `idle_color` still
 /// replaces the entry; a missing value does not — the bar keeps drawing.
 fn draw_heat(
     layer: &Layer,
@@ -663,6 +665,10 @@ mod tests {
     use crate::heat::{HeatBar, HeatParams};
     use llama_core::color::BLACK;
 
+    /// Pins internal `draw_heat` behaviour that config validation currently
+    /// makes unreachable. Only `aura.fans` yields several spans, and any
+    /// Aura `follow` then overlaps that target and is rejected. The follow
+    /// here is written onto the layer after parse.
     #[test]
     fn follow_takes_the_last_span_that_drew() {
         let mut config = parse(

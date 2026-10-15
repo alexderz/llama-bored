@@ -8,7 +8,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Added
 
-- llama-light: `style = "heat"` draws an Aura span as a metal bar, cold sink at the first LED and heater at the last. The metric drives the heater (`attack_s` while it rises, `smooth_s` while it falls); heat flows down in `transit_s`, the bottom `foot_leds` conduct it into the sink, and `follow` paints another Aura target in the top LED's colour (#149).
+- llama-light: `style = "heat"` draws an Aura span as a metal bar, cold sink at the first LED and heater at the last. The metric drives the heater (`attack_s` while it rises, `smooth_s` while it falls); heat flows down in `transit_s`, the bottom `foot_leds` conduct it into the sink (`conduction_s` at least 1 s), and `follow` paints another Aura target in the top LED's colour (#149).
 - llama-light: a descending Aura chain span (`aura.chain[B..A]` or `aura.chain[B..=A]`) runs backwards, LED by LED. `aura.chain[4..2]` is fans 2 and 3 from the last LED of fan 3 back to the first LED of fan 2, so two strips can grow toward where they meet (#143).
 
 ### Changed

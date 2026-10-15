@@ -121,11 +121,11 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #               1 and fewer than the span (default 5)
 #   conduction_s heat: diffusion time of the bar above the foot, in seconds.
 #               At least 1, at most 1000000 (default 20000). Smaller spreads
-#               a band out. Below 1 the conduction step can overflow.
+#               a band out. The 1 s floor is a safety margin, far above the
+#               ~1e-11 s point where the step can overflow.
 #   follow      heat: an Aura target painted solid in the top LED's colour
 #               ("aura.fans" or "aura.chain[...]"; not a keyboard target,
 #               and not a target that shares an LED with this entry).
-#               Several spans: the colour is the last span that drew.
 #   palette     "act" (default: the LCD ramp) | "thermal" | "mono"
 #   stops       instead of palette: [[position, "#RRGGBB"], ...], ascending.
 #               A number is in metric units; a string "60%" is percent of
