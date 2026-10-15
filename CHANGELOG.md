@@ -8,7 +8,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Removed
 
-- The desktop halt notifier (`kraken-lcd-halt.path` and `kraken-lcd-halt-notify.service`) is no longer installed. An upgrade removes those regular files and the global enable link `/etc/systemd/user/default.target.wants/kraken-lcd-halt.path`. A per-user enablement must be disabled by hand with `systemctl --user disable kraken-lcd-halt.path` (#152).
+- The desktop halt notifier (`kraken-lcd-halt.path` and `kraken-lcd-halt-notify.service`) is no longer installed. An upgrade removes those regular files and the global enable link `/etc/systemd/user/default.target.wants/kraken-lcd-halt.path`. Someone who enabled it per user should run `systemctl --user disable kraken-lcd-halt.path` before upgrading. After the upgrade the unit file is gone, so that command reports the unit missing (it may still remove the link); remove `~/.config/systemd/user/default.target.wants/kraken-lcd-halt.path` by hand (#152).
 
 ## 0.6.1 — 2026-10-14
 
