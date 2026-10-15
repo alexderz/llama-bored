@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Removed
+
+- The desktop halt notifier (`kraken-lcd-halt.path` and `kraken-lcd-halt-notify.service`) is no longer installed. An upgrade removes those regular files and the global enable link `/etc/systemd/user/default.target.wants/kraken-lcd-halt.path`. A per-user enablement must be disabled by hand with `systemctl --user disable kraken-lcd-halt.path` (#152).
+
 ## 0.6.1 — 2026-10-14
 
 A heat style that draws an Aura strip as a heated bar, descending chain spans, a token chart that counts each column's own tokens, and a cooling guard that follows the firmware's pump duty steps.
