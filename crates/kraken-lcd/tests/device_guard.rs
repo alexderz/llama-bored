@@ -323,6 +323,53 @@ fn firmware_duty_step_down_with_the_pump_following_does_not_halt() {
 }
 
 #[test]
+fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
+    // #154: firmware stepped 64 -> 77 just before the baseline; the pump was
+    // still at 953 rpm, then 1121 at the follow-up, with pwm1 held at 77.
+    let mut opened = show_ready("prior-up");
+    set_pump(&opened.tree, 1127, 77);
+    opened
+        .lcd
+        .pace_guard()
+        .expect("one firmware step down from the open baseline");
+    set_pump(&opened.tree, 953, 64);
+    opened
+        .lcd
+        .pace_guard()
+        .expect("one firmware step down to 25 %");
+    set_pump(&opened.tree, 953, 77);
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("baseline after the rise, pump still at 25 %");
+    set_pump(&opened.tree, 1121, 77);
+    opened
+        .lcd
+        .tick()
+        .expect("pump arrived at 30 % by the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn pump_still_fast_after_a_duty_drop_before_the_baseline_does_not_halt() {
+    // Open remembered pwm1=89 at 1304 rpm. Duty already 77, pump still fast.
+    let mut opened = show_ready("prior-down");
+    set_pump(&opened.tree, 1304, 77);
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("baseline after the drop, pump still at 35 %");
+    set_pump(&opened.tree, 1000, 77);
+    opened
+        .lcd
+        .tick()
+        .expect("pump arrived at 30 % by the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
 fn duty_jump_beyond_the_step_limit_halts() {
     let mut opened = show_ready("duty-collapse");
     set_pump(&opened.tree, 1127, 77);

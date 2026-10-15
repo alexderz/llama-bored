@@ -31,8 +31,8 @@ use thiserror::Error;
 pub use bulk::{BulkLink, BulkPort, NoBulk};
 pub(crate) use guard::follow_up_due;
 pub use guard::{
-    CoolingSnapshot, Deviation, PUMP_BAND_FLOOR_RPM, PUMP_BAND_PERCENT, PUMP_DUTY_STEP_MAX,
-    pump_band_rpm, pump_in_band,
+    CoolingSnapshot, Deviation, PUMP_BAND_FLOOR_RPM, PUMP_BAND_PERCENT, PUMP_DUTY_PRIOR_MAX,
+    PUMP_DUTY_STEP_MAX, pump_band_rpm, pump_in_band,
 };
 pub use hid::{HidLink, HidPort};
 pub(crate) use sysfs::read_coolant_c;
