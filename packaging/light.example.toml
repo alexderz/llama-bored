@@ -95,6 +95,13 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #                        (default 0) in the last hold_s
 #               "peak"   the highest value, held peak_s, then falling
 #                        linearly (the whole range in peak_s)
+#               "heat"   Aura span as a metal bar. The first LED is a cold
+#                        sink, the last is the heater, and the metric drives
+#                        the heater. A burst travels down the strip; a steady
+#                        load fills from the top. Not for the keyboard.
+#                        thresholds, edge, fill_to and gradient = "position"
+#                        are rejected. A 1-LED span cannot hold a foot; two
+#                        LEDs need foot_leds = 1.
 #   edge        bar, ladder: "round" (default, whole LEDs) | "fractional"
 #               (the last LED lit by the fraction filled)
 #   gradient    bar, ladder: "value" (default: every lit LED the value's
@@ -108,6 +115,15 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 #   hold_s      gate: 0..=60 s (default 1)
 #   shimmer     gate: { depth = 0.2, hz = 0.7 }, brightness x (1 +- depth)
 #   peak_s      peak: 0..=60 s (default 30)
+#   transit_s   heat: seconds for heat to flow from the top LED to the foot.
+#               Above 0, at most 3600 (default 60)
+#   foot_leds   heat: LEDs at the bottom that conduct into the sink. At least
+#               1 and fewer than the span (default 5)
+#   conduction_s heat: diffusion time of the bar above the foot, in seconds.
+#               Above 0, at most 1000000 (default 20000). Smaller spreads a
+#               band out
+#   follow      heat: an Aura target painted solid in the top LED's colour
+#               ("aura.fans" or "aura.chain[...]"; not a keyboard target)
 #   palette     "act" (default: the LCD ramp) | "thermal" | "mono"
 #   stops       instead of palette: [[position, "#RRGGBB"], ...], ascending.
 #               A number is in metric units; a string "60%" is percent of
@@ -185,6 +201,27 @@ brightness_max = 100      # 0..=100 %. A cap on every key
 # scale = "log"
 # style = "pulse"
 # idle_color = "#000010"
+# --- end
+
+# --- example: heat-strips
+# # Two strips on one chain. The front strip is a heated bar: its first LED
+# # is the sink at the bottom, its last LED is the heater. The top strip
+# # follows the heater's colour. A burst of load travels down the front strip.
+# [aura]
+# fans = "chain"
+# chain_len = 2
+# leds_per_fan = 14
+#
+# [[light]]
+# target = "aura.chain[0]"
+# metric = "activity"
+# style = "heat"
+# transit_s = 60
+# foot_leds = 5
+# conduction_s = 20000
+# attack_s = 0.7
+# smooth_s = 0.7
+# follow = "aura.chain[1]"
 # --- end
 
 # --- example: chain-shorthand
