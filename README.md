@@ -858,8 +858,8 @@ band, a steady load fills from the top, and an unknown value feeds the
 heater 0 % so the bar cools and keeps drawing. Below `range.min` the idle
 colour replaces the bar and `follow`, while the bar keeps stepping; a
 missing value cools the bar instead. `follow` paints a second Aura target
-in the top LED's colour. When the entry covers several spans, `follow`
-uses the last span that drew.
+in the top LED's colour. A `follow` cannot be combined with a target that
+covers every fan.
 
 | key | default | |
 |---|---|---|
