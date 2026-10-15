@@ -449,6 +449,18 @@ fn the_renderer_feeds_the_bar_percent_of_range() {
     let as_percent = bar_colours(&percent);
     assert_ne!(as_percent, bar_colours(&raw));
     assert_eq!(frame, as_percent);
+
+    // 50 on [10, 90] is 50 % of the range.
+    let mid_config = chain(
+        "chain_len = 1\nleds_per_fan = 14\n\
+         [[light]]\nstyle = \"heat\"\nfoot_leds = 3\n\
+         attack_s = 0\nsmooth_s = 0\nrange = [10, 90]\n",
+    );
+    let mut mid = Renderer::new(parse(&mid_config).expect("config"));
+    let mid_frame = mid.aura_frame(&activity(Some(50.0), 1), 1.0);
+    let mut fed = HeatBar::new(14, bar_params(0.0, 0.0)).expect("bar");
+    fed.step(50.0, 1.0);
+    assert_eq!(mid_frame, bar_colours(&fed));
 }
 
 #[test]
