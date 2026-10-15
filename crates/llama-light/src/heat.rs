@@ -26,6 +26,11 @@ pub const MAX_GAP_S: f64 = 60.0;
 /// stay a small step.
 pub const MAX_SUBSTEP_S: f64 = 0.5;
 
+/// Shortest `conduction_s`, in seconds. The config accepts this same floor.
+/// A smaller diffusion time makes the implicit step overflow; below about
+/// 1e-11 s the cells stop being finite and stay that way.
+const MIN_CONDUCTION_S: f64 = 1.0;
+
 /// The bar's numbers. Times are seconds; `foot_leds` is a count of LEDs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeatParams {
@@ -59,7 +64,9 @@ pub enum HeatError {
     /// `foot_leds` must be at least 1 and fewer than `leds`, and `leds`
     /// must be at least 2.
     Span { leds: usize, foot_leds: usize },
-    /// `transit_s` or `conduction_s` is not a finite number above 0.
+    /// `transit_s` is not a finite number above 0, `conduction_s` is not a
+    /// finite number of at least 1 second, or a heater time constant is
+    /// negative or non-finite. Below 1 s the conduction step can overflow.
     Time,
 }
 
@@ -100,7 +107,7 @@ impl HeatBar {
         if !params.transit_s.is_finite()
             || params.transit_s <= 0.0
             || !params.conduction_s.is_finite()
-            || params.conduction_s <= 0.0
+            || params.conduction_s < MIN_CONDUCTION_S
             || !params.attack_s.is_finite()
             || params.attack_s < 0.0
             || !params.smooth_s.is_finite()
@@ -472,5 +479,129 @@ mod tests {
                 "LED {index}: 0.05 {a} vs one 2 s gap {c}"
             );
         }
+    }
+
+    #[test]
+    fn attack_rises_and_smooth_falls() {
+        let mut bar = HeatBar::new(
+            8,
+            HeatParams {
+                foot_leds: 1,
+                attack_s: 2.0,
+                smooth_s: 10.0,
+                ..HeatParams::default()
+            },
+        )
+        .expect("bar");
+        bar.step(125.0, 2.0);
+        let risen = 125.0 * (1.0 - (-1.0_f64).exp());
+        assert!(
+            (bar.heater() - risen).abs() < 1e-9,
+            "heater {} wanted {risen}",
+            bar.heater()
+        );
+        bar.step(0.0, 10.0);
+        let fallen = risen * (-1.0_f64).exp();
+        assert!(
+            (bar.heater() - fallen).abs() < 1e-9,
+            "heater {} wanted {fallen}",
+            bar.heater()
+        );
+    }
+
+    #[test]
+    fn conduction_below_one_second_is_rejected() {
+        let slow = HeatParams {
+            conduction_s: 0.5,
+            ..HeatParams::default()
+        };
+        assert!(matches!(HeatBar::new(8, slow), Err(HeatError::Time)));
+        let floor = HeatParams {
+            conduction_s: 1.0,
+            ..HeatParams::default()
+        };
+        assert!(HeatBar::new(8, floor).is_ok());
+    }
+
+    #[test]
+    fn a_fast_transit_stays_finite_and_the_sink_only_removes_heat() {
+        let mut bar = HeatBar::new(
+            28,
+            HeatParams {
+                transit_s: 0.01,
+                attack_s: 0.0,
+                smooth_s: 0.0,
+                ..HeatParams::default()
+            },
+        )
+        .expect("bar");
+        bar.step(80.0, 0.5);
+        let before = sum_cells(&bar);
+        assert!(before.is_finite() && before > 0.0, "{before}");
+        // One sub-step. The heater jumps to 0, so the shift injects nothing
+        // and the sink is the only place heat can go.
+        bar.step(0.0, 0.5);
+        let after = sum_cells(&bar);
+        assert!(after.is_finite(), "{after}");
+        assert!(bar.heater().is_finite());
+        assert!(
+            bar.leds().iter().all(|value| value.is_finite()),
+            "{:?}",
+            bar.leds()
+        );
+        assert!(
+            after < before,
+            "sink flux had the wrong sign: {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn a_huge_gap_matches_a_sixty_second_step() {
+        let mut huge = HeatBar::new(28, HeatParams::default()).expect("bar");
+        let mut capped = HeatBar::new(28, HeatParams::default()).expect("bar");
+        huge.step(40.0, 1.0e6);
+        capped.step(40.0, MAX_GAP_S);
+        assert_eq!(huge.heater(), capped.heater());
+        assert_eq!(huge.leds(), capped.leds());
+    }
+
+    #[test]
+    fn a_one_second_step_is_two_half_second_steps_and_not_one_unsplit_step() {
+        let params = HeatParams {
+            foot_leds: 1,
+            conduction_s: 1.0,
+            attack_s: 0.0,
+            smooth_s: 0.0,
+            ..HeatParams::default()
+        };
+        let mut split = HeatBar::new(14, params).expect("bar");
+        split.step(125.0, 1.0);
+        let mut halves = HeatBar::new(14, params).expect("bar");
+        halves.step(125.0, 0.5);
+        halves.step(125.0, 0.5);
+        assert_eq!(split.heater(), halves.heater());
+        assert_eq!(split.leds(), halves.leds());
+
+        let mut unsplit = HeatBar::new(14, params).expect("bar");
+        unsplit.step_once(125.0, 1.0);
+        assert_ne!(
+            split.leds(),
+            unsplit.leds(),
+            "a 1 s step must be split at {MAX_SUBSTEP_S} s"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_input_leaves_the_bar_unchanged() {
+        let mut bar = HeatBar::new(14, HeatParams::default()).expect("bar");
+        bar.step(40.0, 0.5);
+        let mut twin = bar.clone();
+        bar.step(f64::NAN, 0.5);
+        assert_eq!(bar.heater(), twin.heater());
+        assert_eq!(bar.leds(), twin.leds());
+        bar.step(10.0, 0.5);
+        twin.step(10.0, 0.5);
+        assert_eq!(bar.heater(), twin.heater());
+        assert_eq!(bar.leds(), twin.leds());
     }
 }
