@@ -263,7 +263,7 @@ build.
 | **S2** command table | Every constructible command encodes to an allowlisted two-byte prefix. An out-of-table prefix is refused at runtime. No report can start with `70` (init), `72` (pump/fan duty) or `30 02` (brightness/orientation) |
 | **S3** read-only roots | No writes to `/sys` or `/proc`. A full cycle succeeds on read-only fake roots |
 | **S6** binary symbols | The release writer contains no USB detach, configure, reset or control-transfer symbols, and links only glibc. A secondary check; S1 is the control |
-| **S7** cooling guard | Every deviation halts and latches. After HALTED the fake device records zero further bytes, across crashes and restarts. Firmware-driven `pwm` value changes do not halt |
+| **S7** cooling guard | Every deviation halts and latches. After HALTED the fake device records zero further bytes, across crashes and restarts. Firmware-driven `pwm` value changes do not halt, and the pump band follows one firmware duty step (#147) |
 | **S8** abort after WriteStart | A failure mid-transfer sends exactly one "show stock" and then nothing, and drops all handles |
 | **S9** bucket hygiene | Only foreign or overlapping buckets are deleted. `restore-stock` sends exactly one command |
 | **S10** writer dependencies | The LCD writer's dependency tree has no `ureq`, `nvml-wrapper`, `libloading`, `rustls`, `native-tls` or `http` (`cargo tree` and `cargo deny`). `llama-light` and `llama-metrics` must match exact allowlists (`scripts/s15-light-allow.txt`, `scripts/s16-metrics-allow.txt`) |

@@ -704,8 +704,8 @@ main risk:
   four keyboard report shapes, with no save-to-flash, profile or firmware
   writes. Tests check all three tables.
 - **Cooling guard and HALTED latch.** Every LCD operation is bracketed by
-  read-only checks of the cooler's hwmon (pump mode, pump rpm, USB device,
-  bootloader). Any change stops all device I/O and writes a latch file that
+  read-only checks of the cooler's hwmon (pump mode, pump rpm against the
+  firmware's own pump duty, USB device, bootloader). Any change stops all device I/O and writes a latch file that
   stays until an explicit root command clears it.
 - **Nothing writes sysfs.** The FANS panel only reads.
 - **Split privileges.** One reader with no device access; writers with no
