@@ -646,6 +646,8 @@ pub const MAX_SECONDS: f32 = 60.0;
 pub const MAX_TRANSIT_S: f32 = 3_600.0;
 /// Heat: longest `conduction_s`.
 pub const MAX_CONDUCTION_S: f32 = 1_000_000.0;
+/// Heat: shortest `conduction_s`. Below 1 s the conduction step can overflow.
+pub const MIN_CONDUCTION_S: f32 = 1.0;
 
 struct Ctx<'a> {
     aura: &'a AuraCfg,
@@ -752,6 +754,18 @@ fn positive_seconds(key: &str, value: f64, max: f32) -> Result<f32, ConfigError>
     if value <= 0.0 || value > max {
         return err(format!(
             "{key} = {value} is out of range; allowed above 0 up to {max}"
+        ));
+    }
+    Ok(value)
+}
+
+/// `conduction_s`: finite, at least [`MIN_CONDUCTION_S`] and at most
+/// [`MAX_CONDUCTION_S`]. A shorter time makes the conduction step overflow.
+fn conduction_seconds(key: &str, value: f64) -> Result<f32, ConfigError> {
+    let value = finite_f32(key, value)?;
+    if !(MIN_CONDUCTION_S..=MAX_CONDUCTION_S).contains(&value) {
+        return err(format!(
+            "{key} = {value} is out of range; allowed {MIN_CONDUCTION_S} up to {MAX_CONDUCTION_S}"
         ));
     }
     Ok(value)
@@ -1119,7 +1133,7 @@ fn validate_light(
     };
     let conduction_s = match raw.conduction_s {
         None => DEFAULT_CONDUCTION_S,
-        Some(value) => positive_seconds(&format!("{key}.conduction_s"), value, MAX_CONDUCTION_S)?,
+        Some(value) => conduction_seconds(&format!("{key}.conduction_s"), value)?,
     };
     let follow = match raw.follow.as_deref() {
         None => None,
@@ -1128,6 +1142,11 @@ fn validate_light(
             if follow.is_keyboard() {
                 return err(format!(
                     "{key}.follow = \"{text}\" is on the keyboard; heat follow is an Aura target"
+                ));
+            }
+            if style == Style::Heat && shares_led(&target, &follow, ctx.aura) {
+                return err(format!(
+                    "{key}.follow = \"{text}\" shares LEDs with this entry; heat follow must share no LED with the heat span"
                 ));
             }
             Some(follow)
@@ -1224,6 +1243,40 @@ fn validate_light(
         fixed,
         gate_color,
     })
+}
+
+/// Whether `follow` paints any LED `target` already draws. A reversed span
+/// lists the same LEDs, so it still overlaps.
+fn shares_led(target: &Target, follow: &Target, aura: &AuraCfg) -> bool {
+    let heat = aura_leds(target, aura);
+    let followed = aura_leds(follow, aura);
+    heat.iter().any(|led| followed.contains(led))
+}
+
+/// Every LED index `target` paints, ignoring order. Keyboard targets have
+/// none here; heat follow is rejected before this is asked about them.
+fn aura_leds(target: &Target, aura: &AuraCfg) -> Vec<usize> {
+    let n = aura.leds_per_fan;
+    match target {
+        Target::AuraFans => match aura.layout {
+            Layout::Mirrored => (0..n).collect(),
+            Layout::Chain(fans) => (0..fans.saturating_mul(n)).collect(),
+        },
+        Target::AuraChain {
+            start,
+            end,
+            reversed: _,
+        } => {
+            let Layout::Chain(fans) = aura.layout else {
+                return Vec::new();
+            };
+            if *end > fans {
+                return Vec::new();
+            }
+            (*start * n..*end * n).collect()
+        }
+        Target::KeyboardKeys(_) | Target::KeyboardAll => Vec::new(),
+    }
 }
 
 /// LEDs in one span of `target` (every span of a target is this long).

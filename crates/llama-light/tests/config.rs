@@ -592,13 +592,8 @@ fn heat_parses_its_keys_and_the_defaults_fit_a_six_led_fan() {
         .expect("two LEDs, foot of 1");
     assert_eq!(two.layers[0].foot_leds, 1);
 
-    let fans = parse(
-        "[aura]\nfans = \"chain\"\nchain_len = 2\nleds_per_fan = 14\n\
-         [[light]]\ntarget = \"aura.chain[0]\"\nstyle = \"heat\"\n\
-         follow = \"aura.fans\"\n",
-    )
-    .expect("follow the fans");
-    assert_eq!(fans.layers[0].follow, Some(Target::AuraFans));
+    let floor = parse("[[light]]\nstyle = \"heat\"\nconduction_s = 1\n").expect("floor");
+    assert_eq!(floor.layers[0].conduction_s, 1.0);
 }
 
 #[test]
@@ -654,11 +649,39 @@ fn heat_rejects_keys_that_do_not_apply_and_a_foot_the_span_cannot_hold() {
         ),
         (
             "[[light]]\nstyle = \"heat\"\nconduction_s = 0\n",
-            "light[0].conduction_s = 0 is out of range; allowed above 0 up to 1000000",
+            "light[0].conduction_s = 0 is out of range; allowed 1 up to 1000000",
+        ),
+        (
+            "[[light]]\nstyle = \"heat\"\nconduction_s = 0.5\n",
+            "light[0].conduction_s = 0.5 is out of range; allowed 1 up to 1000000",
         ),
         (
             "[[light]]\nstyle = \"heat\"\nconduction_s = 1000001\n",
-            "out of range; allowed above 0 up to 1000000",
+            "out of range; allowed 1 up to 1000000",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 2\nleds_per_fan = 8\n\
+             [[light]]\ntarget = \"aura.chain[0]\"\nstyle = \"heat\"\n\
+             foot_leds = 1\nfollow = \"aura.chain[0]\"\n",
+            "light[0].follow = \"aura.chain[0]\" shares LEDs with this entry; heat follow must share no LED with the heat span",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 3\nleds_per_fan = 8\n\
+             [[light]]\ntarget = \"aura.chain[0..2]\"\nstyle = \"heat\"\n\
+             follow = \"aura.chain[1]\"\n",
+            "shares LEDs with this entry",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 1\nleds_per_fan = 8\n\
+             [[light]]\ntarget = \"aura.chain[1..0]\"\nstyle = \"heat\"\n\
+             foot_leds = 1\nfollow = \"aura.chain[0]\"\n",
+            "share no LED",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 2\nleds_per_fan = 8\n\
+             [[light]]\ntarget = \"aura.chain[1]\"\nstyle = \"heat\"\n\
+             foot_leds = 1\nfollow = \"aura.fans\"\n",
+            "share no LED",
         ),
         (
             "[[light]]\nstyle = \"heat\"\nfoot_leds = 0\n",
