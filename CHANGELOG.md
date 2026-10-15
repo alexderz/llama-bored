@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- kraken-lcd's cooling guard no longer latches when the pump is still ramping to a small firmware duty step that landed just before the baseline. Capture keeps the previous read's `pwm1` with that baseline for 3 s and, when the two compared duties are equal, uses it as the step's "from" side. A stopped pump, a speed no recent small step explains, a duty jump larger than 13 counts, and a stale earlier duty still halt (#154).
+
 ### Removed
 
 - The desktop halt notifier (`kraken-lcd-halt.path` and `kraken-lcd-halt-notify.service`) is no longer installed. An upgrade removes those regular files and the global enable link `/etc/systemd/user/default.target.wants/kraken-lcd-halt.path`. Someone who enabled it per user should run `systemctl --user disable kraken-lcd-halt.path` before upgrading. After the upgrade the unit file is gone, so that command reports the unit missing (it may still remove the link); remove `~/.config/systemd/user/default.target.wants/kraken-lcd-halt.path` by hand (#152).
