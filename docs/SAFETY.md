@@ -99,9 +99,6 @@ sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt      # refuses non-roo
 sudo systemctl restart kraken-lcd
 ```
 
-An optional user unit, `kraken-lcd-halt.path`, sends a desktop notification
-when the latch appears (`sudo systemctl --global enable kraken-lcd-halt.path`).
-
 ## The RGB writer (llama-light)
 
 - **Colour only.** llama-light reads the snapshot and writes lighting frames.
@@ -226,7 +223,7 @@ anomalies. Nothing on the device needs cleaning up after uninstall.
 | RR7 | A class-wide `DeviceAllow=char-hidraw` would let the writer open every hidraw node (keyboards and so on) | Closed by pinning: udev adds `/dev/kraken-lcd/hid` for the cooler's node only, the writer unit's single hidraw grant is `DeviceAllow=/dev/kraken-lcd/hid`, and the installer checks that the symlink resolves to that node. The writer cross-checks the node against the cooler's sysfs path before opening it (S1). Trade-off: after a USB re-enumeration the writer needs a restart | **Closed** |
 | RR7b | The Aura controller's and the keyboard lighting interface's hidraw nodes may also be world-writable or `uaccess`-tagged by distro or OpenRGB rules | `94-llama-light-hidraw.rules` sorts after them, sets `0660 root:llama-light` and strips `uaccess`; the unit is pinned to `/dev/llama-light/aura` and `/dev/llama-light/keyboard`. Both are checked against sysfs before the open and `fstat` after it; the keyboard's usage page is checked too | **Closed** |
 | RR7c | The writer unit's usbfs grant, `DeviceAllow=char-usb_device rw`, covers every USB device node, not only the cooler's | `71-kraken-lcd.rules` gives only the cooler's usbfs node to group `kraken-lcd`, mode 0660; other USB nodes keep root ownership and their distro modes. The writer opens only the bus and device number it resolves from the cooler's sysfs directory | **Accepted** |
-| RR8 | While HALTED, our last frame can stay on screen and look live | Deliberate: no device I/O beats a fresh screen once cooling looks wrong. CRITICAL log, `systemctl status`, optional desktop alert | **Accepted** |
+| RR8 | While HALTED, our last frame can stay on screen and look live | Deliberate: no device I/O beats a fresh screen once cooling looks wrong. CRITICAL log, `systemctl status` | **Accepted** |
 | RR-LV1 | Prompts and outputs are readable on tty11 (and through llama-view) by anyone at the console, KVM or remote console, or in the `llama-view` group | `[tty] show_text = false` (or `llama-watch run --no-text`) removes the IN/OUT panels, the watcher stops keeping llama text at all, and the header shows "text off". The install skill asks the operator. Text appears only if `LLAMA_SERVER_SLOTS_DEBUG=1` is on. Tails only, no scrollback, and the VT is cleared on stop | **Operator's choice** (default: shown) |
 | RR-LV2 | With `LLAMA_SERVER_SLOTS_DEBUG=1`, llama-server's `/slots` returns whole prompts to **anyone who can reach llama-swap** | Keep llama-swap bound to loopback, or put a proxy in front that blocks any `slots` path for other clients. llama-watch must reach llama-swap directly | **Operator's responsibility** |
 | RR-LV3 | The watcher unit ends any other session on tty11 | tty11 is reserved for the dashboard (`Conflicts=` the tty11 getty) | **Accepted** |

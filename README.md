@@ -764,15 +764,14 @@ compare: `pwm1_enable`/`pwm2_enable` unchanged, pump rpm about the same. Then:
 ```sh
 sudo systemctl enable --now kraken-lcd
 sudo systemctl start llama-light                         # optional RGB; enable to keep it
-sudo systemctl --global enable kraken-lcd-halt.path      # optional desktop alert on HALTED
 sudo usermod -aG llama-view "$USER"                      # optional, for llama-view; log in again
 ```
 
 Installed: binaries in `/usr/local/libexec/llama-bored/` and
 `/usr/local/bin/llama-view`, the font in `/usr/local/share/llama-bored/`,
-configs in `/etc/llama-bored/`, units in `/etc/systemd/system/` and
-`/etc/systemd/user/`, udev rules `71-kraken-lcd`, `72-llama-view`,
-`93-kraken-lcd-hidraw` and `94-llama-light-hidraw` in `/etc/udev/rules.d/`,
+configs in `/etc/llama-bored/`, units in `/etc/systemd/system/`, udev rules
+`71-kraken-lcd`, `72-llama-view`, `93-kraken-lcd-hidraw` and
+`94-llama-light-hidraw` in `/etc/udev/rules.d/`,
 users from `/etc/sysusers.d/llama-bored.conf`. Stable device links:
 `/dev/kraken-lcd/hid`, `/dev/llama-light/aura` and
 `/dev/llama-light/keyboard`.
@@ -1486,11 +1485,9 @@ and the next install refuses until you run them. Stop the writers first.
 
 ```sh
 sudo systemctl disable --now llama-metrics llama-light kraken-lcd llama-watch
-sudo systemctl --global disable kraken-lcd-halt.path
 sudo rm -rf /usr/local/libexec/llama-bored /usr/local/share/llama-bored /etc/llama-bored /var/lib/kraken-lcd
 sudo rm -f /usr/local/bin/llama-view /etc/sysusers.d/llama-bored.conf \
   /etc/systemd/system/{kraken-lcd,llama-watch,llama-light,llama-metrics}.service \
-  /etc/systemd/user/kraken-lcd-halt.path /etc/systemd/user/kraken-lcd-halt-notify.service \
   /etc/udev/rules.d/{71-kraken-lcd,72-llama-view,93-kraken-lcd-hidraw,94-llama-light-hidraw}.rules
 sudo rm -rf /etc/systemd/system/llama-metrics.service.d   # the IPAddressAllow= drop-in, if you made one
 sudo systemctl daemon-reload && sudo udevadm control --reload
