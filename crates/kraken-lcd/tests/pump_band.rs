@@ -8,6 +8,24 @@ fn explained(before: u32, from: u32, duty: u32) -> u32 {
 }
 
 #[test]
+fn stopped_pump_at_a_low_held_duty_latches() {
+    // Duty 20, envelope [7, 33]: 300 * 7 / 20 = 105, band 150, low edge 0.
+    // Without the stopped-pump check this would pass.
+    assert!(!pump_in_band(300, 0, Some(20), Some(20)));
+}
+
+#[test]
+fn duty_clamp_at_one_pins_the_low_edge() {
+    // Held duty 10: [max(1, 10 - 13), 23] = [1, 23]. 2000 * 1 / 10 = 200,
+    // band 150, low edge 50. If the clamp reached 0 the low edge would be 0
+    // and 49 would pass; if the sub wrapped, the low duty would be huge and
+    // 50 would latch.
+    assert_eq!(explained(2000, 10, 1), 200);
+    assert!(pump_in_band(2000, 50, Some(10), Some(10)));
+    assert!(!pump_in_band(2000, 49, Some(10), Some(10)));
+}
+
+#[test]
 fn unknown_or_zero_held_duty_keeps_the_fixed_band() {
     let band = pump_band_rpm(1127);
     assert_eq!(band, 169);

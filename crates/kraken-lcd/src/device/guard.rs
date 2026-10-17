@@ -124,16 +124,17 @@ pub fn pump_band_rpm(baseline: u32) -> u32 {
 
 /// `true` when the pump speed `now` is explained by `before` and the duties.
 ///
-/// When both duties are readable and non-zero and they differ by at most
-/// [`PUMP_DUTY_STEP_MAX`] counts (including equal), `now` may match any
-/// speed explained by a duty in
+/// A stopped pump (`now == 0` while `before > 0`) is always out of band,
+/// before any envelope math: at a low duty the clamp at 1 plus the 150 rpm
+/// floor can make the low edge 0. When both duties are readable and
+/// non-zero and they differ by at most [`PUMP_DUTY_STEP_MAX`] counts
+/// (including equal), `now` may match any speed explained by a duty in
 /// `[min(D) - PUMP_DUTY_STEP_MAX, max(D) + PUMP_DUTY_STEP_MAX]`, clamped at
 /// 1 count, with [`pump_band_rpm`] at each end. D is the two compared
 /// duties. "Explained" is `before` scaled by that duty / the baseline duty,
-/// the same rounding as a one-step follow. A duty of 0 or unknown, or a
-/// jump of more than [`PUMP_DUTY_STEP_MAX`], keeps the fixed band around
-/// `before`. A stopped pump, or a speed no duty in the envelope explains,
-/// is still out of band.
+/// rounding half up. A duty of 0 or unknown, or a jump of more than
+/// [`PUMP_DUTY_STEP_MAX`], keeps the fixed band around `before`. A speed
+/// no duty in the envelope explains is still out of band.
 #[must_use]
 pub fn pump_in_band(
     before: u32,
@@ -141,6 +142,9 @@ pub fn pump_in_band(
     duty_before: Option<u32>,
     duty_now: Option<u32>,
 ) -> bool {
+    if now == 0 && before > 0 {
+        return false;
+    }
     let (low, high) = match (duty_before, duty_now) {
         (Some(from), Some(to))
             if from != 0 && to != 0 && from.abs_diff(to) <= PUMP_DUTY_STEP_MAX =>
@@ -431,6 +435,29 @@ mod tests {
         assert!(!pump_in_band(953, 0, Some(64), Some(64)));
         assert_eq!(compare(&snap(77, 953), &snap(77, 0)), Some(Deviation::Pump));
         assert!(!pump_in_band(953, 0, Some(77), Some(89)));
+    }
+
+    #[test]
+    fn stopped_pump_at_a_low_duty_latches() {
+        // Duty 20, envelope [7, 33]: 300 * 7 / 20 = 105, band 150, low edge 0.
+        // Without the stopped-pump check, 20/300 -> 20/0 would pass.
+        assert_eq!(compare(&snap(20, 300), &snap(20, 0)), Some(Deviation::Pump));
+        assert!(!pump_in_band(300, 0, Some(20), Some(20)));
+    }
+
+    #[test]
+    fn current_duty_widens_the_envelope() {
+        // Held 64: duties [51, 77], 953 * 77 / 64 = 1147, high edge 1319.
+        // With current 77: duties [51, 90], 953 * 90 / 64 = 1340, high edge 1541.
+        // 1400 is past the held-64 edge and inside the widened one. Scaling
+        // from the current duty (953 * 90 / 77 = 1114, high 1281) would latch.
+        assert_eq!(compare(&snap(64, 953), &snap(77, 1400)), None);
+        assert!(pump_in_band(953, 1400, Some(64), Some(77)));
+        assert!(!pump_in_band(953, 1400, Some(64), Some(64)));
+        assert_eq!(
+            compare(&snap(64, 953), &snap(77, 1542)),
+            Some(Deviation::Pump)
+        );
     }
 
     #[test]
