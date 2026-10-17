@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::config::{Config, InvalidConfig, UploadMode, ValidConfig};
 use crate::device::{
-    AutoClearLog, CoolingSnapshot, HidPort, KrakenLcd, LcdSink, NoBulk, OpenRequest,
+    AutoClearLog, CoolingSnapshot, HidPort, KrakenLcd, LatchRemoval, LcdSink, NoBulk, OpenRequest,
     PUMP_LATCH_CLEAR_AFTER, PUMP_LATCH_CLEAR_LIMIT, PUMP_LATCH_CLEAR_WINDOW, PUMP_LATCH_MAX_GAP,
     PortError, PumpBaseline, STATE_DIR, SYS_ROOT, SinkError, UploadFailed, halt_read_is_normal,
     open_resolved_hid, parse_pump_latch, read_auto_clears, read_halt_cooling, read_latch,
@@ -205,7 +205,10 @@ pub trait Clock {
 pub trait HaltWatch {
     /// Directory that holds the latch and the automatic-clear record.
     fn state_dir(&self) -> &Path;
-    /// One read-only cooling snapshot. `None` is an abnormal read.
+    /// One read-only cooling snapshot.
+    ///
+    /// `None` is an abnormal read and resets the pump-clear window. Production
+    /// always returns `Some`; tests use `None` for a failed read.
     fn read_cooling(&mut self) -> Option<CoolingSnapshot>;
 }
 
@@ -550,9 +553,18 @@ where
         let view = presented_view(&snap, &state.history, &prev_view, input.config, streaming);
         prev_view = Some(view.clone());
 
-        if matches!(state.phase, Phase::Halted) && pump_ready(&mut input, &mut state, wall) {
-            state.phase = Phase::Opening;
-            state.pump_clear = PumpClear::Idle;
+        if matches!(state.phase, Phase::Halted) {
+            match pump_ready(&mut input, &mut state) {
+                PumpStep::Open => {
+                    state.phase = Phase::Opening;
+                    state.pump_clear = PumpClear::Idle;
+                }
+                PumpStep::Reclassify => {
+                    state.pump_clear = PumpClear::Idle;
+                    arm_halted(&mut input, &mut state);
+                }
+                PumpStep::Hold => {}
+            }
         }
 
         let opened = match state.phase {
@@ -1136,12 +1148,21 @@ enum PumpClear {
     Watch(PumpWindow),
 }
 
+enum PumpStep {
+    /// Stay halted. The window, if any, is unchanged.
+    Hold,
+    /// The latch is gone. Return to opening and record nothing further.
+    Open,
+    /// The latch changed. Drop this episode and classify the new file.
+    Reclassify,
+}
+
 struct PumpWindow {
     dir: PathBuf,
     baseline: PumpBaseline,
     previous: Option<CoolingSnapshot>,
-    previous_at: Option<SystemTime>,
-    window_at: Option<SystemTime>,
+    previous_at: Option<Instant>,
+    window_at: Option<Instant>,
     blocked: bool,
     logged_bad: bool,
 }
@@ -1149,29 +1170,37 @@ struct PumpWindow {
 fn pump_ready<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
     input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
     state: &mut LoopState<S>,
-    now: SystemTime,
-) -> bool
+) -> PumpStep
 where
+    Clk: Clock,
     Halt: HaltWatch,
     Lg: log::Sink,
 {
     if matches!(state.pump_clear, PumpClear::Idle) {
-        let dir = input.halt.state_dir().to_path_buf();
-        state.pump_clear = classify_latch(&dir);
-        if let PumpClear::Watch(window) = &mut state.pump_clear
-            && matches!(read_auto_clears(&window.dir), AutoClearLog::Bad)
-        {
-            note_bad_clear(window, &mut input.log);
-        }
+        arm_halted(input, state);
     }
     let PumpClear::Watch(window) = &mut state.pump_clear else {
-        return false;
+        return PumpStep::Hold;
     };
     if window.blocked {
-        return false;
+        return PumpStep::Hold;
     }
     let snap = input.halt.read_cooling();
-    observe_pump(window, snap, now, &mut input.log)
+    let mono = input.clock.mono();
+    let wall = input.clock.wall();
+    observe_pump(window, snap, mono, wall, &mut input.log)
+}
+
+fn arm_halted<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
+    state: &mut LoopState<S>,
+) where
+    Halt: HaltWatch,
+    Lg: log::Sink,
+{
+    let dir = input.halt.state_dir().to_path_buf();
+    state.pump_clear = classify_latch(&dir);
+    judge_backoff(&mut state.pump_clear, &mut input.log);
 }
 
 fn classify_latch(dir: &Path) -> PumpClear {
@@ -1192,113 +1221,194 @@ fn classify_latch(dir: &Path) -> PumpClear {
     }
 }
 
+/// One decision per episode, before any cooling read.
+///
+/// The limit is stamps in the 24 h before and including the latch's own
+/// `time=`. A missing or unparsable `time=` is human-only. Either one logs
+/// a single CRITICAL and stops the cooling reads for this episode.
+fn judge_backoff(slot: &mut PumpClear, log: &mut impl log::Sink) {
+    let PumpClear::Watch(window) = slot else {
+        return;
+    };
+    let Some(latch_time) = window.baseline.time() else {
+        note_bad_time(window, log);
+        return;
+    };
+    match read_auto_clears(&window.dir) {
+        AutoClearLog::Bad => note_corrupt(window, log),
+        AutoClearLog::Times(times) if limit_reached(&times, latch_time) => {
+            note_exhausted(window, log);
+        }
+        AutoClearLog::Times(_) => {}
+    }
+}
+
 fn observe_pump(
     window: &mut PumpWindow,
     snap: Option<CoolingSnapshot>,
-    now: SystemTime,
+    mono: Instant,
+    wall: SystemTime,
     log: &mut impl log::Sink,
-) -> bool {
+) -> PumpStep {
     let Some(current) = snap else {
         window.previous = None;
-        window.previous_at = Some(now);
+        window.previous_at = Some(mono);
         window.window_at = None;
-        return false;
+        return PumpStep::Hold;
     };
     let gapped = window
         .previous_at
-        .is_some_and(|previous| gap_breaks(previous, now));
+        .is_some_and(|previous| gap_breaks(previous, mono));
     let normal = halt_read_is_normal(&window.baseline, window.previous.as_ref(), &current);
     window.previous = Some(current);
-    window.previous_at = Some(now);
+    window.previous_at = Some(mono);
     if !normal {
         window.window_at = None;
-        return false;
+        return PumpStep::Hold;
     }
     if gapped || window.window_at.is_none() {
-        window.window_at = Some(now);
-        return false;
+        window.window_at = Some(mono);
+        return PumpStep::Hold;
     }
-    let start = window.window_at.unwrap_or(now);
-    let Ok(elapsed) = now.duration_since(start) else {
-        window.window_at = Some(now);
-        return false;
+    let start = window.window_at.unwrap_or(mono);
+    let Some(elapsed) = mono.checked_duration_since(start) else {
+        window.window_at = Some(mono);
+        return PumpStep::Hold;
     };
     if elapsed < PUMP_LATCH_CLEAR_AFTER {
-        return false;
+        return PumpStep::Hold;
     }
-    commit_clear(window, now, log)
+    commit_clear(window, wall, log)
 }
 
-fn commit_clear(window: &mut PumpWindow, now: SystemTime, log: &mut impl log::Sink) -> bool {
-    let AutoClearLog::Times(times) = read_auto_clears(&window.dir) else {
-        note_bad_clear(window, log);
-        return false;
-    };
-    let mut recent: Vec<u64> = times
-        .into_iter()
-        .filter(|stamped| in_clear_window(*stamped, now))
-        .collect();
-    if recent.len() >= PUMP_LATCH_CLEAR_LIMIT {
-        return false;
+fn commit_clear(window: &mut PumpWindow, wall: SystemTime, log: &mut impl log::Sink) -> PumpStep {
+    match read_latch(&window.dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return PumpStep::Open,
+        Err(_) => return PumpStep::Reclassify,
+        Ok(text) => match parse_pump_latch(&text) {
+            Some(parsed) if parsed == window.baseline => {}
+            _ => return PumpStep::Reclassify,
+        },
     }
-    let Ok(unix) = now.duration_since(UNIX_EPOCH) else {
-        return false;
+    let times = match read_auto_clears(&window.dir) {
+        AutoClearLog::Times(times) => times,
+        AutoClearLog::Bad => {
+            note_corrupt(window, log);
+            return PumpStep::Hold;
+        }
     };
-    recent.push(unix.as_secs());
-    if store_auto_clears(&window.dir, &recent).is_err() {
-        note_bad_clear(window, log);
-        return false;
+    let Some(latch_time) = window.baseline.time() else {
+        note_bad_time(window, log);
+        return PumpStep::Hold;
+    };
+    if limit_reached(&times, latch_time) {
+        note_exhausted(window, log);
+        return PumpStep::Hold;
     }
-    if remove_latch(&window.dir).is_err() {
-        if !window.logged_bad {
-            crit(
+    let Ok(unix) = wall.duration_since(UNIX_EPOCH) else {
+        return PumpStep::Hold;
+    };
+    let mut kept = retain_recent(times, latch_time);
+    let counted = kept
+        .iter()
+        .filter(|stamped| **stamped <= latch_time)
+        .count()
+        + 1;
+    kept.push(unix.as_secs());
+    if store_auto_clears(&window.dir, &kept).is_err() {
+        note_corrupt(window, log);
+        return PumpStep::Hold;
+    }
+    match remove_latch(&window.dir) {
+        LatchRemoval::Removed => {}
+        LatchRemoval::UnlinkFailed => {
+            note_blocked(
+                window,
                 log,
                 "cooling guard auto-clear recorded the clear but could not remove the latch",
             );
-            window.logged_bad = true;
+            return PumpStep::Hold;
         }
-        window.blocked = true;
-        return false;
+        LatchRemoval::DirSyncFailed => {
+            crit(
+                log,
+                "cooling guard auto-clear removed the latch but the directory sync failed",
+            );
+            return PumpStep::Open;
+        }
     }
     let after_s = PUMP_LATCH_CLEAR_AFTER.as_secs();
-    let count = recent.len();
     let limit = PUMP_LATCH_CLEAR_LIMIT;
     let hours = PUMP_LATCH_CLEAR_WINDOW.as_secs() / 3600;
     crit(
         log,
         &format!(
-            "cooling guard latch cleared after {after_s} s of normal pump operation (auto-clear {count} of {limit} in {hours} h)"
+            "cooling guard latch cleared after {after_s} s of normal pump operation (auto-clear {counted} of {limit} in {hours} h)"
         ),
     );
-    true
+    PumpStep::Open
 }
 
-fn note_bad_clear(window: &mut PumpWindow, log: &mut impl log::Sink) {
+fn note_exhausted(window: &mut PumpWindow, log: &mut impl log::Sink) {
+    let limit = PUMP_LATCH_CLEAR_LIMIT;
+    let hours = PUMP_LATCH_CLEAR_WINDOW.as_secs() / 3600;
+    note_blocked(
+        window,
+        log,
+        &format!("cooling guard: auto-clear limit ({limit} in {hours} h) reached; run clear-halt"),
+    );
+}
+
+fn note_bad_time(window: &mut PumpWindow, log: &mut impl log::Sink) {
+    note_blocked(
+        window,
+        log,
+        "cooling guard: pump latch time is missing or unparsable; run clear-halt",
+    );
+}
+
+fn note_corrupt(window: &mut PumpWindow, log: &mut impl log::Sink) {
+    note_blocked(
+        window,
+        log,
+        "cooling guard auto-clear state is unreadable or corrupt; not clearing the pump latch",
+    );
+}
+
+fn note_blocked(window: &mut PumpWindow, log: &mut impl log::Sink, message: &str) {
     if !window.logged_bad {
-        crit(
-            log,
-            "cooling guard auto-clear state is unreadable or corrupt; not clearing the pump latch",
-        );
+        crit(log, message);
         window.logged_bad = true;
     }
     window.blocked = true;
 }
 
-fn gap_breaks(previous: SystemTime, now: SystemTime) -> bool {
-    match now.duration_since(previous) {
-        Ok(gap) => gap > PUMP_LATCH_MAX_GAP,
-        Err(_) => true,
+fn gap_breaks(previous: Instant, now: Instant) -> bool {
+    match now.checked_duration_since(previous) {
+        Some(gap) => gap > PUMP_LATCH_MAX_GAP,
+        None => true,
     }
 }
 
-fn in_clear_window(stamped: u64, now: SystemTime) -> bool {
-    let Some(stamped_at) = UNIX_EPOCH.checked_add(Duration::from_secs(stamped)) else {
-        return true;
-    };
-    match now.duration_since(stamped_at) {
-        Ok(age) => age <= PUMP_LATCH_CLEAR_WINDOW,
-        Err(_) => true,
-    }
+fn limit_reached(times: &[u64], latch_time: u64) -> bool {
+    times
+        .iter()
+        .filter(|stamped| stamp_in_latch_window(**stamped, latch_time))
+        .count()
+        >= PUMP_LATCH_CLEAR_LIMIT
+}
+
+fn retain_recent(times: Vec<u64>, latch_time: u64) -> Vec<u64> {
+    let lower = latch_time.saturating_sub(PUMP_LATCH_CLEAR_WINDOW.as_secs());
+    times
+        .into_iter()
+        .filter(|stamped| *stamped >= lower)
+        .collect()
+}
+
+fn stamp_in_latch_window(stamped: u64, latch_time: u64) -> bool {
+    let lower = latch_time.saturating_sub(PUMP_LATCH_CLEAR_WINDOW.as_secs());
+    stamped >= lower && stamped <= latch_time
 }
 
 fn crit(log: &mut impl log::Sink, message: &str) {
@@ -1494,24 +1604,29 @@ mod tests {
     }
 
     #[test]
-    fn in_clear_window_includes_the_24h_mark_and_excludes_older() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let now_unix = 1_700_000_000u64;
-        assert!(in_clear_window(now_unix - 24 * 60 * 60, now));
-        assert!(!in_clear_window(now_unix - 24 * 60 * 60 - 1, now));
-        assert!(in_clear_window(now_unix + 10, now));
-        assert!(in_clear_window(u64::MAX, now));
+    fn stamps_in_the_24h_before_the_latch_time_count() {
+        let latch = 1_700_000_000u64;
+        let day = PUMP_LATCH_CLEAR_WINDOW.as_secs();
+        assert!(stamp_in_latch_window(latch - day, latch));
+        assert!(stamp_in_latch_window(latch, latch));
+        assert!(!stamp_in_latch_window(latch - day - 1, latch));
+        assert!(!stamp_in_latch_window(latch + 1, latch));
+        assert!(stamp_in_latch_window(0, 10));
+        assert!(!stamp_in_latch_window(11, 10));
+        assert!(!stamp_in_latch_window(u64::MAX, latch));
+        assert!(limit_reached(&[latch - 3, latch - 2, latch - 1], latch));
+        assert!(!limit_reached(&[latch - 2, latch - 1, latch + 5], latch));
     }
 
     #[test]
     fn gap_of_five_seconds_holds_and_one_nanosecond_more_restarts() {
-        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let start = Instant::now();
         assert!(!gap_breaks(start, start + PUMP_LATCH_MAX_GAP));
         assert!(gap_breaks(
             start,
             start + PUMP_LATCH_MAX_GAP + Duration::from_nanos(1)
         ));
-        assert!(gap_breaks(start, start - Duration::from_secs(1)));
+        assert!(gap_breaks(start + Duration::from_secs(1), start));
     }
 
     #[test]
