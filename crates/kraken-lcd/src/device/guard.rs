@@ -2,8 +2,8 @@
 //!
 //! A pump latch (`reason=fan1_input`) can clear itself after
 //! [`PUMP_LATCH_CLEAR_AFTER`] of normal pump reads on the monotonic clock,
-//! unless [`PUMP_LATCH_CLEAR_LIMIT`] automatic clears already fall in the
-//! [`PUMP_LATCH_CLEAR_WINDOW`] before and including the latch's `time=`.
+//! unless [`PUMP_LATCH_CLEAR_LIMIT`] automatic clears already fall at or
+//! after the latch's `time=` minus [`PUMP_LATCH_CLEAR_WINDOW`].
 //!
 //! `pwm1` and `pwm2` are copied into the snapshot for the log. Neither is
 //! compared on its own: the firmware curve moves them while the enable files
@@ -66,13 +66,15 @@ pub const PUMP_LATCH_CLEAR_AFTER: Duration = Duration::from_secs(600);
 /// A stall of the monotonic clock restarts it. A wall-clock jump alone does not.
 pub const PUMP_LATCH_MAX_GAP: Duration = Duration::from_secs(5);
 
-/// Automatic clears allowed in the 24 h before and including a latch's `time=`.
+/// Automatic clears allowed at or after a latch's `time=` minus [`PUMP_LATCH_CLEAR_WINDOW`].
 pub const PUMP_LATCH_CLEAR_LIMIT: usize = 3;
 
 /// How far before a latch's `time=` an automatic clear still counts.
 ///
-/// The bound is the latch time, not the clock at the clear. A latch that is
-/// already at [`PUMP_LATCH_CLEAR_LIMIT`] stays until `clear-halt`.
+/// Every stamp at or after `time=` minus this window counts, including a
+/// stamp later than `time=`. The window stays anchored to the latch. A
+/// latch that is already at [`PUMP_LATCH_CLEAR_LIMIT`] stays until
+/// `clear-halt`.
 pub const PUMP_LATCH_CLEAR_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// State file of recent automatic-clear unix times, beside the latch.
@@ -395,8 +397,10 @@ pub(crate) fn store_auto_clears(state_dir: &Path, times: &[u64]) -> std::io::Res
 /// [`LatchRemoval::DirSyncFailed`] means the file is already gone.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LatchRemoval {
-    /// The latch file is gone and the directory was synced.
+    /// The latch file was removed and the directory was synced.
     Removed,
+    /// The latch file was already absent and the directory was synced.
+    AlreadyGone,
     /// The latch file is still there.
     UnlinkFailed,
     /// The latch file is gone. Syncing its directory failed.
@@ -406,17 +410,24 @@ pub(crate) enum LatchRemoval {
 /// Remove `<state_dir>/halted` and fsync the directory.
 ///
 /// This is the only removal besides `clear-halt`. A latch that is already
-/// gone still gets a directory sync, and that sync's failure is
-/// [`LatchRemoval::DirSyncFailed`] rather than a failed removal.
+/// gone still gets a directory sync. A successful sync is
+/// [`LatchRemoval::AlreadyGone`]. A failed sync is
+/// [`LatchRemoval::DirSyncFailed`].
 pub(crate) fn remove_latch(state_dir: &Path) -> LatchRemoval {
-    if let Err(err) = std::fs::remove_file(state_dir.join("halted"))
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return LatchRemoval::UnlinkFailed;
-    }
+    let already_gone = match std::fs::remove_file(state_dir.join("halted")) {
+        Ok(()) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => return LatchRemoval::UnlinkFailed,
+    };
     match std::fs::File::open(state_dir) {
         Ok(dir) => match rustix::fs::fsync(&dir) {
-            Ok(()) => LatchRemoval::Removed,
+            Ok(()) => {
+                if already_gone {
+                    LatchRemoval::AlreadyGone
+                } else {
+                    LatchRemoval::Removed
+                }
+            }
             Err(_) => LatchRemoval::DirSyncFailed,
         },
         Err(_) => LatchRemoval::DirSyncFailed,
@@ -1138,6 +1149,7 @@ mod tests {
         std::fs::write(dir.join(PUMP_AUTO_CLEARED_FILE), b"10\n").expect("log");
         assert_eq!(remove_latch(&dir), LatchRemoval::Removed);
         assert!(!dir.join("halted").exists());
+        assert_eq!(remove_latch(&dir), LatchRemoval::AlreadyGone);
         assert_eq!(
             std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("kept"),
             b"10\n"

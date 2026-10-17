@@ -738,6 +738,32 @@ fn three_clears_in_24h_keep_the_fourth_latch() {
 }
 
 #[test]
+fn latch_time_earlier_than_three_stamps_is_exhausted_and_never_clears() {
+    let scratch = Scratch::new("future-stamps");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let body = format!(
+        "{}\n{}\n{}\n",
+        START_UNIX + 10,
+        START_UNIX + 20,
+        START_UNIX + 30
+    );
+    std::fs::write(scratch.0.join(PUMP_AUTO_CLEARED_FILE), &body).expect("record");
+    let config = load_config(&scratch.0);
+    let watch = Steady::watch(&scratch.0);
+    let reads = watch.reads();
+    let ran = run_with(&config, 700, JumpClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert_stays(&scratch.0, &ran);
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
+        body
+    );
+    assert_eq!(crit_count(&ran, &exhaustion_line()), 1);
+}
+
+#[test]
 fn clear_older_than_24h_does_not_count() {
     let scratch = Scratch::new("aged");
     std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
@@ -944,6 +970,38 @@ fn store_failure_leaves_the_latch_in_place() {
 }
 
 #[test]
+fn three_stamps_appended_at_read_599_block_the_clear() {
+    let scratch = Scratch::new("commit-limit");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let dir = scratch.0.clone();
+    let body = format!(
+        "{}\n{}\n{}\n",
+        START_UNIX - 3,
+        START_UNIX - 2,
+        START_UNIX - 1
+    );
+    let record = body.clone();
+    let watch = SeqWatch::new(&scratch.0, move |n| {
+        if n == 599 {
+            std::fs::write(dir.join(PUMP_AUTO_CLEARED_FILE), &body).expect("stamps");
+        }
+        Some(normal())
+    });
+    let reads = watch.reads();
+    let ran = run_with(&config, 650, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 601);
+    assert_stays(&scratch.0, &ran);
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
+        record
+    );
+    assert_eq!(crit_count(&ran, &exhaustion_line()), 1);
+}
+
+#[test]
 fn second_halt_in_the_same_process_needs_a_fresh_600s() {
     let scratch = Scratch::new("second-halt");
     let config = load_config(&scratch.0);
@@ -969,7 +1027,10 @@ fn second_halt_in_the_same_process_needs_a_fresh_600s() {
         std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
         format!("{first}\n{second}\n")
     );
-    assert_eq!(crit_count(&ran, &clear_line(1)), 2);
+    // Both latches carry time=START_UNIX. The first stamp is 601 s later, so
+    // it counts toward the second clear.
+    assert_eq!(crit_count(&ran, &clear_line(1)), 1);
+    assert_eq!(crit_count(&ran, &clear_line(2)), 1);
 }
 
 #[test]

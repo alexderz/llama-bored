@@ -1223,9 +1223,10 @@ fn classify_latch(dir: &Path) -> PumpClear {
 
 /// One decision per episode, before any cooling read.
 ///
-/// The limit is stamps in the 24 h before and including the latch's own
-/// `time=`. A missing or unparsable `time=` is human-only. Either one logs
-/// a single CRITICAL and stops the cooling reads for this episode.
+/// The limit is every stamp at or after the latch's `time=` minus 24 h,
+/// including stamps later than `time=`. A missing or unparsable `time=` is
+/// human-only. Either one logs a single CRITICAL and stops the cooling reads
+/// for this episode.
 fn judge_backoff(slot: &mut PumpClear, log: &mut impl log::Sink) {
     let PumpClear::Watch(window) = slot else {
         return;
@@ -1309,18 +1310,23 @@ fn commit_clear(window: &mut PumpWindow, wall: SystemTime, log: &mut impl log::S
         return PumpStep::Hold;
     };
     let mut kept = retain_recent(times, latch_time);
-    let counted = kept
-        .iter()
-        .filter(|stamped| **stamped <= latch_time)
-        .count()
-        + 1;
+    // `retain_recent` already dropped stamps older than the latch window.
+    // Every stamp it kept counts, including one later than `latch_time`.
+    let counted = kept.len() + 1;
     kept.push(unix.as_secs());
     if store_auto_clears(&window.dir, &kept).is_err() {
         note_corrupt(window, log);
         return PumpStep::Hold;
     }
+    // Tests unlink here so `remove_latch` can observe an already-gone latch.
+    #[cfg(test)]
+    drop_stored_latch(&window.dir);
     match remove_latch(&window.dir) {
         LatchRemoval::Removed => {}
+        LatchRemoval::AlreadyGone => {
+            crit(log, "cooling guard latch was already cleared");
+            return PumpStep::Open;
+        }
         LatchRemoval::UnlinkFailed => {
             note_blocked(
                 window,
@@ -1398,8 +1404,12 @@ fn limit_reached(times: &[u64], latch_time: u64) -> bool {
         >= PUMP_LATCH_CLEAR_LIMIT
 }
 
+fn window_lower(latch_time: u64) -> u64 {
+    latch_time.saturating_sub(PUMP_LATCH_CLEAR_WINDOW.as_secs())
+}
+
 fn retain_recent(times: Vec<u64>, latch_time: u64) -> Vec<u64> {
-    let lower = latch_time.saturating_sub(PUMP_LATCH_CLEAR_WINDOW.as_secs());
+    let lower = window_lower(latch_time);
     times
         .into_iter()
         .filter(|stamped| *stamped >= lower)
@@ -1407,11 +1417,39 @@ fn retain_recent(times: Vec<u64>, latch_time: u64) -> Vec<u64> {
 }
 
 fn stamp_in_latch_window(stamped: u64, latch_time: u64) -> bool {
-    let lower = latch_time.saturating_sub(PUMP_LATCH_CLEAR_WINDOW.as_secs());
-    stamped >= lower && stamped <= latch_time
+    stamped >= window_lower(latch_time)
+}
+
+/// When set, [`commit_clear`] unlinks the latch after the stamp is stored
+/// and before [`remove_latch`], so the removal observes [`LatchRemoval::AlreadyGone`].
+#[cfg(test)]
+static DROP_STORED_LATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn drop_stored_latch(dir: &Path) {
+    if DROP_STORED_LATCH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::fs::remove_file(dir.join("halted"));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CRITS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_crit(message: &str) {
+    TEST_CRITS.with(|slot| {
+        if let Some(lines) = slot.borrow_mut().as_mut() {
+            lines.push(message.to_owned());
+        }
+    });
 }
 
 fn crit(log: &mut impl log::Sink, message: &str) {
+    #[cfg(test)]
+    record_crit(message);
     log::emit(log, Priority::Crit, message);
 }
 
@@ -1604,18 +1642,76 @@ mod tests {
     }
 
     #[test]
-    fn stamps_in_the_24h_before_the_latch_time_count() {
+    fn stamps_from_24h_before_the_latch_time_onward_count() {
         let latch = 1_700_000_000u64;
         let day = PUMP_LATCH_CLEAR_WINDOW.as_secs();
         assert!(stamp_in_latch_window(latch - day, latch));
         assert!(stamp_in_latch_window(latch, latch));
+        assert!(stamp_in_latch_window(latch + 1, latch));
+        assert!(stamp_in_latch_window(u64::MAX, latch));
         assert!(!stamp_in_latch_window(latch - day - 1, latch));
-        assert!(!stamp_in_latch_window(latch + 1, latch));
         assert!(stamp_in_latch_window(0, 10));
-        assert!(!stamp_in_latch_window(11, 10));
-        assert!(!stamp_in_latch_window(u64::MAX, latch));
+        assert!(stamp_in_latch_window(11, 10));
         assert!(limit_reached(&[latch - 3, latch - 2, latch - 1], latch));
-        assert!(!limit_reached(&[latch - 2, latch - 1, latch + 5], latch));
+        assert!(limit_reached(&[latch - 2, latch - 1, latch + 5], latch));
+        assert!(limit_reached(&[latch + 1, latch + 2, latch + 3], latch));
+        assert!(!limit_reached(&[latch - day - 1, latch - 1, latch], latch));
+        assert!(!limit_reached(&[latch - 2, latch - 1], latch));
+        assert_eq!(
+            retain_recent(vec![latch - day - 1, latch + 1, u64::MAX], latch),
+            vec![latch + 1, u64::MAX]
+        );
+    }
+
+    #[test]
+    fn commit_clear_logs_already_cleared_when_the_latch_vanishes_after_the_stamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-already-gone-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let latch = "\
+CRITICAL time=1700000000 reason=fan1_input
+baseline z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=1000 devnum=2 bootloader=no
+current z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=0 devnum=2 bootloader=no
+";
+        std::fs::write(dir.join("halted"), latch).expect("latch");
+        let baseline = parse_pump_latch(latch).expect("parse");
+        let mut window = PumpWindow {
+            dir: dir.clone(),
+            baseline,
+            previous: None,
+            previous_at: None,
+            window_at: None,
+            blocked: false,
+            logged_bad: false,
+        };
+        DROP_STORED_LATCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        TEST_CRITS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_600);
+        let step = commit_clear(&mut window, wall, &mut log::Stderr);
+        DROP_STORED_LATCH.store(false, std::sync::atomic::Ordering::Relaxed);
+        let lines = TEST_CRITS.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+        assert!(matches!(step, PumpStep::Open));
+        assert!(!window.blocked);
+        assert!(!dir.join("halted").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(crate::device::PUMP_AUTO_CLEARED_FILE))
+                .expect("stamp"),
+            "1700000600\n"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("cooling guard latch was already cleared")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("cleared after")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

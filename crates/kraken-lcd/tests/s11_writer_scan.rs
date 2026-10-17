@@ -1476,13 +1476,30 @@ fn writer_source_passes_s11_and_the_file_set_is_non_empty() {
 /// `join("halted")` stays on those paths plus the existing presence checks
 /// and the auto-clear read of the latch body. `service.rs` does not unlink
 /// or rename. `remove_latch` has one production caller. Nothing renames
-/// onto the latch file.
+/// onto the latch file. `write_durable` and `store_auto_clears` each have
+/// one production caller, and `write_durable` is passed
+/// `PUMP_AUTO_CLEARED_FILE`. Production code does not alias `remove_latch`
+/// or `write_durable`.
 #[test]
 fn pump_auto_clear_is_the_only_new_latch_removal() {
+    assert!(use_item_aliases(
+        "use crate::device::guard::remove_latch as unlink_halt;\n",
+        "remove_latch"
+    ));
+    assert!(use_item_aliases(
+        "use super::{write_durable as publish};\n",
+        "write_durable"
+    ));
+    assert!(!use_item_aliases(
+        "use crate::device::guard::remove_latch;\n",
+        "remove_latch"
+    ));
     let src = writer_src();
     let mut removals = Vec::new();
     let mut joins = BTreeMap::<String, usize>::new();
     let mut callers = Vec::new();
+    let mut durable = Vec::new();
+    let mut stores = Vec::new();
     for rel in rs_rels(&src) {
         let text = fs::read_to_string(src.join(&rel)).unwrap_or_else(|err| panic!("{rel}: {err}"));
         let code = strip_cfg_test(&strip_comments(&text));
@@ -1502,6 +1519,31 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
                 callers.push((rel.clone(), enclosing_fn_name(&code, at)));
             }
         }
+        for at in call_sites(&code, "write_durable") {
+            if fn_item_name(&code, at) {
+                continue;
+            }
+            let args = call_args(&code, at, "write_durable".len()).unwrap_or("");
+            assert_eq!(
+                nth_arg(args, 1),
+                Some("PUMP_AUTO_CLEARED_FILE"),
+                "{rel} write_durable must pass PUMP_AUTO_CLEARED_FILE as the name"
+            );
+            durable.push((rel.clone(), enclosing_fn_name(&code, at)));
+        }
+        for at in call_sites(&code, "store_auto_clears") {
+            if !fn_item_name(&code, at) {
+                stores.push((rel.clone(), enclosing_fn_name(&code, at)));
+            }
+        }
+        assert!(
+            !use_item_aliases(&code, "remove_latch"),
+            "{rel} aliases remove_latch"
+        );
+        assert!(
+            !use_item_aliases(&code, "write_durable"),
+            "{rel} aliases write_durable"
+        );
         for at in call_sites(&code, "rename") {
             let args = call_args(&code, at, "rename".len()).unwrap_or("");
             assert!(
@@ -1546,6 +1588,18 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
         callers,
         vec![("service.rs".to_owned(), "commit_clear".to_owned())],
         "remove_latch has one production caller"
+    );
+    durable.sort();
+    stores.sort();
+    assert_eq!(
+        durable,
+        vec![("device/guard.rs".to_owned(), "store_auto_clears".to_owned())],
+        "write_durable has one production caller"
+    );
+    assert_eq!(
+        stores,
+        vec![("service.rs".to_owned(), "commit_clear".to_owned())],
+        "store_auto_clears has one production caller"
     );
     assert_eq!(
         joins.get("device/guard.rs").copied(),
@@ -1603,6 +1657,79 @@ fn call_args(code: &str, name_at: usize, name_len: usize) -> Option<&str> {
     let open = name_at + name_len + (rest.len() - trimmed.len());
     let end = paren_end(code, open)?;
     Some(&code[open..=end])
+}
+
+fn nth_arg(args: &str, index: usize) -> Option<&str> {
+    let inner = args.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut n = 0usize;
+    for (i, byte) in inner.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                if n == index {
+                    return Some(inner[start..i].trim());
+                }
+                n += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if n == index {
+        Some(inner[start..].trim())
+    } else {
+        None
+    }
+}
+
+fn use_item_aliases(code: &str, name: &str) -> bool {
+    let mut rest = code;
+    while let Some(at) = rest.find("use") {
+        if !ident_boundary(rest, at, "use".len()) {
+            rest = &rest[at + "use".len()..];
+            continue;
+        }
+        let after = &rest[at + "use".len()..];
+        let Some(semi) = after.find(';') else {
+            break;
+        };
+        if aliases_in(&after[..semi], name) {
+            return true;
+        }
+        rest = &after[semi + 1..];
+    }
+    false
+}
+
+fn aliases_in(item: &str, name: &str) -> bool {
+    let mut search = item;
+    let mut base = 0usize;
+    while let Some(at) = search.find(name) {
+        let abs = base + at;
+        if ident_boundary(item, abs, name.len()) {
+            let rest = item[abs + name.len()..].trim_start();
+            if keyword_as(rest) {
+                return true;
+            }
+        }
+        let next = at + name.len();
+        base += next;
+        search = &search[next..];
+    }
+    false
+}
+
+fn keyword_as(rest: &str) -> bool {
+    let Some(after) = rest.strip_prefix("as") else {
+        return false;
+    };
+    after
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
 }
 
 fn paren_end(code: &str, open: usize) -> Option<usize> {
