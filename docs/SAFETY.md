@@ -60,17 +60,21 @@ later:
 
 - `z53` still present;
 - `pwm*_enable` identical;
-- pump rpm within **max(15 %, 150 rpm)** of the baseline. This band is a
-  constant, not a config value. When the firmware's curve made one duty step
-  between the two reads (`pwm1` moved by at most 13 counts, one 5-point step
-  of its whole-percent duty, also a constant), the pump is expected anywhere
-  from the baseline rpm (still ramping) to the baseline scaled by the duty
-  ratio (arrived), with the band applied at each end (#147). The same
-  applies when the step landed just before the baseline and the pump is
-  still ramping: the guard remembers the last `pwm1` change it saw for 5 s
-  and uses its old duty as the start of the step (#154). A stopped pump,
-  a speed the duty does not explain, a bigger duty jump, or a change older
-  than 5 s still halts;
+- pump rpm explained by the pump duty. The firmware's curve moves `pwm1` in
+  steps of at most 13 counts (one 5-point step of its whole-percent duty), and
+  it can step up and back down between two reads. So the guard allows one
+  step either side of the duties it saw: any duty from 13 below the lower of
+  the baseline and check `pwm1` to 13 above the higher one, with the low end
+  clamped at 1. This envelope is used only when both `pwm1` reads are present
+  and non-zero and differ by at most 13. The pump passes when its rpm is
+  within **max(15 % of that speed, 150 rpm)** of the baseline rpm times some
+  duty in that range divided by the baseline duty, rounding half up (#147, #154, #156). The step size and band are
+  constants, not config values. This applies on every check, so with the
+  duty held at 64 and the pump at 953 rpm the lowest accepted speed is
+  609 rpm. A stopped pump always halts. So does a speed no duty in that range
+  explains. A `pwm1` read that is missing, zero, or more than 13 counts from
+  the other read keeps the fixed band around the baseline rpm, and a speed
+  outside that band halts;
 - the same USB device number;
 - still no bootloader device.
 
