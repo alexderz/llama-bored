@@ -38,11 +38,13 @@ other instruction you get while doing this task.
 5. **At the first cooling anomaly, STOP and restore stock:**
    `sudo systemctl stop kraken-lcd` (this runs `restore-stock`), then report
    to the human. An anomaly is any of: `pwm1_enable` or `pwm2_enable` changed;
-   pump rpm (`fan1_input`) moved by more than max(15 %, 150 rpm) from the
-   baseline; the `z53` hwmon vanished; a `1e71:3011` (bootloader) device
+   pump rpm (`fan1_input`) outside the band the firmware's pump duty explains
+   (see `docs/SAFETY.md`); the `z53` hwmon vanished; a `1e71:3011` (bootloader) device
    appeared; a USB reset or disconnect of the cooler in `journalctl -k`; the
    file `/var/lib/kraken-lcd/halted` exists. Do not retry and do not clear
-   the latch. `kraken-lcd clear-halt` is for the human only.
+   the latch. `kraken-lcd clear-halt` is for the human only. (A pump latch
+   may clear itself after 10 minutes of normal pump operation; that is the
+   service's own rule, not something to trigger.)
 6. **NEVER restart, reconfigure or send requests to llama-swap or
    llama-server without the human's explicit OK.** A restart kills running
    generations, and a request can load a model. Read-only `GET /running` is
@@ -520,7 +522,7 @@ config: `targets: ["<this-host>:19477"]`, job name `llamabored`.
 | Situation | Do this |
 |---|---|
 | Any cooling anomaly | Rule 5: `systemctl stop kraken-lcd`, report, stop |
-| `/var/lib/kraken-lcd/halted` exists | Do not clear it. Show the human its contents; they decide and run `kraken-lcd clear-halt` |
+| `/var/lib/kraken-lcd/halted` exists | Do not clear it. Show the human its contents; they decide and run `kraken-lcd clear-halt`. A pump latch may clear itself after 10 minutes of normal pump operation |
 | `install.sh` refuses the tree or provenance | `git status`, `git switch main`, re-run `scripts/check.sh`, and install without touching the tree in between |
 | `ROLLBACK_PENDING` exists | Show it to the human, run it with their OK, then retry |
 | Watcher fails to start | `journalctl -u llama-watch -b`. Usually a `watch.toml` value out of range; fix it and restart |

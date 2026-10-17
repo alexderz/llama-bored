@@ -705,8 +705,10 @@ main risk:
   writes. Tests check all three tables.
 - **Cooling guard and HALTED latch.** Every LCD operation is bracketed by
   read-only checks of the cooler's hwmon (pump mode, pump rpm against the
-  firmware's own pump duty, USB device, bootloader). Any change stops all device I/O and writes a latch file that
-  stays until an explicit root command clears it.
+  firmware's own pump duty, USB device, bootloader). Any change stops all device I/O and writes a latch file.
+  A pump-speed latch clears itself after 10 minutes of normal pump operation
+  (at most 3 times a day); any other latch stays until an explicit root
+  command clears it.
 - **Nothing writes sysfs.** The FANS panel only reads.
 - **Split privileges.** One reader with no device access; writers with no
   network and only their own device nodes. kraken-lcd's hidraw grant is
@@ -1461,7 +1463,7 @@ when it stops, so a TV drops an old entry sooner.
 | `install.sh`: "a previous install failed" | Run the rollback in `ROLLBACK_PENDING`, then retry |
 | LCD says **no data** | llama-watch is stopped or failing: `journalctl -u llama-watch` |
 | LCD says **AI down** | llama-swap is not answering at `[llama] url` |
-| LCD frozen, `journalctl -u kraken-lcd -p crit` shows `cooling guard halted` or `cooling guard latch is present` | The cooling guard tripped. Check the cooler, read `/var/lib/kraken-lcd/halted`, then `sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt` and restart kraken-lcd |
+| LCD frozen, `journalctl -u kraken-lcd -p crit` shows `cooling guard halted` or `cooling guard latch is present` | The cooling guard tripped. A pump latch (`reason=fan1_input`) clears itself after 10 minutes of normal pump operation, up to 3 times a day. Otherwise check the cooler, read `/var/lib/kraken-lcd/halted`, then `sudo /usr/local/libexec/llama-bored/kraken-lcd clear-halt` and restart kraken-lcd |
 | `show-image`: interface 0 is bound | kraken-lcd is running. Stop it first |
 | LCD or RGB stops after a replug or resume | The hidraw node got a new number; restart `kraken-lcd` or `llama-light` |
 | Gauge never passes ~50, or pegs at idle | Tune `[load] cpu_limit_w` and the idle watts; the ACTIVITY row shows the source |
