@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.6.2 — 2026-10-17
+
+Two cooling-guard fixes for false LCD halts: the pump band now covers the firmware curve hunting between two duty steps, and a pump latch clears itself after 10 minutes of normal pump operation. The desktop halt notifier is gone.
+
 ### Added
 
 - kraken-lcd clears a pump latch (`reason=fan1_input`) after 600 s of continuous normal pump operation on the monotonic clock, and records the wall time in `/var/lib/kraken-lcd/auto-cleared` before it removes the latch. The 600 s window and the 5 s gap use the monotonic clock; a wall-clock jump alone does not shorten or reset them. Time spent suspended does not count toward the 600 s, because the timing uses the monotonic clock. At most 3 automatic clears are allowed among stamps at or after the latch's own `time=` minus 24 h, including stamps later than `time=`. A latch past that limit, or one whose `time=` is missing or unparsable, stays until `clear-halt`, logs CRITICAL once, and does not age out. A latch that is already gone when the clear would be recorded is not an error and is not counted; a latch that changed is reclassified and not counted. Any other latch reason, or an unreadable or corrupt back-off file, leaves the latch in place until `clear-halt`. A monotonic gap longer than 5 s, an abnormal read, or a service restart only starts the 600 s window over. Each automatic clear logs CRITICAL with the window and the count (#158).
