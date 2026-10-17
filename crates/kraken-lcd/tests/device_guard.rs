@@ -119,8 +119,10 @@ fn pwm2_enable_change_halts_after_the_op_and_at_the_next_tick() {
 }
 
 #[test]
-fn pump_drop_of_twenty_percent_halts_after_the_op_and_at_the_next_tick() {
-    let dropped = fixture::PUMP_RPM * 80 / 100;
+fn pump_drop_below_the_envelope_halts_after_the_op_and_at_the_next_tick() {
+    // Open baseline is 1304 rpm at pwm1 89. Envelope duties [76, 102];
+    // low explained 1114, band 167 -> 947. 600 is well under.
+    let dropped = 600u32;
     let mut opened = show_ready("pump-after");
     mutate_after_baseline(&opened, move |tree| {
         std::fs::write(tree.hwmon().join("fan1_input"), format!("{dropped}\n")).expect("rpm");
@@ -294,18 +296,19 @@ fn stopped_pump_after_a_duty_step_halts() {
 
 #[test]
 fn pump_change_the_duty_does_not_explain_halts() {
+    // Envelope for 77 -> 89 is duties [64, 102]; 1127 * 102 / 77 = 1493,
+    // high edge 1716. 2800 is well above.
     let mut opened = show_ready("duty-up-overshoot");
     set_pump(&opened.tree, 1127, 77);
-    mutate_after_baseline(&opened, |tree| set_pump(tree, 1700, 89));
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 2800, 89));
     assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
     assert_halted(&mut opened, "pump far over a raised duty");
 
-    // Same rpm jump with the duty held: the band does not move.
-    let mut opened = show_ready("held-duty-jump");
-    set_pump(&opened.tree, 1127, 77);
-    mutate_after_baseline(&opened, |tree| set_pump(tree, 1298, 77));
+    let mut opened = show_ready("held-duty-full");
+    set_pump(&opened.tree, 953, 64);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 2800, 64));
     assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
-    assert_halted(&mut opened, "jump with the duty held");
+    assert_halted(&mut opened, "full speed with the duty held");
 }
 
 #[test]
@@ -323,34 +326,52 @@ fn firmware_duty_step_down_with_the_pump_following_does_not_halt() {
 }
 
 #[test]
-fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
-    // #154: firmware stepped 64 -> 77; the next read already shows 77 while
-    // the pump is still at 953, then a later baseline is still 77 / 953,
-    // then 1121 at the follow-up. The last *change* is 64, not the last read.
-    let mut opened = show_ready("prior-up");
-    set_pump(&opened.tree, 1127, 77);
-    opened
-        .lcd
-        .pace_guard()
-        .expect("one firmware step down from the open baseline");
+fn hunt_at_held_duty_does_not_halt() {
+    // 21:54: pwm1 held at 64, pump 953 -> 1115 (the unseen 77 step).
+    let mut opened = show_ready("hunt-up");
     set_pump(&opened.tree, 953, 64);
-    opened
-        .lcd
-        .pace_guard()
-        .expect("one firmware step down to 25 %");
-    set_pump(&opened.tree, 953, 77);
-    opened
-        .lcd
-        .pace_guard()
-        .expect("the change is seen; pwm1 is already 77");
-    opened
-        .lcd
-        .pace_guard()
-        .expect("a later read still at 77, pump still at 25 %");
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1115, 64));
     opened
         .lcd
         .show(&Frame::new())
-        .expect("baseline after two reads at the new duty");
+        .expect("21:54 hunt after the op");
+    opened.lcd.tick().expect("21:54 hunt at the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+
+    let mut opened = show_ready("hunt-up-tick");
+    set_pump(&opened.tree, 953, 64);
+    opened.lcd.show(&Frame::new()).expect("show");
+    set_pump(&opened.tree, 1115, 64);
+    opened.lcd.tick().expect("21:54 hunt at the next tick");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn hunt_down_at_held_duty_does_not_halt() {
+    // Mirror: pwm1 held at 77, pump 1120 -> 950.
+    let mut opened = show_ready("hunt-down");
+    set_pump(&opened.tree, 1120, 77);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 950, 77));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("hunt down after the op");
+    opened.lcd.tick().expect("hunt down at the follow-up");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
+    // #154: duty already 77, pump still at 953, then 1121 at the follow-up.
+    let mut opened = show_ready("prior-up");
+    set_pump(&opened.tree, 953, 77);
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("baseline at the new duty, pump still at 25 %");
     set_pump(&opened.tree, 1121, 77);
     opened
         .lcd
@@ -361,22 +382,11 @@ fn pump_still_ramping_to_a_duty_set_before_the_baseline_does_not_halt() {
 }
 
 #[test]
-fn two_duty_changes_use_only_the_latest() {
-    // 64 -> 77 -> 89: only 77 -> 89 steers. 1127 -> 1298 at pwm1 89 is that
-    // step; 64 -> 89 is 25 counts and would keep the fixed band (1298 is 2
-    // rpm past 1127 + 169).
+fn hunt_at_the_new_duty_after_two_steps_does_not_halt() {
+    // 64 -> 77 -> 89, then 1127 -> 1298 at pwm1 89. Envelope around 89
+    // includes one step down; 1298 is the 35 % speed.
     let mut opened = show_ready("two-changes");
-    set_pump(&opened.tree, 1127, 77);
-    opened.lcd.pace_guard().expect("89 -> 77");
-    set_pump(&opened.tree, 953, 64);
-    opened.lcd.pace_guard().expect("77 -> 64");
-    set_pump(&opened.tree, 1127, 77);
-    opened.lcd.pace_guard().expect("64 -> 77");
     set_pump(&opened.tree, 1127, 89);
-    opened
-        .lcd
-        .pace_guard()
-        .expect("77 -> 89; a later read already at 89");
     opened
         .lcd
         .show(&Frame::new())
@@ -385,14 +395,14 @@ fn two_duty_changes_use_only_the_latest() {
     opened
         .lcd
         .tick()
-        .expect("pump arrived at 35 % from the latest step");
+        .expect("pump arrived at 35 % inside the envelope");
     assert!(!opened.lcd.is_halted());
     assert!(!opened.tree.latch().exists());
 }
 
 #[test]
 fn pump_still_fast_after_a_duty_drop_before_the_baseline_does_not_halt() {
-    // Open remembered pwm1=89 at 1304 rpm. Duty already 77, pump still fast.
+    // Duty already 77, pump still fast at 1304, then 1000 at the follow-up.
     let mut opened = show_ready("prior-down");
     set_pump(&opened.tree, 1304, 77);
     opened
@@ -406,6 +416,41 @@ fn pump_still_fast_after_a_duty_drop_before_the_baseline_does_not_halt() {
         .expect("pump arrived at 30 % by the follow-up");
     assert!(!opened.lcd.is_halted());
     assert!(!opened.tree.latch().exists());
+}
+
+#[test]
+fn envelope_edge_at_held_duty_does_not_halt_and_one_past_it_halts() {
+    // 64/953: duties [51, 77], high explained 1147, band 172 -> 1319.
+    let mut opened = show_ready("envelope-in");
+    set_pump(&opened.tree, 953, 64);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1319, 64));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("just inside the high edge");
+    assert!(!opened.lcd.is_halted());
+    assert!(!opened.tree.latch().exists());
+
+    let mut opened = show_ready("envelope-out");
+    set_pump(&opened.tree, 953, 64);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 1320, 64));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "one rpm past the high edge");
+
+    let mut opened = show_ready("envelope-low-in");
+    set_pump(&opened.tree, 953, 64);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 609, 64));
+    opened
+        .lcd
+        .show(&Frame::new())
+        .expect("just inside the low edge");
+    assert!(!opened.lcd.is_halted());
+
+    let mut opened = show_ready("envelope-low-out");
+    set_pump(&opened.tree, 953, 64);
+    mutate_after_baseline(&opened, |tree| set_pump(tree, 608, 64));
+    assert_eq!(opened.lcd.show(&Frame::new()), Err(SinkError::Halted));
+    assert_halted(&mut opened, "one rpm past the low edge");
 }
 
 #[test]

@@ -1,12 +1,17 @@
-//! #147: the pump band follows the duty the firmware reports in `pwm1`.
+//! The pump band follows a one-step envelope around the compared `pwm1` duties.
 
 use kraken_lcd::device::{PUMP_DUTY_STEP_MAX, pump_band_rpm, pump_in_band};
 
+fn explained(before: u32, from: u32, duty: u32) -> u32 {
+    let n = (u64::from(before) * u64::from(duty) + u64::from(from) / 2) / u64::from(from);
+    u32::try_from(n).unwrap()
+}
+
 #[test]
-fn held_duty_keeps_the_fixed_band() {
+fn unknown_or_zero_held_duty_keeps_the_fixed_band() {
     let band = pump_band_rpm(1127);
     assert_eq!(band, 169);
-    for duty in [Some(77), None, Some(0)] {
+    for duty in [None, Some(0)] {
         assert!(pump_in_band(1127, 1127 + band, duty, duty), "{duty:?}");
         assert!(!pump_in_band(1127, 1127 + band + 1, duty, duty), "{duty:?}");
         assert!(pump_in_band(1127, 1127 - band, duty, duty), "{duty:?}");
@@ -15,21 +20,24 @@ fn held_duty_keeps_the_fixed_band() {
 }
 
 #[test]
-fn the_logged_halt_is_inside_the_band_now() {
-    assert!(!pump_in_band(1127, 1298, Some(77), Some(77)));
+fn the_logged_halt_and_the_hunt_are_in_band() {
+    assert!(pump_in_band(1127, 1298, Some(77), Some(77)));
     assert!(pump_in_band(1127, 1298, Some(77), Some(89)));
     assert!(pump_in_band(1298, 1127, Some(89), Some(77)));
 }
 
 #[test]
-fn range_runs_from_the_old_speed_to_the_scaled_one() {
-    // 1127 * 89 / 77 = 1302.6 -> 1303; band at that end is 195.
-    let high = 1303 + pump_band_rpm(1303);
-    assert!(pump_in_band(1127, high, Some(77), Some(89)));
-    assert!(!pump_in_band(1127, high + 1, Some(77), Some(89)));
-    let low = 1127 - pump_band_rpm(1127);
-    assert!(pump_in_band(1127, low, Some(77), Some(89)));
-    assert!(!pump_in_band(1127, low - 1, Some(77), Some(89)));
+fn envelope_runs_from_one_step_below_to_one_step_above() {
+    // 77 -> 89: duties [64, 102]. 1127 * 64 / 77 = 937; 1127 * 102 / 77 = 1493.
+    let low = explained(1127, 77, 64);
+    let high = explained(1127, 77, 102);
+    assert_eq!((low, high), (937, 1493));
+    let low_edge = low - pump_band_rpm(low);
+    let high_edge = high + pump_band_rpm(high);
+    assert!(pump_in_band(1127, high_edge, Some(77), Some(89)));
+    assert!(!pump_in_band(1127, high_edge + 1, Some(77), Some(89)));
+    assert!(pump_in_band(1127, low_edge, Some(77), Some(89)));
+    assert!(!pump_in_band(1127, low_edge - 1, Some(77), Some(89)));
     assert!(!pump_in_band(1127, 0, Some(77), Some(89)));
 }
 
@@ -59,13 +67,17 @@ fn extreme_values_do_not_overflow() {
 }
 
 #[test]
-fn a_duty_drop_widens_the_band_downward() {
-    // 1304 * 77 / 89 = 1128; low edge 1128 - 169 = 959. The fixed band alone
-    // would stop at 1304 - 195 = 1109.
+fn a_duty_drop_widens_the_envelope_downward() {
+    // 89 -> 77: duties [64, 102]. 1304 * 64 / 89 = 938; low edge 788.
+    // The fixed band alone would stop at 1304 - 195 = 1109.
+    let low = explained(1304, 89, 64);
+    assert_eq!(low, 938);
+    let low_edge = low - pump_band_rpm(low);
     assert!(pump_in_band(1304, 1000, Some(89), Some(77)));
-    assert!(pump_in_band(1304, 959, Some(89), Some(77)));
-    assert!(!pump_in_band(1304, 958, Some(89), Some(77)));
-    assert!(!pump_in_band(1304, 1000, Some(89), Some(89)));
+    assert!(pump_in_band(1304, low_edge, Some(89), Some(77)));
+    assert!(!pump_in_band(1304, low_edge - 1, Some(89), Some(77)));
+    // Held 89 is the same hunt: 1000 is inside duties [76, 102].
+    assert!(pump_in_band(1304, 1000, Some(89), Some(89)));
 }
 
 #[test]
@@ -105,6 +117,7 @@ fn every_five_point_firmware_step_follows() {
         );
     }
     // The step one quantum below #147: 25 -> 30 %, pump about 937 -> 1127.
-    assert!(!pump_in_band(937, 1127, Some(64), Some(64)));
+    // Held 64 is the same hunt as 21:54.
+    assert!(pump_in_band(937, 1127, Some(64), Some(64)));
     assert!(pump_in_band(937, 1127, Some(64), Some(77)));
 }
