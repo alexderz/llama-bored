@@ -263,6 +263,7 @@ fn run<S: LcdSink + Clone + 'static>(
         open: move || Ok(lcd.clone()),
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     })
 }
 
@@ -1187,6 +1188,7 @@ fn bootloader_in_stream_sends_nothing() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert!(opened.get(), "bootloader is detected at open");
@@ -1219,6 +1221,7 @@ fn latch_at_start_skips_stream_open() {
         },
         assets: &mut assets,
         latch_at_start: true,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert!(!opened.get(), "a present latch does not open the device");

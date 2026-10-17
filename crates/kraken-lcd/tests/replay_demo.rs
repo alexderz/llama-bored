@@ -218,6 +218,7 @@ fn replay_recorded_snapshots() {
         open: move || Ok(dump.clone()),
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     println!("frames: {}", count.borrow());
 }

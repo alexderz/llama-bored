@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- kraken-lcd clears a pump latch (`reason=fan1_input`) after 600 s of continuous normal pump operation, and records the time in `/var/lib/kraken-lcd/auto-cleared` before it removes the latch. At most 3 automatic clears count in any 24 h. Any other latch reason, a gap longer than 5 s, an abnormal read, a restart, or an unreadable back-off file leaves the latch in place until `clear-halt`. Each automatic clear logs CRITICAL with the window and the count (#158).
+
 ### Fixed
 
 - kraken-lcd's cooling guard accepts a pump speed explained by any duty within one firmware step (13 `pwm1` counts) of the duties on the baseline and the check (both non-zero and at most 13 apart; low end clamped at 1), plus the usual ±15 % / 150 rpm band. A hunt that steps up and back between two reads (2026-10-15 21:54: pwm1 held at 64, pump 953 → 1115) no longer latches. The envelope applies on every check, so at 64/953 with the duty held the lowest accepted rpm is 609 (about −36 %), where it was 803. A stopped pump still always latches; a speed no duty in that envelope explains still halts, and a missing, zero, or more-than-13-count duty jump keeps the fixed band around the baseline rpm. The #154 5 s duty-change memory is gone: the envelope covers those cases from the two compared duties alone (#156).

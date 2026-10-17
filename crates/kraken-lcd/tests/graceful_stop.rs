@@ -220,6 +220,7 @@ fn run(config: &ValidConfig, lcd: &StopDuringUpload, log: &Lines) -> LoopExit {
         open: move || Ok(sink.clone()),
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     })
 }
 
