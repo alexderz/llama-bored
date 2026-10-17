@@ -280,6 +280,7 @@ fn fresh_then_stale_restores_stock_once_then_forces_the_next_slot() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(
         exit,
@@ -349,6 +350,7 @@ fn halted_watch_down_sends_nothing() {
         },
         assets: &mut assets,
         latch_at_start: true,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -400,6 +402,7 @@ fn restore_cap_still_uploads_no_data_until_the_next_show_liquid() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     let times = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
@@ -490,6 +493,7 @@ fn external_latch_halts_before_the_follow_up() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -533,6 +537,7 @@ fn bootloader_watch_down_sends_no_show_liquid() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert_eq!(

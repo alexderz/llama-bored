@@ -29,10 +29,14 @@ pub fn z53_exists(sys_root: &Path) -> bool {
 use thiserror::Error;
 
 pub use bulk::{BulkLink, BulkPort, NoBulk};
-pub(crate) use guard::follow_up_due;
+pub(crate) use guard::{
+    AutoClearLog, PumpBaseline, follow_up_due, halt_read_is_normal, parse_pump_latch,
+    read_auto_clears, read_halt_cooling, read_latch, remove_latch, store_auto_clears,
+};
 pub use guard::{
-    CoolingSnapshot, Deviation, PUMP_BAND_FLOOR_RPM, PUMP_BAND_PERCENT, PUMP_DUTY_STEP_MAX,
-    pump_band_rpm, pump_in_band,
+    CoolingSnapshot, Deviation, PUMP_AUTO_CLEARED_FILE, PUMP_BAND_FLOOR_RPM, PUMP_BAND_PERCENT,
+    PUMP_DUTY_STEP_MAX, PUMP_LATCH_CLEAR_AFTER, PUMP_LATCH_CLEAR_LIMIT, PUMP_LATCH_CLEAR_WINDOW,
+    PUMP_LATCH_MAX_GAP, pump_band_rpm, pump_in_band,
 };
 pub use hid::{HidLink, HidPort};
 pub(crate) use sysfs::read_coolant_c;

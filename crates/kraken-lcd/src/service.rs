@@ -1,15 +1,18 @@
 //! Main loop, state machine, start-up self-checks, and sd-notify.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sd_notify::NotifyState;
 use thiserror::Error;
 
 use crate::config::{Config, InvalidConfig, UploadMode, ValidConfig};
 use crate::device::{
-    HidPort, KrakenLcd, LcdSink, NoBulk, OpenRequest, PortError, STATE_DIR, SYS_ROOT, SinkError,
-    UploadFailed, open_resolved_hid,
+    AutoClearLog, CoolingSnapshot, HidPort, KrakenLcd, LcdSink, NoBulk, OpenRequest,
+    PUMP_LATCH_CLEAR_AFTER, PUMP_LATCH_CLEAR_LIMIT, PUMP_LATCH_CLEAR_WINDOW, PUMP_LATCH_MAX_GAP,
+    PortError, PumpBaseline, STATE_DIR, SYS_ROOT, SinkError, UploadFailed, halt_read_is_normal,
+    open_resolved_hid, parse_pump_latch, read_auto_clears, read_halt_cooling, read_latch,
+    remove_latch, store_auto_clears,
 };
 use crate::history::History;
 use crate::log::{self, Priority};
@@ -198,6 +201,53 @@ pub trait Clock {
     fn sleep(&mut self, d: Duration);
 }
 
+/// Halted-phase cooling reads. Production reads sysfs. Tests script snapshots.
+pub trait HaltWatch {
+    /// Directory that holds the latch and the automatic-clear record.
+    fn state_dir(&self) -> &Path;
+    /// One read-only cooling snapshot. `None` is an abnormal read.
+    fn read_cooling(&mut self) -> Option<CoolingSnapshot>;
+}
+
+impl<H: HaltWatch + ?Sized> HaltWatch for &mut H {
+    fn state_dir(&self) -> &Path {
+        (**self).state_dir()
+    }
+
+    fn read_cooling(&mut self) -> Option<CoolingSnapshot> {
+        (**self).read_cooling()
+    }
+}
+
+/// Tests that never watch a halted pump. The state directory does not exist,
+/// so a latch found at start stays collect-only.
+pub struct NoHaltWatch;
+
+impl HaltWatch for NoHaltWatch {
+    fn state_dir(&self) -> &Path {
+        Path::new("/var/empty/kraken-lcd/no-halt-watch")
+    }
+
+    fn read_cooling(&mut self) -> Option<CoolingSnapshot> {
+        None
+    }
+}
+
+struct SysfsHalt {
+    sys_root: PathBuf,
+    state_dir: PathBuf,
+}
+
+impl HaltWatch for SysfsHalt {
+    fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn read_cooling(&mut self) -> Option<CoolingSnapshot> {
+        Some(read_halt_cooling(&self.sys_root))
+    }
+}
+
 impl<C: Clock + ?Sized> Clock for &mut C {
     fn mono(&self) -> Instant {
         (**self).mono()
@@ -367,7 +417,7 @@ impl LoopExit {
 }
 
 /// Inputs for [`run_loop`]. Production and tests share this path.
-pub struct LoopInput<'a, Samp, Clk, Ntf, Stp, Lg, Op> {
+pub struct LoopInput<'a, Samp, Clk, Ntf, Stp, Lg, Op, Halt> {
     /// Validated config. The loop does not re-validate.
     pub config: &'a ValidConfig,
     /// Collector or a scripted sampler.
@@ -386,6 +436,9 @@ pub struct LoopInput<'a, Samp, Clk, Ntf, Stp, Lg, Op> {
     pub assets: &'a mut Assets,
     /// Latch was present before the first open. Skips all device I/O.
     pub latch_at_start: bool,
+    /// Cooling reads while [`Phase::Halted`] is a pump latch. Production is
+    /// [`SysfsHalt`]. Tests that never halt pass [`NoHaltWatch`].
+    pub halt: Halt,
 }
 
 #[derive(Clone, Copy)]
@@ -398,8 +451,8 @@ enum Phase {
 }
 
 /// Main loop. `READY=1` is sent here; start-up checks happen before the call.
-pub fn run_loop<S, Samp, Clk, Ntf, Stp, Lg, Op>(
-    mut input: LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
+pub fn run_loop<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    mut input: LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
 ) -> LoopExit
 where
     S: LcdSink,
@@ -409,6 +462,7 @@ where
     Stp: Stop,
     Lg: log::Sink,
     Op: FnMut() -> Result<S, SinkError>,
+    Halt: HaltWatch,
 {
     input.notify.ready();
     let tick = tick_duration(input.config.writer.tick_s);
@@ -444,6 +498,7 @@ where
         } else {
             Phase::Opening
         },
+        pump_clear: PumpClear::Idle,
     };
     let mut prev_view: Option<View> = None;
     let stock_after = Duration::from_secs(input.config.snapshot.watch_down_stock_after_s);
@@ -494,6 +549,11 @@ where
         state.history.add(snap.t_mono, snap.load);
         let view = presented_view(&snap, &state.history, &prev_view, input.config, streaming);
         prev_view = Some(view.clone());
+
+        if matches!(state.phase, Phase::Halted) && pump_ready(&mut input, &mut state, wall) {
+            state.phase = Phase::Opening;
+            state.pump_clear = PumpClear::Idle;
+        }
 
         let opened = match state.phase {
             Phase::Halted | Phase::Bootloader => TickDev::Continue,
@@ -624,6 +684,8 @@ struct LoopState<S> {
     /// open. Cleared by the first success and by the first failure after it.
     grace_until: Option<Instant>,
     phase: Phase,
+    /// Pump-latch auto-clear for the current halted episode.
+    pump_clear: PumpClear,
 }
 
 fn note_operation<S>(state: &mut LoopState<S>, now: Instant) {
@@ -631,8 +693,8 @@ fn note_operation<S>(state: &mut LoopState<S>, now: Instant) {
     state.follow_up_pending = true;
 }
 
-fn try_open<S, Samp, Clk, Ntf, Stp, Lg, Op>(
-    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
+fn try_open<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
     state: &mut LoopState<S>,
     now: Instant,
 ) -> TickDev
@@ -709,8 +771,8 @@ fn next_stream_retry(last: Option<Duration>) -> Duration {
     })
 }
 
-fn stream_frame<S, Samp, Clk, Ntf, Stp, Lg, Op>(
-    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
+fn stream_frame<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
     state: &mut LoopState<S>,
     view: &View,
     now: Instant,
@@ -833,8 +895,8 @@ where
     }
 }
 
-fn stream_guard<S, Samp, Clk, Ntf, Stp, Lg, Op>(
-    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
+fn stream_guard<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
     state: &mut LoopState<S>,
     now: Instant,
 ) -> TickDev
@@ -871,8 +933,8 @@ where
     }
 }
 
-fn ours_tick<S, Samp, Clk, Ntf, Stp, Lg, Op>(
-    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op>,
+fn ours_tick<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
     state: &mut LoopState<S>,
     view: &View,
     now: Instant,
@@ -1062,6 +1124,181 @@ fn enter_halt<S>(state: &mut LoopState<S>, log: &mut impl log::Sink) {
     crit(log, "cooling guard halted; collect only");
     state.sink = None;
     state.phase = Phase::Halted;
+    state.pump_clear = PumpClear::Idle;
+}
+
+enum PumpClear {
+    /// The latch file has not been classified for this halted episode.
+    Idle,
+    /// Not a pump latch, or the file cannot be read. Never auto-clear.
+    Never,
+    /// A pump latch. The window lives only in this process.
+    Watch(PumpWindow),
+}
+
+struct PumpWindow {
+    dir: PathBuf,
+    baseline: PumpBaseline,
+    previous: Option<CoolingSnapshot>,
+    previous_at: Option<SystemTime>,
+    window_at: Option<SystemTime>,
+    blocked: bool,
+    logged_bad: bool,
+}
+
+fn pump_ready<S, Samp, Clk, Ntf, Stp, Lg, Op, Halt>(
+    input: &mut LoopInput<'_, Samp, Clk, Ntf, Stp, Lg, Op, Halt>,
+    state: &mut LoopState<S>,
+    now: SystemTime,
+) -> bool
+where
+    Halt: HaltWatch,
+    Lg: log::Sink,
+{
+    if matches!(state.pump_clear, PumpClear::Idle) {
+        let dir = input.halt.state_dir().to_path_buf();
+        state.pump_clear = classify_latch(&dir);
+        if let PumpClear::Watch(window) = &mut state.pump_clear
+            && matches!(read_auto_clears(&window.dir), AutoClearLog::Bad)
+        {
+            note_bad_clear(window, &mut input.log);
+        }
+    }
+    let PumpClear::Watch(window) = &mut state.pump_clear else {
+        return false;
+    };
+    if window.blocked {
+        return false;
+    }
+    let snap = input.halt.read_cooling();
+    observe_pump(window, snap, now, &mut input.log)
+}
+
+fn classify_latch(dir: &Path) -> PumpClear {
+    let Ok(text) = read_latch(dir) else {
+        return PumpClear::Never;
+    };
+    match parse_pump_latch(&text) {
+        Some(baseline) => PumpClear::Watch(PumpWindow {
+            dir: dir.to_path_buf(),
+            baseline,
+            previous: None,
+            previous_at: None,
+            window_at: None,
+            blocked: false,
+            logged_bad: false,
+        }),
+        None => PumpClear::Never,
+    }
+}
+
+fn observe_pump(
+    window: &mut PumpWindow,
+    snap: Option<CoolingSnapshot>,
+    now: SystemTime,
+    log: &mut impl log::Sink,
+) -> bool {
+    let Some(current) = snap else {
+        window.previous = None;
+        window.previous_at = Some(now);
+        window.window_at = None;
+        return false;
+    };
+    let gapped = window
+        .previous_at
+        .is_some_and(|previous| gap_breaks(previous, now));
+    let normal = halt_read_is_normal(&window.baseline, window.previous.as_ref(), &current);
+    window.previous = Some(current);
+    window.previous_at = Some(now);
+    if !normal {
+        window.window_at = None;
+        return false;
+    }
+    if gapped || window.window_at.is_none() {
+        window.window_at = Some(now);
+        return false;
+    }
+    let start = window.window_at.unwrap_or(now);
+    let Ok(elapsed) = now.duration_since(start) else {
+        window.window_at = Some(now);
+        return false;
+    };
+    if elapsed < PUMP_LATCH_CLEAR_AFTER {
+        return false;
+    }
+    commit_clear(window, now, log)
+}
+
+fn commit_clear(window: &mut PumpWindow, now: SystemTime, log: &mut impl log::Sink) -> bool {
+    let AutoClearLog::Times(times) = read_auto_clears(&window.dir) else {
+        note_bad_clear(window, log);
+        return false;
+    };
+    let mut recent: Vec<u64> = times
+        .into_iter()
+        .filter(|stamped| in_clear_window(*stamped, now))
+        .collect();
+    if recent.len() >= PUMP_LATCH_CLEAR_LIMIT {
+        return false;
+    }
+    let Ok(unix) = now.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    recent.push(unix.as_secs());
+    if store_auto_clears(&window.dir, &recent).is_err() {
+        note_bad_clear(window, log);
+        return false;
+    }
+    if remove_latch(&window.dir).is_err() {
+        if !window.logged_bad {
+            crit(
+                log,
+                "cooling guard auto-clear recorded the clear but could not remove the latch",
+            );
+            window.logged_bad = true;
+        }
+        window.blocked = true;
+        return false;
+    }
+    let after_s = PUMP_LATCH_CLEAR_AFTER.as_secs();
+    let count = recent.len();
+    let limit = PUMP_LATCH_CLEAR_LIMIT;
+    let hours = PUMP_LATCH_CLEAR_WINDOW.as_secs() / 3600;
+    crit(
+        log,
+        &format!(
+            "cooling guard latch cleared after {after_s} s of normal pump operation (auto-clear {count} of {limit} in {hours} h)"
+        ),
+    );
+    true
+}
+
+fn note_bad_clear(window: &mut PumpWindow, log: &mut impl log::Sink) {
+    if !window.logged_bad {
+        crit(
+            log,
+            "cooling guard auto-clear state is unreadable or corrupt; not clearing the pump latch",
+        );
+        window.logged_bad = true;
+    }
+    window.blocked = true;
+}
+
+fn gap_breaks(previous: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(previous) {
+        Ok(gap) => gap > PUMP_LATCH_MAX_GAP,
+        Err(_) => true,
+    }
+}
+
+fn in_clear_window(stamped: u64, now: SystemTime) -> bool {
+    let Some(stamped_at) = UNIX_EPOCH.checked_add(Duration::from_secs(stamped)) else {
+        return true;
+    };
+    match now.duration_since(stamped_at) {
+        Ok(age) => age <= PUMP_LATCH_CLEAR_WINDOW,
+        Err(_) => true,
+    }
 }
 
 fn crit(log: &mut impl log::Sink, message: &str) {
@@ -1094,6 +1331,10 @@ pub fn run(config_path: &Path, trace_hid: bool) -> i32 {
     let mut reader = SnapshotReader::open(Duration::from_secs_f64(config.snapshot.stale_after_s));
     let mut clock = RealClock;
     let mut notify = SdNotify;
+    let mut halt = SysfsHalt {
+        sys_root: env.sys_root.clone(),
+        state_dir: env.state_dir.clone(),
+    };
     run_loop(LoopInput {
         config: &config,
         sampler: &mut reader,
@@ -1104,6 +1345,7 @@ pub fn run(config_path: &Path, trace_hid: bool) -> i32 {
         open: || KrakenLcd::connect(rotate, trace_hid),
         assets: &mut assets,
         latch_at_start: latch,
+        halt: &mut halt,
     })
     .code()
 }
@@ -1249,6 +1491,27 @@ mod tests {
         let t1 = t0 + Duration::from_secs(7);
         assert_eq!(wall_delta(t0, t1, tick), Duration::from_secs(7));
         assert_eq!(wall_delta(t1, t0, tick), tick);
+    }
+
+    #[test]
+    fn in_clear_window_includes_the_24h_mark_and_excludes_older() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let now_unix = 1_700_000_000u64;
+        assert!(in_clear_window(now_unix - 24 * 60 * 60, now));
+        assert!(!in_clear_window(now_unix - 24 * 60 * 60 - 1, now));
+        assert!(in_clear_window(now_unix + 10, now));
+        assert!(in_clear_window(u64::MAX, now));
+    }
+
+    #[test]
+    fn gap_of_five_seconds_holds_and_one_nanosecond_more_restarts() {
+        let start = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert!(!gap_breaks(start, start + PUMP_LATCH_MAX_GAP));
+        assert!(gap_breaks(
+            start,
+            start + PUMP_LATCH_MAX_GAP + Duration::from_nanos(1)
+        ));
+        assert!(gap_breaks(start, start - Duration::from_secs(1)));
     }
 
     #[test]

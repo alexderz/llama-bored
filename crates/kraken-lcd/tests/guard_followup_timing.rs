@@ -181,6 +181,7 @@ fn follow_up_runs_at_the_first_tick_at_least_two_seconds_later() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     let seen = ticks.lock().unwrap_or_else(|err| err.into_inner()).clone();
     assert_eq!(

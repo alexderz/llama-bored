@@ -7,7 +7,7 @@
 //! calls. This text scan does not see them. The unit's kernel sandbox
 //! (`ProtectSystem`, `ProcSubset`, `PrivateNetwork`) is the backstop.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -118,9 +118,15 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("config.rs", "struct", "ValidConfig"),
     ("config.rs", "struct", "Writer"),
     ("device/guard.rs", "const", "FOLLOW_UP_AFTER"),
+    ("device/guard.rs", "const", "PUMP_AUTO_CLEARED_FILE"),
     ("device/guard.rs", "const", "PUMP_BAND_FLOOR_RPM"),
     ("device/guard.rs", "const", "PUMP_BAND_PERCENT"),
     ("device/guard.rs", "const", "PUMP_DUTY_STEP_MAX"),
+    ("device/guard.rs", "const", "PUMP_LATCH_CLEAR_AFTER"),
+    ("device/guard.rs", "const", "PUMP_LATCH_CLEAR_LIMIT"),
+    ("device/guard.rs", "const", "PUMP_LATCH_CLEAR_WINDOW"),
+    ("device/guard.rs", "const", "PUMP_LATCH_MAX_GAP"),
+    ("device/guard.rs", "enum", "AutoClearLog"),
     ("device/guard.rs", "enum", "Deviation"),
     ("device/guard.rs", "field", "CoolingSnapshot.bootloader"),
     ("device/guard.rs", "field", "CoolingSnapshot.devnum"),
@@ -139,14 +145,22 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("device/guard.rs", "fn", "find_z53"),
     ("device/guard.rs", "fn", "follow_up_due"),
     ("device/guard.rs", "fn", "format_halt"),
+    ("device/guard.rs", "fn", "halt_read_is_normal"),
     ("device/guard.rs", "fn", "log_halt"),
+    ("device/guard.rs", "fn", "parse_pump_latch"),
     ("device/guard.rs", "fn", "pump_band_rpm"),
     ("device/guard.rs", "fn", "pump_in_band"),
+    ("device/guard.rs", "fn", "read_auto_clears"),
+    ("device/guard.rs", "fn", "read_halt_cooling"),
+    ("device/guard.rs", "fn", "read_latch"),
+    ("device/guard.rs", "fn", "remove_latch"),
+    ("device/guard.rs", "fn", "store_auto_clears"),
     // exception: W_OK probe for show-image pre-flight; path is the state dir.
     // Call sites are fenced to device/ (state_dir_writable_hits).
     ("device/guard.rs", "fn", "state_dir_writable"),
     ("device/guard.rs", "struct", "CoolingGuard"),
     ("device/guard.rs", "struct", "CoolingSnapshot"),
+    ("device/guard.rs", "struct", "PumpBaseline"),
     ("device/hid.rs", "const", "REPLY_BUDGET"),
     ("device/hid.rs", "const", "REPLY_LIMIT"),
     ("device/hid.rs", "enum", "ExchangeError"),
@@ -190,6 +204,7 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("service.rs", "field", "LoopInput.assets"),
     ("service.rs", "field", "LoopInput.clock"),
     ("service.rs", "field", "LoopInput.config"),
+    ("service.rs", "field", "LoopInput.halt"),
     ("service.rs", "field", "LoopInput.latch_at_start"),
     ("service.rs", "field", "LoopInput.log"),
     ("service.rs", "field", "LoopInput.notify"),
@@ -215,6 +230,9 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("service.rs", "fn", "wall_jump_limit"),
     ("service.rs", "fn", "z53_exists"),
     ("service.rs", "impl", "Clock for &mut C"),
+    ("service.rs", "impl", "HaltWatch for &mut H"),
+    ("service.rs", "impl", "HaltWatch for NoHaltWatch"),
+    ("service.rs", "impl", "HaltWatch for SysfsHalt"),
     ("service.rs", "impl", "Clock for RealClock"),
     ("service.rs", "impl", "Notifier for &mut N"),
     ("service.rs", "impl", "Notifier for SdNotify"),
@@ -225,14 +243,18 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("service.rs", "struct", "CheckEnv"),
     ("service.rs", "struct", "LoopInput"),
     ("service.rs", "struct", "NeverStop"),
+    ("service.rs", "struct", "NoHaltWatch"),
     ("service.rs", "struct", "RealClock"),
     ("service.rs", "struct", "SdNotify"),
     ("service.rs", "struct", "StopFlag"),
     ("service.rs", "trait", "Clock"),
+    ("service.rs", "trait", "HaltWatch"),
     ("service.rs", "trait", "Notifier"),
     ("service.rs", "trait", "Sampler"),
     ("service.rs", "trait", "Stop"),
     ("service.rs", "trait_fn", "Clock::mono"),
+    ("service.rs", "trait_fn", "HaltWatch::read_cooling"),
+    ("service.rs", "trait_fn", "HaltWatch::state_dir"),
     ("service.rs", "trait_fn", "Clock::sleep"),
     ("service.rs", "trait_fn", "Clock::wall"),
     ("service.rs", "trait_fn", "Notifier::ready"),
@@ -1445,6 +1467,69 @@ fn writer_source_passes_s11_and_the_file_set_is_non_empty() {
     assert!(
         saw_constant,
         "the snapshot path must appear as llama_core::wire::SNAPSHOT_PATH"
+    );
+}
+
+/// `remove_file` of the latch stays in `clear_halt_at` and in `remove_latch`.
+/// `join("halted")` stays on those paths plus the existing presence checks
+/// and the auto-clear read of the latch body.
+#[test]
+fn pump_auto_clear_is_the_only_new_latch_removal() {
+    let src = writer_src();
+    let mut removals = Vec::new();
+    let mut joins = BTreeMap::<String, usize>::new();
+    for rel in rs_rels(&src) {
+        let text = fs::read_to_string(src.join(&rel)).unwrap_or_else(|err| panic!("{rel}: {err}"));
+        let code = strip_cfg_test(&strip_comments(&text));
+        let mut search = code.as_str();
+        let mut base = 0usize;
+        while let Some(at) = search.find("remove_file") {
+            let abs = base + at;
+            if ident_boundary(&code, abs, "remove_file".len()) {
+                removals.push((rel.clone(), enclosing_fn_name(&code, abs)));
+            }
+            let next = at + "remove_file".len();
+            base += next;
+            search = &search[next..];
+        }
+        let n = code.matches("join(\"halted\")").count();
+        if n > 0 {
+            joins.insert(rel.clone(), n);
+        }
+        if rel == "service.rs" {
+            assert!(
+                !code.contains("OpenOptions"),
+                "service.rs must not gain a write of the latch or the auto-clear record"
+            );
+            assert!(
+                !code.contains("remove_file"),
+                "service.rs must not remove the latch"
+            );
+        }
+    }
+    removals.sort();
+    assert_eq!(
+        removals,
+        vec![
+            ("device/guard.rs".to_owned(), "remove_latch".to_owned()),
+            ("main.rs".to_owned(), "clear_halt_at".to_owned()),
+        ],
+        "latch removal must stay these two functions"
+    );
+    assert_eq!(
+        joins.get("device/guard.rs").copied(),
+        Some(4),
+        "guard.rs join(\"halted\"): presence, write, read, remove"
+    );
+    assert_eq!(
+        joins.get("service.rs").copied(),
+        Some(2),
+        "service.rs join(\"halted\"): latch_present and halt_latch_path"
+    );
+    assert_eq!(
+        joins.len(),
+        2,
+        "no other file may join the latch: {joins:?}"
     );
 }
 
@@ -4002,6 +4087,78 @@ fn push_char_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &
             }
         }
     }
+}
+
+fn ident_boundary(code: &str, at: usize, len: usize) -> bool {
+    let chars: Vec<char> = code.chars().collect();
+    let mut byte = 0usize;
+    let mut index = 0usize;
+    while index < chars.len() && byte < at {
+        byte += chars[index].len_utf8();
+        index += 1;
+    }
+    if byte != at {
+        return false;
+    }
+    let before_ok = index == 0 || !is_ident_continue(chars[index - 1]);
+    let end = index + len;
+    let after_ok = end >= chars.len() || !is_ident_continue(chars[end]);
+    before_ok && after_ok
+}
+
+fn enclosing_fn_name(code: &str, at: usize) -> String {
+    let head = &code[..at];
+    let fn_at = head
+        .rfind("fn ")
+        .unwrap_or_else(|| panic!("no fn before {at}"));
+    let rest = &head[fn_at + 3..];
+    rest.chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect()
+}
+
+fn strip_cfg_test(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    const MARK: &str = "#[cfg(test)]";
+    while let Some(at) = rest.find(MARK) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + MARK.len()..];
+        let trimmed = after.trim_start();
+        if let Some(end) = cfg_test_item_end(trimmed) {
+            rest = &trimmed[end..];
+            continue;
+        }
+        out.push_str(MARK);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn cfg_test_item_end(trimmed: &str) -> Option<usize> {
+    let item = trimmed.trim_start_matches(|ch: char| ch == '#' || ch.is_whitespace());
+    let skipped = trimmed.len() - item.len();
+    if item.starts_with("use ") {
+        let end = item.find(';')?;
+        return Some(skipped + end + 1);
+    }
+    if !(item.starts_with("mod ")
+        || item.starts_with("fn ")
+        || item.starts_with("impl ")
+        || item.starts_with("struct ")
+        || item.starts_with("enum ")
+        || item.starts_with("const ")
+        || item.starts_with("static "))
+    {
+        return None;
+    }
+    if let Some(brace) = item.find('{') {
+        let end = matching_brace(item, brace)?;
+        return Some(skipped + end + 1);
+    }
+    let end = item.find(';')?;
+    Some(skipped + end + 1)
 }
 
 fn matching_brace(code: &str, open: usize) -> Option<usize> {

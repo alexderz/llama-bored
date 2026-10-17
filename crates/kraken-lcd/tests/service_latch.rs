@@ -213,6 +213,7 @@ fn run_collect_only(
         },
         assets: &mut assets,
         latch_at_start: true,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     (exit, opens)
 }

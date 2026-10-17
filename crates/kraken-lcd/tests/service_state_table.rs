@@ -360,6 +360,7 @@ impl Harness {
             open: || opens.open(),
             assets: &mut assets,
             latch_at_start: latch,
+            halt: kraken_lcd::service::NoHaltWatch,
         });
         Ok(exit)
     }
@@ -519,6 +520,7 @@ fn cooling_guard_deviation_halts() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert_eq!(liquid_count(&h.lcd), 0, "HALTED never sends ShowLiquid");
@@ -651,6 +653,7 @@ fn wall_clock_jump_detaches() {
         open: || opens.open(),
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     assert!(
@@ -710,6 +713,7 @@ fn run_clock_shift(
         open: || opens.open(),
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     })
 }
 
@@ -889,6 +893,7 @@ fn run_jumping(h: &mut Harness, ticks: u32, latch: bool, amount: Duration, hold:
         open: || opens.open(),
         assets: &mut assets,
         latch_at_start: latch,
+        halt: kraken_lcd::service::NoHaltWatch,
     })
 }
 
@@ -960,6 +965,7 @@ fn failed_uploads_are_rate_limited_over_ten_minutes() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Restored);
     let attempts = shows.load(std::sync::atomic::Ordering::Relaxed);

@@ -1,5 +1,9 @@
 //! Read-only cooling baseline. A deviation latches and stops device I/O.
 //!
+//! A pump latch (`reason=fan1_input`) can clear itself after
+//! [`PUMP_LATCH_CLEAR_AFTER`] of normal pump reads, at most
+//! [`PUMP_LATCH_CLEAR_LIMIT`] times per [`PUMP_LATCH_CLEAR_WINDOW`].
+//!
 //! `pwm1` and `pwm2` are copied into the snapshot for the log. Neither is
 //! compared on its own: the firmware curve moves them while the enable files
 //! stay put. `pwm1` (the pump duty) only steers the pump band: a speed
@@ -47,6 +51,26 @@ pub const PUMP_BAND_FLOOR_RPM: u32 = 150;
 /// band. A bigger jump between the two reads is not that curve, so the
 /// fixed band applies and a pump that does not keep its speed halts.
 pub const PUMP_DUTY_STEP_MAX: u32 = 13;
+
+/// Continuous normal pump reads that clear a pump latch (`reason=fan1_input`).
+///
+/// The window is wall time. A service restart starts it over.
+pub const PUMP_LATCH_CLEAR_AFTER: Duration = Duration::from_secs(600);
+
+/// A longer gap between halted cooling reads restarts the clear window.
+///
+/// A service tick is at most 2 s, so a tick on time stays inside the window.
+/// A stall or a suspend, which moves the wall clock, does not.
+pub const PUMP_LATCH_MAX_GAP: Duration = Duration::from_secs(5);
+
+/// Automatic clears allowed inside [`PUMP_LATCH_CLEAR_WINDOW`].
+pub const PUMP_LATCH_CLEAR_LIMIT: usize = 3;
+
+/// How far back an automatic clear still counts toward [`PUMP_LATCH_CLEAR_LIMIT`].
+pub const PUMP_LATCH_CLEAR_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// State file of recent automatic-clear unix times, beside the latch.
+pub const PUMP_AUTO_CLEARED_FILE: &str = "auto-cleared";
 
 /// Why a later snapshot does not match the baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,27 +238,7 @@ impl CoolingGuard {
 
     pub(crate) fn read(&self) -> CoolingSnapshot {
         let root = self.sys_root.canonicalize().ok();
-        let z53 = root.as_deref().and_then(find_z53);
-        let bootloader = root
-            .as_deref()
-            .and_then(|root| sysfs::bootloader_present_at(root).ok())
-            .unwrap_or(true);
-        CoolingSnapshot {
-            z53: z53.is_some(),
-            pwm1_enable: z53
-                .as_deref()
-                .and_then(|dir| read_u32(&dir.join("pwm1_enable"))),
-            pwm2_enable: z53
-                .as_deref()
-                .and_then(|dir| read_u32(&dir.join("pwm2_enable"))),
-            pwm1: z53.as_deref().and_then(|dir| read_u32(&dir.join("pwm1"))),
-            pwm2: z53.as_deref().and_then(|dir| read_u32(&dir.join("pwm2"))),
-            fan1_rpm: z53
-                .as_deref()
-                .and_then(|dir| read_u32(&dir.join("fan1_input"))),
-            devnum: read_u32(&self.device_dir.join("devnum")),
-            bootloader,
-        }
+        cooling_snapshot(root.as_deref(), Some(&self.device_dir))
     }
 
     /// Write `<state_dir>/halted` and fsync it. The body is the critical log line.
@@ -252,6 +256,269 @@ impl CoolingGuard {
         rustix::fs::fsync(&dir)?;
         Ok(())
     }
+}
+
+/// Identity fields from a pump latch's baseline line.
+///
+/// Duties and rpm are not part of the identity. The clear window compares
+/// those with [`compare`] against the previous read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PumpBaseline {
+    z53: bool,
+    pwm1_enable: Option<u32>,
+    pwm2_enable: Option<u32>,
+    devnum: Option<u32>,
+}
+
+/// Recent automatic-clear times, or a file that cannot be trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AutoClearLog {
+    /// Unix seconds, oldest first. Missing and empty files are an empty vec.
+    Times(Vec<u64>),
+    /// Unreadable or corrupt. The caller must not clear.
+    Bad,
+}
+
+/// One halted-phase cooling read. Discovers `1e71:3008` read-only.
+///
+/// `idVendor`, `idProduct`, and `devnum` are the only USB files opened, plus
+/// the same hwmon files as [`CoolingGuard::read`]. No HID, USB, or bulk node
+/// is opened. Zero or several `3008` devices leave `devnum` missing.
+#[must_use]
+pub(crate) fn read_halt_cooling(sys_root: &Path) -> CoolingSnapshot {
+    let root = sys_root.canonicalize().ok();
+    let device = root.as_deref().and_then(find_kraken_device_dir);
+    cooling_snapshot(root.as_deref(), device.as_deref())
+}
+
+/// `Some` only for a pump latch whose baseline line parses in full.
+///
+/// The first line must contain exactly one `reason=` token and its value
+/// must be `fan1_input`. Any other reason, a missing baseline line, or a
+/// baseline line that is not the [`format_halt`] field list returns `None`.
+#[must_use]
+pub(crate) fn parse_pump_latch(text: &str) -> Option<PumpBaseline> {
+    let mut lines = text.lines();
+    let header = lines.next()?;
+    if !header_is_pump(header) {
+        return None;
+    }
+    parse_baseline_line(lines.next()?)
+}
+
+/// `true` when `current` can count toward the pump-latch clear window.
+///
+/// `previous` is the read from the tick before. The first read of a streak
+/// passes `None` and skips [`compare`].
+#[must_use]
+pub(crate) fn halt_read_is_normal(
+    baseline: &PumpBaseline,
+    previous: Option<&CoolingSnapshot>,
+    current: &CoolingSnapshot,
+) -> bool {
+    if required(current).is_some() {
+        return false;
+    }
+    if previous.is_some_and(|prev| compare(prev, current).is_some()) {
+        return false;
+    }
+    match current.fan1_rpm {
+        Some(rpm) if rpm != 0 => {}
+        _ => return false,
+    }
+    current.z53 == baseline.z53
+        && current.pwm1_enable == baseline.pwm1_enable
+        && current.pwm2_enable == baseline.pwm2_enable
+        && current.devnum == baseline.devnum
+        && !current.bootloader
+}
+
+/// Read [`PUMP_AUTO_CLEARED_FILE`]. Missing is no clears yet.
+#[must_use]
+pub(crate) fn read_auto_clears(state_dir: &Path) -> AutoClearLog {
+    match std::fs::read_to_string(state_dir.join(PUMP_AUTO_CLEARED_FILE)) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AutoClearLog::Times(Vec::new()),
+        Err(_) => AutoClearLog::Bad,
+        Ok(text) => parse_auto_clears(&text).map_or(AutoClearLog::Bad, AutoClearLog::Times),
+    }
+}
+
+/// Replace [`PUMP_AUTO_CLEARED_FILE`] via a temp file, fsync, rename, and a
+/// directory fsync. The caller records a clear before it removes the latch.
+pub(crate) fn store_auto_clears(state_dir: &Path, times: &[u64]) -> std::io::Result<()> {
+    let mut body = String::new();
+    for time in times {
+        body.push_str(&time.to_string());
+        body.push('\n');
+    }
+    write_durable(state_dir, PUMP_AUTO_CLEARED_FILE, body.as_bytes())
+}
+
+/// Remove `<state_dir>/halted` and fsync the directory.
+///
+/// This is the only removal besides `clear-halt`.
+pub(crate) fn remove_latch(state_dir: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(state_dir.join("halted"))?;
+    let dir = std::fs::File::open(state_dir)?;
+    rustix::fs::fsync(&dir)?;
+    Ok(())
+}
+
+/// Body of `<state_dir>/halted`. Missing and unreadable are both errors.
+pub(crate) fn read_latch(state_dir: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(state_dir.join("halted"))
+}
+
+fn cooling_snapshot(root: Option<&Path>, device_dir: Option<&Path>) -> CoolingSnapshot {
+    let z53 = root.and_then(find_z53);
+    let bootloader = root
+        .and_then(|root| sysfs::bootloader_present_at(root).ok())
+        .unwrap_or(true);
+    CoolingSnapshot {
+        z53: z53.is_some(),
+        pwm1_enable: z53
+            .as_deref()
+            .and_then(|dir| read_u32(&dir.join("pwm1_enable"))),
+        pwm2_enable: z53
+            .as_deref()
+            .and_then(|dir| read_u32(&dir.join("pwm2_enable"))),
+        pwm1: z53.as_deref().and_then(|dir| read_u32(&dir.join("pwm1"))),
+        pwm2: z53.as_deref().and_then(|dir| read_u32(&dir.join("pwm2"))),
+        fan1_rpm: z53
+            .as_deref()
+            .and_then(|dir| read_u32(&dir.join("fan1_input"))),
+        devnum: device_dir.and_then(|dir| read_u32(&dir.join("devnum"))),
+        bootloader,
+    }
+}
+
+fn find_kraken_device_dir(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root.join("bus/usb/devices")).ok()?;
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.contains(':') || name.starts_with("usb") {
+            continue;
+        }
+        let Ok(dir) = entry.path().canonicalize() else {
+            continue;
+        };
+        if !dir.starts_with(root) {
+            continue;
+        }
+        if is_kraken_lcd(&dir) {
+            found.push(dir);
+        }
+    }
+    if found.len() == 1 { found.pop() } else { None }
+}
+
+fn is_kraken_lcd(dir: &Path) -> bool {
+    let Ok(vendor) = std::fs::read_to_string(dir.join("idVendor")) else {
+        return false;
+    };
+    let Ok(product) = std::fs::read_to_string(dir.join("idProduct")) else {
+        return false;
+    };
+    vendor.trim().eq_ignore_ascii_case("1e71") && product.trim().eq_ignore_ascii_case("3008")
+}
+
+fn header_is_pump(header: &str) -> bool {
+    let mut reasons = 0u32;
+    let mut pump = false;
+    for token in header.split_whitespace() {
+        let Some(value) = token.strip_prefix("reason=") else {
+            continue;
+        };
+        reasons += 1;
+        pump = value == "fan1_input";
+    }
+    reasons == 1 && pump
+}
+
+fn parse_baseline_line(line: &str) -> Option<PumpBaseline> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "baseline" {
+        return None;
+    }
+    let z53 = parse_flag(keyed(&mut tokens, "z53")?)?;
+    let pwm1_enable = parse_opt_u32(keyed(&mut tokens, "pwm1_enable")?)?;
+    let pwm2_enable = parse_opt_u32(keyed(&mut tokens, "pwm2_enable")?)?;
+    let _pwm1 = parse_opt_u32(keyed(&mut tokens, "pwm1")?)?;
+    let _pwm2 = parse_opt_u32(keyed(&mut tokens, "pwm2")?)?;
+    let _fan = parse_opt_u32(keyed(&mut tokens, "fan1_rpm")?)?;
+    let devnum = parse_opt_u32(keyed(&mut tokens, "devnum")?)?;
+    let _bootloader = parse_flag(keyed(&mut tokens, "bootloader")?)?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(PumpBaseline {
+        z53,
+        pwm1_enable,
+        pwm2_enable,
+        devnum,
+    })
+}
+
+fn keyed<'a>(tokens: &mut impl Iterator<Item = &'a str>, key: &str) -> Option<&'a str> {
+    let token = tokens.next()?;
+    let (got, value) = token.split_once('=')?;
+    if got != key || value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_flag(value: &str) -> Option<bool> {
+    match value {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_opt_u32(value: &str) -> Option<Option<u32>> {
+    if value == "missing" {
+        return Some(None);
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(Some(value.parse().ok()?))
+}
+
+fn parse_auto_clears(text: &str) -> Option<Vec<u64>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        out.push(line.parse().ok()?);
+    }
+    Some(out)
+}
+
+fn write_durable(state_dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = state_dir.join(format!(".{name}.tmp"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    rustix::fs::fsync(&file)?;
+    drop(file);
+    std::fs::rename(&tmp, state_dir.join(name))?;
+    let dir = std::fs::File::open(state_dir)?;
+    rustix::fs::fsync(&dir)?;
+    Ok(())
 }
 
 pub(crate) fn format_halt(
@@ -539,5 +806,156 @@ mod tests {
         assert!(body.contains("reason=fan1_input"), "{body}");
         assert!(!body.contains("pwm1_prior"), "{body}");
         assert!(!body.contains(" prior="), "{body}");
+    }
+
+    #[test]
+    fn pump_latch_text_parses_and_other_reasons_do_not() {
+        let pump = format_halt(Some(&snap(64, 1000)), &snap(64, 0), Deviation::Pump);
+        let baseline = parse_pump_latch(&pump).expect("pump latch");
+        assert!(halt_read_is_normal(&baseline, None, &snap(64, 1000)));
+        assert!(!halt_read_is_normal(&baseline, None, &snap(64, 0)));
+        let steady = snap(64, 1000);
+        assert!(halt_read_is_normal(
+            &baseline,
+            Some(&steady),
+            &snap(64, 1000)
+        ));
+        assert!(!halt_read_is_normal(
+            &baseline,
+            Some(&steady),
+            &snap(64, 2800)
+        ));
+        let mut enable = snap(64, 1000);
+        enable.pwm1_enable = Some(2);
+        assert!(!halt_read_is_normal(&baseline, None, &enable));
+        let mut devnum = snap(64, 1000);
+        devnum.devnum = Some(9);
+        assert!(!halt_read_is_normal(&baseline, None, &devnum));
+
+        for dev in [
+            Deviation::Z53Missing,
+            Deviation::Pwm1Enable,
+            Deviation::Pwm2Enable,
+            Deviation::Devnum,
+            Deviation::Bootloader,
+            Deviation::Unreadable,
+        ] {
+            let body = format_halt(Some(&snap(64, 1000)), &snap(64, 1000), dev);
+            assert!(parse_pump_latch(&body).is_none(), "{body}");
+        }
+        assert!(parse_pump_latch("not a latch\n").is_none());
+        let missing = format_halt(None, &snap(64, 0), Deviation::Pump);
+        assert!(parse_pump_latch(&missing).is_none(), "{missing}");
+        let doubled = pump.replacen(
+            "reason=fan1_input",
+            "reason=fan1_input reason=fan1_input",
+            1,
+        );
+        assert!(parse_pump_latch(&doubled).is_none());
+    }
+
+    #[test]
+    fn auto_clear_file_rejects_corrupt_lines() {
+        assert_eq!(parse_auto_clears(""), Some(vec![]));
+        assert_eq!(parse_auto_clears("10\n20\n"), Some(vec![10, 20]));
+        assert_eq!(parse_auto_clears("10\nnope\n"), None);
+        assert_eq!(parse_auto_clears("\n"), None);
+        assert_eq!(parse_auto_clears("10 \n"), None);
+        assert_eq!(parse_auto_clears("10\n\n"), None);
+    }
+
+    #[test]
+    fn store_auto_clears_replaces_the_file_and_drops_the_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-auto-clear-store-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(matches!(read_auto_clears(&dir), AutoClearLog::Times(times) if times.is_empty()));
+        store_auto_clears(&dir, &[10, 20]).expect("store");
+        assert!(!dir.join(".auto-cleared.tmp").exists());
+        assert_eq!(
+            std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("read"),
+            b"10\n20\n"
+        );
+        assert!(matches!(read_auto_clears(&dir), AutoClearLog::Times(times) if times == [10, 20]));
+        std::fs::write(dir.join(PUMP_AUTO_CLEARED_FILE), b"nope\n").expect("corrupt");
+        assert!(matches!(read_auto_clears(&dir), AutoClearLog::Bad));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_named_auto_cleared_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-auto-clear-dir-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("dir");
+        assert!(matches!(read_auto_clears(&dir), AutoClearLog::Bad));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_latch_removes_halted_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-remove-latch-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("halted"), b"latch\n").expect("latch");
+        std::fs::write(dir.join(PUMP_AUTO_CLEARED_FILE), b"10\n").expect("log");
+        remove_latch(&dir).expect("remove");
+        assert!(!dir.join("halted").exists());
+        assert_eq!(
+            std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("kept"),
+            b"10\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn halt_cooling_read_uses_the_one_kraken_and_skips_interfaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-halt-sysfs-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hwmon = dir.join("class/hwmon/hwmon0");
+        let device = dir.join("bus/usb/devices/3-5");
+        std::fs::create_dir_all(&hwmon).expect("hwmon");
+        std::fs::create_dir_all(&device).expect("device");
+        std::fs::create_dir_all(dir.join("bus/usb/devices/3-5:1.0")).expect("iface");
+        std::fs::create_dir_all(dir.join("bus/usb/devices/usb3")).expect("hub");
+        std::fs::write(hwmon.join("name"), "z53\n").expect("name");
+        for (name, value) in [
+            ("pwm1_enable", "0"),
+            ("pwm2_enable", "0"),
+            ("pwm1", "64"),
+            ("pwm2", "51"),
+            ("fan1_input", "1000"),
+        ] {
+            std::fs::write(hwmon.join(name), format!("{value}\n")).expect(name);
+        }
+        std::fs::write(device.join("idVendor"), "1E71\n").expect("vendor");
+        std::fs::write(device.join("idProduct"), "3008\n").expect("product");
+        std::fs::write(device.join("devnum"), "2\n").expect("devnum");
+        let snap = read_halt_cooling(&dir);
+        assert!(snap.z53);
+        assert_eq!(snap.pwm1_enable, Some(0));
+        assert_eq!(snap.fan1_rpm, Some(1000));
+        assert_eq!(snap.devnum, Some(2));
+        assert!(!snap.bootloader);
+        assert!(required(&snap).is_none());
+
+        let other = dir.join("bus/usb/devices/3-6");
+        std::fs::create_dir_all(&other).expect("second");
+        std::fs::write(other.join("idVendor"), "1e71\n").expect("vendor");
+        std::fs::write(other.join("idProduct"), "3008\n").expect("product");
+        std::fs::write(other.join("devnum"), "4\n").expect("devnum");
+        assert_eq!(read_halt_cooling(&dir).devnum, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

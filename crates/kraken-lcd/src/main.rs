@@ -800,6 +800,26 @@ mod tests {
     }
 
     #[test]
+    fn clear_halt_yes_removes_only_the_latch() {
+        let dir = std::env::temp_dir().join(format!(
+            "t14-clear-halt-yes-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let latch = dir.join("halted");
+        let record = dir.join("auto-cleared");
+        std::fs::write(&latch, b"CRITICAL time=1 reason=fan1_input\n").expect("latch");
+        std::fs::write(&record, b"10\n20\n").expect("record");
+        let mut stdin = io::Cursor::new(b"YES\n".to_vec());
+        let mut stderr = Vec::new();
+        clear_halt_at(&latch, true, &mut stdin, &mut stderr).expect("cleared");
+        assert!(!latch.exists());
+        assert_eq!(std::fs::read(&record).expect("record stays"), b"10\n20\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn clear_halt_with_no_latch_exits_ok_without_prompting() {
         let missing = std::env::temp_dir().join(format!(
             "t14-no-latch-{}-missing",

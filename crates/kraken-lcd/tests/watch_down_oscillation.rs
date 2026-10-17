@@ -225,6 +225,7 @@ fn two_hours_of_oscillation_stays_inside_the_write_budget() {
         },
         assets: &mut assets,
         latch_at_start: false,
+        halt: kraken_lcd::service::NoHaltWatch,
     });
     assert_eq!(exit, LoopExit::Stopped);
     let writes = writes.lock().unwrap_or_else(|err| err.into_inner()).clone();
