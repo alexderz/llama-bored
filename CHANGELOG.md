@@ -8,7 +8,7 @@ All notable changes to llama-bored. Versions follow
 
 ### Added
 
-- kraken-lcd clears a pump latch (`reason=fan1_input`) after 600 s of continuous normal pump operation, and records the time in `/var/lib/kraken-lcd/auto-cleared` before it removes the latch. At most 3 automatic clears count in any 24 h. Any other latch reason, a gap longer than 5 s, an abnormal read, a restart, or an unreadable back-off file leaves the latch in place until `clear-halt`. Each automatic clear logs CRITICAL with the window and the count (#158).
+- kraken-lcd clears a pump latch (`reason=fan1_input`) after 600 s of continuous normal pump operation on the monotonic clock, and records the wall time in `/var/lib/kraken-lcd/auto-cleared` before it removes the latch. The 600 s window and the 5 s gap use the monotonic clock; a wall-clock jump alone does not shorten or reset them. At most 3 automatic clears in the 24 h before and including the latch's own `time=` are allowed. A latch past that limit, or one whose `time=` is missing or unparsable, stays until `clear-halt`, logs CRITICAL once, and does not age out. A latch that is already gone when the clear would be recorded is not an error and is not counted; a latch that changed is reclassified and not counted. Any other latch reason, a monotonic gap longer than 5 s, an abnormal read, a restart of the 600 s window, or an unreadable back-off file leaves the latch in place until `clear-halt`. Each automatic clear logs CRITICAL with the window and the count (#158).
 
 ### Fixed
 

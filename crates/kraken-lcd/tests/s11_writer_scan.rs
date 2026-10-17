@@ -128,6 +128,7 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("device/guard.rs", "const", "PUMP_LATCH_MAX_GAP"),
     ("device/guard.rs", "enum", "AutoClearLog"),
     ("device/guard.rs", "enum", "Deviation"),
+    ("device/guard.rs", "enum", "LatchRemoval"),
     ("device/guard.rs", "field", "CoolingSnapshot.bootloader"),
     ("device/guard.rs", "field", "CoolingSnapshot.devnum"),
     ("device/guard.rs", "field", "CoolingSnapshot.fan1_rpm"),
@@ -147,6 +148,7 @@ const PUBLIC_SURFACE: &[(&str, &str, &str)] = &[
     ("device/guard.rs", "fn", "format_halt"),
     ("device/guard.rs", "fn", "halt_read_is_normal"),
     ("device/guard.rs", "fn", "log_halt"),
+    ("device/guard.rs", "fn", "PumpBaseline::time"),
     ("device/guard.rs", "fn", "parse_pump_latch"),
     ("device/guard.rs", "fn", "pump_band_rpm"),
     ("device/guard.rs", "fn", "pump_in_band"),
@@ -1472,12 +1474,15 @@ fn writer_source_passes_s11_and_the_file_set_is_non_empty() {
 
 /// `remove_file` of the latch stays in `clear_halt_at` and in `remove_latch`.
 /// `join("halted")` stays on those paths plus the existing presence checks
-/// and the auto-clear read of the latch body.
+/// and the auto-clear read of the latch body. `service.rs` does not unlink
+/// or rename. `remove_latch` has one production caller. Nothing renames
+/// onto the latch file.
 #[test]
 fn pump_auto_clear_is_the_only_new_latch_removal() {
     let src = writer_src();
     let mut removals = Vec::new();
     let mut joins = BTreeMap::<String, usize>::new();
+    let mut callers = Vec::new();
     for rel in rs_rels(&src) {
         let text = fs::read_to_string(src.join(&rel)).unwrap_or_else(|err| panic!("{rel}: {err}"));
         let code = strip_cfg_test(&strip_comments(&text));
@@ -1492,6 +1497,18 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
             base += next;
             search = &search[next..];
         }
+        for at in call_sites(&code, "remove_latch") {
+            if !fn_item_name(&code, at) {
+                callers.push((rel.clone(), enclosing_fn_name(&code, at)));
+            }
+        }
+        for at in call_sites(&code, "rename") {
+            let args = call_args(&code, at, "rename".len()).unwrap_or("");
+            assert!(
+                !args.contains("\"halted\""),
+                "{rel} renames onto halted: {args}"
+            );
+        }
         let n = code.matches("join(\"halted\")").count();
         if n > 0 {
             joins.insert(rel.clone(), n);
@@ -1505,9 +1522,18 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
                 !code.contains("remove_file"),
                 "service.rs must not remove the latch"
             );
+            assert!(
+                !has_ident(&code, "unlink"),
+                "service.rs must not unlink the latch or the auto-clear record"
+            );
+            assert!(
+                !has_ident(&code, "rename"),
+                "service.rs must not rename the latch or the auto-clear record"
+            );
         }
     }
     removals.sort();
+    callers.sort();
     assert_eq!(
         removals,
         vec![
@@ -1515,6 +1541,11 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
             ("main.rs".to_owned(), "clear_halt_at".to_owned()),
         ],
         "latch removal must stay these two functions"
+    );
+    assert_eq!(
+        callers,
+        vec![("service.rs".to_owned(), "commit_clear".to_owned())],
+        "remove_latch has one production caller"
     );
     assert_eq!(
         joins.get("device/guard.rs").copied(),
@@ -1531,6 +1562,84 @@ fn pump_auto_clear_is_the_only_new_latch_removal() {
         2,
         "no other file may join the latch: {joins:?}"
     );
+}
+
+fn call_sites(code: &str, name: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut search = code;
+    let mut base = 0usize;
+    while let Some(at) = search.find(name) {
+        let abs = base + at;
+        if ident_boundary(code, abs, name.len()) {
+            let rest = code[abs + name.len()..].trim_start();
+            if rest.starts_with('(') {
+                found.push(abs);
+            }
+        }
+        let next = at + name.len();
+        base += next;
+        search = &search[next..];
+    }
+    found
+}
+
+fn fn_item_name(code: &str, at: usize) -> bool {
+    let head = code[..at].trim_end();
+    let Some(before) = head.strip_suffix("fn") else {
+        return false;
+    };
+    before
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+fn call_args(code: &str, name_at: usize, name_len: usize) -> Option<&str> {
+    let rest = &code[name_at + name_len..];
+    let trimmed = rest.trim_start();
+    if !trimmed.starts_with('(') {
+        return None;
+    }
+    let open = name_at + name_len + (rest.len() - trimmed.len());
+    let end = paren_end(code, open)?;
+    Some(&code[open..=end])
+}
+
+fn paren_end(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut index = open;
+    let mut in_str = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_str {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == b'"' {
+                in_str = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 #[test]

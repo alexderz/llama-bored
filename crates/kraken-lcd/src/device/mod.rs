@@ -30,7 +30,7 @@ use thiserror::Error;
 
 pub use bulk::{BulkLink, BulkPort, NoBulk};
 pub(crate) use guard::{
-    AutoClearLog, PumpBaseline, follow_up_due, halt_read_is_normal, parse_pump_latch,
+    AutoClearLog, LatchRemoval, PumpBaseline, follow_up_due, halt_read_is_normal, parse_pump_latch,
     read_auto_clears, read_halt_cooling, read_latch, remove_latch, store_auto_clears,
 };
 pub use guard::{

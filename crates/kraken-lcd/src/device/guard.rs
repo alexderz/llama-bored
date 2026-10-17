@@ -1,8 +1,9 @@
 //! Read-only cooling baseline. A deviation latches and stops device I/O.
 //!
 //! A pump latch (`reason=fan1_input`) can clear itself after
-//! [`PUMP_LATCH_CLEAR_AFTER`] of normal pump reads, at most
-//! [`PUMP_LATCH_CLEAR_LIMIT`] times per [`PUMP_LATCH_CLEAR_WINDOW`].
+//! [`PUMP_LATCH_CLEAR_AFTER`] of normal pump reads on the monotonic clock,
+//! unless [`PUMP_LATCH_CLEAR_LIMIT`] automatic clears already fall in the
+//! [`PUMP_LATCH_CLEAR_WINDOW`] before and including the latch's `time=`.
 //!
 //! `pwm1` and `pwm2` are copied into the snapshot for the log. Neither is
 //! compared on its own: the firmware curve moves them while the enable files
@@ -12,6 +13,7 @@
 //! fixed here and are not configuration.
 
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,19 +56,23 @@ pub const PUMP_DUTY_STEP_MAX: u32 = 13;
 
 /// Continuous normal pump reads that clear a pump latch (`reason=fan1_input`).
 ///
-/// The window is wall time. A service restart starts it over.
+/// The window uses the monotonic clock. A wall-clock jump does not move it.
+/// A service restart starts it over.
 pub const PUMP_LATCH_CLEAR_AFTER: Duration = Duration::from_secs(600);
 
-/// A longer gap between halted cooling reads restarts the clear window.
+/// A longer monotonic gap between halted cooling reads restarts the clear window.
 ///
 /// A service tick is at most 2 s, so a tick on time stays inside the window.
-/// A stall or a suspend, which moves the wall clock, does not.
+/// A stall of the monotonic clock restarts it. A wall-clock jump alone does not.
 pub const PUMP_LATCH_MAX_GAP: Duration = Duration::from_secs(5);
 
-/// Automatic clears allowed inside [`PUMP_LATCH_CLEAR_WINDOW`].
+/// Automatic clears allowed in the 24 h before and including a latch's `time=`.
 pub const PUMP_LATCH_CLEAR_LIMIT: usize = 3;
 
-/// How far back an automatic clear still counts toward [`PUMP_LATCH_CLEAR_LIMIT`].
+/// How far before a latch's `time=` an automatic clear still counts.
+///
+/// The bound is the latch time, not the clock at the clear. A latch that is
+/// already at [`PUMP_LATCH_CLEAR_LIMIT`] stays until `clear-halt`.
 pub const PUMP_LATCH_CLEAR_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// State file of recent automatic-clear unix times, beside the latch.
@@ -258,16 +264,32 @@ impl CoolingGuard {
     }
 }
 
-/// Identity fields from a pump latch's baseline line.
+/// Parsed pump latch. Equality is the race check in the auto-clear.
 ///
-/// Duties and rpm are not part of the identity. The clear window compares
-/// those with [`compare`] against the previous read.
+/// `time` is the `time=` token on the first line. `None` means it was missing
+/// or unparsable, and the latch is human-only. The duty and rpm fields are
+/// stored so a human edit of the baseline line compares unequal. The clear
+/// window still judges the pump with [`compare`] against the previous read,
+/// and the identity check uses `z53`, the enable files, and `devnum`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PumpBaseline {
+    time: Option<u64>,
     z53: bool,
     pwm1_enable: Option<u32>,
     pwm2_enable: Option<u32>,
+    pwm1: Option<u32>,
+    pwm2: Option<u32>,
+    fan1_rpm: Option<u32>,
     devnum: Option<u32>,
+    bootloader: bool,
+}
+
+impl PumpBaseline {
+    /// `time=` from the latch's first line. `None` is missing or unparsable.
+    #[must_use]
+    pub(crate) fn time(&self) -> Option<u64> {
+        self.time
+    }
 }
 
 /// Recent automatic-clear times, or a file that cannot be trusted.
@@ -296,6 +318,8 @@ pub(crate) fn read_halt_cooling(sys_root: &Path) -> CoolingSnapshot {
 /// The first line must contain exactly one `reason=` token and its value
 /// must be `fan1_input`. Any other reason, a missing baseline line, or a
 /// baseline line that is not the [`format_halt`] field list returns `None`.
+/// A missing or unparsable `time=` on that first line still returns `Some`,
+/// with the time left empty, so the caller can keep the latch for a human.
 #[must_use]
 pub(crate) fn parse_pump_latch(text: &str) -> Option<PumpBaseline> {
     let mut lines = text.lines();
@@ -303,7 +327,9 @@ pub(crate) fn parse_pump_latch(text: &str) -> Option<PumpBaseline> {
     if !header_is_pump(header) {
         return None;
     }
-    parse_baseline_line(lines.next()?)
+    let mut baseline = parse_baseline_line(lines.next()?)?;
+    baseline.time = header_time(header);
+    Some(baseline)
 }
 
 /// `true` when `current` can count toward the pump-latch clear window.
@@ -334,13 +360,23 @@ pub(crate) fn halt_read_is_normal(
 }
 
 /// Read [`PUMP_AUTO_CLEARED_FILE`]. Missing is no clears yet.
+///
+/// Anything that is not a regular file, including a symlink, is [`AutoClearLog::Bad`].
 #[must_use]
 pub(crate) fn read_auto_clears(state_dir: &Path) -> AutoClearLog {
-    match std::fs::read_to_string(state_dir.join(PUMP_AUTO_CLEARED_FILE)) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AutoClearLog::Times(Vec::new()),
-        Err(_) => AutoClearLog::Bad,
-        Ok(text) => parse_auto_clears(&text).map_or(AutoClearLog::Bad, AutoClearLog::Times),
-    }
+    let path = state_dir.join(PUMP_AUTO_CLEARED_FILE);
+    let text = match std::fs::symlink_metadata(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return AutoClearLog::Times(Vec::new());
+        }
+        Err(_) => return AutoClearLog::Bad,
+        Ok(meta) if meta.file_type().is_file() => match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(_) => return AutoClearLog::Bad,
+        },
+        Ok(_) => return AutoClearLog::Bad,
+    };
+    parse_auto_clears(&text).map_or(AutoClearLog::Bad, AutoClearLog::Times)
 }
 
 /// Replace [`PUMP_AUTO_CLEARED_FILE`] via a temp file, fsync, rename, and a
@@ -354,19 +390,54 @@ pub(crate) fn store_auto_clears(state_dir: &Path, times: &[u64]) -> std::io::Res
     write_durable(state_dir, PUMP_AUTO_CLEARED_FILE, body.as_bytes())
 }
 
-/// Remove `<state_dir>/halted` and fsync the directory.
+/// Result of removing `<state_dir>/halted`.
 ///
-/// This is the only removal besides `clear-halt`.
-pub(crate) fn remove_latch(state_dir: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(state_dir.join("halted"))?;
-    let dir = std::fs::File::open(state_dir)?;
-    rustix::fs::fsync(&dir)?;
-    Ok(())
+/// [`LatchRemoval::DirSyncFailed`] means the file is already gone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LatchRemoval {
+    /// The latch file is gone and the directory was synced.
+    Removed,
+    /// The latch file is still there.
+    UnlinkFailed,
+    /// The latch file is gone. Syncing its directory failed.
+    DirSyncFailed,
 }
 
-/// Body of `<state_dir>/halted`. Missing and unreadable are both errors.
+/// Remove `<state_dir>/halted` and fsync the directory.
+///
+/// This is the only removal besides `clear-halt`. A latch that is already
+/// gone still gets a directory sync, and that sync's failure is
+/// [`LatchRemoval::DirSyncFailed`] rather than a failed removal.
+pub(crate) fn remove_latch(state_dir: &Path) -> LatchRemoval {
+    if let Err(err) = std::fs::remove_file(state_dir.join("halted"))
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        return LatchRemoval::UnlinkFailed;
+    }
+    match std::fs::File::open(state_dir) {
+        Ok(dir) => match rustix::fs::fsync(&dir) {
+            Ok(()) => LatchRemoval::Removed,
+            Err(_) => LatchRemoval::DirSyncFailed,
+        },
+        Err(_) => LatchRemoval::DirSyncFailed,
+    }
+}
+
+/// Body of `<state_dir>/halted`.
+///
+/// Only a regular file is readable. A symlink or any other node is an error,
+/// so the caller treats it as unparsable. [`std::io::ErrorKind::NotFound`]
+/// still means the latch is absent.
 pub(crate) fn read_latch(state_dir: &Path) -> std::io::Result<String> {
-    std::fs::read_to_string(state_dir.join("halted"))
+    let path = state_dir.join("halted");
+    let meta = std::fs::symlink_metadata(&path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "halted is not a regular file",
+        ));
+    }
+    std::fs::read_to_string(path)
 }
 
 fn cooling_snapshot(root: Option<&Path>, device_dir: Option<&Path>) -> CoolingSnapshot {
@@ -439,6 +510,29 @@ fn header_is_pump(header: &str) -> bool {
     reasons == 1 && pump
 }
 
+/// The single `time=` token on the latch's first line, or `None` when it is
+/// missing, repeated, or not a decimal unix second.
+fn header_time(header: &str) -> Option<u64> {
+    let mut found: Option<Option<u64>> = None;
+    for token in header.split_whitespace() {
+        let Some(value) = token.strip_prefix("time=") else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(parse_unix_secs(value));
+    }
+    found.flatten()
+}
+
+fn parse_unix_secs(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn parse_baseline_line(line: &str) -> Option<PumpBaseline> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "baseline" {
@@ -447,19 +541,24 @@ fn parse_baseline_line(line: &str) -> Option<PumpBaseline> {
     let z53 = parse_flag(keyed(&mut tokens, "z53")?)?;
     let pwm1_enable = parse_opt_u32(keyed(&mut tokens, "pwm1_enable")?)?;
     let pwm2_enable = parse_opt_u32(keyed(&mut tokens, "pwm2_enable")?)?;
-    let _pwm1 = parse_opt_u32(keyed(&mut tokens, "pwm1")?)?;
-    let _pwm2 = parse_opt_u32(keyed(&mut tokens, "pwm2")?)?;
-    let _fan = parse_opt_u32(keyed(&mut tokens, "fan1_rpm")?)?;
+    let pwm1 = parse_opt_u32(keyed(&mut tokens, "pwm1")?)?;
+    let pwm2 = parse_opt_u32(keyed(&mut tokens, "pwm2")?)?;
+    let fan1_rpm = parse_opt_u32(keyed(&mut tokens, "fan1_rpm")?)?;
     let devnum = parse_opt_u32(keyed(&mut tokens, "devnum")?)?;
-    let _bootloader = parse_flag(keyed(&mut tokens, "bootloader")?)?;
+    let bootloader = parse_flag(keyed(&mut tokens, "bootloader")?)?;
     if tokens.next().is_some() {
         return None;
     }
     Some(PumpBaseline {
+        time: None,
         z53,
         pwm1_enable,
         pwm2_enable,
+        pwm1,
+        pwm2,
+        fan1_rpm,
         devnum,
+        bootloader,
     })
 }
 
@@ -507,15 +606,39 @@ fn parse_auto_clears(text: &str) -> Option<Vec<u64>> {
 
 fn write_durable(state_dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = state_dir.join(format!(".{name}.tmp"));
+    // A leftover temp must be a regular file or absent. A directory, a
+    // symlink, or anything else fails closed and is left in place.
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(meta) if meta.file_type().is_file() => rustix::fs::unlink(&tmp)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "auto-clear temp is not a regular file",
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let result = publish_temp(state_dir, &tmp, name, bytes);
+    if result.is_err()
+        && let Ok(meta) = std::fs::symlink_metadata(&tmp)
+        && meta.file_type().is_file()
+    {
+        let _ = rustix::fs::unlink(&tmp);
+    }
+    result
+}
+
+fn publish_temp(state_dir: &Path, tmp: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
+        .create_new(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(tmp)?;
     file.write_all(bytes)?;
     rustix::fs::fsync(&file)?;
     drop(file);
-    std::fs::rename(&tmp, state_dir.join(name))?;
+    std::fs::rename(tmp, state_dir.join(name))?;
     let dir = std::fs::File::open(state_dir)?;
     rustix::fs::fsync(&dir)?;
     Ok(())
@@ -812,6 +935,7 @@ mod tests {
     fn pump_latch_text_parses_and_other_reasons_do_not() {
         let pump = format_halt(Some(&snap(64, 1000)), &snap(64, 0), Deviation::Pump);
         let baseline = parse_pump_latch(&pump).expect("pump latch");
+        assert!(baseline.time.is_some(), "{pump}");
         assert!(halt_read_is_normal(&baseline, None, &snap(64, 1000)));
         assert!(!halt_read_is_normal(&baseline, None, &snap(64, 0)));
         let steady = snap(64, 1000);
@@ -855,6 +979,30 @@ mod tests {
     }
 
     #[test]
+    fn baseline_line_with_a_trailing_token_is_rejected() {
+        let pump = format_halt(Some(&snap(64, 1000)), &snap(64, 0), Deviation::Pump);
+        let trailing = pump.replacen("bootloader=no\n", "bootloader=no extra\n", 1);
+        assert_ne!(trailing, pump);
+        assert!(parse_pump_latch(&trailing).is_none(), "{trailing}");
+    }
+
+    #[test]
+    fn a_pump_latch_with_a_bad_time_still_parses() {
+        let pump = format_halt(Some(&snap(64, 1000)), &snap(64, 0), Deviation::Pump);
+        let baseline_line = pump.lines().nth(1).expect("baseline");
+        for header in [
+            "CRITICAL reason=fan1_input",
+            "CRITICAL time= reason=fan1_input",
+            "CRITICAL time=nope reason=fan1_input",
+            "CRITICAL time=1 time=2 reason=fan1_input",
+        ] {
+            let text = format!("{header}\n{baseline_line}\n");
+            let parsed = parse_pump_latch(&text).expect(header);
+            assert_eq!(parsed.time, None, "{header}");
+        }
+    }
+
+    #[test]
     fn auto_clear_file_rejects_corrupt_lines() {
         assert_eq!(parse_auto_clears(""), Some(vec![]));
         assert_eq!(parse_auto_clears("10\n20\n"), Some(vec![10, 20]));
@@ -886,6 +1034,87 @@ mod tests {
     }
 
     #[test]
+    fn stale_temp_file_is_replaced_and_a_non_file_temp_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-auto-clear-temp-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let tmp = dir.join(".auto-cleared.tmp");
+        std::fs::write(&tmp, b"stale").expect("stale");
+        store_auto_clears(&dir, &[1]).expect("replace");
+        assert!(!tmp.exists());
+        assert_eq!(
+            std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("read"),
+            b"1\n"
+        );
+
+        std::fs::create_dir(&tmp).expect("dir temp");
+        assert!(store_auto_clears(&dir, &[2]).is_err());
+        assert!(tmp.is_dir());
+        assert_eq!(
+            std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("untouched"),
+            b"1\n"
+        );
+        std::fs::remove_dir(&tmp).expect("rmdir");
+
+        std::os::unix::fs::symlink("nope", &tmp).expect("symlink");
+        assert!(store_auto_clears(&dir, &[3]).is_err());
+        assert!(
+            tmp.symlink_metadata()
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("untouched"),
+            b"1\n"
+        );
+        rustix::fs::unlink(&tmp).expect("unlink symlink");
+
+        std::fs::remove_file(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("clear dest");
+        std::fs::create_dir(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("dest dir");
+        assert!(store_auto_clears(&dir, &[4]).is_err());
+        assert!(
+            !tmp.exists(),
+            "a temp created before a failed rename is removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlink_latch_and_a_symlink_auto_cleared_are_unreadable() {
+        let dir = std::env::temp_dir().join(format!(
+            "pump-auto-clear-symlink-{}",
+            rustix::process::getpid().as_raw_nonzero().get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("real-latch"),
+            b"CRITICAL time=1 reason=fan1_input\n",
+        )
+        .expect("real");
+        std::os::unix::fs::symlink("real-latch", dir.join("halted")).expect("link");
+        let err = read_latch(&dir).expect_err("symlink latch");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        std::fs::create_dir(dir.join("halted-dir")).expect("dir node");
+        std::fs::rename(dir.join("halted"), dir.join("halted-link")).expect("move link");
+        std::fs::rename(dir.join("halted-dir"), dir.join("halted")).expect("dir named halted");
+        assert!(read_latch(&dir).is_err());
+
+        std::fs::write(dir.join("real-log"), b"10\n").expect("log");
+        std::os::unix::fs::symlink("real-log", dir.join(PUMP_AUTO_CLEARED_FILE)).expect("link");
+        assert!(matches!(read_auto_clears(&dir), AutoClearLog::Bad));
+        assert_eq!(
+            std::fs::read(dir.join("real-log")).expect("target"),
+            b"10\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_directory_named_auto_cleared_is_unreadable() {
         let dir = std::env::temp_dir().join(format!(
             "pump-auto-clear-dir-{}",
@@ -907,7 +1136,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(dir.join("halted"), b"latch\n").expect("latch");
         std::fs::write(dir.join(PUMP_AUTO_CLEARED_FILE), b"10\n").expect("log");
-        remove_latch(&dir).expect("remove");
+        assert_eq!(remove_latch(&dir), LatchRemoval::Removed);
         assert!(!dir.join("halted").exists());
         assert_eq!(
             std::fs::read(dir.join(PUMP_AUTO_CLEARED_FILE)).expect("kept"),

@@ -9,7 +9,7 @@ use kraken_lcd::collector::{AiState, Snapshot};
 use kraken_lcd::config::{Config, ValidConfig};
 use kraken_lcd::device::{
     CoolingSnapshot, FakeLcd, LcdSink, PUMP_AUTO_CLEARED_FILE, PUMP_LATCH_CLEAR_AFTER,
-    PUMP_LATCH_MAX_GAP, SinkError,
+    PUMP_LATCH_CLEAR_LIMIT, PUMP_LATCH_CLEAR_WINDOW, PUMP_LATCH_MAX_GAP, SinkError,
 };
 use kraken_lcd::log::{self, Priority};
 use kraken_lcd::render::Frame;
@@ -127,6 +127,8 @@ impl Clock for FakeClock {
 }
 
 /// Adds `PUMP_LATCH_MAX_GAP + 1 s` of wall time on sleep 300.
+///
+/// Monotonic time advances only by the requested sleep, so the jump is wall-only.
 struct GappedClock {
     mono: Instant,
     wall: SystemTime,
@@ -158,6 +160,83 @@ impl Clock for GappedClock {
         self.wall += d;
         if self.sleeps == 300 {
             self.wall += PUMP_LATCH_MAX_GAP + Duration::from_secs(1);
+        }
+    }
+}
+
+/// Adds `PUMP_LATCH_MAX_GAP + 1 s` of monotonic time on sleep 300.
+///
+/// Wall time advances only by the requested sleep.
+struct MonoGappedClock {
+    mono: Instant,
+    wall: SystemTime,
+    sleeps: u32,
+}
+
+impl MonoGappedClock {
+    fn new() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(START_UNIX),
+            sleeps: 0,
+        }
+    }
+}
+
+impl Clock for MonoGappedClock {
+    fn mono(&self) -> Instant {
+        self.mono
+    }
+
+    fn wall(&self) -> SystemTime {
+        self.wall
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        self.sleeps += 1;
+        self.mono += d;
+        self.wall += d;
+        if self.sleeps == 300 {
+            self.mono += PUMP_LATCH_MAX_GAP + Duration::from_secs(1);
+        }
+    }
+}
+
+/// The first sleep jumps both clocks forward 25 h. Later sleeps are normal.
+struct JumpClock {
+    mono: Instant,
+    wall: SystemTime,
+    jumped: bool,
+}
+
+impl JumpClock {
+    fn new() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(START_UNIX),
+            jumped: false,
+        }
+    }
+}
+
+impl Clock for JumpClock {
+    fn mono(&self) -> Instant {
+        self.mono
+    }
+
+    fn wall(&self) -> SystemTime {
+        self.wall
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        if !self.jumped {
+            self.jumped = true;
+            let ahead = Duration::from_secs(25 * 60 * 60);
+            self.mono += ahead;
+            self.wall += ahead;
+        } else {
+            self.mono += d;
+            self.wall += d;
         }
     }
 }
@@ -358,8 +437,36 @@ fn run_steady(config: &ValidConfig, dir: &Path, ticks: u32, latch_at_start: bool
 
 fn clear_line(n: usize) -> String {
     let after = PUMP_LATCH_CLEAR_AFTER.as_secs();
+    let limit = PUMP_LATCH_CLEAR_LIMIT;
+    let hours = PUMP_LATCH_CLEAR_WINDOW.as_secs() / 3600;
     format!(
-        "cooling guard latch cleared after {after} s of normal pump operation (auto-clear {n} of 3 in 24 h)"
+        "cooling guard latch cleared after {after} s of normal pump operation (auto-clear {n} of {limit} in {hours} h)"
+    )
+}
+
+fn exhaustion_line() -> String {
+    let limit = PUMP_LATCH_CLEAR_LIMIT;
+    let hours = PUMP_LATCH_CLEAR_WINDOW.as_secs() / 3600;
+    format!("cooling guard: auto-clear limit ({limit} in {hours} h) reached; run clear-halt")
+}
+
+fn bad_time_line() -> &'static str {
+    "cooling guard: pump latch time is missing or unparsable; run clear-halt"
+}
+
+fn crit_count(ran: &Ran, needle: &str) -> usize {
+    ran.log
+        .crits()
+        .iter()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
+fn latch_text(time: &str, pwm2_enable: u32) -> String {
+    format!(
+        "CRITICAL time={time} reason=fan1_input\n\
+baseline z53=yes pwm1_enable=0 pwm2_enable={pwm2_enable} pwm1=64 pwm2=51 fan1_rpm=1000 devnum=2 bootloader=no\n\
+current z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=0 devnum=2 bootloader=no\n"
     )
 }
 
@@ -473,8 +580,12 @@ fn abnormal_read_at_599s_restarts_the_window() {
 }
 
 #[test]
-fn gap_between_reads_does_not_clear_at_the_original_600s() {
-    let scratch = Scratch::new("gap-short");
+fn wall_jump_alone_neither_shortens_nor_resets_the_window() {
+    // Sleep 300 adds 6 s of wall time. A wall-clock window would clear at
+    // tick 594 (stamp START+600) or, if the jump counted as a gap, not until
+    // tick 900. Mono still reaches 600 s at tick 600, and the stamp is the
+    // wall clock there: START+606.
+    let scratch = Scratch::new("wall-jump");
     std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
     let config = load_config(&scratch.0);
     let ran = run_with(
@@ -485,24 +596,40 @@ fn gap_between_reads_does_not_clear_at_the_original_600s() {
         true,
         || Ok(FakeLcd::new()),
     );
+    assert_cleared(&scratch.0, &ran, START_UNIX + 606, 1, 1);
+}
+
+#[test]
+fn mono_gap_between_reads_does_not_clear_at_the_original_600s() {
+    let scratch = Scratch::new("mono-gap-short");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let ran = run_with(
+        &config,
+        601,
+        MonoGappedClock::new(),
+        Steady::watch(&scratch.0),
+        true,
+        || Ok(FakeLcd::new()),
+    );
     assert_stays(&scratch.0, &ran);
     assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
 }
 
 #[test]
-fn gap_between_reads_restarts_the_window() {
-    let scratch = Scratch::new("gap");
+fn mono_gap_between_reads_restarts_the_window() {
+    let scratch = Scratch::new("mono-gap");
     std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
     let config = load_config(&scratch.0);
     let ran = run_with(
         &config,
         901,
-        GappedClock::new(),
+        MonoGappedClock::new(),
         Steady::watch(&scratch.0),
         true,
         || Ok(FakeLcd::new()),
     );
-    assert_cleared(&scratch.0, &ran, START_UNIX + 906, 1, 1);
+    assert_cleared(&scratch.0, &ran, START_UNIX + 900, 1, 1);
 }
 
 #[test]
@@ -601,11 +728,13 @@ fn three_clears_in_24h_keep_the_fourth_latch() {
     std::fs::write(scratch.0.join(PUMP_AUTO_CLEARED_FILE), &body).expect("record");
     let config = load_config(&scratch.0);
     let ran = run_steady(&config, &scratch.0, 601, true);
+    assert_eq!(ran.reads, 0);
     assert_stays(&scratch.0, &ran);
     assert_eq!(
         std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
         body
     );
+    assert_eq!(crit_count(&ran, &exhaustion_line()), 1);
 }
 
 #[test]
@@ -676,4 +805,274 @@ fn unreadable_auto_clear_state_means_no_clear() {
         .filter(|line| line.contains("unreadable or corrupt"))
         .collect();
     assert_eq!(bad.len(), 1, "{:?}", ran.log.crits());
+}
+
+#[test]
+fn exhausted_latch_logs_once_and_never_clears_25h_later() {
+    let scratch = Scratch::new("exhausted-25h");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let body = format!(
+        "{}\n{}\n{}\n",
+        START_UNIX - 3000,
+        START_UNIX - 2000,
+        START_UNIX - 1000
+    );
+    std::fs::write(scratch.0.join(PUMP_AUTO_CLEARED_FILE), &body).expect("record");
+    let config = load_config(&scratch.0);
+    let watch = Steady::watch(&scratch.0);
+    let reads = watch.reads();
+    let ran = run_with(&config, 700, JumpClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert_stays(&scratch.0, &ran);
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
+        body
+    );
+    assert_eq!(crit_count(&ran, &exhaustion_line()), 1);
+}
+
+#[test]
+fn exhausted_latch_stays_after_restart() {
+    let scratch = Scratch::new("exhausted-restart");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let body = format!(
+        "{}\n{}\n{}\n",
+        START_UNIX - 3000,
+        START_UNIX - 2000,
+        START_UNIX - 1000
+    );
+    std::fs::write(scratch.0.join(PUMP_AUTO_CLEARED_FILE), &body).expect("record");
+    let config = load_config(&scratch.0);
+    let first = run_steady(&config, &scratch.0, 20, true);
+    assert_eq!(first.reads, 0);
+    assert_stays(&scratch.0, &first);
+    assert_eq!(crit_count(&first, &exhaustion_line()), 1);
+    let watch = Steady::watch(&scratch.0);
+    let reads = watch.reads();
+    let second = run_with(&config, 700, JumpClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert_stays(&scratch.0, &second);
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
+        body
+    );
+    assert_eq!(crit_count(&second, &exhaustion_line()), 1);
+}
+
+#[test]
+fn latch_with_a_bad_time_never_clears() {
+    for time in ["nope", "", "1 2"] {
+        let label = if time.is_empty() { "missing" } else { time };
+        let scratch = Scratch::new(&format!("bad-time-{label}"));
+        let body = if time == "1 2" {
+            "CRITICAL time=1 time=2 reason=fan1_input\n\
+baseline z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=1000 devnum=2 bootloader=no\n\
+current z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=0 devnum=2 bootloader=no\n"
+                .to_owned()
+        } else if time.is_empty() {
+            "CRITICAL reason=fan1_input\n\
+baseline z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=1000 devnum=2 bootloader=no\n\
+current z53=yes pwm1_enable=0 pwm2_enable=0 pwm1=64 pwm2=51 fan1_rpm=0 devnum=2 bootloader=no\n"
+                .to_owned()
+        } else {
+            latch_text(time, 0)
+        };
+        std::fs::write(scratch.0.join("halted"), &body).expect("latch");
+        let config = load_config(&scratch.0);
+        let ran = run_steady(&config, &scratch.0, 601, true);
+        assert_eq!(ran.reads, 0, "{time}");
+        assert_stays(&scratch.0, &ran);
+        assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists(), "{time}");
+        assert_eq!(crit_count(&ran, bad_time_line()), 1, "{time}");
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("halted")).expect("kept"),
+            body,
+            "{time}"
+        );
+    }
+}
+
+#[test]
+fn read_that_differs_in_pwm2_enable_never_auto_clears() {
+    let scratch = Scratch::new("pwm2-enable");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let mut snap = normal();
+    snap.pwm2_enable = Some(1);
+    let watch = SeqWatch::new(&scratch.0, move |_n| Some(snap.clone()));
+    let ran = run_with(&config, 601, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_stays(&scratch.0, &ran);
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+}
+
+#[test]
+fn fan1_zero_never_auto_clears() {
+    let scratch = Scratch::new("fan1-zero");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let watch = SeqWatch::new(&scratch.0, |_n| Some(cooling(0, 0, 2)));
+    let ran = run_with(&config, 601, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_stays(&scratch.0, &ran);
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+}
+
+#[test]
+fn store_failure_leaves_the_latch_in_place() {
+    let scratch = Scratch::new("store-fails");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    std::fs::create_dir(scratch.0.join(".auto-cleared.tmp")).expect("temp dir");
+    let config = load_config(&scratch.0);
+    let watch = Steady::watch(&scratch.0);
+    let reads = watch.reads();
+    let ran = run_with(&config, 650, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 601);
+    assert_stays(&scratch.0, &ran);
+    assert!(scratch.0.join("halted").exists());
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+    assert!(scratch.0.join(".auto-cleared.tmp").is_dir());
+    assert_eq!(crit_count(&ran, "latch cleared"), 0);
+}
+
+#[test]
+fn second_halt_in_the_same_process_needs_a_fresh_600s() {
+    let scratch = Scratch::new("second-halt");
+    let config = load_config(&scratch.0);
+    let dir = scratch.0.clone();
+    let watch = Steady::watch(&scratch.0);
+    let reads = watch.reads();
+    let mut opens_made = 0u32;
+    let ran = run_with(&config, 1203, FakeClock::new(), watch, false, move || {
+        opens_made += 1;
+        Ok(LatchSink {
+            dir: dir.clone(),
+            arm: opens_made <= 2,
+            inner: FakeLcd::new(),
+        })
+    });
+    assert_eq!(reads.load(Ordering::Relaxed), 1202);
+    assert_eq!(ran.opens, 3);
+    assert_eq!(ran.exit, LoopExit::Stopped);
+    assert!(!scratch.0.join("halted").exists());
+    let first = START_UNIX + 601;
+    let second = START_UNIX + 1202;
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("record"),
+        format!("{first}\n{second}\n")
+    );
+    assert_eq!(crit_count(&ran, &clear_line(1)), 2);
+}
+
+#[test]
+fn none_read_resets_the_window() {
+    let scratch = Scratch::new("none-read");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let watch = SeqWatch::new(&scratch.0, |n| if n == 300 { None } else { Some(normal()) });
+    let ran = run_with(&config, 902, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_cleared(&scratch.0, &ran, START_UNIX + 901, 1, 1);
+}
+
+#[test]
+fn human_clear_during_the_window_is_not_recorded() {
+    let scratch = Scratch::new("human-clear");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let dir = scratch.0.clone();
+    let watch = SeqWatch::new(&scratch.0, move |n| {
+        if n == 600 {
+            std::fs::remove_file(dir.join("halted")).expect("human clear");
+        }
+        Some(normal())
+    });
+    let ran = run_with(&config, 601, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_eq!(ran.exit, LoopExit::Stopped);
+    assert_eq!(ran.opens, 1);
+    assert!(!scratch.0.join("halted").exists());
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+    let crits = ran.log.crits();
+    assert!(
+        crits.iter().all(|line| !line.contains("latch cleared")),
+        "{crits:?}"
+    );
+    assert!(
+        crits.iter().all(|line| !line.contains("could not remove")),
+        "{crits:?}"
+    );
+    assert!(
+        crits
+            .iter()
+            .all(|line| !line.contains("directory sync failed")),
+        "{crits:?}"
+    );
+}
+
+#[test]
+fn replaced_latch_is_reclassified_and_not_recorded() {
+    let scratch = Scratch::new("replaced");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    let config = load_config(&scratch.0);
+    let dir = scratch.0.clone();
+    let replacement = latch_text("1700000001", 1);
+    let watch = SeqWatch::new(&scratch.0, move |n| {
+        if n == 600 {
+            std::fs::write(dir.join("halted"), &replacement).expect("replace");
+        }
+        Some(normal())
+    });
+    let ran = run_with(&config, 601, FakeClock::new(), watch, true, || {
+        Ok(FakeLcd::new())
+    });
+    assert_stays(&scratch.0, &ran);
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+    let body = std::fs::read_to_string(scratch.0.join("halted")).expect("kept");
+    assert!(body.contains("time=1700000001"), "{body}");
+    assert!(body.contains("pwm2_enable=1"), "{body}");
+    assert_eq!(crit_count(&ran, "latch cleared"), 0);
+}
+
+#[test]
+fn symlink_latch_never_auto_clears() {
+    let scratch = Scratch::new("symlink-latch");
+    std::fs::write(scratch.0.join("real"), pump_latch()).expect("real");
+    std::os::unix::fs::symlink("real", scratch.0.join("halted")).expect("link");
+    let config = load_config(&scratch.0);
+    let ran = run_steady(&config, &scratch.0, 601, true);
+    assert_eq!(ran.reads, 0);
+    assert_stays(&scratch.0, &ran);
+    assert!(!scratch.0.join(PUMP_AUTO_CLEARED_FILE).exists());
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join("real")).expect("target"),
+        pump_latch()
+    );
+}
+
+#[test]
+fn symlink_auto_cleared_means_no_clear() {
+    let scratch = Scratch::new("symlink-record");
+    std::fs::write(scratch.0.join("halted"), pump_latch()).expect("latch");
+    std::fs::write(scratch.0.join("real-log"), b"1\n").expect("log");
+    std::os::unix::fs::symlink("real-log", scratch.0.join(PUMP_AUTO_CLEARED_FILE)).expect("link");
+    let config = load_config(&scratch.0);
+    let ran = run_steady(&config, &scratch.0, 601, true);
+    assert_eq!(ran.reads, 0);
+    assert_stays(&scratch.0, &ran);
+    assert_eq!(
+        std::fs::read(scratch.0.join("real-log")).expect("target"),
+        b"1\n"
+    );
+    assert_eq!(crit_count(&ran, "unreadable or corrupt"), 1);
 }
