@@ -93,13 +93,41 @@ Any failed check moves the writer to **HALTED**:
 4. It keeps running and feeding the systemd watchdog, so systemd does not
    restart it into another attempt.
 
-The latch **persists** across crashes, restarts and reboots. While it exists,
+The latch **persists** across crashes, restarts and reboots (only a pump
+latch can clear itself, as described below). While it exists,
 `run` does no device I/O, and `restore-stock` (including the one in
 `ExecStopPost`) exits without touching the device.
 
-**Clearing it is a human decision.** The latch is cleared by an explicit
-root command; `clear-halt` refuses to run as any other user and asks you to
-type `YES`. After you have checked the cooler:
+**A pump latch can clear itself (#158).** Every pump latch so far was a false
+alarm from the firmware's own curve, so a latch with `reason=fan1_input` and a
+valid `time=` clears itself after **10 minutes of continuous normal pump
+operation**. While the latch can still clear itself, the service reads the same sysfs
+values the guard reads once per loop (change mode: `writer.tick_s`, 0.5 s by
+default and at most 2 s; stream mode: `stream_fps`) and opens no device
+handle. A read is normal when it passes the guard's
+checks against the read before it, the pump is not stopped, and `z53`, both
+`pwm*_enable` modes and the USB device number match the latch's baseline with
+no bootloader present. An abnormal read, a gap of more than 5 s between reads,
+or a restart starts the 10 minutes over; the 10 minutes and the 5 s gap use the monotonic
+clock, so a wall-clock change cannot shorten or reset them, and time spent
+suspended does not count. Before removing the latch it records the
+wall-clock time in `/var/lib/kraken-lcd/auto-cleared`; the latch is removed
+only after that write succeeds, and a recorded clear counts even if the
+removal then fails. At most **3 automatic clears** apply to each latch: every recorded clear
+from 24 hours before that latch's `time=` onward counts, including later ones,
+so the count does not shrink as time passes. If three already fall in it, the
+latch stays until `clear-halt`, across restarts, and logs one `crit` line
+saying so. Each automatic clear also logs
+at `crit`. The writer then starts again through the normal open path,
+with every check in place.
+
+**Any other latch is a human decision.** A latch for any other reason (missing `z53`, a
+changed `pwm*_enable`, a new device number, the bootloader, an unreadable
+value), a pump latch with a missing or bad `time=`, an unparsable latch file,
+or an unreadable or corrupt `auto-cleared` file never clears by itself. A
+missing or empty `auto-cleared` file means no clears yet. Clearing takes an explicit root command; `clear-halt` refuses to
+run as any other user and asks you to type `YES`. After you have checked the
+cooler:
 
 ```sh
 cat /var/lib/kraken-lcd/halted                                  # time and both snapshots
