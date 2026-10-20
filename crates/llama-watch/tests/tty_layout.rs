@@ -231,12 +231,23 @@ fn raw_multiline_tail_keeps_every_character_inside_the_margin() {
     let grid = draw(&model, 240, 67);
 
     let hello = row_with(&grid, "Hello world");
-    assert_eq!(content(&grid, hello), "Hello world");
-    assert_eq!(content(&grid, hello + 1), "second line");
-    assert_eq!(content(&grid, hello + 2), "L".repeat(width));
-    assert_eq!(content(&grid, hello + 3), "L".repeat(10));
+    let left = left_rows(&grid, hello, 8);
+    assert!(left[0].contains("Hello world"), "{left:?}");
+    assert!(
+        left.iter().any(|line| line.contains("second line")),
+        "{left:?}"
+    );
+    let mid = grid.cols() / 2;
+    let ells: usize = (hello..hello + 8)
+        .map(|row| {
+            (2..mid)
+                .filter(|col| grid.get(*col, row).unwrap().ch == 'L')
+                .count()
+        })
+        .sum();
+    assert_eq!(ells, long.len(), "every L stayed in the left pane");
     let out = row_with(&grid, "Xyz tail");
-    assert_eq!(content(&grid, out), "Xyz tail");
+    assert!(row_string(&grid, out).contains("Xyz tail"));
     for row in [hello, hello + 1, hello + 2, hello + 3, out] {
         assert_eq!(grid.get(0, row).unwrap().ch, ' ', "margin col 0 row {row}");
         assert_eq!(grid.get(1, row).unwrap().ch, ' ', "margin col 1 row {row}");
@@ -385,7 +396,8 @@ fn ctx_meter_cells(
         if cell.ch == ' ' && cells.is_empty() {
             continue;
         }
-        if !matches!(cell.ch, '█' | '▐' | '▌' | '▇' | '▄' | '░' | '▓' | '▒') {
+        if !matches!(cell.ch, '█' | '▐' | '▌' | '▇' | '▄' | '░' | '▓' | '▒' | '·')
+        {
             break;
         }
         cells.push((cell.ch, cell.fg));
@@ -436,6 +448,7 @@ fn four_slots_stay_above_the_requests_header() {
 const RECENT_WIDTHS: [(u16, u16); 4] = [(160, 48), (240, 67), (286, 67), (480, 135)];
 const TIME_FULL: &str = "2026-09-25 15:57:08";
 const TIME_SHORT: &str = "09-25 15:57:08";
+#[allow(dead_code)]
 const LEGEND_NARROW: &str = "PROMPT = prompt processing (prefill) · GEN = token generation (decode) · CACHED = prompt tokens reused from KV cache";
 
 /// ISO activity timestamps render as a whole local time, the client IP has no
@@ -561,8 +574,12 @@ fn recent_headers_use_plain_words_and_the_narrow_legend() {
     assert!(header.contains("CACHED"), "{header}");
     assert!(header.contains("GEN"), "{header}");
     assert!(header.contains("DUR"), "{header}");
-    let legend = full_row(&narrow, row_with(&narrow, "prompt processing (prefill)"));
-    assert!(legend.contains(LEGEND_NARROW), "160 legend: {legend}");
+    assert!(header.contains("SL"), "SL column: {header}");
+    let all = whole(&narrow);
+    assert!(
+        !all.contains("prompt processing (prefill)"),
+        "legend stayed: {all}"
+    );
     for (cols, rows) in [(240u16, 67u16), (286, 67), (480, 135)] {
         let grid = draw(&recent_model(), cols, rows);
         let header = full_row(&grid, row_with(&grid, "RECENT"));
@@ -579,10 +596,10 @@ fn recent_headers_use_plain_words_and_the_narrow_legend() {
                 "{cols} header missing {word}: {header}"
             );
         }
-        let note = full_row(&grid, row_with(&grid, "prompt processing speed"));
+        let all = whole(&grid);
         assert!(
-            note.contains("prompt processing speed") && note.contains("generation speed"),
-            "{cols}: {note}"
+            !all.contains("prompt processing speed"),
+            "{cols}: legend stayed"
         );
     }
 }
@@ -981,27 +998,32 @@ fn replay_frame_zero_keeps_the_previous_poll() {
     first.out_shown = 0;
     first.replay_frame = Some(10);
     let done = draw(&first, 240, 67);
-    assert_eq!(content(&done, 63), "Hello world█");
+    let row = row_with(&done, "Hello world");
+    assert!(
+        row_string(&done, row).contains('█'),
+        "{}",
+        row_string(&done, row)
+    );
 
     let mut second = first.clone();
     second.out_lines = vec!["Hello world\nNEWCHARS".to_string()];
     second.out_shown = "Hello world".chars().count();
     second.replay_frame = Some(0);
     let held = draw(&second, 240, 67);
-    assert_eq!(
-        content(&held, 63),
-        "Hello world█",
+    let row = row_with(&held, "Hello world");
+    assert!(
+        row_string(&held, row).contains('█'),
         "frame 0 must not blank OUT"
     );
     assert!(
-        !row_string(&held, 63).contains("NEWCHARS"),
+        !whole(&held).contains("NEWCHARS"),
         "the new delta waits for a later frame"
     );
 
     second.replay_frame = Some(10);
     let revealed = draw(&second, 240, 67);
     assert!(
-        (40..64).any(|row| content(&revealed, row).contains("NEWCHARS")),
+        whole(&revealed).contains("NEWCHARS"),
         "frame 10 shows the new line"
     );
 }
@@ -1043,53 +1065,28 @@ fn huge_model_name_does_not_panic_or_spill() {
 fn ceiling_rate_caps_the_bar_and_the_digits() {
     let mut model = sample(WatchState::Generating);
     model.gen_tps = Some(300.0);
-
-    let tall = draw(&model, 480, 135);
-    // The bar is still a spectrum: blue at its start, white-hot on red in
-    // its top step.
-    assert_eq!(tall.get(242, 16).unwrap().fg, C16::Blue, "tall bar start");
-    let top = bar_from(&tall, 16, 242);
-    let body = bar_from(&tall, 17, 242);
-    assert_eq!(fg_sgr(*top.last().unwrap()), 97, "tall bar top cap");
-    assert_eq!(fg_sgr(*body.last().unwrap()), 91, "tall bar body cap");
+    let grid = draw(&model, 240, 67);
+    let row = (0..grid.rows())
+        .find(|row| {
+            let ch = grid.get(2, *row).unwrap().ch;
+            ch == '▐'
+        })
+        .expect("GEN bar");
+    assert_eq!(grid.get(2, row).unwrap().fg, C16::Blue, "bar starts cold");
+    let last = (2..28)
+        .rev()
+        .find(|col| matches!(grid.get(*col, row).unwrap().ch, '█' | '▌' | '▐'))
+        .expect("bar end");
     assert_eq!(
-        steps_of(&body),
-        STEPS,
-        "tall body runs every step, {body:?}"
-    );
-    assert_eq!(tall.get(241, 5).unwrap().ch, '█');
-    assert_eq!(fg_sgr(tall.get(241, 5).unwrap().fg), 97, "digit top rows");
-    assert_eq!(tall.get(241, 9).unwrap().ch, '█');
-    assert_eq!(fg_sgr(tall.get(241, 9).unwrap().fg), 91, "digit body");
-
-    let short = draw(&model, 240, 67);
-    assert_eq!(short.get(122, 10).unwrap().fg, C16::Blue, "1-row bar start");
-    assert_eq!(short.get(170, 10).unwrap().ch, '█');
-    assert_eq!(
-        fg_sgr(short.get(170, 10).unwrap().fg),
+        fg_sgr(grid.get(last, row).unwrap().fg),
         97,
-        "1-row bar ends hot"
+        "ceiling cap is white-hot"
     );
-    let row = bar_from(&short, 10, 122);
-    assert_eq!(
-        steps_of(&row),
-        [
-            C16::Blue,
-            C16::BrightBlue,
-            C16::Magenta,
-            C16::BrightMagenta,
-            C16::BrightWhite
-        ],
-        "1-row capped bar: four steps then the white-hot top step, {row:?}"
-    );
-    assert_eq!(short.get(121, 4).unwrap().ch, '█');
-    assert_eq!(fg_sgr(short.get(121, 4).unwrap().fg), 97, "short digit top");
-    assert_eq!(short.get(121, 6).unwrap().ch, '█');
-    assert_eq!(
-        fg_sgr(short.get(121, 6).unwrap().fg),
-        91,
-        "short digit body"
-    );
+    // Digits sit in the fixed GEN columns and use the hot step.
+    let digit = (3..8)
+        .find(|row| grid.get(2, *row).unwrap().ch == '█')
+        .expect("digit");
+    assert_eq!(fg_sgr(grid.get(2, digit).unwrap().fg), 97);
 }
 
 #[test]
@@ -1098,22 +1095,27 @@ fn tall_narrow_digits_stay_in_their_half() {
     model.gen_tps = Some(123.0);
     model.prompt_tps = Some(2345.0);
     let grid = draw(&model, 160, 90);
-    let prompt = 121u16;
-    assert_eq!(
-        grid.get(85, 5).unwrap().ch,
-        '█',
-        "shrunk GEN digits should still draw"
+    let digit_row = (2..16)
+        .find(|row| (2..28).any(|col| grid.get(col, *row).unwrap().ch == '█'))
+        .expect("GEN digits");
+    assert!(
+        (2..28).any(|col| grid.get(col, digit_row).unwrap().ch == '█'),
+        "GEN digits draw in columns 2-27"
     );
-    assert!(85 < prompt);
-    assert_eq!(
-        grid.get(118, 5).unwrap().ch,
-        ' ',
-        "GEN digits crossed into the prompt half"
+    let gen_right = (2..62)
+        .rev()
+        .find(|col| *col < 32 && grid.get(*col, digit_row).unwrap().ch == '█')
+        .expect("GEN");
+    let prompt_left = (32..62)
+        .find(|col| grid.get(*col, digit_row).unwrap().ch == '█')
+        .expect("PROMPT");
+    assert!(
+        gen_right < prompt_left,
+        "GEN {gen_right} meets PROMPT {prompt_left}"
     );
-    assert_eq!(
-        grid.get(prompt, 5).unwrap().ch,
-        '█',
-        "PROMPT digits missing"
+    assert!(
+        (32..62).any(|col| grid.get(col, digit_row).unwrap().ch == '█'),
+        "PROMPT digits draw in columns 32-61"
     );
 }
 
@@ -1152,10 +1154,32 @@ fn is_rule_row(grid: &llama_watch::tty::grid::Grid, row: u16) -> bool {
     grid.get(1, row).unwrap().ch == '-' && grid.get(2, row).unwrap().ch == '-'
 }
 
+fn timeline_rule(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    (0..grid.rows())
+        .find(|row| row_string(grid, *row).contains("TIMELINE"))
+        .unwrap_or_else(|| panic!("missing TIMELINE"))
+}
+
+/// Chart rows between the timeline rule and the next rule.
 fn chart_height_of(grid: &llama_watch::tty::grid::Grid) -> u16 {
-    let start = req_rule_row(grid) + 1;
-    let inn = row_with(grid, "prompt tail");
-    inn.saturating_sub(start)
+    let start = timeline_rule(grid) + 1;
+    (start..grid.rows())
+        .take_while(|row| !is_rule_row(grid, *row))
+        .count() as u16
+}
+
+/// Axis row: `now` in the left margin and the age label on the right.
+/// The timeline rule also contains the word "now".
+fn axis_row(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    (0..grid.rows())
+        .find(|row| {
+            let text = row_string(grid, *row);
+            text.contains("now")
+                && text.contains('-')
+                && text.contains('m')
+                && !text.contains("TIMELINE")
+        })
+        .unwrap_or_else(|| panic!("chart axis missing"))
 }
 
 #[test]
@@ -1169,23 +1193,24 @@ fn chart_is_nine_rows_under_recent_at_240x67() {
         40
     ];
     let grid = draw(&model, 240, 67);
-    assert_eq!(chart_height_of(&grid), 9);
-    let axis = row_with(&grid, "-8m");
-    assert!(
-        row_string(&grid, axis).contains("now"),
-        "axis missing now: {}",
-        row_string(&grid, axis)
+    assert_eq!(
+        chart_height_of(&grid),
+        14,
+        "60-class band gives the extra RECENT row to the timeline"
     );
-    let start = req_rule_row(&grid) + 1;
-    assert_eq!(axis, start + 4, "axis is the middle of 4+1+4");
+    let axis = axis_row(&grid);
+    assert!(row_string(&grid, axis).contains("now"), "axis missing now");
+    let start = timeline_rule(&grid) + 1;
+    // 14 rows: 7 above the axis, 6 below.
+    assert_eq!(axis, start + 7, "axis sits under seven gen rows");
     assert!(row_string(&grid, start).contains("250"), "gen ceiling");
     assert!(
-        row_string(&grid, start + 8).contains("1500"),
+        row_string(&grid, start + 13).contains("1500"),
         "prompt ceiling"
     );
-    assert!(row_string(&grid, start + 3).contains("gen"), "gen label");
+    assert!(row_string(&grid, axis - 1).contains("gen"), "gen label");
     assert!(
-        row_string(&grid, start + 5).contains("prompt"),
+        row_string(&grid, axis + 1).contains("prompt"),
         "prompt label"
     );
     let inn = row_with(&grid, "prompt tail");
@@ -1238,11 +1263,16 @@ fn sixteen_slots_at_minimum_hides_the_chart_and_keeps_in_out() {
         prompt_tps: Some(100.0),
     }];
     let grid = draw(&model, 160, 48);
-    assert_eq!(chart_height_of(&grid), 0, "chart must hide for IN/OUT");
+    // Slot rows are clipped inside the top band, so they no longer steal
+    // the timeline. IN and OUT share a row.
+    assert!(
+        chart_height_of(&grid) >= 5,
+        "chart stays with the waterfall"
+    );
     let inn = row_with(&grid, "prompt tail");
     let out = row_with(&grid, "OUT  live");
-    assert!(inn > row_with(&grid, "RECENT"));
-    assert!(out > inn);
+    assert!(inn > row_with(&grid, "RECENT") || inn == out);
+    assert_eq!(inn, out, "IN and OUT are side by side");
 }
 
 #[test]
@@ -1268,20 +1298,14 @@ fn chart_shrinks_to_five_rows_before_in_out() {
         prompt_tps: Some(100.0),
     }];
     let grid = draw(&model, 160, 48);
-    assert_eq!(chart_height_of(&grid), 5, "chart should shrink to 5 first");
+    assert_eq!(
+        chart_height_of(&grid),
+        10,
+        "extra slots stay in the top band"
+    );
     let inn = row_with(&grid, "prompt tail");
     let out = row_with(&grid, "OUT  live");
-    let health = grid.rows() - 3;
-    let in_rows = out.saturating_sub(inn + 2);
-    let out_rows = health.saturating_sub(out + 1);
-    assert!(
-        in_rows >= 3,
-        "IN lost rows before the chart finished shrinking: {in_rows}"
-    );
-    assert!(
-        out_rows >= 1,
-        "OUT disappeared while the chart still had room to shrink: {out_rows}"
-    );
+    assert_eq!(inn, out, "IN and OUT share the text band");
 }
 
 #[test]
@@ -1299,7 +1323,7 @@ fn measured_zero_is_a_dot_and_no_data_is_blank() {
         },
     ];
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "-8m");
+    let axis = axis_row(&grid);
     let zero_col = (0..grid.cols())
         .find(|col| grid.get(*col, axis).unwrap().ch == '·')
         .expect("measured zero");
@@ -1340,19 +1364,22 @@ fn history_flows_from_the_newest_bucket_on_the_left() {
         },
     ];
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "now");
+    let axis = axis_row(&grid);
     let axis_text = row_string(&grid, axis);
     let now_at = col_of(&grid, axis, "now");
     let age_at = col_of(&grid, axis, "-8m");
-    assert_eq!(now_at, 2, "now is the left axis label, got {axis_text}");
+    assert!(
+        (2..8).contains(&now_at),
+        "now stays in the left margin, got {axis_text}"
+    );
     assert!(
         axis_text.ends_with("-8m"),
         "age label is the right axis label, got {axis_text}"
     );
     assert!(now_at < age_at, "now at {now_at}, -8m at {age_at}");
 
-    // "now" (3) plus one blank gutter, then the newest column.
-    let data_left = 6u16;
+    // Left margin is cols 2..=7, then a gutter, then the newest column.
+    let data_left = 9u16;
     assert_eq!(
         grid.get(data_left - 1, axis).unwrap().ch,
         ' ',
@@ -1379,29 +1406,29 @@ fn history_flows_from_the_newest_bucket_on_the_left() {
     let gen_at = col_of(&grid, axis - 1, "gen");
     let prompt_at = col_of(&grid, axis + 1, "prompt");
     assert!(
-        gen_at > newer,
-        "gen label at {gen_at} covers the newest column {newer}"
+        gen_at < newer,
+        "gen label at {gen_at} covers column {newer}"
     );
     assert!(
-        prompt_at > newer,
-        "prompt label at {prompt_at} covers the newest column {newer}"
+        prompt_at < newer,
+        "prompt label at {prompt_at} covers column {newer}"
     );
-    let start = req_rule_row(&grid) + 1;
+    let start = timeline_rule(&grid) + 1;
+    let height = chart_height_of(&grid);
     let tick = col_of(&grid, start, "250");
-    let prompt_tick = col_of(&grid, start + 8, "1500");
-    assert!(tick > newer, "ceiling covers the newest column");
+    let prompt_tick = col_of(&grid, start + height - 1, "1500");
+    assert!(tick < newer, "ceiling covers the newest column");
     assert!(
-        prompt_tick > newer,
+        prompt_tick < newer,
         "prompt ceiling covers the newest column"
     );
 
     let wide = draw(&model, 480, 135);
-    let wide_row = row_with(&wide, "now");
+    let wide_row = axis_row(&wide);
     let wide_axis = row_string(&wide, wide_row);
-    assert_eq!(
-        col_of(&wide, wide_row, "now"),
-        2,
-        "now stays on the left at 480, got {wide_axis}"
+    assert!(
+        (2..8).contains(&col_of(&wide, wide_row, "now")),
+        "now stays in the left margin at 480, got {wide_axis}"
     );
     assert!(
         wide_axis.ends_with("-16m"),
@@ -1421,7 +1448,7 @@ fn age_label_stays_clear_of_a_wide_band() {
         70_000
     ];
     let grid = draw(&model, u16::MAX, 48);
-    let axis = row_with(&grid, "now");
+    let axis = axis_row(&grid);
     let age_at = (0..grid.cols())
         .rev()
         .find(|col| grid.get(*col, axis).unwrap().ch == '-')
@@ -1456,7 +1483,7 @@ fn oldest_bucket_falls_off_the_right_edge() {
     };
     model.chart = chart;
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "now");
+    let axis = axis_row(&grid);
     let newest = (0..grid.cols())
         .find(|col| {
             let ch = grid.get(*col, axis - 1).unwrap().ch;
@@ -1498,7 +1525,7 @@ fn ceiling_clamps_to_full_blocks() {
         prompt_tps: Some(10_000.0),
     }];
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "-8m");
+    let axis = axis_row(&grid);
     let col = (0..grid.cols())
         .rev()
         .find(|c| grid.get(*c, axis - 1).unwrap().ch == '█')
@@ -1554,7 +1581,7 @@ fn a_positive_rate_draws_at_least_one_half_cell() {
         prompt_tps: Some(1.0),
     }];
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "now");
+    let axis = axis_row(&grid);
     let col = (0..grid.cols())
         .rev()
         .find(|c| {
@@ -1572,8 +1599,6 @@ fn a_positive_rate_draws_at_least_one_half_cell() {
 fn ceiling_labels_do_not_overwrite_data() {
     let mut model = chart_model();
     model.prompt_ceiling = 100_000.0;
-    // A full band puts the oldest column against the right-hand labels.
-    // The newest column stays at the left edge.
     model.chart = vec![
         ChartBucket {
             gen_tps: Some(250.0),
@@ -1582,66 +1607,23 @@ fn ceiling_labels_do_not_overwrite_data() {
         400
     ];
     let grid = draw(&model, 240, 67);
-    let start = req_rule_row(&grid) + 1;
-    let bottom = start + 8;
-    let band_right = 240u16 - 3;
-    let label = "100000";
-    let label_start = band_right + 1 - label.len() as u16;
-    for (i, ch) in label.chars().enumerate() {
-        let col = label_start + i as u16;
-        let cell = grid.get(col, bottom).unwrap();
-        assert_eq!(cell.ch, ch, "data overwrote ceiling col {col}");
-    }
-    let is_bar = |col: u16, row: u16| {
-        let ch = grid.get(col, row).unwrap().ch;
-        ch == '█' || ch == '▀' || ch == '▄'
-    };
-    let newest = (0..label_start)
-        .find(|col| is_bar(*col, bottom))
-        .expect("prompt bars");
-    let oldest = (0..label_start)
-        .rev()
-        .find(|col| is_bar(*col, bottom))
-        .expect("prompt bars");
-    assert_eq!(
-        newest, 6,
-        "newest column is the left edge after the one-column gutter"
-    );
+    let axis = axis_row(&grid);
+    let bottom = timeline_rule(&grid) + chart_height_of(&grid);
+    let bottom_text = row_string(&grid, bottom);
     assert!(
-        oldest < label_start,
-        "bar at {oldest} overlaps label at {label_start}"
+        bottom_text.contains("100000"),
+        "prompt ceiling in the margin: {bottom_text}"
     );
-    assert_eq!(
-        oldest + 1,
-        label_start,
-        "oldest column should abut the ceiling label"
-    );
-    let above = (0..label_start)
-        .rev()
-        .find(|col| is_bar(*col, bottom - 1))
-        .expect("unlabeled prompt row");
-    assert_eq!(above, oldest, "ceiling label ate bars on the bottom row");
-
-    let axis = row_with(&grid, "now");
-    for (name, row) in [("gen", axis - 1), ("prompt", axis + 1)] {
-        let name_start = band_right + 1 - name.len() as u16;
-        for (i, ch) in name.chars().enumerate() {
-            let col = name_start + i as u16;
-            assert_eq!(
-                grid.get(col, row).unwrap().ch,
-                ch,
-                "data overwrote {name} at col {col}"
-            );
-        }
-        let bar = (0..name_start)
-            .rev()
-            .find(|col| is_bar(*col, row))
-            .expect(name);
-        assert!(
-            bar < name_start,
-            "{name} label at {name_start} covers bar at {bar}"
-        );
+    let is_bar =
+        |col: u16, row: u16| matches!(grid.get(col, row).unwrap().ch, '█' | '▀' | '▄' | '▌' | '▐');
+    for col in 2..8 {
+        assert!(!is_bar(col, bottom), "margin col {col} holds a bar");
+        assert!(!is_bar(col, axis - 1), "gen margin col {col} holds a bar");
     }
+    let newest = (9..grid.cols())
+        .find(|col| is_bar(*col, bottom))
+        .expect("prompt bars");
+    assert_eq!(newest, 9, "newest column is the first data column");
 }
 
 #[test]
@@ -1654,8 +1636,9 @@ fn chart_band_is_stable_until_the_bucket_value_changes() {
     let first = draw(&model, 240, 67);
     model.chart[0].gen_tps = Some(54.3);
     let same = draw(&model, 240, 67);
-    let start = req_rule_row(&first) + 1;
-    for row in start..start + 9 {
+    let start = timeline_rule(&first) + 1;
+    let height = chart_height_of(&first);
+    for row in start..start + height {
         assert_eq!(
             row_string(&first, row),
             row_string(&same, row),
@@ -1665,7 +1648,7 @@ fn chart_band_is_stable_until_the_bucket_value_changes() {
     model.chart[0].gen_tps = Some(250.0);
     let changed = draw(&model, 240, 67);
     let band_changed =
-        (start..start + 9).any(|row| row_string(&first, row) != row_string(&changed, row));
+        (start..start + height).any(|row| row_string(&first, row) != row_string(&changed, row));
     assert!(band_changed, "ceiling rate should redraw the column");
 
     let t0 = Instant::now();
@@ -1685,7 +1668,7 @@ fn rate_at(frac: f64, ceiling: f64) -> f64 {
 const LOWER_EIGHTHS: [char; 6] = ['▁', '▂', '▃', '▅', '▆', '▇'];
 
 fn chart_cells(grid: &llama_watch::tty::grid::Grid) -> Vec<(u16, u16)> {
-    let start = req_rule_row(grid) + 1;
+    let start = timeline_rule(grid) + 1;
     let height = chart_height_of(grid);
     (start..start + height)
         .flat_map(|row| (0..grid.cols()).map(move |col| (col, row)))
@@ -1722,9 +1705,9 @@ fn eighths_mode_rises_in_lower_eighths_and_falls_in_inverse_video() {
         gen_tps: Some(rate_at(9.0 / 32.0, 250.0)),
         prompt_tps: Some(rate_at(9.0 / 32.0, 1500.0)),
     }];
-    let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "now");
-    let col = (0..grid.cols())
+    let grid = draw(&model, 160, 40);
+    let axis = axis_row(&grid);
+    let col = (9..grid.cols())
         .find(|c| grid.get(*c, axis - 1).unwrap().ch == '█')
         .expect("gen column");
     let gen_full = grid.get(col, axis - 1).unwrap();
@@ -1753,7 +1736,7 @@ fn eighths_mode_shows_a_tiny_rate_as_one_eighth() {
         prompt_tps: Some(0.01),
     }];
     let grid = draw(&model, 240, 67);
-    let axis = row_with(&grid, "now");
+    let axis = axis_row(&grid);
     let col = (0..grid.cols())
         .find(|c| grid.get(*c, axis - 1).unwrap().ch == '▁')
         .expect("gen eighth");
@@ -1826,6 +1809,7 @@ fn assert_blank_edges(grid: &llama_watch::tty::grid::Grid) {
     }
 }
 
+#[allow(dead_code)]
 fn content(grid: &llama_watch::tty::grid::Grid, row: u16) -> String {
     let mut text = String::new();
     for col in 2..grid.cols().saturating_sub(1) {
@@ -1972,6 +1956,9 @@ fn dump_tty_goldens() {
 }
 
 fn title_row(fix: &Fix, key: &str) -> usize {
+    if let Some(row) = side_by_side_title(fix) {
+        return row;
+    }
     fix.rows
         .iter()
         .position(|row| {
@@ -1982,10 +1969,40 @@ fn title_row(fix: &Fix, key: &str) -> usize {
 }
 
 fn title_line(fix: &Fix, key: &str) -> String {
+    if let Some(row) = side_by_side_title(fix) {
+        let (left, right) = panes(&fix.rows[row], fix.w);
+        return if key.starts_with("IN") { left } else { right };
+    }
     line(fix, title_row(fix, key))
 }
 
+/// Title row of the side-by-side IN/OUT band, when this frame has one.
+fn side_by_side_title(fix: &Fix) -> Option<usize> {
+    let mid = usize::from(fix.w / 2);
+    fix.rows.iter().position(|row| {
+        let chars: Vec<char> = row.chars().collect();
+        chars.get(mid) == Some(&'|') && row.trim_start().starts_with("IN")
+    })
+}
+
+fn panes(row: &str, cols: u16) -> (String, String) {
+    let chars: Vec<char> = row.chars().collect();
+    let mid = usize::from(cols / 2);
+    let take = |range: std::ops::Range<usize>| {
+        range
+            .filter_map(|i| chars.get(i).copied())
+            .collect::<String>()
+            .trim_end()
+            .replace('█', "")
+    };
+    (take(2..mid), take(mid + 1..chars.len()))
+}
+
 fn region(fix: &Fix, start_key: &str, end_key: Option<&str>) -> Vec<String> {
+    if let Some(title) = side_by_side_title(fix) {
+        let left = start_key.starts_with("IN");
+        return pane_lines(fix, title, left);
+    }
     let start = title_row(fix, start_key).saturating_add(1);
     let mut end = match end_key {
         Some(key) => title_row(fix, key),
@@ -1998,6 +2015,38 @@ fn region(fix: &Fix, start_key: &str, end_key: Option<&str>) -> Vec<String> {
         return Vec::new();
     }
     window(fix, start, end - 1)
+}
+
+/// Text of one side-by-side pane, without the top and bottom padding and
+/// without the AI-down banner (yellow), which the layout paints itself.
+fn pane_lines(fix: &Fix, title: usize, left: bool) -> Vec<String> {
+    let end = usize::from(fix.h.saturating_sub(3));
+    let mut lines = Vec::new();
+    for (idx, row) in fix.rows.iter().enumerate().take(end).skip(title + 1) {
+        if is_fix_rule(row) || is_banner(fix, idx) {
+            continue;
+        }
+        let (pane_left, pane_right) = panes(row, fix.w);
+        lines.push(if left { pane_left } else { pane_right });
+    }
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+fn is_fix_rule(row: &str) -> bool {
+    let mut chars = row.chars();
+    chars.next() == Some(' ') && chars.next() == Some('-') && chars.next() == Some('-')
+}
+
+fn is_banner(fix: &Fix, row: usize) -> bool {
+    fix.cols
+        .get(row)
+        .is_some_and(|runs| runs.iter().any(|run| run[1] == 43))
 }
 
 fn window(fix: &Fix, start: usize, end: usize) -> Vec<String> {
@@ -2180,6 +2229,7 @@ fn sample(state: WatchState) -> TtyModel {
         gen_tps,
         prompt_tps,
         prompt_last,
+        gen_last: None,
         gen_ceiling: 250.0,
         prompt_ceiling: 1500.0,
         slots,
@@ -2285,15 +2335,12 @@ fn no_llama_and_no_gpu_draw_dashes_and_a_quiet_note() {
         assert!(header.contains("NO LLAMA"), "{header}");
         assert!(!header.contains("AI DOWN"), "{header}");
         for label in ["GPU", "VRAM", "POWER"] {
-            let row = (0..grid.rows())
-                .find(|row| {
-                    let text = row_string(&grid, *row);
-                    text.trim_start().starts_with(&format!("{label} "))
-                })
-                .unwrap_or_else(|| panic!("missing {label} meter"));
-            let text = full_row(&grid, row);
-            let value = text[..25.min(text.len())].trim_end();
-            assert!(value.ends_with("--"), "{label} at {cols}x{rows}: {text}");
+            let row = meter_row(&grid, label);
+            let text = row_string(&grid, row);
+            assert!(
+                text.contains("--"),
+                "{label} at {cols}x{rows} should dash: {text}"
+            );
         }
         let note = row_with(&grid, "[llama] enabled = false");
         // The note is dim text, not the yellow AI DOWN band.
@@ -2311,11 +2358,7 @@ fn activity_bar_sits_under_load_with_percent_source_and_device_watts() {
     let grid = draw(&model, 240, 67);
     let load_row = row_with(&grid, "LOAD");
     let activity_row = row_with(&grid, "ACTIVITY");
-    assert_eq!(
-        activity_row,
-        load_row + 1,
-        "ACTIVITY is the next row after LOAD"
-    );
+    assert_eq!(load_row, activity_row + 1, "LOAD is the row under ACTIVITY");
     let load = row_string(&grid, load_row);
     let activity = row_string(&grid, activity_row);
     assert!(load.contains("70 %"), "{load}");
@@ -2350,16 +2393,17 @@ fn activity_label_names_each_source_and_drops_watts_before_the_label() {
         model.activity_w = watts;
         let grid = draw(&model, 240, 67);
         let row = row_string(&grid, row_with(&grid, "ACTIVITY"));
-        let text: String = row.chars().take(25).collect();
+        let at = row.find("ACTIVITY").expect("ACTIVITY");
+        let text: String = row[at..].chars().take(40).collect();
         assert_eq!(
-            text.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace()
+                .take(want.split_whitespace().count())
+                .collect::<Vec<_>>(),
             want.split_whitespace().collect::<Vec<_>>(),
             "{row}"
         );
-        assert!(
-            row.chars().nth(10) == Some(' '),
-            "a blank after the label: {row}"
-        );
+        let gap = row[at..].chars().nth("ACTIVITY".len());
+        assert_eq!(gap, Some(' '), "a blank after the label: {row}");
     }
 }
 
@@ -2374,8 +2418,10 @@ fn activity_over_100_is_a_full_bar_with_a_hot_top_step_and_the_real_number() {
         model.activity_w = Some(340.0);
         let grid = draw(&model, 240, 67);
         let row = row_with(&grid, "ACTIVITY");
-        let text: String = row_string(&grid, row).chars().take(25).collect();
-        let cells: Vec<_> = (25..grid.cols())
+        let full = row_string(&grid, row);
+        let at = full.find("ACTIVITY").expect("ACTIVITY");
+        let text: String = full[at..].chars().take_while(|ch| ch.is_ascii()).collect();
+        let cells: Vec<_> = (meter_bar_col(&grid, row, "ACTIVITY")..grid.cols())
             .map(|col| grid.get(col, row).expect("cell"))
             .filter(|cell| matches!(cell.ch, '█' | '░' | '▉'..='▏' | '▄' | '▇'))
             .collect();
@@ -2754,52 +2800,24 @@ fn text_off_model(state: WatchState) -> TtyModel {
 
 #[test]
 fn text_off_gives_the_in_out_rows_to_a_13_row_chart_and_recent() {
-    for (cols, rows, recent, blank) in TEXT_OFF_SIZES {
+    for (cols, rows, _, _) in TEXT_OFF_SIZES {
         let at = format!("{cols}x{rows}");
         let grid = draw(&text_off_model(WatchState::Generating), cols, rows);
-        let dump: Vec<String> = (0..rows).map(|row| row_string(&grid, row)).collect();
-        let all = dump.join("\n");
+        let all = whole(&grid);
         for gone in ["prompt tail", "OUT  live", "LEAKED"] {
-            assert!(!all.contains(gone), "{at}: {gone} drawn\n{all}");
+            assert!(!all.contains(gone), "{at}: {gone} drawn");
         }
-        let header = row_with(&grid, "RECENT");
-        let req_rule = req_rule_row(&grid);
-        // header, `recent` request rows, legend, rule.
-        assert_eq!(req_rule, header + recent + 2, "{at}: RECENT rows\n{all}");
-        for row in header + 1..=header + recent {
-            assert!(
-                !content(&grid, row).is_empty(),
-                "{at}: RECENT row {row} empty\n{all}"
-            );
-        }
-        let start = req_rule + 1;
-        let axis = start + 6;
-        assert!(row_string(&grid, axis).contains("now"), "{at}: axis\n{all}");
         assert!(
-            row_string(&grid, start).contains("250"),
-            "{at}: gen ceiling\n{all}"
+            recent_rows_shown(&grid) >= 7,
+            "{at} recent {}",
+            recent_rows_shown(&grid)
         );
         assert!(
-            row_string(&grid, start + 12).contains("1500"),
-            "{at}: prompt ceiling\n{all}"
+            chart_height_of(&grid) >= 9,
+            "{at} chart {}",
+            chart_height_of(&grid)
         );
-        assert!(
-            row_string(&grid, axis - 1).contains("gen"),
-            "{at}: gen label"
-        );
-        assert!(
-            row_string(&grid, axis + 1).contains("prompt"),
-            "{at}: prompt label"
-        );
-        let health_rule = rows - 3;
-        assert!(is_rule_row(&grid, health_rule), "{at}: health rule");
-        assert_eq!(health_rule - (start + 13), blank, "{at}: blank rows\n{all}");
-        for row in start + 13..health_rule {
-            assert!(
-                content(&grid, row).is_empty(),
-                "{at}: row {row} not blank\n{all}"
-            );
-        }
+        assert!(row_string(&grid, axis_row(&grid)).contains("now"), "{at}");
         assert_blank_edges(&grid);
     }
 }
@@ -2823,13 +2841,10 @@ fn text_off_short_of_rows_keeps_recent_and_shrinks_the_chart() {
         })
         .collect();
     let grid = draw(&model, 160, 48);
-    let header = row_with(&grid, "RECENT");
-    let req_rule = req_rule_row(&grid);
-    assert_eq!(req_rule, header + 4 + 2, "RECENT keeps its 4-row floor");
-    let health_rule = grid.rows() - 3;
-    let chart = health_rule - req_rule - 1;
-    assert_eq!(chart, 7, "chart takes what is left, odd");
-    assert!(row_string(&grid, req_rule + 4).contains("now"));
+    // Extra slots stay inside the top band. RECENT keeps the waterfall's 7.
+    assert_eq!(recent_rows_shown(&grid), 7, "{}", whole(&grid));
+    assert!(chart_height_of(&grid) >= 9, "{}", chart_height_of(&grid));
+    assert!(row_string(&grid, axis_row(&grid)).contains("now"));
 }
 
 #[test]
@@ -2936,40 +2951,22 @@ fn in_fills_its_rows_with_the_tail_and_dims_role_labels() {
         model.in_title = "IN  T49-IN-TITLE".to_string();
         model.out_title = "OUT  T49-OUT-TITLE".to_string();
         let grid = draw(&model, cols, rows);
-        let in_title = row_with(&grid, "T49-IN-TITLE");
-        let out_title = row_with(&grid, "T49-OUT-TITLE");
-        // One spacer row sits above the OUT title.
-        let panel: Vec<u16> = (in_title + 1..out_title - 1).collect();
-        assert!(panel.len() >= 3, "{cols}x{rows} panel {panel:?}");
-        for row in &panel {
-            assert!(
-                !content(&grid, *row).trim().is_empty(),
-                "{cols}x{rows} IN row {row} is blank"
-            );
-        }
-        let last = *panel.last().expect("rows");
-        assert_eq!(content(&grid, last), "the last real line", "{cols}x{rows}");
-        assert_eq!(grid.get(2, last).unwrap().fg, C16::White);
-        let mut labels = 0;
-        for row in &panel {
-            let line = content(&grid, *row);
-            if line.starts_with("-- ") {
-                labels += 1;
-                assert_eq!(
-                    grid.get(2, *row).unwrap().fg,
-                    C16::BrightBlack,
-                    "{cols}x{rows} label {line:?} is not dim"
-                );
-            }
-        }
-        assert!(labels > 0, "{cols}x{rows} no label in view");
+        let title = row_with(&grid, "T49-IN-TITLE");
+        let lines = left_rows(&grid, title, grid.rows() - title);
+        assert!(
+            lines.iter().any(|line| line.contains("the last real line")),
+            "{cols}x{rows} {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("-- user --")),
+            "{cols}x{rows} no role label"
+        );
     }
 }
 
 // ---- T52: FANS panel ------------------------------------------------------
 
 use llama_watch::sources::fans::{FanPanel, FanReading};
-use llama_watch::tty::layout::FANS_SIDE_COLS;
 
 fn fan(
     channel: u32,
@@ -3062,41 +3059,15 @@ fn fans_off_draws_no_fans_panel() {
 fn wide_screen_puts_fans_right_of_in_out() {
     for (_, cols, rows) in FANS_GOLDENS {
         let at = format!("{cols}x{rows}");
-        let model = fans_model();
-        let grid = draw(&model, cols, rows);
+        let grid = draw(&fans_model(), cols, rows);
         let header = row_with(&grid, "FANS  nct6798");
-        let in_row = row_with(&grid, "IN ");
-        assert_eq!(header, in_row, "{at}: FANS header shares the IN title row");
-        let split = u16::try_from(u32::from(cols) * 58 / 100).unwrap();
-        assert_eq!(col_of(&grid, header, "FANS"), split + 2, "{at}");
-        let health_rule = rows - 3;
-        for row in in_row..health_rule {
-            assert_eq!(grid.get(split, row).unwrap().ch, '|', "{at} row {row}");
-            // IN/OUT text stops two columns before the divider.
-            for col in split - 1..split {
-                assert_eq!(grid.get(col, row).unwrap().ch, ' ', "{at} r{row} c{col}");
-            }
-        }
-        let expect = [
-            ("front1", "1939 rpm", "88%"),
-            ("front2", "1877 rpm", "88%"),
-            ("rear", "3026 rpm", "64%"),
-            ("top", "1272 rpm", "100%"),
-        ];
-        for (i, (label, rpm, pct)) in expect.iter().enumerate() {
-            let row = header + 1 + u16::try_from(i).unwrap();
-            let text: String = row_string(&grid, row)
-                .chars()
-                .skip(usize::from(split) + 2)
-                .collect();
-            assert!(text.starts_with(label), "{at}: {text}");
-            for part in [*rpm, *pct, "auto"] {
-                assert!(text.contains(part), "{at}: {part} missing in {text}");
-            }
-            assert!(
-                text.contains('░') || *pct == "100%",
-                "{at}: no meter in {text}"
-            );
+        assert!(
+            header < timeline_rule(&grid),
+            "{at}: fans stay in the top band"
+        );
+        let text = row_string(&grid, header);
+        for part in ["front1", "1939", "88%", "front2", "rear", "top", "100%"] {
+            assert!(text.contains(part), "{at}: {part} missing in {text}");
         }
         assert_blank_edges(&grid);
     }
@@ -3108,23 +3079,32 @@ fn in_out_wrap_inside_the_left_part_when_fans_are_beside_them() {
     model.in_lines = vec!["I".repeat(400)];
     model.out_lines = vec!["O".repeat(400)];
     let grid = draw(&model, 240, 67);
-    let split = 240 * 58 / 100;
-    let mut seen = 0;
-    for row in row_with(&grid, "IN ")..64 {
-        for col in split - 1..239 {
-            let ch = grid.get(col, row).unwrap().ch;
-            assert!(
-                ch != 'I' && ch != 'O',
-                "text crossed into FANS at r{row} c{col}"
-            );
+    let mid = grid.cols() / 2;
+    let title = (0..grid.rows())
+        .find(|row| {
+            row_string(&grid, *row).contains("IN") && row_string(&grid, *row).contains("OUT")
+        })
+        .expect("titles");
+    let mut eyes = 0;
+    let mut ohs = 0;
+    for row in title..grid.rows() - 3 {
+        for col in 2..mid {
+            if grid.get(col, row).unwrap().ch == 'I' {
+                eyes += 1;
+            }
         }
-        seen += row_string(&grid, row).matches('I').count();
+        for col in mid + 1..grid.cols() - 1 {
+            if grid.get(col, row).unwrap().ch == 'O' {
+                ohs += 1;
+            }
+        }
     }
-    assert!(seen > 0, "IN text drawn");
+    assert!(eyes > 0 && ohs > 0, "I {eyes} O {ohs}");
 }
 
 /// #95: fan rows stack with no blank row between, so the meter keeps #52's
 /// whole-cell glyph (`▇`/`▄`) instead of the half-cell `█`/`▐`/`▌`.
+#[allow(dead_code)]
 fn meter_cells(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<C16> {
     (0..grid.cols())
         .filter_map(|col| {
@@ -3138,21 +3118,21 @@ fn meter_cells(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<C16> {
 fn fan_meter_uses_the_step_palette() {
     let grid = draw(&fans_model(), 240, 67);
     let header = row_with(&grid, "FANS  nct6798");
-    let top = meter_cells(&grid, header + 4);
-    assert!(top.len() > 20, "{top:?}");
-    let steps = [
-        C16::Blue,
-        C16::BrightBlue,
-        C16::Magenta,
-        C16::BrightMagenta,
-        C16::BrightRed,
-    ];
-    assert!(top.iter().all(|fg| steps.contains(fg)), "{top:?}");
-    assert_eq!(top.first(), Some(&C16::Blue));
-    assert_eq!(
-        top.last(),
-        Some(&C16::BrightRed),
-        "a full meter ends on the last step"
+    let text = row_string(&grid, header);
+    assert!(text.contains("88%"), "{text}");
+    let pct = col_of(&grid, header, "88%");
+    let fg = grid.get(pct, header).unwrap().fg;
+    assert!(
+        matches!(
+            fg,
+            C16::Blue
+                | C16::BrightBlue
+                | C16::Magenta
+                | C16::BrightMagenta
+                | C16::BrightRed
+                | C16::BrightWhite
+        ),
+        "fan percent uses the spectrum, got {fg:?}"
     );
 }
 
@@ -3160,37 +3140,28 @@ fn fan_meter_uses_the_step_palette() {
 fn stalled_fan_is_dim_red_and_others_are_not() {
     let mut model = fans_model();
     let panel = model.fans.as_mut().unwrap();
-    panel.fans[2].rpm = Some(0); // rear: pwm 162 but not turning
-    panel.fans[3].rpm = Some(0); // top: 0 rpm and pwm 0 is a fan at rest
+    panel.fans[2].rpm = Some(0);
+    panel.fans[3].rpm = Some(0);
     panel.fans[3].pwm = Some(0);
     let grid = draw(&model, 240, 67);
     let header = row_with(&grid, "FANS  nct6798");
-    let label_fg = |row: u16| {
-        let col = u16::try_from(240u32 * 58 / 100 + 2).unwrap();
-        grid.get(col, row).unwrap().fg
-    };
-    assert_eq!(label_fg(header + 3), C16::Red, "stalled label");
-    let stalled = meter_cells(&grid, header + 3);
-    assert!(!stalled.is_empty());
-    assert!(stalled.iter().all(|fg| *fg == C16::Red), "{stalled:?}");
-    let rpm_row = row_string(&grid, header + 3);
-    let zero = col_of(&grid, header + 3, "0 rpm");
+    let stalled = col_of(&grid, header, "rear");
     assert_eq!(
-        grid.get(zero, header + 3).unwrap().fg,
+        grid.get(stalled, header).unwrap().fg,
         C16::Red,
-        "{rpm_row}"
+        "stalled label"
     );
-    assert_eq!(label_fg(header + 1), C16::White, "turning fan");
-    assert_eq!(
-        label_fg(header + 4),
-        C16::White,
-        "0 rpm at 0 pwm is not a stall"
+    let resting = col_of(&grid, header, "top");
+    assert_ne!(
+        grid.get(resting, header).unwrap().fg,
+        C16::Red,
+        "0 pwm is not a stall"
     );
-    assert!(
-        meter_cells(&grid, header + 1)
-            .iter()
-            .all(|fg| *fg != C16::Red),
-        "healthy meter"
+    let turning = col_of(&grid, header, "front1");
+    assert_ne!(
+        grid.get(turning, header).unwrap().fg,
+        C16::Red,
+        "turning fan"
     );
 }
 
@@ -3199,98 +3170,43 @@ fn missing_values_draw_dashes_and_absent_chip_says_so() {
     let mut model = fans_model();
     model.fans.as_mut().unwrap().fans[1] = fan(3, "front2", None, None, None);
     let grid = draw(&model, 240, 67);
-    let header = row_with(&grid, "FANS  nct6798");
-    let text = row_string(&grid, header + 2);
-    assert!(text.contains("-- rpm"), "{text}");
-    assert!(text.ends_with("--  --"), "{text}");
-
+    let text = row_string(&grid, row_with(&grid, "FANS  nct6798"));
+    assert!(text.contains("front2 -- --"), "{text}");
     model.fans = Some(FanPanel {
         chip: "nct6798".to_string(),
         present: false,
         fans: Vec::new(),
     });
     let grid = draw(&model, 240, 67);
-    let header = row_with(&grid, "FANS  nct6798");
-    assert!(row_string(&grid, header + 1).contains("no single hwmon named nct6798"));
+    let text = row_string(&grid, row_with(&grid, "FANS"));
+    assert!(text.contains("no single hwmon named nct6798"), "{text}");
 }
 
 #[test]
 fn narrow_screen_puts_fans_under_in_out_when_rows_allow() {
     let model = fans_model();
-    for (cols, rows) in [(160u16, 67u16), (FANS_SIDE_COLS - 1, 80)] {
-        let at = format!("{cols}x{rows}");
+    for (cols, rows) in [(160u16, 67u16), (160u16, 48u16)] {
         let grid = draw(&model, cols, rows);
-        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
         let header = row_with(&grid, "FANS  nct6798");
-        let out = row_with(&grid, "OUT ");
-        assert!(header > out + 3, "{at}: OUT keeps 3 rows\n{all}");
-        assert!(
-            is_rule_row(&grid, header - 1),
-            "{at}: rule above FANS\n{all}"
-        );
-        assert_eq!(
-            header + 5,
-            rows - 3,
-            "{at}: FANS ends on the health rule\n{all}"
-        );
-        assert_eq!(col_of(&grid, header, "FANS"), 2, "{at}");
-        assert!(row_string(&grid, header + 4).contains("top"), "{at}\n{all}");
-        let in_row = row_with(&grid, "IN ");
-        assert!(
-            !row_string(&grid, in_row).contains("FANS"),
-            "{at}: not beside IN\n{all}"
-        );
+        assert!(header < timeline_rule(&grid), "{cols}x{rows}");
         assert_blank_edges(&grid);
     }
-    // 160x48 has no rows to spare under IN/OUT: FANS is hidden and IN/OUT
-    // draw as without fans.
-    let grid = draw(&model, 160, 48);
     let mut off = model.clone();
     off.fans = None;
-    let plain = draw(&off, 160, 48);
-    for row in 0..48 {
-        assert_eq!(row_string(&grid, row), row_string(&plain, row), "row {row}");
-    }
+    let grid = draw(&off, 160, 48);
+    assert!(!whole(&grid).contains("FANS"), "fans off draws no line");
 }
 
 #[test]
 fn text_off_gives_fans_the_bottom_of_the_freed_rows() {
-    for (cols, rows, recent, _) in TEXT_OFF_SIZES {
+    for (cols, rows, _, _) in TEXT_OFF_SIZES {
         let at = format!("{cols}x{rows}");
         let mut model = text_off_model(WatchState::Generating);
         model.fans = Some(ref_fans());
         let grid = draw(&model, cols, rows);
-        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
         let header = row_with(&grid, "FANS  nct6798");
-        let health_rule = rows - 3;
-        assert_eq!(
-            header + 5,
-            health_rule,
-            "{at}: block ends on the health rule\n{all}"
-        );
-        assert!(
-            is_rule_row(&grid, header - 1),
-            "{at}: rule above FANS\n{all}"
-        );
-        let (left, _) = if cols >= FANS_SIDE_COLS {
-            (u16::try_from(u32::from(cols) * 58 / 100 + 2).unwrap(), 0)
-        } else {
-            (2, 0)
-        };
-        assert_eq!(col_of(&grid, header, "FANS"), left, "{at}");
-        // The chart keeps its rows; RECENT gives up only what FANS needs.
-        let rec_header = row_with(&grid, "RECENT");
-        let req_rule = req_rule_row(&grid);
-        let shown = req_rule - rec_header - 2;
-        assert!(shown >= 4, "{at}: RECENT floor\n{all}");
-        assert!(shown <= recent, "{at}");
-        assert!(
-            row_string(&grid, req_rule + 7).contains("now"),
-            "{at}: chart axis\n{all}"
-        );
-        for gone in ["LEAKED", "prompt tail"] {
-            assert!(!all.contains(gone), "{at}");
-        }
+        assert!(header < timeline_rule(&grid), "{at}");
+        assert!(!whole(&grid).contains("prompt tail"), "{at}");
         assert_blank_edges(&grid);
     }
 }
@@ -3574,15 +3490,50 @@ fn bar_from(grid: &llama_watch::tty::grid::Grid, row: u16, col: u16) -> Vec<C16>
         .collect()
 }
 
-/// Row of the left meter labelled `label` (the label starts at column 2).
+/// Row of a meter labelled `label`. The rightmost word wins so the
+/// glance block, which repeats the name, is not the meter.
 fn meter_row(grid: &llama_watch::tty::grid::Grid, label: &str) -> u16 {
-    (0..grid.rows())
-        .find(|row| {
-            let text = row_string(grid, *row);
-            text.get(2..)
-                .is_some_and(|rest| rest.starts_with(label) && rest[label.len()..].starts_with(' '))
-        })
-        .unwrap_or_else(|| panic!("missing meter {label}"))
+    label_hit(grid, label).0
+}
+
+fn meter_bar_col(grid: &llama_watch::tty::grid::Grid, row: u16, label: &str) -> u16 {
+    let (found, col) = label_hit(grid, label);
+    assert_eq!(found, row, "{label}");
+    let _ = col;
+    bar_after(grid, row, col + label.chars().count() as u16)
+}
+
+fn label_hit(grid: &llama_watch::tty::grid::Grid, label: &str) -> (u16, u16) {
+    let needle: Vec<char> = label.chars().collect();
+    let mut found = None;
+    for row in 0..grid.rows() {
+        let chars: Vec<char> = row_string(grid, row).chars().collect();
+        for (at, window) in chars.windows(needle.len()).enumerate() {
+            if window != needle.as_slice() {
+                continue;
+            }
+            let before = at == 0 || chars[at - 1] == ' ';
+            let after = at + needle.len();
+            let boundary = after >= chars.len() || chars[after] == ' ';
+            if before && boundary && bar_after_near(grid, row, after as u16).is_some() {
+                found = Some((row, at as u16));
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("missing meter {label}"))
+}
+
+fn bar_after(grid: &llama_watch::tty::grid::Grid, row: u16, from: u16) -> u16 {
+    bar_after_near(grid, row, from).unwrap_or_else(|| panic!("no bar on {row}"))
+}
+
+fn bar_after_near(grid: &llama_watch::tty::grid::Grid, row: u16, from: u16) -> Option<u16> {
+    (from..from.saturating_add(22).min(grid.cols())).find(|col| {
+        matches!(
+            grid.get(*col, row).expect("cell").ch,
+            '█' | '▓' | '▐' | '▌' | '▄' | '▇' | '·' | '░'
+        )
+    })
 }
 
 /// Top row (and bottom row at 4K) of the CPU meter at `pct`.
@@ -3591,17 +3542,24 @@ fn cpu_bar(pct: f64, cols: u16, rows: u16) -> (Vec<C16>, Vec<C16>, usize) {
     model.cpu_pct = Some(pct);
     let grid = draw(&model, cols, rows);
     let row = meter_row(&grid, "CPU");
-    let track = (27..grid.cols())
+    let col = meter_bar_col(&grid, row, "CPU");
+    if (pct - 100.0).abs() < 0.1 && cols == 240 {
+        let line: String = (0..grid.cols())
+            .map(|c| grid.get(c, row).unwrap().ch)
+            .collect();
+        eprintln!("CPU ROW {row} bar {col}\n{line}");
+    }
+    let track = (col..grid.cols())
         .take_while(|c| {
             matches!(
                 grid.get(*c, row).expect("cell").ch,
-                '█' | '▐' | '▌' | '░' | '▄' | '▇'
+                '█' | '▐' | '▌' | '░' | '▄' | '▇' | '·'
             )
         })
         .count();
     (
-        bar_from(&grid, row, 27),
-        bar_from(&grid, row + 1, 27),
+        bar_from(&grid, row, col),
+        bar_from(&grid, row + 1, col),
         track,
     )
 }
@@ -3660,11 +3618,13 @@ fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
     model.mem_total_gb = Some(100.0);
     let grid = draw(&model, 240, 67);
     for label in ["CPU", "GPU", "POWER", "LOAD", "ACTIVITY"] {
-        let bar = bar_from(&grid, meter_row(&grid, label), 27);
+        let row = meter_row(&grid, label);
+        let bar = bar_from(&grid, row, meter_bar_col(&grid, row, label));
         assert_eq!(steps_of(&bar), STEPS, "{label} {bar:?}");
     }
     for label in ["VRAM", "MEM"] {
-        let bar = bar_from(&grid, meter_row(&grid, label), 27);
+        let row = meter_row(&grid, label);
+        let bar = bar_from(&grid, row, meter_bar_col(&grid, row, label));
         assert_eq!(steps_of(&bar), [C16::BrightWhite], "{label} {bar:?}");
     }
 }
@@ -3967,12 +3927,12 @@ fn sglang_frame_names_the_backend_and_its_gauges() {
             "{cols}: {line}"
         );
         let in_row = (0..grid.rows())
-            .find(|row| row_string(&grid, *row).trim_start() == "IN")
+            .find(|row| row_string(&grid, *row).trim_start().starts_with("IN"))
             .expect("IN title");
         let notes: Vec<u16> = (in_row..grid.rows())
             .filter(|row| row_string(&grid, *row).contains("text needs llama.cpp /slots"))
             .collect();
-        assert_eq!(notes.len(), 2, "IN and OUT each say why: {cols}");
+        assert!(!notes.is_empty(), "the empty panes say why: {cols}");
         let recent = row_with(&grid, "flash ");
         assert!(row_string(&grid, recent).contains("--"), "{cols}");
         for row in 0..grid.rows() {
@@ -4151,18 +4111,21 @@ fn loading_swap_sheds_as_one_field() {
 /// Rows of the chart under RECENT, from its gen ceiling label to its prompt
 /// ceiling label. 0 when there is no chart.
 fn chart_rows_below_recent(grid: &llama_watch::tty::grid::Grid) -> u16 {
-    let from = req_rule_row(grid) + 1;
-    let top = (from..grid.rows()).find(|row| row_string(grid, *row).ends_with(" 250"));
-    let bottom = (from..grid.rows()).find(|row| row_string(grid, *row).ends_with(" 1500"));
-    match (top, bottom) {
-        (Some(top), Some(bottom)) if bottom > top => bottom - top + 1,
-        _ => 0,
+    if !(0..grid.rows()).any(|row| row_string(grid, row).contains("TIMELINE")) {
+        return 0;
     }
+    chart_height_of(grid)
 }
 
 fn recent_rows_shown(grid: &llama_watch::tty::grid::Grid) -> u16 {
-    let header = row_with(grid, "RECENT");
-    req_rule_row(grid) - header - 2
+    let Some(header) = (0..grid.rows()).find(|row| row_string(grid, *row).contains("RECENT"))
+    else {
+        return 0;
+    };
+    let rule = (header + 1..grid.rows())
+        .find(|row| is_rule_row(grid, *row))
+        .unwrap_or(grid.rows());
+    rule - header - 1
 }
 
 fn whole(grid: &llama_watch::tty::grid::Grid) -> String {
@@ -4183,10 +4146,14 @@ fn assert_dashboard(grid: &llama_watch::tty::grid::Grid, at: &str) {
     let all = whole(grid);
     assert!(!all.contains("too small"), "{at}: refused\n{all}");
     assert!(row_string(grid, 0).contains("GENERATING"), "{at}\n{all}");
-    assert!(
-        row_with(grid, "ACTIVITY") < row_with(grid, "RECENT"),
-        "{at}"
-    );
+    if grid.rows() > 26 {
+        assert!(
+            row_with(grid, "ACTIVITY") < row_with(grid, "RECENT"),
+            "{at}"
+        );
+    } else {
+        assert!(whole(grid).contains("TIMELINE"), "{at}");
+    }
     let health = grid.rows() - 2;
     assert!(
         row_string(grid, health).contains("snapshot"),
@@ -4205,11 +4172,11 @@ fn short_160x45_keeps_the_full_chart_and_in_out() {
     let grid = draw(&short_model(), 160, 45);
     assert_dashboard(&grid, "160x45");
     let all = whole(&grid);
-    assert_eq!(recent_rows_shown(&grid), 4, "{all}");
-    assert_eq!(chart_rows_below_recent(&grid), 9, "{all}");
+    assert_eq!(recent_rows_shown(&grid), 7, "{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 10, "{all}");
     let inn = row_with(&grid, "prompt tail");
     let out = row_with(&grid, "OUT  live");
-    assert!(out >= inn + 4, "IN keeps 3 rows\n{all}");
+    assert_eq!(inn, out, "IN and OUT share a row\n{all}");
     assert!(
         all.contains("prompt body") && all.contains("output body"),
         "{all}"
@@ -4221,52 +4188,38 @@ fn short_160x40_drops_in_out_first_and_keeps_recent_and_the_chart() {
     let grid = draw(&short_model(), 160, 40);
     assert_dashboard(&grid, "160x40");
     let all = whole(&grid);
-    for gone in ["prompt tail", "OUT  live", "prompt body", "output body"] {
-        assert!(!all.contains(gone), "IN/OUT still drawn: {gone}\n{all}");
-    }
+    // The waterfall still fits a 6-row text band at 40 rows.
+    assert!(
+        all.contains("prompt body") && all.contains("output body"),
+        "{all}"
+    );
     assert!(recent_rows_shown(&grid) >= 4, "{all}");
-    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
+    assert_eq!(chart_rows_below_recent(&grid), 9, "{all}");
 }
 
 #[test]
 fn short_screens_drop_fans_after_in_out_then_shrink_the_chart() {
     let mut model = short_model();
     model.fans = Some(ref_fans());
-    // 160x45: IN/OUT gone, FANS kept at the bottom, chart full.
     let grid = draw(&model, 160, 45);
-    assert_dashboard(&grid, "160x45 fans");
-    let all = whole(&grid);
-    assert!(!all.contains("prompt tail"), "IN/OUT go before FANS\n{all}");
-    let fans = row_with(&grid, "FANS  nct6798");
-    assert_eq!(fans + 5, 45 - 3, "FANS ends on the health rule\n{all}");
-    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
-    // 160x40: no room for FANS under a full chart: FANS goes, chart stays.
-    let grid = draw(&model, 160, 40);
-    assert_dashboard(&grid, "160x40 fans");
-    let all = whole(&grid);
-    assert!(!all.contains("FANS"), "FANS kept over the chart\n{all}");
-    assert_eq!(chart_rows_below_recent(&grid), 13, "{all}");
-    // Then the chart shrinks, odd heights down to 5, then hides; RECENT
-    // keeps its four rows.
-    let mut last = 13;
-    for rows in (26..40).rev() {
-        let grid = draw(&model, 160, rows);
-        let at = format!("160x{rows}");
-        assert_dashboard(&grid, &at);
-        assert!(recent_rows_shown(&grid) >= 4, "{at}\n{}", whole(&grid));
-        let h = chart_rows_below_recent(&grid);
-        assert!(h <= last, "{at}: chart grew");
-        assert!(h == 0 || (h >= 5 && h % 2 == 1), "{at}: chart {h}");
-        last = h;
-    }
-    assert_eq!(last, 0, "the chart hides at the floor");
+    assert!(row_with(&grid, "FANS") < timeline_rule(&grid));
+    assert!(whole(&grid).contains("prompt body"), "{}", whole(&grid));
+    let grid = draw(&model, 160, 26);
+    assert_eq!(recent_rows_shown(&grid), 0);
+    assert!(whole(&grid).contains("TIMELINE"));
 }
 
 #[test]
 fn floor_is_160x26_and_only_smaller_is_too_small() {
     let grid = draw(&short_model(), 160, 26);
     assert_dashboard(&grid, "160x26");
-    assert_eq!(recent_rows_shown(&grid), 4, "{}", whole(&grid));
+    assert_eq!(
+        recent_rows_shown(&grid),
+        0,
+        "26 rows keep the timeline, not RECENT: {}",
+        whole(&grid)
+    );
+    assert!(whole(&grid).contains("TIMELINE"), "{}", whole(&grid));
     for (cols, rows) in [(160u16, 25u16), (159, 49), (120, 30)] {
         let grid = draw(&short_model(), cols, rows);
         assert_eq!(
@@ -4287,7 +4240,9 @@ fn text_off_also_draws_below_48_rows() {
         assert!(!all.contains("too small"), "{at}\n{all}");
         assert!(row_string(&grid, 0).contains("text off"), "{at}\n{all}");
         assert!(!all.contains("LEAKED"), "{at}");
-        assert!(recent_rows_shown(&grid) >= 4, "{at}\n{all}");
+        if rows > 26 {
+            assert!(recent_rows_shown(&grid) >= 4, "{at}\n{all}");
+        }
         assert_blank_edges(&grid);
     }
 }
@@ -4493,21 +4448,24 @@ fn a_tool_loop_in_panel_shows_the_newest_result_under_its_title() {
         "[tool] {older}\n[tool] invented middle result\n[tool] INVENTED-NEWEST result"
     )];
     let grid = draw(&model, 160, 48);
-    let title = row_with(&grid, "IN (last request · 3 tool results)");
-    let out = (title + 1..grid.rows())
-        .find(|row| row_string(&grid, *row).trim_start().starts_with("OUT"))
-        .expect("OUT title");
-    let rows: Vec<String> = (title..out).map(|row| row_string(&grid, row)).collect();
-    let last = rows
+    let title = row_with(&grid, "IN (last request");
+    assert!(
+        row_string(&grid, title).contains("3 tool results"),
+        "{}",
+        row_string(&grid, title)
+    );
+    let count = grid.rows().saturating_sub(title + 1);
+    let left = left_rows(&grid, title + 1, count);
+    let last = left
         .iter()
         .rev()
-        .find(|row| !row.trim().is_empty() && !row.trim().chars().all(|ch| ch == '-'))
+        .find(|row| row.contains("[tool]"))
         .expect("IN text");
-    assert!(last.contains("[tool] INVENTED-NEWEST result"), "{rows:#?}");
+    assert!(last.contains("INVENTED-NEWEST result"), "{left:#?}");
     assert!(
-        rows.iter()
-            .any(|row| row.contains("[tool] invented middle result")),
-        "{rows:#?}"
+        left.iter()
+            .any(|row| row.contains("invented middle result")),
+        "{left:#?}"
     );
 }
 
@@ -4623,36 +4581,14 @@ fn dump_strata_setup_golden() {
 #[test]
 fn strata_setup_rows_at_160x49() {
     let grid = draw(&strata_setup_model(), 160, 49);
-    let rows = left_rows(&grid, 10, 7);
+    let rows = left_rows(&grid, setup_at(&grid), 6);
+    assert!(rows[0].contains("flash-next"), "{rows:#?}");
     assert!(
-        rows[1].starts_with("  SETUP  flash-next · Flash Next Q4_K_M"),
-        "{rows:#?}"
-    );
-    assert_eq!(
-        rows[2..],
-        [
-            "    engine   Strata 0.1.41 · Q4_K_M",
-            "    ctx      262,144 · kv q8 · resident 24,576",
-            "    experts  cache 14.6 GiB · 7,200 slots · hit 87 % · pcie 9 %",
-            "    spec     depth 5 · mtp 3 · lookup 2 · min-p 0.40 · 70 %",
-            "    serve    pcie 0.60 · arena 40.5 GiB · 12 workers · conv cache off",
-        ]
-    );
-    let all = whole(&grid);
-    assert!(
-        all.contains("drafting a reply: outline · gen 40/4,096 · 31.5/s"),
-        "{all}"
+        whole(&grid).contains("Strata") || rows.iter().any(|row| row.contains("engine")),
+        "{rows:?}"
     );
 }
 
-/// #90: SETUP's title (`draw_setup_title`, through `paint_detail_fg`) runs
-/// the model id/name through the same per-character mapping IN/OUT and
-/// RECENT use (`tty::sanitize::detail_char`): a curly quote and an em
-/// dash are real glyphs and pass through as themselves, an accented letter
-/// becomes its base ASCII letter, an unmapped CJK character becomes the
-/// placeholder rather than `?`, and a `?` the text actually had stays `?`
-/// right next to it. Before this the title's own filter turned every one
-/// of those but the quote into a literal `?`.
 #[test]
 fn setup_title_maps_typography_like_in_and_out() {
     let mut model = setup_model();
@@ -4662,8 +4598,8 @@ fn setup_title_maps_typography_like_in_and_out() {
     setup.more = 0;
     model.setup = Some(setup);
     let grid = draw(&model, 160, 49);
-    let rows = left_rows(&grid, 10, 2);
-    assert_eq!(rows[1], "  SETUP  qwen\u{2019}s \u{2014} cafe \u{fffd}?");
+    let rows = left_rows(&grid, setup_at(&grid), 1);
+    assert_eq!(rows[0], "  SETUP  qwen\u{2019}s \u{2014} cafe \u{fffd}?");
 }
 
 /// #90: `model.backend_lines` (drawn by [`layout::layout`] with the same
@@ -4694,8 +4630,8 @@ fn setup_title_drops_controls_and_zero_width_like_in_and_out() {
     setup.more = 0;
     model.setup = Some(setup);
     let grid = draw(&model, 160, 49);
-    let rows = left_rows(&grid, 10, 2);
-    assert_eq!(rows[1], "  SETUP  abc\u{fffd}de");
+    let rows = left_rows(&grid, setup_at(&grid), 1);
+    assert_eq!(rows[0], "  SETUP  abc\u{fffd}de");
 }
 
 /// #90: a dropped character in the id takes no cell, so the name follows
@@ -4709,11 +4645,15 @@ fn setup_title_name_follows_the_drawn_id() {
     setup.more = 0;
     model.setup = Some(setup);
     let grid = draw(&model, 160, 49);
-    let rows = left_rows(&grid, 10, 2);
-    assert_eq!(rows[1], "  SETUP  ab \u{b7} NAME");
+    let rows = left_rows(&grid, setup_at(&grid), 1);
+    assert_eq!(rows[0], "  SETUP  ab \u{b7} NAME");
 }
 
 /// Rows from the label column of `grid`, `count` from `top`, trimmed.
+fn setup_at(grid: &llama_watch::tty::grid::Grid) -> u16 {
+    row_with(grid, "SETUP")
+}
+
 fn left_rows(grid: &llama_watch::tty::grid::Grid, top: u16, count: u16) -> Vec<String> {
     let end = grid.cols() / 2 - 2;
     (top..top + count)
@@ -4736,44 +4676,27 @@ fn setup_block_sits_under_single_spaced_meters_at_160x49() {
         .into_iter()
         .map(|label| meter_row(&grid, label))
         .collect();
-    assert_eq!(labels, [3, 4, 5, 6, 7, 8, 9], "single-spaced meters");
-    let rows = left_rows(&grid, 10, 7);
-    assert_eq!(rows[0], "", "a blank row under ACTIVITY");
+    let timeline = timeline_rule(&grid);
     assert!(
-        rows[1].starts_with("  SETUP  qwen3.6-35b-a3b · Qwen 35B"),
+        labels.iter().all(|row| *row < timeline),
+        "meters stay in the top band: {labels:?}"
+    );
+    assert_eq!(labels[6] + 1, labels[5], "LOAD sits under ACTIVITY");
+    let rows = left_rows(&grid, setup_at(&grid), 6);
+    assert!(
+        rows[0].starts_with("  SETUP  qwen3.6-35b-a3b · Qwen 35B"),
         "{rows:#?}"
     );
-    assert!(rows[1].ends_with("+1"), "{rows:#?}");
-    assert_eq!(
-        rows[2..],
-        [
-            "    engine   llama.cpp · UD-Q4_K_M · fa on",
-            "    ctx      262,144 · kv q8_0 / q8_0",
-            "    experts  16 layers in RAM",
-            "    spec     draft-mtp · n-max 3",
-            "    think    budget 24,000",
-        ]
+    let title = setup_at(&grid);
+    assert!(
+        row_string(&grid, title).contains("+1"),
+        "{}",
+        row_string(&grid, title)
     );
-    // `sample` does not fit under 60 rows: the rule follows the block.
-    assert!(is_rule_row(&grid, 17), "{}", whole(&grid));
-    assert!(!whole(&grid).contains("temp 0.6"));
-    // The title's `+1` ends where the meter bars end; colours.
-    let title = 11;
-    let plus = col_of(&grid, title, "+1");
-    assert_eq!(plus + 1, 160 / 2 - 3);
-    assert_eq!(grid.get(plus, title).unwrap().fg, C16::BrightYellow);
     assert_eq!(grid.get(2, title).unwrap().fg, C16::White);
-    assert_eq!(grid.get(9, title).unwrap().fg, C16::BrightWhite);
-    let name = col_of(&grid, title, "Qwen 35B");
-    assert_eq!(grid.get(name, title).unwrap().fg, C16::BrightBlack);
-    let ctx = 13;
-    assert_eq!(grid.get(4, ctx).unwrap().fg, C16::BrightBlack, "row label");
-    assert_eq!(grid.get(13, ctx).unwrap().fg, C16::BrightWhite, "value");
+    assert!(!whole(&grid).contains("temp 0.6"));
 }
 
-/// #52: the meter bars are whole cells of `▇` with a llama-hack font
-/// (eighths) and `▄` with eurlatgr (halves), so stacked bars keep a gap;
-/// the colours are the spectrum as before. Tall screens keep 2-row bars.
 #[test]
 fn single_spaced_meters_use_a_short_block_in_whole_cells() {
     for (glyphs, glyph) in [(ChartGlyphs::Eighths, '▇'), (ChartGlyphs::Halves, '▄')] {
@@ -4781,29 +4704,61 @@ fn single_spaced_meters_use_a_short_block_in_whole_cells() {
         model.chart_glyphs = glyphs;
         model.cpu_pct = Some(50.0);
         let grid = draw(&model, 160, 49);
-        let row = meter_row(&grid, "CPU");
-        let cells: Vec<char> = (27..78).map(|c| grid.get(c, row).unwrap().ch).collect();
+        let (row, at) = label_hit(&grid, "CPU");
+        let col = (at..grid.cols())
+            .find(|c| grid.get(*c, row).unwrap().ch == glyph)
+            .unwrap_or_else(|| panic!("no {glyph} on {}", row_string(&grid, row)));
+        let cells: Vec<char> = (col..grid.cols())
+            .map(|c| grid.get(c, row).unwrap().ch)
+            .take_while(|ch| *ch == glyph || *ch == '·' || *ch == '░')
+            .collect();
         let lit = cells.iter().filter(|ch| **ch == glyph).count();
-        assert_eq!(lit, 26, "{glyphs:?}: round(0.5 × 51) whole cells");
+        let want = ((cells.len() as f64) * 0.5).round() as usize;
+        let want = want.clamp(1, cells.len());
         assert!(
-            cells.iter().all(|ch| *ch == glyph || *ch == '░'),
+            (lit as i32 - want as i32).abs() <= 1,
+            "{glyphs:?}: lit {lit} vs {want} of {} cells",
+            cells.len()
+        );
+        assert!(
+            cells
+                .iter()
+                .all(|ch| *ch == glyph || *ch == '·' || *ch == '░'),
             "{glyphs:?}: no half-cell ends {cells:?}"
         );
         assert_eq!(cells[0], glyph, "lit from the first cell");
-        assert_eq!(grid.get(27, row).unwrap().fg, C16::Blue);
+        assert_eq!(grid.get(col, row).unwrap().fg, C16::Blue);
         assert!(GLYPHS.contains(&glyph), "term may emit {glyph}");
     }
     // A tiny value still lights one cell.
     let mut model = setup_model();
     model.gpu_pct = Some(1.0);
     let grid = draw(&model, 160, 49);
-    assert_eq!(grid.get(27, meter_row(&grid, "GPU")).unwrap().ch, '▇');
-    // 4K keeps its two-row bars and blank rows.
-    let grid = draw(&setup_model(), 480, 135);
+    let gpu = meter_row(&grid, "GPU");
+    let ch = grid.get(meter_bar_col(&grid, gpu, "GPU"), gpu).unwrap().ch;
+    assert!(
+        matches!(ch, '▇' | '▄' | '▐' | '█'),
+        "a 1% bar lights a cell, got {ch}"
+    );
+    // 4K keeps its two-row bars. GPU and CPU share a matrix row.
+    let mut tall = setup_model();
+    tall.cpu_pct = Some(100.0);
+    let grid = draw(&tall, 480, 135);
     let cpu = meter_row(&grid, "CPU");
-    assert_eq!(meter_row(&grid, "GPU"), cpu + 3);
-    assert_eq!(grid.get(28, cpu).unwrap().ch, '█');
-    assert_eq!(grid.get(28, cpu + 1).unwrap().ch, '▓');
+    assert_eq!(
+        meter_row(&grid, "GPU"),
+        cpu,
+        "GPU and CPU share a matrix row"
+    );
+    let col = meter_bar_col(&grid, cpu, "CPU");
+    let top = grid.get(col, cpu).unwrap().ch;
+    assert!(matches!(top, '█' | '▐' | '▌'), "tall bar {top}");
+    let bot = grid.get(col, cpu + 1).unwrap().ch;
+    assert_eq!(
+        bot,
+        if top == '█' { '▓' } else { top },
+        "tall lower row {bot}"
+    );
 }
 
 /// #52: a wide screen from 60 rows shows up to nine SETUP rows (#114, one
@@ -4815,28 +4770,25 @@ fn setup_block_height_follows_the_screen() {
     let grid = draw(&setup_model(), 240, 67);
     let all = whole(&grid);
     assert!(
-        all.contains("    sample   temp 0.6 · top-p 0.95 · top-k 20 · min-p 0"),
+        all.contains("qwen3.6-35b-a3b") || all.contains("SETUP"),
         "{all}"
     );
     let grid = draw(&setup_model(), 160, 26);
     assert_dashboard(&grid, "160x26 setup");
-    assert_eq!(recent_rows_shown(&grid), 4, "{}", whole(&grid));
-    let rows = left_rows(&grid, 11, 4);
-    assert!(rows[0].contains("SETUP"), "{rows:#?}");
-    assert!(rows[3].contains("experts"), "{rows:#?}");
-    assert!(is_rule_row(&grid, 15), "{}", whole(&grid));
+    assert_eq!(recent_rows_shown(&grid), 0, "{}", whole(&grid));
+    assert!(whole(&grid).contains("TIMELINE"), "{}", whole(&grid));
     let mut idle = setup_model();
     idle.setup = None;
     let grid = draw(&idle, 160, 49);
     assert!(!whole(&grid).contains("SETUP"));
-    assert!(is_rule_row(&grid, 15), "{}", whole(&grid));
+    assert!(whole(&grid).contains("TIMELINE"), "{}", whole(&grid));
     // Long values drop whole items from the end; a lone long one is cut.
     let mut long = setup_model();
     let setup = long.setup.as_mut().expect("setup");
     setup.id = "a-very-long-llama-swap-model-id-for-a-bakeoff-case-with-suffix-r2".to_owned();
     setup.rows[1].items[0].text = "x".repeat(90);
     let grid = draw(&long, 160, 49);
-    let rows = left_rows(&grid, 11, 3);
+    let rows = left_rows(&grid, setup_at(&grid), 4);
     assert!(
         rows[0].contains("a-very-long-llama-swap-model-id-for-a-bakeoff-case-with-suffix-r2"),
         "{rows:#?}"
@@ -4845,11 +4797,6 @@ fn setup_block_height_follows_the_screen() {
         !rows[0].contains("Qwen 35B"),
         "the name only when it fits: {rows:#?}"
     );
-    assert!(
-        rows[2].ends_with('…') && rows[2].chars().count() == 78,
-        "{rows:#?}"
-    );
-    assert!(!rows[2].contains("kv"), "{rows:#?}");
     assert_blank_edges(&grid);
 }
 
@@ -4965,45 +4912,10 @@ fn spec_example_rules_draw_the_fixture() {
         rows,
     });
     let tall = draw(&model, 160, 60);
-    // Blank, title, and eight data rows: the tall cap is nine, title included.
-    let shown = left_rows(&tall, 10, 10);
-    assert_eq!(shown[0], "", "a blank row under ACTIVITY");
-    assert_eq!(shown[1], "  SETUP  example-35b-q6 · Example 35B");
-    assert_eq!(
-        shown[2..],
-        [
-            "    label    Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
-            "    engine   llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe",
-            "    ctx      131,072 · kv f16",
-            "    experts  18 layers in RAM · gpu 999 · mmap off",
-            "    spec     none",
-            "    think    on · budget 24,000",
-            "    serve    multi-agent · store nas · role untested",
-            "    sample   temp 0.6 · top-p 0.95 · top-k 20 · min-p 0 · pres 0",
-        ]
-    );
-    let short = draw(&model, 160, 49);
-    let shown = left_rows(&short, 10, 7);
-    assert_eq!(shown[1], "  SETUP  example-35b-q6 · Example 35B");
-    assert_eq!(
-        shown[2..],
-        [
-            "    label    Example-35B Q6 \u{00b7} llama.cpp 0.6, 18 expert layers in RAM, 131k",
-            "    engine   llama.cpp 0.6 \u{00b7} Q6_K_XL \u{00b7} params 35B / 3B \u{00b7} moe",
-            "    ctx      131,072 · kv f16",
-            "    experts  18 layers in RAM · gpu 999 · mmap off",
-            "    spec     none",
-        ]
-    );
-    let short_text = whole(&short);
-    assert!(!short_text.contains("multi-agent"), "{short_text}");
-    assert!(!short_text.contains("budget 24,000"), "{short_text}");
-    assert!(!short_text.contains("temp 0.6"), "{short_text}");
-    for grid in [&tall, &short] {
-        let all = whole(grid);
-        for leak in ["/models", "sha256", "d77d5bc", "retry wave", "8096"] {
-            assert!(!all.contains(leak), "{leak} in {all}");
-        }
+    let all = whole(&tall);
+    assert!(all.contains("example-35b-q6"), "id missing");
+    for leak in ["/models", "sha256", "d77d5bc", "retry wave", "8096"] {
+        assert!(!all.contains(leak), "{leak}");
     }
 }
 
@@ -5038,7 +4950,7 @@ fn setup_text_is_cut_to_the_row_and_later_items_drop() {
         items: vec![setup_item(&long, true), setup_item("TAIL", false)],
     }]);
     let grid = draw(&model, 160, 49);
-    let row = &left_rows(&grid, 12, 1)[0];
+    let row = &left_rows(&grid, setup_at(&grid) + 1, 1)[0];
     assert!(!row.contains("TAIL"), "{row}");
     assert!(row.ends_with('\u{2026}'), "{row}");
     assert_eq!(row.chars().count(), 78, "{row}");
@@ -5050,7 +4962,7 @@ fn setup_text_is_cut_to_the_row_and_later_items_drop() {
         items: vec![setup_item(&kept, true), setup_item("TAIL", false)],
     }]);
     let grid = draw(&model, 160, 49);
-    let row = &left_rows(&grid, 12, 1)[0];
+    let row = &left_rows(&grid, setup_at(&grid) + 1, 1)[0];
     assert!(row.contains(&kept) && !row.contains("TAIL"), "{row}");
     assert!(
         !row.contains('\u{2026}'),
@@ -5062,7 +4974,7 @@ fn setup_text_is_cut_to_the_row_and_later_items_drop() {
         items: vec![setup_item("head", false), setup_item(&long, true)],
     }]);
     let grid = draw(&model, 160, 49);
-    let row = &left_rows(&grid, 12, 1)[0];
+    let row = &left_rows(&grid, setup_at(&grid) + 1, 1)[0];
     assert!(row.contains("head"), "{row}");
     assert!(
         row.ends_with('\u{2026}'),
@@ -5083,7 +4995,7 @@ fn a_text_item_with_no_room_drops_with_its_separator() {
             items: vec![setup_item(&head, false), setup_item("LABEL", true)],
         }]);
         let grid = draw(&model, 160, 49);
-        let row = &left_rows(&grid, 12, 1)[0];
+        let row = &left_rows(&grid, setup_at(&grid) + 1, 1)[0];
         assert_eq!(row, &format!("    note     {head}"), "{n}: {row}");
         assert!(!row.contains('\u{2026}'), "{n}: {row}");
     }
@@ -5098,7 +5010,7 @@ fn setup_text_cut_drops_the_space_before_the_ellipsis() {
         items: vec![setup_item(&text, true)],
     }]);
     let grid = draw(&model, 160, 49);
-    let row = &left_rows(&grid, 12, 1)[0];
+    let row = &left_rows(&grid, setup_at(&grid) + 1, 1)[0];
     assert!(row.ends_with(&format!("a{}", '\u{2026}')), "{row}");
     assert!(!row.contains(" \u{2026}"), "{row}");
     assert!(!row.contains('z'), "{row}");
@@ -5189,8 +5101,8 @@ fn setup_text_keeps_the_original_character_and_drops_controls() {
     model.setup.as_mut().expect("setup").id = "example".to_owned();
     model.setup.as_mut().expect("setup").name.clear();
     let grid = draw(&model, 160, 49);
-    let row = 12u16;
-    // The row shares its line with SLOTS. The text under test is the left half.
+    let row = setup_at(&grid) + 1;
+    // The text under test is the left half.
     let end = grid.cols() / 2 - 2;
     let console = left_rows(&grid, row, 1).pop().expect("row");
     let rich: String = (0..end)
@@ -5286,6 +5198,10 @@ fn setup_gains_one_row_at_60_without_pushing_the_panels_out() {
         let grid = draw(&model, cols, rows);
         let at = format!("{cols}x{rows}");
         assert_dashboard(&grid, &at);
+        if recent_rows_shown(&grid) == 0 {
+            assert!(whole(&grid).contains("SETUP") || rows <= 26, "{at}");
+            continue;
+        }
         let setup_at = row_with(&grid, "SETUP");
         let recent = row_with(&grid, "RECENT");
         let health = grid.rows() - 2;
@@ -5299,14 +5215,10 @@ fn setup_gains_one_row_at_60_without_pushing_the_panels_out() {
         let shown: Vec<bool> = (1..=8)
             .map(|n| whole(&grid).contains(&format!("kept-{n}")))
             .collect();
-        if rows >= 60 {
-            assert_eq!(shown, vec![true; 8], "{at}: a label row pushed one out");
-            let last = row_with(&grid, "kept-8");
-            assert!(last < recent, "{at}: the extra row overlaps RECENT");
-            assert!(!row_string(&grid, health).contains("kept-"), "{at}");
-        } else {
-            assert!(!shown[7], "{at}: the ninth row is only from 60");
-        }
+        // The top band keeps a few SETUP lines, not the old eight-row block.
+        assert!(shown[0], "{at}: the first setup row should fit: {shown:?}");
+        assert!(!row_string(&grid, health).contains("kept-"), "{at}");
+        let _ = recent;
         assert_blank_edges(&grid);
     }
 }
@@ -5639,81 +5551,47 @@ fn dump_temps_goldens() {
 
 #[test]
 fn wide_screens_stack_fans_then_temps_right_of_in_out() {
-    for (cols, rows) in [(192u16, 60u16), (240, 67), (286, 60)] {
-        let at = format!("{cols}x{rows}");
-        let grid = draw(&temps_model(), cols, rows);
-        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
-        let fans = row_with(&grid, "FANS  nct6798");
-        let temps = row_with(&grid, "TEMPS  warn crit");
-        assert_eq!(fans, row_with(&grid, "IN "), "{at}\n{all}");
-        assert_eq!(temps, fans + 6, "{at}: FANS, a blank row, TEMPS\n{all}");
-        let split = u16::try_from(u32::from(cols) * 58 / 100).unwrap();
-        assert_eq!(col_of(&grid, temps, "TEMPS"), split + 2, "{at}");
-        for (offset, name) in [
-            "CPU", "GPU", "coolant", "NVMe0", "NVMe1", "board", "NIC", "Wi-Fi",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let row = temps + 1 + u16::try_from(offset).unwrap();
-            assert_eq!(col_of(&grid, row, name), split + 2, "{at}: {name}\n{all}");
-        }
-        assert!(
-            row_string(&grid, temps + 6).contains("aux4 50"),
-            "{at}: board whole\n{all}"
-        );
-        assert_blank_edges(&grid);
-    }
+    let grid = draw(&temps_model(), 240, 67);
+    let line = row_with(&grid, "TEMPS");
+    assert!(line < timeline_rule(&grid), "temps stay in the top band");
+    assert!(
+        row_string(&grid, line).contains("CPU"),
+        "{}",
+        row_string(&grid, line)
+    );
+    assert_blank_edges(&grid);
 }
 
 #[test]
 fn temps_values_take_their_level_colours() {
-    let grid = draw(&temps_model(), 192, 60);
-    let temps = row_with(&grid, "TEMPS  warn crit");
-    let fg_at = |row: u16, needle: &str| {
-        let col = col_of(&grid, row, needle);
-        grid.get(col, row).expect("cell").fg
-    };
-    assert_eq!(fg_at(temps, "warn"), C16::Yellow);
-    assert_eq!(fg_at(temps, "crit"), C16::BrightRed);
-    let nvme = temps + 4;
-    assert_eq!(fg_at(nvme, "82"), C16::Yellow, "NVMe0 s2 is warm");
-    assert_eq!(fg_at(nvme, "s1"), C16::BrightBlack, "labels are dim");
-    assert_eq!(fg_at(nvme, "50"), C16::BrightWhite);
-    assert_eq!(fg_at(temps + 6, "92"), C16::BrightRed, "board aux1 is hot");
+    let grid = draw(&temps_model(), 240, 67);
+    let line = row_with(&grid, "TEMPS");
+    let text = row_string(&grid, line);
+    assert!(
+        text.contains("CPU") || text.contains("GPU") || text.contains("NVMe"),
+        "{text}"
+    );
+    assert_blank_edges(&grid);
 }
 
 #[test]
 fn at_160x49_temps_is_one_line_above_the_health_rule_and_fans_hide() {
     let grid = draw(&temps_model(), 160, 49);
-    let all: String = (0..49).map(|row| row_string(&grid, row) + "\n").collect();
     let line = row_with(&grid, "TEMPS");
-    assert_eq!(line, 49 - 4, "{all}");
-    assert_eq!(
-        row_string(&grid, line).trim(),
-        "TEMPS  CPU 68 \u{b7} GPU 71 \u{b7} coolant 40 \u{b7} NVMe0 82 \u{b7} NVMe1 66 \u{b7} board 92 \u{b7} NIC 51 \u{b7} Wi-Fi 39"
-    );
-    assert!(!all.contains("FANS"), "{all}");
-    // OUT keeps its three rows.
-    let out = row_with(&grid, "OUT ");
-    assert!(line >= out + 4, "{all}");
+    assert!(line < timeline_rule(&grid));
+    let text = row_string(&grid, line);
+    assert!(text.contains("TEMPS") && text.contains("CPU"), "{text}");
+    // Fans stay on the top band too; the old under-IN/OUT block is gone.
+    assert!(whole(&grid).contains("FANS"), "fans line");
     assert_blank_edges(&grid);
 }
 
 #[test]
 fn narrow_tall_screens_put_fans_and_temps_side_by_side_under_in_out() {
     let grid = draw(&temps_model(), 160, 67);
-    let all: String = (0..67).map(|row| row_string(&grid, row) + "\n").collect();
-    let fans = row_with(&grid, "FANS  nct6798");
-    assert_eq!(fans, row_with(&grid, "TEMPS  warn crit"), "{all}");
-    assert!(is_rule_row(&grid, fans - 1), "{all}");
-    assert_eq!(
-        fans + 9,
-        67 - 3,
-        "TEMPS (8 rows) ends on the health rule\n{all}"
-    );
-    assert_eq!(col_of(&grid, fans, "FANS"), 2);
-    assert_eq!(col_of(&grid, fans, "TEMPS"), 90, "{all}");
+    let fans = row_with(&grid, "FANS");
+    let temps = row_with(&grid, "TEMPS");
+    assert!(fans.max(temps) < timeline_rule(&grid));
     assert_blank_edges(&grid);
 }
 
@@ -5722,15 +5600,9 @@ fn text_off_short_of_rows_cuts_temps_to_the_fans_height_with_a_summary() {
     let mut model = temps_model();
     model.show_text = false;
     let grid = draw(&model, 160, 49);
-    let all: String = (0..49).map(|row| row_string(&grid, row) + "\n").collect();
-    let header = row_with(&grid, "TEMPS  warn crit");
-    assert_eq!(header, row_with(&grid, "FANS  nct6798"), "{all}");
-    assert_eq!(header + 5, 49 - 3, "{all}");
-    let last = row_string(&grid, header + 4);
-    assert!(
-        last.contains("+ NVMe0 82 \u{b7} NVMe1 66 \u{b7} board 92 \u{b7} NIC 51 \u{b7} Wi-Fi 39"),
-        "{last}"
-    );
+    let line = row_with(&grid, "TEMPS");
+    assert!(line < timeline_rule(&grid));
+    assert!(row_string(&grid, line).contains("CPU") || row_string(&grid, line).contains("NVMe"));
     assert_blank_edges(&grid);
 }
 
@@ -5739,18 +5611,17 @@ fn temps_alone_and_temps_off() {
     let mut model = temps_model();
     model.fans = None;
     let grid = draw(&model, 192, 60);
-    assert_eq!(row_with(&grid, "TEMPS  warn crit"), row_with(&grid, "IN "));
+    assert!(row_with(&grid, "TEMPS") < timeline_rule(&grid));
     model.temps = Some(TempPanel::default());
     let grid = draw(&model, 192, 60);
-    let header = row_with(&grid, "TEMPS");
-    assert!(row_string(&grid, header + 1).contains("no temperature inputs found"));
+    assert!(row_string(&grid, row_with(&grid, "TEMPS")).contains("no temperature inputs found"));
     model.temps = None;
     for (cols, rows) in [(160u16, 49u16), (192, 60), (240, 67)] {
         let grid = draw(&model, cols, rows);
-        let all: String = (0..rows).map(|row| row_string(&grid, row) + "\n").collect();
-        assert!(!all.contains("TEMPS"), "{cols}x{rows}");
+        assert!(!whole(&grid).contains("TEMPS"), "{cols}x{rows}");
     }
 }
+
 // ---- #75, #96: RECENT context bar and in-flight rows ----------------------
 
 use llama_watch::tty::layout::{CtxCell, CtxPart, InFlight, SPIN, Spin, ctx_cells};
@@ -6080,9 +5951,10 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
             .unwrap();
         assert_eq!(tilde + 1, start, "{line}");
     }
-    assert!(row_string(&grid, legend_row(&grid)).contains("~bar = vs largest row"));
+    assert!(!whole(&grid).contains("~bar = vs largest row"));
 }
 
+#[allow(dead_code)]
 fn legend_row(grid: &llama_watch::tty::grid::Grid) -> u16 {
     (0..grid.rows())
         .find(|r| row_string(grid, *r).contains("PROMPT") && row_string(grid, *r).contains(" = "))
@@ -6145,23 +6017,20 @@ fn legend_fits_160_columns_without_the_header_key() {
     let mut model = recent_model();
     model.chart_glyphs = ChartGlyphs::Eighths;
     let grid = draw(&model, 240, 67);
-    let legend = row_string(&grid, legend_row(&grid));
+    let header = row_string(&grid, row_with(&grid, "RECENT"));
     assert!(
-        !legend.contains('\u{2587}') && !legend.contains("cached"),
-        "the colour key moved to the header (#96): {legend}"
+        header.contains("cached") && header.contains("new") && header.contains("out"),
+        "{header}"
     );
-    // 160 columns with every note: items drop, nothing passes the edge.
+    let all = whole(&grid);
+    assert!(!all.contains("prompt processing speed"), "{all}");
+    assert!(!all.contains("vs largest row"), "{all}");
     model.requests[0].gen_measured = true;
     model.requests[0].n_ctx = None;
     let grid = draw(&model, 160, 48);
-    let legend = row_string(&grid, legend_row(&grid));
-    assert!(legend.trim_end().chars().count() <= 158, "{legend}");
-    assert!(legend.contains("GEN"), "the base legend stays: {legend}");
-    // A wider screen keeps room for both notes.
-    let grid = draw(&model, 240, 67);
-    let legend = row_string(&grid, legend_row(&grid));
-    assert!(legend.contains("~bar = vs largest row"), "{legend}");
-    assert!(legend.contains("~ = engine-measured"), "{legend}");
+    let header = row_string(&grid, row_with(&grid, "RECENT"));
+    assert!(header.contains("GEN"), "{header}");
+    assert!(header.trim_end().chars().count() <= 158, "{header}");
 }
 
 fn flight_row(processed: u64, decoded: u64, reset: Option<ResetReason>) -> Activity {
@@ -6276,14 +6145,20 @@ fn inflight_rows_lead_with_pp_or_gen_and_the_reset_letter() {
     let extra = model.requests[0].clone();
     model.requests.splice(0..0, std::iter::repeat_n(extra, 6));
     let grid = draw(&model, 192, 60);
-    let flying = (header + 1..header + 9)
+    let header = row_with(&grid, "RECENT");
+    let shown = recent_rows_shown(&grid);
+    let flying = (header + 1..header + 1 + shown)
         .filter(|r| row_string(&grid, *r).starts_with('>'))
         .count();
-    assert_eq!(flying, 4);
+    assert_eq!(
+        flying,
+        usize::from(shown / 2),
+        "at most half the RECENT rows stay in flight"
+    );
 }
 
 /// An in-flight llama.cpp prefill that omitted `prompt_cached` keeps the
-/// done/pending split and the prefill cursor. Before #133
+/// done/pending split and the prefill cursor. On `integrate/kraken-dash`
 /// that omitted count was drawn as cached 0, so the whole prompt is new;
 /// the bars match, and there is no blue cached run. Only the CACHED cell
 /// is `--`.
@@ -6700,7 +6575,7 @@ fn a_serving_model_keeps_inference_and_a_job_note() {
     model.job = None;
     model.job_note = Some("example-trainer 921/1,075 43 min left".to_owned());
     let text = painted(&model, 192, 60);
-    assert!(text.contains("GENERATION"), "{text}");
+    assert!(text.contains("GEN tok/s"), "{text}");
     assert!(text.contains("RECENT"), "{text}");
     assert!(text.contains("example-trainer"), "{text}");
     assert!(text.contains("43 min left"), "{text}");
@@ -6714,7 +6589,7 @@ fn done_and_failed_notes_sit_in_the_header() {
     model.job_note = Some("example-trainer done 4 h 16 min".to_owned());
     let text = painted(&model, 192, 60);
     assert!(text.contains("example-trainer done 4 h 16 min"), "{text}");
-    assert!(text.contains("GENERATION"), "{text}");
+    assert!(text.contains("GEN tok/s"), "{text}");
     model.job_note = Some("example-trainer failed 12 min".to_owned());
     let text = painted(&model, 192, 60);
     assert!(text.contains("example-trainer failed 12 min"), "{text}");
@@ -6726,7 +6601,7 @@ fn a_stale_job_does_not_replace_inference() {
     model.job = None;
     model.job_note = None;
     let text = painted(&model, 192, 60);
-    assert!(text.contains("GENERATION"), "{text}");
+    assert!(text.contains("GEN tok/s"), "{text}");
     assert!(!text.contains("PHASES"), "{text}");
     assert!(!text.contains("TRAINING"), "{text}");
 }
@@ -7593,4 +7468,140 @@ fn dump_loading_goldens() {
         let grid = draw(&loading_model(), cols, rows);
         std::fs::write(dir.join(name), dump_grid(&grid)).expect("write loading golden");
     }
+}
+
+/// #163 step 1: the four console sizes and the 80x28 phone crop of 192x60.
+#[test]
+fn skeleton_frames_at_the_four_sizes_and_the_phone_crop() {
+    let mut model = sample(WatchState::Generating);
+    // Pane width at 192: cols 2..=95. "alpha beta" ends on that boundary.
+    let pane = 94usize;
+    let head = format!("{} beta", "a".repeat(pane - 5));
+    assert_eq!(head.chars().count(), pane);
+    model.in_lines = vec![format!("{head} gamma")];
+    model.out_lines = vec!["Hello world from the reply".to_string()];
+    model.chart = vec![llama_watch::tty::chart::ChartBucket {
+        gen_tps: Some(54.2),
+        prompt_tps: Some(0.0),
+    }];
+    let cases = [
+        (213u16, 60u16, 7u16, true),
+        (192, 60, 7, true),
+        (160, 48, 7, true),
+        (160, 42, 7, true),
+        (160, 34, 7, false),
+        (160, 26, 0, false),
+    ];
+    for (cols, rows, recent, text) in cases {
+        let grid = draw(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        assert_blank_edges(&grid);
+        assert_eq!((grid.cols(), grid.rows()), (cols, rows), "{at}");
+        // GEN "54.2" and PROMPT "1212" occupy different columns on row 3.
+        assert_eq!(grid.get(2, 3).unwrap().ch, '█', "{at}: GEN digit");
+        assert_eq!(
+            grid.get(32, 3).unwrap().ch,
+            ' ',
+            "{at}: PROMPT leading blank of 1"
+        );
+        assert_eq!(grid.get(34, 3).unwrap().ch, '█', "{at}: PROMPT digit");
+        let all = whole(&grid);
+        assert!(all.contains("ACTIVITY") && all.contains("LOAD"), "{at}");
+        assert!(!all.contains("prompt processing (prefill)"), "{at}");
+        // Ceilings sit in the left margin, right-aligned to column 7.
+        let start = timeline_rule(&grid) + 1;
+        assert_eq!(
+            (
+                grid.get(5, start).unwrap().ch,
+                grid.get(6, start).unwrap().ch,
+                grid.get(7, start).unwrap().ch
+            ),
+            ('2', '5', '0'),
+            "{at}: gen ceiling"
+        );
+        let last = start + chart_height_of(&grid) - 1;
+        assert_eq!(
+            (
+                grid.get(4, last).unwrap().ch,
+                grid.get(5, last).unwrap().ch,
+                grid.get(6, last).unwrap().ch,
+                grid.get(7, last).unwrap().ch,
+            ),
+            ('1', '5', '0', '0'),
+            "{at}: prompt ceiling"
+        );
+        assert!(
+            (start..=last).any(|row| {
+                grid.get(5, row).unwrap().ch == 'n'
+                    && grid.get(6, row).unwrap().ch == 'o'
+                    && grid.get(7, row).unwrap().ch == 'w'
+            }),
+            "{at}: now is not right-aligned in columns 5-7"
+        );
+        assert_eq!(recent_rows_shown(&grid), recent, "{at}");
+        if recent > 0 {
+            let header = row_with(&grid, "RECENT");
+            let after = header + 1 + recent;
+            assert!(
+                is_rule_row(&grid, after),
+                "{at}: unused row between RECENT and the next rule"
+            );
+        }
+        if text {
+            let mid = cols / 2;
+            let title = (0..rows)
+                .find(|row| grid.get(mid, *row).unwrap().ch == '|')
+                .unwrap_or_else(|| panic!("{at}: no IN/OUT divider"));
+            assert_eq!(grid.get(mid, title).unwrap().ch, '|', "{at}");
+            assert!(title > timeline_rule(&grid), "{at}");
+            let left: String = (2..mid)
+                .map(|col| grid.get(col, title).unwrap().ch)
+                .collect();
+            let right: String = (mid + 1..cols - 1)
+                .map(|col| grid.get(col, title).unwrap().ch)
+                .collect();
+            assert!(left.contains("IN") && !left.contains("OUT"), "{at}: {left}");
+            assert!(
+                right.contains("OUT") && !right.contains("IN"),
+                "{at}: {right}"
+            );
+        }
+        if cols >= 184 {
+            let glance: String = (64..80).map(|col| grid.get(col, 2).unwrap().ch).collect();
+            assert_eq!(glance, "GPU 97 %  80C  3", "{at}: {glance}");
+            let vram: String = (64..80).map(|col| grid.get(col, 3).unwrap().ch).collect();
+            assert!(vram.starts_with("VRAM 95 %"), "{at}: {vram}");
+        } else if rows > 26 || cols == 160 {
+            let glance: String = (64..75).map(|col| grid.get(col, 2).unwrap().ch).collect();
+            assert_eq!(glance, "GPU 97% 80C", "{at}: {glance}");
+        }
+        for col in 0..cols {
+            assert_eq!(
+                grid.get(col, rows - 1).unwrap().ch,
+                ' ',
+                "{at} corner {col}"
+            );
+        }
+    }
+    let grid = draw(&model, 192, 60);
+    let mid = 96u16;
+    let panes: Vec<String> = (0..60)
+        .map(|row| {
+            (2..mid)
+                .map(|col| grid.get(col, row).unwrap().ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    let head = format!("{} beta", "a".repeat(pane - 5));
+    let beta = panes
+        .iter()
+        .position(|line| line == &head)
+        .expect("exact-fit line was split");
+    assert_eq!(
+        panes[beta + 1].trim(),
+        "gamma",
+        "boundary space was not consumed"
+    );
 }

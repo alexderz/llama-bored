@@ -672,6 +672,7 @@ mod tests {
             gen_tps: None,
             prompt_tps: None,
             prompt_last: None,
+            gen_last: None,
             gen_ceiling: 250.0,
             prompt_ceiling: 1500.0,
             slots: Vec::new(),

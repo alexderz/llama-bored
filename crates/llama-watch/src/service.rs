@@ -483,6 +483,8 @@ struct TickState {
     /// Each model's context size by llama-swap key, kept after it unloads
     /// so its RECENT rows keep their scale (#75).
     ctx_sizes: BTreeMap<String, u64>,
+    /// Last non-zero decode rate for the dim GEN digits (#163).
+    gen_last: Option<f64>,
 }
 
 impl TickState {
@@ -524,6 +526,7 @@ impl TickState {
             starting_since: HashMap::new(),
             flights: crate::inflight::Tracker::default(),
             ctx_sizes: BTreeMap::new(),
+            gen_last: None,
         }
     }
 }
@@ -981,6 +984,9 @@ fn tty_model(
 ) -> TtyModel {
     note_stopping(&mut tick.stopping_since, &sample.snapshot.models, mono);
     note_starting(&mut tick.starting_since, &sample.snapshot.models, mono);
+    if let Some(rate) = tick.detail.gen_tps.filter(|v| v.is_finite() && *v > 0.0) {
+        tick.gen_last = Some(rate);
+    }
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
     let (model_loading, model_stopping) = header_swap(sample, watch);
     let no_slots = first_without_slots(sample, watch);
@@ -1083,6 +1089,7 @@ fn tty_model(
         gen_tps: tick.detail.gen_tps,
         prompt_tps: tick.detail.prompt_tps,
         prompt_last: prompt_last(&tick.detail.slots),
+        gen_last: tick.gen_last,
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
         slots: {
