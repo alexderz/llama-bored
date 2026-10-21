@@ -6,11 +6,13 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- tty11's glance beside the GEN and PROMPT digits (GPU, VRAM, the two HOT rows, DISK, NET, CPU, ACT, LOAD and the state word) is replaced. It is gone at every width, with its HOT rows and their #173 ordering; the gauges on the right show the same. From 192 columns SETUP takes its place: from column 64 on the headline's top row, over the headline's rows, up to one column short of the left half's end, with its title, labels and values at the offsets they have under SLOTS, and it is no longer drawn under SLOTS as well. A row whose items do not fit wraps whole items onto continuation lines in the value column while rows remain, breaking at a ` · ` so a pair joined by a rule's own separator (`kv q8_0 / q8_0`) wraps together unless the pair alone is wider than the room; an item wider than the room has a line of its own and is cut with `…`, and #114's `text` rules hold. Rows that do not fit drop. The title's `+N` counts them, the rows cut short (trailing items left out on their last line; a row whose one item left is cut with `…` is drawn and not counted) and the other loaded models. Under 192 columns the spot beside the digits stays empty and SETUP stays under SLOTS as before, one line a row, where `+N` now also counts the rows cut short (#177).
+- Each temperature gauge shows the reading of its TEMPS row that is nearest its own limit (the highest gauge percent against that sensor's warning and critical points, ties to the hotter), not the row's hottest reading, so a sensor near a low limit is no longer hidden behind a hotter one with a higher limit. The label stays the row's name, and the coolest gauges still shed first (#177).
+
 ### Fixed
 
-- tty11's glance HOT rows list the sensors closest to or past their limits: past critical first, then past warning, then nearest below the warning point, with sensors that have no thresholds last and ties in panel order. They listed the ones furthest below it, so a critical sensor never showed while a cold one did (#173).
-- A HOT row that does not fit the glance drops its margin whole instead of showing a lone `+`, then shortens the sensor name, down to three characters, so the mark and the temperature are never cut: a six-character critical sensor at 100 C or more no longer reads `10` on a 160-column screen (#173).
-- tty11 no longer crashes on a temperature sensor whose label or rename has non-ASCII characters (such as `é`): the glance's HOT row cut names to six bytes, which could split a character; it now cuts six characters (#173).
 - The big rate digits' 7 has a straight right-hand stem again; the stepped 7 from #163 read as broken (#175).
 
 ## 0.7.0 — 2026-10-21

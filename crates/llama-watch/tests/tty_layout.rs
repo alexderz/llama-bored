@@ -3509,8 +3509,8 @@ fn bar_from(grid: &llama_watch::tty::grid::Grid, row: u16, col: u16) -> Vec<C16>
         .collect()
 }
 
-/// Row of a meter labelled `label`. The rightmost word wins so the
-/// glance block, which repeats the name, is not the meter.
+/// Row of a meter labelled `label`. The rightmost word wins, so a word on
+/// the left half that repeats the name is not the meter.
 fn meter_row(grid: &llama_watch::tty::grid::Grid, label: &str) -> u16 {
     label_hit(grid, label).0
 }
@@ -7631,14 +7631,15 @@ fn skeleton_frames_at_the_four_sizes_and_the_phone_crop() {
                 "{at}: {right}"
             );
         }
-        if cols >= 184 {
-            let glance: String = (64..80).map(|col| grid.get(col, 2).unwrap().ch).collect();
-            assert_eq!(glance, "GPU 97 %  80C  3", "{at}: {glance}");
-            let vram: String = (64..80).map(|col| grid.get(col, 3).unwrap().ch).collect();
-            assert!(vram.starts_with("VRAM 95 %"), "{at}: {vram}");
-        } else if rows > 26 || cols == 160 {
-            let glance: String = (64..75).map(|col| grid.get(col, 2).unwrap().ch).collect();
-            assert_eq!(glance, "GPU 97% 80C", "{at}: {glance}");
+        // #177: SETUP beside the digits from 192 columns, where the glance
+        // was; under 192 that spot is empty.
+        let beside: String = (64..cols / 2 - 2)
+            .map(|col| grid.get(col, 2).unwrap().ch)
+            .collect();
+        if cols >= 192 {
+            assert!(beside.starts_with("SETUP  qwen3.6"), "{at}: {beside}");
+        } else {
+            assert!(beside.trim().is_empty(), "{at}: {beside}");
         }
         for col in 0..cols {
             assert_eq!(
@@ -8050,72 +8051,24 @@ fn memory_pressure_turns_the_swap_label_yellow() {
     assert_eq!(grid.get(col, row).unwrap().fg, C16::White);
 }
 
+/// #163, #177: the 80x28 phone crop of a 160-column frame holds the two
+/// rate digits.
 #[test]
-fn glance_rows_show_disk_and_net_from_the_same_reading() {
-    let grid = draw(&with_host_rates(false), 192, 60);
-    let disk: String = (64..96).map(|col| grid.get(col, 6).unwrap().ch).collect();
-    let net: String = (64..96).map(|col| grid.get(col, 7).unwrap().ch).collect();
-    let vram: String = (64..96).map(|col| grid.get(col, 3).unwrap().ch).collect();
-    assert!(disk.starts_with("DISK R 1.8 G/s"), "{disk}");
-    assert!(disk.contains("12 M/s"), "{disk}");
-    assert!(net.starts_with("NET  118 M/s"), "{net}");
-    assert!(vram.contains("SWAP 0.4G"), "{vram}");
-}
-
-fn glance_rows(grid: &llama_watch::tty::grid::Grid, cols: std::ops::Range<u16>) -> Vec<String> {
-    (2..10)
-        .map(|row| {
-            cols.clone()
-                .map(|col| grid.get(col, row).unwrap().ch)
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
-        .collect()
-}
-
-/// #163: the narrow glance (160 columns) is the approved compact frame,
-/// one fact a row, all inside the 80x28 phone crop: GPU, VRAM, two HOT,
-/// DISK, NET, CPU, ACT. LOAD keeps its meter on the right.
-#[test]
-fn narrow_glance_is_the_approved_compact_frame() {
+fn phone_crop_holds_the_two_rate_digits() {
     for rows in [26u16, 48] {
         let grid = draw(&with_host_rates(false), 160, rows);
-        let glance = glance_rows(&grid, 64..80);
-        for (row, label) in [
-            (0, "GPU "),
-            (1, "VRAM "),
-            (2, "HOT"),
-            (4, "DISK 1.8 G/s"),
-            (5, "NET 118 M/s"),
-            (6, "CPU "),
-            (7, "ACT "),
-        ] {
-            assert!(
-                glance[row].starts_with(label),
-                "160x{rows} glance row {row}: {glance:?}"
-            );
-        }
-        let text = whole(&grid);
-        assert!(text.contains("LOAD"), "{text}");
-        // The second hottest sensor sits under the first, as in the mock-up.
-        let mut hot = with_host_rates(false);
-        hot.temps = temps_model().temps;
-        let hot_rows = glance_rows(&draw(&hot, 160, rows), 64..80);
-        let second = &hot_rows[3];
-        assert!(
-            second.starts_with("    ") && !second.trim().is_empty(),
-            "160x{rows}: {hot_rows:?}"
-        );
-        // The rate digits stay in the crop beside the glance.
         let lit = |cols: std::ops::Range<u16>| {
             (3..8).any(|row| {
                 cols.clone()
                     .any(|col| grid.get(col, row).unwrap().ch == '█')
             })
         };
-        assert!(lit(2..28), "GEN digits");
-        assert!(lit(32..62), "PROMPT digits");
+        assert!(lit(2..28), "160x{rows}: GEN digits");
+        assert!(lit(32..62), "160x{rows}: PROMPT digits");
+        // LOAD keeps its gauge on the right.
+        let load = meter_row(&grid, "LOAD");
+        assert!(load < timeline_rule(&grid), "160x{rows}: LOAD at {load}");
+        assert!(label_hit(&grid, "LOAD").1 >= 80, "160x{rows}");
     }
 }
 
@@ -8353,8 +8306,10 @@ fn byte_rates_roll_over_to_the_next_unit() {
         let mut model = with_host_rates(false);
         model.disk_read_bps = Some(bps);
         let grid = draw(&model, 192, 60);
-        let row = row_string(&grid, meter_row(&grid, "DISK R"));
-        assert!(row.contains(&format!("DISK R {text} ")), "{bps}: {row}");
+        // The gauge's value field: label and value, 18 cells.
+        let (row, col) = label_hit(&grid, "DISK R");
+        let field = cells_between(&grid, row, col, col + 18);
+        assert!(field.ends_with(&format!(" {text}")), "{bps}: {field}");
     }
 }
 
@@ -8606,8 +8561,8 @@ fn a_claim_still_draws_with_the_gauge_grid() {
     }
 }
 
-/// #163's 80x28 phone crop of the left edge holds the headline and the
-/// glance; no gauge reaches into it, at any size.
+/// #163's 80x28 phone crop of the left edge holds the headline; no gauge
+/// reaches into it, at any size.
 #[test]
 fn no_gauge_reaches_the_phone_crop() {
     // Segments mark the gauge cells apart from the chart's blocks.
@@ -8911,10 +8866,9 @@ fn starting_blanks_the_level_gauges_even_with_readings() {
     assert!(swap.ends_with("0.4/16.0 G"), "{swap}");
 }
 
-/// #165, #173: the tty hides NVMe Sensor 1 and 2 and the board's AUXTIN2
-/// (`temps::TTY_BLOCK`) from its gauges, TEMPS rows and the glance's HOT
-/// rows, even when one is the hottest reading. Without the block the two
-/// hottest lead the HOT rows.
+/// #165: the tty hides NVMe Sensor 1 and 2 and the board's AUXTIN2
+/// (`temps::TTY_BLOCK`) from its gauges and TEMPS rows, even when one is
+/// the hottest reading.
 #[test]
 fn a_tty_blocked_sensor_never_reaches_the_screen() {
     use llama_watch::config::Temps;
@@ -8944,7 +8898,7 @@ fn a_tty_blocked_sensor_never_reaches_the_screen() {
     };
     for (cols, rows) in [(213u16, 60u16), (160, 26), (160, 49)] {
         let all = screen(&TempLook::new(&Temps::default()), cols, rows);
-        // Short labels for the TEMPS and HOT rows, values for the gauges.
+        // Short labels for the TEMPS rows, values for the gauges.
         for gone in ["s1", "s2", "aux2", "94 C", "96 C", "99 C"] {
             assert!(!all.contains(gone), "{cols}x{rows}: {gone}\n{all}");
         }
@@ -8956,37 +8910,7 @@ fn a_tty_blocked_sensor_never_reaches_the_screen() {
             open.contains("99 C") && open.contains("96 C"),
             "{cols}x{rows}\n{open}"
         );
-        // The HOT rows (the margin may be cut at 160 columns): blocked,
-        // what is left (the board's SYSTIN alone, so its row name); open,
-        // the critical AUXTIN2 and Sensor 2 first.
-        let blocked = hot_pair(&all);
-        assert!(blocked[0].starts_with("HOT board 40"), "{blocked:?}");
-        let open = hot_pair(&open);
-        assert!(open[0].starts_with("HOT !!aux2 99"), "{open:?}");
-        assert!(open[1].starts_with("    !!s2 96"), "{open:?}");
     }
-}
-
-/// The glance's two HOT rows of a frame's text, 16 cells from `HOT`.
-fn hot_pair(all: &str) -> [String; 2] {
-    let rows: Vec<Vec<char>> = all.lines().map(|r| r.chars().collect()).collect();
-    let at = rows
-        .iter()
-        .position(|r| r.windows(4).any(|w| w == ['H', 'O', 'T', ' ']))
-        .expect("a HOT row");
-    let col = rows[at]
-        .windows(4)
-        .position(|w| w == ['H', 'O', 'T', ' '])
-        .unwrap();
-    [at, at + 1].map(|r| {
-        rows[r]
-            .iter()
-            .skip(col)
-            .take(16)
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    })
 }
 
 // ---- #167: the GPU reservation and every claim in the header ------------
@@ -9541,97 +9465,12 @@ fn gauge_bars_are_solid_unless_bar_segments() {
     }
 }
 
-// ---- #173: the glance's HOT rows lead with the hottest ----------------------
-
-/// One TEMPS row for [`hot_rows_of`]: name, °C, warning and critical points.
-type HotItem<'a> = (&'a str, i32, Option<(i32, i32)>);
-
-/// The two HOT rows for a TEMPS panel of one item a row, on the narrow
-/// (160-column) glance.
-fn hot_rows_of(items: &[HotItem]) -> [String; 2] {
-    let mut model = with_host_rates(false);
-    model.temps = Some(TempPanel {
-        groups: items
-            .iter()
-            .map(|(name, c, limits)| TempGroup {
-                name: (*name).to_string(),
-                items: vec![temp_marked("", *c, Level::Normal, *limits)],
-            })
-            .collect(),
-    });
-    let grid = draw(&model, 160, 48);
-    let glance = glance_rows(&grid, 64..80);
-    [glance[2].clone(), glance[3].trim_start().to_string()]
-}
-
-/// #173: past critical first, then past warning, then nearest below; the
-/// coldest is not shown. Past critical outranks a bigger margin past the
-/// warning: an NVMe at 86 of 82/85 over a CPU at 89 of 80/90.
-#[test]
-fn hot_rows_lead_with_the_critical_sensor_and_drop_the_cold_one() {
-    let limits = Some((800, 900));
-    let hot = hot_rows_of(&[
-        ("cd", 25, limits),
-        ("wm", 70, limits),
-        ("cr", 92, limits),
-        ("md", 60, limits),
-    ]);
-    assert_eq!(hot, ["HOT !!cr 92 +12", "wm 70 -10"], "{hot:?}");
-    assert!(hot.iter().all(|r| !r.contains("cd")), "{hot:?}");
-    let hot = hot_rows_of(&[("cp", 89, Some((800, 900))), ("nv", 86, Some((820, 850)))]);
-    assert_eq!(hot, ["HOT !!nv 86 +4", "!cp 89 +9"], "{hot:?}");
-}
-
-/// #173: a sensor without thresholds never outranks one with them, even
-/// at 99 C against 30 C.
-#[test]
-fn a_sensor_without_thresholds_ranks_after_every_one_with_them() {
-    let limits = Some((800, 900));
-    let hot = hot_rows_of(&[("ba", 99, None), ("co", 30, limits)]);
-    assert_eq!(hot, ["HOT co 30 -50", "ba 99"], "{hot:?}");
-    let hot = hot_rows_of(&[("ba", 99, None), ("aa", 30, limits), ("bb", 31, limits)]);
-    assert_eq!(hot, ["HOT bb 31 -49", "aa 30 -50"], "{hot:?}");
-}
-
-/// #173: equal heat keeps panel order.
-#[test]
-fn hot_rows_keep_panel_order_on_a_tie() {
-    let limits = Some((800, 900));
-    let hot = hot_rows_of(&[("cd", 25, limits), ("aa", 70, limits), ("bb", 70, limits)]);
-    assert_eq!(hot, ["HOT aa 70 -10", "bb 70 -10"], "{hot:?}");
-    let hot = hot_rows_of(&[("cd", 25, limits), ("bb", 70, limits), ("aa", 70, limits)]);
-    assert_eq!(hot, ["HOT bb 70 -10", "aa 70 -10"], "{hot:?}");
-}
-
-/// #173: at 160 columns the glance is 15 cells. A critical row that does
-/// not fit drops its margin whole, never a lone `+`; a six-character name
-/// at 104 C shortens so the temperature stays whole (it printed `10`).
-#[test]
-fn a_hot_row_that_does_not_fit_drops_its_margin_then_shortens_its_name() {
-    let limits = Some((800, 900));
-    let hot = hot_rows_of(&[("aux1", 92, limits), ("cd", 25, limits)]);
-    assert_eq!(hot[0], "HOT !!aux1 92", "{hot:?}");
-    let hot = hot_rows_of(&[("sensor", 104, limits), ("cd", 25, limits)]);
-    assert_eq!(hot[0], "HOT !!senso 104", "{hot:?}");
-    // The second row the same: `!NVMe0 82`, no `+`.
-    let hot = hot_rows_of(&[("aux1", 92, limits), ("NVMe0", 82, Some((820, 850)))]);
-    assert_eq!(hot, ["HOT !!aux1 92", "!NVMe0 82"], "{hot:?}");
-    // A row that fits keeps its margin.
-    let hot = hot_rows_of(&[("cr", 92, limits), ("cd", 25, limits)]);
-    assert_eq!(hot[0], "HOT !!cr 92 +12", "{hot:?}");
-}
-
 /// #173: a renamed, non-ASCII sensor label (`aééééééx`) draws without a
-/// panic at 160 and 213 columns: the HOT row cuts it to six characters,
-/// not six bytes, and fits the glance; its gauge label keeps seven cells.
+/// panic at 213 columns; its gauge label keeps seven cells.
 #[test]
 fn a_multi_byte_sensor_label_draws_at_its_width() {
     let limits = Some((800, 900));
     let name = "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}x";
-    let six = "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}";
-    let hot = hot_rows_of(&[(name, 92, limits), ("cd", 25, limits)]);
-    assert_eq!(hot[0], format!("HOT !!{six} 92"), "{hot:?}");
-    assert_eq!(hot[0].chars().count(), 15, "the 15-cell glance at 160");
     let mut model = with_host_rates(false);
     model.temps = Some(TempPanel {
         groups: vec![
@@ -9646,8 +9485,6 @@ fn a_multi_byte_sensor_label_draws_at_its_width() {
         ],
     });
     let grid = draw(&model, 213, 60);
-    let glance = glance_rows(&grid, 64..93);
-    assert_eq!(glance[2], format!("HOT !!{six} 92 +12"), "{glance:?}");
     // The gauge label is seven cells: the console folds `é` to `e`
     // (sanitize), the grid file keeps it.
     let all = whole(&grid);
@@ -9662,27 +9499,282 @@ fn a_multi_byte_sensor_label_draws_at_its_width() {
     );
 }
 
-/// #173: ties keep panel order on a long panel too, where an unstable sort
-/// would not: 24 sensors tied at 70 C among 16 cooler ones, in an order
-/// the sort has to work on.
+// ---- #177: SETUP beside the rate digits in place of the glance ------------
+
+/// Cells `from..to` of `row`, trimmed at the end.
+fn cells_between(grid: &llama_watch::tty::grid::Grid, row: u16, from: u16, to: u16) -> String {
+    (from..to)
+        .map(|col| grid.get(col, row).unwrap().ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+fn one_item_row(label: &str, text: &str) -> SetupRow {
+    SetupRow {
+        label: label.to_owned(),
+        items: vec![setup_item(text, false)],
+    }
+}
+
+/// A row of four items that takes two lines in the 19 value cells at 192
+/// columns: `aaaa · bbbbbbbb` (15), then `cccccc · dddddddddd` (19).
+fn four_item_row() -> SetupRow {
+    SetupRow {
+        label: "wrap".to_owned(),
+        items: ["aaaa", "bbbbbbbb", "cccccc", "dddddddddd"]
+            .into_iter()
+            .map(|text| setup_item(text, false))
+            .collect(),
+    }
+}
+
+/// #177: from 192 columns SETUP starts at column 64 on the headline's top
+/// row, labels at 66 and values at 75, and it is not drawn under SLOTS.
 #[test]
-fn hot_rows_keep_panel_order_on_a_tie_in_a_long_panel() {
-    let limits = Some((800, 900));
-    let names: Vec<String> = (0..40).map(|i| format!("t{i:02}")).collect();
-    let items: Vec<HotItem> = names
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let c = if i % 5 == 1 || i % 5 == 3 {
-                40 + (i as i32 % 7)
-            } else {
-                70
-            };
-            (name.as_str(), c, limits)
-        })
-        .rev()
+fn setup_sits_beside_the_rate_digits_from_192_columns() {
+    let rows = vec![
+        one_item_row("alpha", "zq-one"),
+        one_item_row("beta", "zq-two"),
+        one_item_row("gamma", "zq-three"),
+    ];
+    for cols in [192u16, 213] {
+        let at = format!("{cols}x60");
+        let grid = draw(&with_setup_rows(rows.clone()), cols, 60);
+        let end = cols / 2 - 2;
+        let title = cells_between(&grid, 2, 64, end);
+        assert!(title.starts_with("SETUP  qwen3.6-35b-a3b"), "{at}: {title}");
+        assert_eq!(grid.get(64, 2).unwrap().fg, C16::White, "{at}");
+        assert_eq!(
+            cells_between(&grid, 3, 64, end),
+            "  alpha    zq-one",
+            "{at}"
+        );
+        assert_eq!(
+            cells_between(&grid, 4, 64, end),
+            "  beta     zq-two",
+            "{at}"
+        );
+        assert_eq!(
+            cells_between(&grid, 5, 64, end),
+            "  gamma    zq-three",
+            "{at}"
+        );
+        assert_eq!(cells_between(&grid, 6, 64, end), "", "{at}");
+        // Drawn once: not under SLOTS as well.
+        let all = whole(&grid);
+        assert_eq!(all.matches("SETUP").count(), 1, "{at}\n{all}");
+        assert_eq!(all.matches("zq-").count(), 3, "{at}\n{all}");
+        assert_blank_edges(&grid);
+    }
+}
+
+/// #177: under 192 columns (160x49) the spot beside the digits stays
+/// empty and SETUP stays under SLOTS: title at column 2, labels at 4,
+/// values at 13.
+#[test]
+fn setup_stays_under_slots_at_160_columns() {
+    let model = with_setup_rows(vec![one_item_row("alpha", "zq-one")]);
+    let grid = draw(&model, 160, 49);
+    for row in 2..12 {
+        assert_eq!(cells_between(&grid, row, 64, 78), "", "row {row}");
+    }
+    let title = setup_at(&grid);
+    assert!(title >= 12, "under SLOTS: {title}");
+    assert!(cells_between(&grid, title, 2, 78).starts_with("SETUP  qwen3.6"));
+    assert_eq!(cells_between(&grid, title + 1, 2, 78), "  alpha    zq-one");
+    assert_eq!(whole(&grid).matches("SETUP").count(), 1);
+}
+
+/// #177: beside the digits a row that does not fit wraps whole items onto
+/// a continuation line in the value column; an item wider than the room
+/// has a line of its own and is cut with `…` at column 93.
+#[test]
+fn setup_beside_the_digits_wraps_whole_items() {
+    let wide = SetupRow {
+        label: "cut".to_owned(),
+        items: vec![setup_item(&"e".repeat(30), false), setup_item("ff", false)],
+    };
+    let grid = draw(&with_setup_rows(vec![four_item_row(), wide]), 192, 60);
+    assert_eq!(
+        cells_between(&grid, 3, 64, 94),
+        "  wrap     aaaa \u{b7} bbbbbbbb"
+    );
+    assert_eq!(
+        cells_between(&grid, 4, 64, 94),
+        format!("{}cccccc \u{b7} dddddddddd", " ".repeat(11))
+    );
+    assert_eq!(
+        cells_between(&grid, 5, 64, 94),
+        format!("  cut      {}\u{2026}", "e".repeat(18))
+    );
+    assert_eq!(
+        cells_between(&grid, 6, 64, 94),
+        format!("{}ff", " ".repeat(11))
+    );
+    // Under SLOTS the same rows keep one line each (#114).
+    let grid = draw(&with_setup_rows(vec![four_item_row()]), 160, 49);
+    let title = setup_at(&grid);
+    assert_eq!(
+        cells_between(&grid, title + 1, 2, 78),
+        "  wrap     aaaa \u{b7} bbbbbbbb \u{b7} cccccc \u{b7} dddddddddd"
+    );
+}
+
+/// #177: rows that do not fit beside the digits drop, and the title's `+N`
+/// counts them with the view's own `more`, and with every row cut short:
+/// trailing items left out on its last line. A row whose one item left is
+/// cut with `…` is drawn and not counted.
+#[test]
+fn setup_beside_the_digits_counts_dropped_rows_in_its_more() {
+    // The headline has ten rows at 192x60: the title and nine lines. The
+    // wrapped row takes two, seven single rows the rest, three drop.
+    let mut rows = vec![four_item_row()];
+    rows.extend((1..=10).map(|i| one_item_row("row", &format!("zq-{i:02}"))));
+    let mut model = with_setup_rows(rows);
+    let grid = draw(&model, 192, 60);
+    let all = whole(&grid);
+    assert!(all.contains("zq-07") && !all.contains("zq-08"), "{all}");
+    let title = cells_between(&grid, 2, 64, 94);
+    assert!(title.ends_with("+3"), "{title}");
+    assert_eq!(grid.get(93, 2).unwrap().ch, '3');
+    model.setup.as_mut().expect("setup").more = 1;
+    let title = cells_between(&draw(&model, 192, 60), 2, 64, 94);
+    assert!(title.ends_with("+4"), "{title}");
+    // Eight single rows leave one line for the wrapped row: it keeps what
+    // fits on that line and leaves two items out, so it counts.
+    let eight: Vec<SetupRow> = (1..=8)
+        .map(|i| one_item_row("row", &format!("zq-{i:02}")))
         .collect();
-    // Panel order is t39 .. t00; the first tied at 70 are t39 and t37.
-    let hot = hot_rows_of(&items);
-    assert_eq!(hot, ["HOT t39 70 -10", "t37 70 -10"], "{hot:?}");
+    let mut rows = eight.clone();
+    rows.push(four_item_row());
+    let mut model = with_setup_rows(rows);
+    let grid = draw(&model, 192, 60);
+    assert_eq!(
+        cells_between(&grid, 11, 64, 94),
+        "  wrap     aaaa \u{b7} bbbbbbbb"
+    );
+    assert!(!whole(&grid).contains("cccccc"));
+    let title = cells_between(&grid, 2, 64, 94);
+    assert!(title.ends_with("+1"), "{title}");
+    model.setup.as_mut().expect("setup").more = 2;
+    let title = cells_between(&draw(&model, 192, 60), 2, 64, 94);
+    assert!(title.ends_with("+3"), "{title}");
+    // One item too wide for its line is cut with `…`: drawn, not counted.
+    let mut rows = eight;
+    rows.push(one_item_row("cut", &"e".repeat(30)));
+    let grid = draw(&with_setup_rows(rows), 192, 60);
+    assert_eq!(
+        cells_between(&grid, 11, 64, 94),
+        format!("  cut      {}\u{2026}", "e".repeat(18))
+    );
+    assert!(!cells_between(&grid, 2, 64, 94).contains('+'));
+}
+
+/// #177: under SLOTS a row is one line; one that leaves items out counts
+/// in `+N`, one whose only item is cut with `…` does not.
+#[test]
+fn setup_under_slots_counts_rows_cut_short() {
+    let cut = SetupRow {
+        label: "cut".to_owned(),
+        items: vec![setup_item(&"e".repeat(62), false), setup_item("ff", false)],
+    };
+    let grid = draw(&with_setup_rows(vec![cut]), 160, 49);
+    let title = setup_at(&grid);
+    assert!(
+        cells_between(&grid, title, 2, 78).ends_with("+1"),
+        "{}",
+        cells_between(&grid, title, 2, 78)
+    );
+    let lone = one_item_row("cut", &"e".repeat(80));
+    let grid = draw(&with_setup_rows(vec![lone]), 160, 49);
+    let title = setup_at(&grid);
+    assert!(!cells_between(&grid, title, 2, 78).contains('+'));
+    assert!(cells_between(&grid, title + 1, 2, 78).ends_with('\u{2026}'));
+}
+
+/// #177: 191 columns draw nothing beside the digits and keep SETUP under
+/// SLOTS; 192 draw it beside them.
+#[test]
+fn setup_moves_beside_the_digits_at_exactly_192_columns() {
+    let model = with_setup_rows(vec![one_item_row("alpha", "zq-one")]);
+    let grid = draw(&model, 191, 60);
+    for row in 2..12 {
+        assert_eq!(cells_between(&grid, row, 64, 93), "", "191: row {row}");
+    }
+    let title = setup_at(&grid);
+    assert!(title >= 12, "191: under SLOTS at {title}");
+    assert!(cells_between(&grid, title, 2, 93).starts_with("SETUP  qwen3.6"));
+    assert_eq!(cells_between(&grid, title + 1, 2, 93), "  alpha    zq-one");
+    let grid = draw(&model, 192, 60);
+    assert!(cells_between(&grid, 2, 64, 94).starts_with("SETUP  qwen3.6"));
+    assert_eq!(cells_between(&grid, 3, 64, 94), "  alpha    zq-one");
+    assert_eq!(setup_at(&grid), 2);
+}
+
+/// #177: with llama-swap down, starting, or polling off, a setup view
+/// draws nothing beside the digits.
+#[test]
+fn setup_beside_the_digits_only_while_generating_or_ready() {
+    for state in [
+        WatchState::AiDown,
+        WatchState::Starting,
+        WatchState::NoLlama,
+    ] {
+        let mut model = sample(state);
+        model.setup = Some(qwen_setup());
+        let grid = draw(&model, 213, 60);
+        for row in 2..12 {
+            assert_eq!(
+                cells_between(&grid, row, 64, 104),
+                "",
+                "{state:?}: row {row}"
+            );
+        }
+        assert!(!whole(&grid).contains("SETUP"), "{state:?}");
+    }
+}
+
+/// #177: a view without rows draws its title alone beside the digits.
+#[test]
+fn setup_beside_the_digits_without_rows_is_the_title() {
+    let grid = draw(&with_setup_rows(Vec::new()), 192, 60);
+    let title = cells_between(&grid, 2, 64, 94);
+    assert!(title.starts_with("SETUP  qwen3.6-35b-a3b"), "{title}");
+    assert!(!title.contains('+'), "{title}");
+    for row in 3..12 {
+        assert_eq!(cells_between(&grid, row, 64, 94), "", "row {row}");
+    }
+}
+
+/// #177: a temperature gauge shows its group's reading nearest its own
+/// limit, not the hottest: 60 C of a 65 C warning point over 80 C of
+/// 100 C. A tie on the gauge percent goes to the hotter reading. The label
+/// stays the group's name.
+#[test]
+fn a_temperature_gauge_picks_the_reading_nearest_its_limit() {
+    let gauge_text = |items: Vec<TempItem>| {
+        let mut model = gauge_model();
+        model.fans = None;
+        model.temps = Some(TempPanel {
+            groups: vec![TempGroup {
+                name: "probe".to_string(),
+                items,
+            }],
+        });
+        let grid = draw(&model, 213, 60);
+        let (row, col) = label_hit(&grid, "probe");
+        cells_between(&grid, row, col, col + 18)
+    };
+    let near = gauge_text(vec![
+        temp_marked("hot", 80, Level::Normal, Some((1000, 1100))),
+        temp_marked("near", 60, Level::Normal, Some((650, 750))),
+    ]);
+    assert_eq!(near, "probe         60 C");
+    // 50 C of 80 and 35 C of 50 are both half way from 20 C.
+    let tie = gauge_text(vec![
+        temp_marked("a", 35, Level::Normal, Some((500, 600))),
+        temp_marked("b", 50, Level::Normal, Some((800, 900))),
+    ]);
+    assert_eq!(tie, "probe         50 C");
 }

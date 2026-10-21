@@ -414,6 +414,22 @@ it drop before the text is cut. Under 48 rows it uses only the rows beside
 SLOTS, so the short-screen panel order is unchanged. With nothing loaded,
 or llama-swap down, it is gone.
 
+On the dashboard with the gauge grid (#163), SETUP sits by width (#177).
+From 192 columns it is beside the GEN and PROMPT digits, where the glance
+block was: from column 64 on the headline's top row, over the headline's
+rows, up to one column short of the left half's end, with its labels and
+values at the offsets it has under SLOTS, and it is not drawn under SLOTS
+as well. A row whose items do not fit wraps whole items onto the next
+line in the value column while rows remain, breaking at a ` · `, so
+`kv q8_0 / q8_0` wraps as one unless it alone is wider than the room; an
+item wider than the room has a line of its own and is cut with `…`. Rows
+that do not fit drop. The title's `+N` counts them, the rows cut short
+(trailing items left out on their last line), and the other loaded models;
+a row whose one item left is cut with `…` is drawn and not counted. Under
+192 columns the spot beside the digits stays empty and SETUP takes the
+rows left under SLOTS, one line a row; there `+N` counts the rows cut
+short and the other models.
+
 The meter bars are whole cells of `▇` (lower seven eighths) when
 `tty.chart_glyphs = "eighths"`, which needs the llama-hack font, so
 stacked bars keep a gap; with `"halves"` (a console font such as eurlatgr,
@@ -421,7 +437,10 @@ which has no `▇`) they use `▄`. 4K screens (90+ rows) keep their two-row
 bars.
 
 The right-hand gauges are solid `▄` bars, the same on tty11, in the grid
-file, in llama-view and in the llama-cast stream (#170). With
+file, in llama-view and in the llama-cast stream (#170). Each temperature
+gauge is one TEMPS row, labelled with its name, and shows the reading
+nearest its own limit: the highest gauge percent against that sensor's
+warning and critical points, ties to the hotter one (#177). With
 `tty.bar_segments = true` each lit cell is one pixel column short, so a
 hairline shows between cells (#165): the grid file carries U+E584, tty11
 draws it with a llama-hack font (`chart_glyphs = "eighths"`) and `▄` with
