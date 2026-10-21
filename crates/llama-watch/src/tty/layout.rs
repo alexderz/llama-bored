@@ -2186,8 +2186,8 @@ const DIGITS: [&[&str]; 11] = [
     &["#.#", "#.#", "###", "..#", "..#"],
     &["###", "#..", "###", "..#", "###"],
     &["###", "#..", "###", "#.#", "###"],
-    // Steps down to the left instead of a solid right-hand stem.
-    &["###", "..#", ".#.", ".#.", "#.."],
+    // A straight right-hand stem, as before #163 (Alex chose it, #175).
+    &["###", "..#", "..#", "..#", "..#"],
     &["###", "#.#", "###", "#.#", "###"],
     // A foot that curls left: not a full-width foot that blobs into the
     // bowl, and not a straight stem that reads as 4.
@@ -9234,11 +9234,11 @@ mod tests {
     }
 
     #[test]
-    fn five_row_digits_keep_0_open_and_9_unblobbed() {
+    fn five_row_digits_keep_0_open_9_unblobbed_and_7_straight() {
         assert_eq!(DIGITS[0], &[".#.", "#.#", "#.#", "#.#", ".#."][..]);
         assert!(DIGITS[0].iter().all(|row| row.contains('.')));
         assert_eq!(DIGITS[3][2], ".##");
-        assert_eq!(DIGITS[7][4], "#..");
+        assert_eq!(DIGITS[7], &["###", "..#", "..#", "..#", "..#"][..]);
         assert_eq!(DIGITS[9][4], ".##");
         assert_ne!(DIGITS[9][4], "###");
         for glyph in DIGITS {
