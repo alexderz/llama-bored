@@ -1373,10 +1373,17 @@ const SETUP_ROWS: u16 = 6;
 /// From 60 rows: one more than the eight the block had, so a label row
 /// does not push the last row out (#114).
 const SETUP_ROWS_TALL: u16 = 9;
-/// SETUP row labels start here; their items at [`SETUP_VALUE_X`].
-const SETUP_LABEL_X: u16 = 4;
-const SETUP_VALUE_X: u16 = 13;
+/// The SETUP title's column under ACTIVITY and under SLOTS.
+const SETUP_X: u16 = 2;
+/// Row labels start this far right of the title; their items at
+/// [`SETUP_VALUE_DX`]. The same offsets beside the digits (#177).
+const SETUP_LABEL_DX: u16 = 2;
+const SETUP_VALUE_DX: u16 = 11;
 const SETUP_TITLE: &str = "SETUP";
+/// From this many columns SETUP sits beside the rate digits, from
+/// [`SETUP_BESIDE_X`], and not under SLOTS (#177).
+const SETUP_BESIDE_COLS: u16 = 192;
+const SETUP_BESIDE_X: u16 = 64;
 
 /// The SETUP block (#52) under ACTIVITY, a blank row below it, left
 /// aligned under the meters. Returns the mid rule's row: `base_rule`
@@ -1414,26 +1421,62 @@ fn draw_setup(grid: &mut Grid, model: &TtyModel, g: &Geom, base_rule: u16) -> u1
         return base_rule;
     }
     let right = usize::from(g.left_end());
-    draw_setup_title(grid, view, top, right);
+    draw_setup_title(grid, view, SETUP_X, top, right, view.more);
     let mut used: u16 = 1;
     for row in &view.rows {
         if used >= budget {
             break;
         }
-        draw_setup_row(grid, row, top.saturating_add(used), right);
+        draw_setup_row(grid, row, SETUP_X, top.saturating_add(used), right, 1);
         used += 1;
     }
     base_rule.max(top.saturating_add(used))
 }
 
-/// `SETUP  <id> · <name>` with `+N` at the right end. The name only when
-/// it fits whole; the id is cut with `…` when even it does not.
-fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
-    paint_str(grid, 2, row, SETUP_TITLE, C16::White, C16::Black);
-    let x = 2 + SETUP_TITLE.len() + 2;
+/// SETUP beside the rate digits (#177), in place of the glance: from
+/// [`SETUP_BESIDE_X`] on the headline's top row, over its `rows`, up to
+/// one column short of `left_end`. A row wraps whole items while rows
+/// remain. The title's `+N` counts the view's own `more`, the rows that do
+/// not fit, and the rows cut short: trailing items left out on their last
+/// line. A row whose last item is only cut with `…` is drawn whole.
+fn draw_setup_beside(grid: &mut Grid, model: &TtyModel, top: u16, rows: u16, left_end: u16) {
+    let Some(view) = &model.setup else { return };
+    if rows == 0 || !matches!(model.state, WatchState::Generating | WatchState::Ready) {
+        return;
+    }
+    let right = usize::from(left_end.saturating_sub(1));
+    let mut used: u16 = 1;
+    let mut hidden = 0usize;
+    for row in &view.rows {
+        let left = rows.saturating_sub(used);
+        if left == 0 {
+            hidden += 1;
+            continue;
+        }
+        let drawn = draw_setup_row(grid, row, SETUP_BESIDE_X, top + used, right, left);
+        used += drawn.lines;
+        hidden += usize::from(drawn.cut);
+    }
+    let more = view.more.saturating_add(hidden);
+    draw_setup_title(grid, view, SETUP_BESIDE_X, top, right, more);
+}
+
+/// `SETUP  <id> · <name>` from `x`, with `+N` (`more`) at the right end.
+/// The name only when it fits whole; the id is cut with `…` when even it
+/// does not.
+fn draw_setup_title(
+    grid: &mut Grid,
+    view: &SetupView,
+    x: u16,
+    row: u16,
+    right: usize,
+    more: usize,
+) {
+    paint_str(grid, x, row, SETUP_TITLE, C16::White, C16::Black);
+    let x = usize::from(x) + SETUP_TITLE.len() + 2;
     let mut end = right.saturating_add(1);
-    if view.more > 0 {
-        let more = format!("+{}", view.more);
+    if more > 0 {
+        let more = format!("+{more}");
         let at = end.saturating_sub(more.chars().count());
         paint_str(grid, col_u16(at), row, &more, C16::BrightYellow, C16::Black);
         end = at.saturating_sub(2);
@@ -1451,26 +1494,60 @@ fn draw_setup_title(grid: &mut Grid, view: &SetupView, row: u16, right: usize) {
     }
 }
 
-/// `  label    item · item`. Trailing items drop until the row fits, then
-/// the last one is cut. A `text` value stays: items after it drop first,
-/// and the value is cut to the room rather than dropped (#114). A text
-/// value that is not the row's first item, with fewer than two cells left,
-/// drops with its separator: a bare ` · ` or a lone `…` is not drawn.
-fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
+/// What [`draw_setup_row`] drew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SetupDrawn {
+    lines: u16,
+    /// Trailing items were left out on the last line (#177).
+    cut: bool,
+}
+
+/// `  label    item · item` from `x`, on up to `lines` lines. Items that
+/// do not fit wrap whole onto continuation lines in the value column
+/// (#177), breaking at a ` · ` ([`setup_lines`]), and an item wider than
+/// the room has a line to itself and is cut. On the last line trailing
+/// items drop until it fits, then the last one is cut. A `text` value
+/// stays: items after it drop first, and the value is cut to the room
+/// rather than dropped (#114). A text value that is not the line's first
+/// item, with fewer than two cells left, drops with its separator: a bare
+/// ` · ` or a lone `…` is not drawn. With one line this is the row as it
+/// was before #177.
+fn draw_setup_row(
+    grid: &mut Grid,
+    setup: &SetupRow,
+    x: u16,
+    row: u16,
+    right: usize,
+    lines: u16,
+) -> SetupDrawn {
     let label: String = setup.label.chars().take(8).collect();
     paint_detail(
         grid,
-        usize::from(SETUP_LABEL_X),
+        usize::from(x + SETUP_LABEL_DX),
         usize::from(row),
         &label,
         8,
     );
-    let x = usize::from(SETUP_VALUE_X);
-    let room = right.saturating_add(1).saturating_sub(x);
-    let keep = setup_items_kept(&setup.items, room);
-    let mut col = x;
-    for (i, item) in setup.items[..keep].iter().enumerate() {
-        let used = col - x;
+    let at = usize::from(x + SETUP_VALUE_DX);
+    let room = right.saturating_add(1).saturating_sub(at);
+    let spans = setup_lines(&setup.items, room, lines);
+    let cut = spans
+        .last()
+        .is_some_and(|span| span.end < setup.items.len());
+    let mut drawn: u16 = 0;
+    for span in spans {
+        draw_setup_items(grid, &setup.items[span], at, row + drawn, room);
+        drawn += 1;
+    }
+    SetupDrawn { lines: drawn, cut }
+}
+
+/// One line of items from `at`, `room` cells wide; the first draws no
+/// separator.
+fn draw_setup_items(grid: &mut Grid, items: &[SetupItem], at: usize, row: u16, room: usize) {
+    let mut col = at;
+    for (i, item) in items.iter().enumerate() {
+        let used = col - at;
         if i > 0 {
             let sep_room = room.saturating_sub(used);
             let sep_w = detail_width(&item.sep).min(sep_room);
@@ -1479,7 +1556,7 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
             }
             col += paint_detail(grid, col, usize::from(row), &item.sep, sep_room);
         }
-        let left = room.saturating_sub(col - x);
+        let left = room.saturating_sub(col - at);
         let text = cut_text(&item.text, left);
         let fg = if item.dim {
             C16::BrightBlack
@@ -1488,6 +1565,34 @@ fn draw_setup_row(grid: &mut Grid, setup: &SetupRow, row: u16, right: usize) {
         };
         col += paint_detail_fg(grid, col, usize::from(row), &text, left, fg);
     }
+}
+
+/// The items of each line, at most `lines` (at least one). While a line
+/// remains after this one, a line takes items while they fit whole, at
+/// least one, and breaks at the last ` · ` before the first that does not
+/// fit: an item with a rule's own `sep` (`kv q8_0 / q8_0`) wraps with the
+/// one before it, unless the two are wider than the room. The last line
+/// keeps what [`setup_items_kept`] keeps of the rest.
+fn setup_lines(items: &[SetupItem], room: usize, lines: u16) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while out.len() + 1 < usize::from(lines) {
+        let mut end = start + 1;
+        while end < items.len() && setup_items_width(&items[start..=end]) <= room {
+            end += 1;
+        }
+        if end >= items.len() {
+            break;
+        }
+        let at = (start + 1..=end)
+            .rev()
+            .find(|&at| items[at].sep == llama_core::detail::SEPARATOR)
+            .unwrap_or(end);
+        out.push(start..at);
+        start = at;
+    }
+    out.push(start..start + setup_items_kept(&items[start..], room));
+    out
 }
 
 /// `text`, or its first `width - 1` characters and `…`. Trailing spaces of
@@ -6643,9 +6748,13 @@ fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid 
     let left_end = cols / 2 - 2;
     let right_x = cols / 2 + 1;
     let right_end = cols - 3;
-    draw_headline(&mut grid, model, &g, top, left_end);
+    draw_headline(&mut grid, model, &g, top);
     draw_gauges(&mut grid, model, top, right_x, right_end, band.top);
-    place_slots_and_setup(&mut grid, model, &mut g, top, band.top, left_end);
+    let beside = cols >= SETUP_BESIDE_COLS;
+    if beside {
+        draw_setup_beside(&mut grid, model, top, headline_rows(&g), left_end);
+    }
+    place_slots_and_setup(&mut grid, model, &mut g, top, band.top, left_end, !beside);
 
     let band_rule = top + band.top;
     draw_timeline_rule(&mut grid, band_rule, cols, model.chart_bucket_s);
@@ -6694,7 +6803,7 @@ fn paint_raw(grid: &mut Grid, mut col: u16, row: u16, text: &str, fg: C16) {
     }
 }
 
-fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end: u16) {
+fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16) {
     let ph: u16 = if g.tall { 2 } else { 1 };
     let pw_start: u16 = if g.tall { 4 } else { 2 };
     let bar_rows = g.bar_rows;
@@ -6803,7 +6912,6 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
     );
     draw_ticks(grid, 2, tick_row, 26, model.gen_ceiling);
     draw_ticks(grid, 32, tick_row, 30, model.prompt_ceiling);
-    draw_glance(grid, model, top, left_end);
 }
 
 fn shown_digit_text(value: Option<f64>, dim: bool) -> String {
@@ -6842,279 +6950,6 @@ fn paint_rate_label(
     if at + u16::try_from(text.chars().count()).unwrap_or(u16::MAX) <= stop {
         paint_str(grid, at, row, &text, C16::BrightBlack, C16::Black);
     }
-}
-
-fn draw_glance(grid: &mut Grid, model: &TtyModel, top: u16, left_end: u16) {
-    if left_end < 64 {
-        return;
-    }
-    let wide = left_end >= 92;
-    let max_col = left_end.min(92);
-    let cells = usize::from(max_col - 64 + 1);
-    let lines = glance_lines(model, wide, cells);
-    for (i, line) in lines.iter().enumerate() {
-        let Ok(dy) = u16::try_from(i) else { break };
-        paint_bits(grid, 64, top + dy, line, max_col);
-    }
-}
-
-struct Bit {
-    text: String,
-    fg: C16,
-    exact: Option<Rgb>,
-}
-
-fn bit(text: impl Into<String>, fg: C16) -> Bit {
-    Bit {
-        text: text.into(),
-        fg,
-        exact: None,
-    }
-}
-
-fn paint_bits(grid: &mut Grid, mut col: u16, row: u16, bits: &[Bit], max_col: u16) {
-    for part in bits {
-        for ch in part.text.chars() {
-            if col > max_col {
-                return;
-            }
-            paint(grid, col, row, ch, part.fg, C16::Black);
-            if let Some(rgb) = part.exact {
-                grid.set_exact_fg(col, row, rgb);
-            }
-            col += 1;
-        }
-    }
-}
-
-/// The glance's rows; `cells` is its width, which the HOT rows fit.
-fn glance_lines(model: &TtyModel, wide: bool, cells: usize) -> Vec<Vec<Bit>> {
-    // Narrow (160 columns) is the approved compact form, one fact a row:
-    // GPU, VRAM, two HOT, DISK, NET, CPU, ACT. LOAD has its own meter on
-    // the right and the state word is in the header.
-    if host_meters(model) {
-        return glance_host(model, wide, cells);
-    }
-    let gpu = pct_i(model.gpu_pct);
-    let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
-    let vram = percent_of(model.vram_used_gb, model.vram_total_gb);
-    let mem = percent_of(model.mem_used_gb, model.mem_total_gb);
-    let cpu = pct_i(model.cpu_pct);
-    let load = pct_i(model.load_pct);
-    let act = pct_i(model.activity_pct);
-    let hot = hottest(model);
-    if wide {
-        vec![
-            gpu_wide(model, &gpu, gpu_fg),
-            vec![
-                bit(format!("VRAM {} %", pct_of(vram)), C16::BrightWhite),
-                bit("  MEM ", C16::White),
-                bit(format!("{} %", pct_of(mem)), C16::BrightWhite),
-            ],
-            hot_line("HOT ", hot.first(), cells),
-            hot_line("    ", hot.get(1), cells),
-            vec![
-                bit(format!("CPU {cpu} %"), C16::BrightWhite),
-                bit("  LOAD ", C16::White),
-                bit(format!("{load} %"), C16::BrightWhite),
-            ],
-            vec![
-                bit("ACT ", C16::White),
-                bit(format!("{act} %"), C16::BrightWhite),
-                bit(activity_tail(model), C16::BrightBlack),
-            ],
-            vec![bit(format!("LOAD {load} %"), C16::BrightWhite)],
-            glance_state(model),
-        ]
-    } else {
-        vec![
-            vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
-            vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
-            hot_line("HOT ", hot.first(), cells),
-            hot_line("    ", hot.get(1), cells),
-            vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
-            vec![bit(format!("ACT {act}%"), C16::BrightWhite)],
-            vec![bit(format!("LOAD {load}%"), C16::BrightWhite)],
-            glance_state(model),
-        ]
-    }
-}
-
-fn gpu_wide(model: &TtyModel, gpu: &str, fg: C16) -> Vec<Bit> {
-    let power = match (model.power_w, model.power_limit_w) {
-        (Some(w), Some(limit)) => format!("  {}/{} W", w.round() as i64, limit.round() as i64),
-        _ => String::new(),
-    };
-    vec![
-        bit(format!("GPU {gpu} %"), fg),
-        bit(format!("  {}", temp_c(model.gpu_c)), C16::BrightWhite),
-        bit(power, C16::BrightBlack),
-    ]
-}
-
-fn glance_state(model: &TtyModel) -> Vec<Bit> {
-    let text = match model.state {
-        WatchState::Generating => "gen live",
-        WatchState::Ready => "idle",
-        WatchState::AiDown => "AI down",
-        WatchState::Starting => "starting",
-        WatchState::NoLlama => "no llama",
-    };
-    vec![bit(text, C16::BrightBlack)]
-}
-
-fn activity_tail(model: &TtyModel) -> String {
-    match (model.activity_src, model.activity_w) {
-        (Some(src), Some(w)) if w.is_finite() => format!(" {} {} W", src.label(), w.round() as i64),
-        (Some(src), _) => format!(" {}", src.label()),
-        _ => String::new(),
-    }
-}
-
-fn pct_i(pct: Option<f64>) -> String {
-    pct.map(|p| format!("{}", p.round() as i64))
-        .unwrap_or_else(|| "--".into())
-}
-
-fn pct_of(pct: Option<f64>) -> String {
-    pct.map(|p| format!("{}", p.round() as i64))
-        .unwrap_or_else(|| "--".into())
-}
-
-fn temp_c(c: Option<i32>) -> String {
-    c.map(|n| format!("{n}C")).unwrap_or_else(|| "--".into())
-}
-
-fn step_fg(pct: f64) -> C16 {
-    if pct > 100.0 {
-        C16::BrightWhite
-    } else {
-        let step = ((pct.max(0.0) / 100.0) * 5.0).floor() as usize;
-        STEPS[step.min(STEPS.len() - 1)]
-    }
-}
-
-struct Hot {
-    name: String,
-    c: i32,
-    /// `None` without thresholds: such a sensor ranks after every one
-    /// that has them.
-    heat: Option<Heat>,
-    glyph: &'static str,
-    fg: C16,
-}
-
-/// Where a reading stands against its warning and critical points.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum HeatBand {
-    Below,
-    Warn,
-    Crit,
-}
-
-/// A sensor's rank on the HOT rows, highest first: its band, then the
-/// reading less the warning point (tenths).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Heat {
-    band: HeatBand,
-    margin: i32,
-}
-
-/// The glance's HOT rows (#173): past critical first, then past warning,
-/// then nearest below the warning point; a sensor without thresholds after
-/// all of those. Ties keep panel order.
-fn hottest(model: &TtyModel) -> Vec<Hot> {
-    let Some(panel) = &model.temps else {
-        return Vec::new();
-    };
-    let mut rows = Vec::new();
-    for group in &panel.groups {
-        for item in &group.items {
-            let name = if item.label.is_empty() {
-                &group.name
-            } else {
-                &item.label
-            };
-            // Six characters, not bytes: a renamed label can be non-ASCII.
-            let name: String = name.chars().take(6).collect();
-            let (glyph, fg, heat) = sensor_mark(item);
-            rows.push(Hot {
-                name,
-                c: (f64::from(item.tenths) / 10.0).round() as i32,
-                heat,
-                glyph,
-                fg,
-            });
-        }
-    }
-    // Descending, and stable; `None` is below every `Some`.
-    rows.sort_by_key(|row| std::cmp::Reverse(row.heat));
-    rows.truncate(4);
-    rows
-}
-
-fn sensor_mark(item: &TempItem) -> (&'static str, C16, Option<Heat>) {
-    let Some((warn, crit)) = item.thresholds else {
-        return ("", level_fg(item.level), None);
-    };
-    let margin = item.tenths - warn;
-    let heat = |band| Some(Heat { band, margin });
-    if item.tenths >= crit {
-        ("!!", C16::Red, heat(HeatBand::Crit))
-    } else if item.tenths >= warn {
-        ("!", C16::Yellow, heat(HeatBand::Warn))
-    } else if warn - item.tenths <= 40 {
-        ("^", C16::BrightYellow, heat(HeatBand::Below))
-    } else {
-        ("", C16::BrightWhite, heat(HeatBand::Below))
-    }
-}
-
-/// The shortest a HOT row's name gets to make room for its temperature.
-const HOT_NAME_MIN: usize = 3;
-
-/// One HOT row in `cells` (#173): prefix, mark, name, temperature and the
-/// margin to the warning point. When it does not fit, the margin goes
-/// whole (never a lone `+`), then the name shortens, down to
-/// [`HOT_NAME_MIN`]; the mark and the temperature are never cut.
-fn hot_line(prefix: &str, hot: Option<&Hot>, cells: usize) -> Vec<Bit> {
-    let Some(hot) = hot else {
-        return vec![bit(prefix.trim_end().to_string(), C16::White)];
-    };
-    let margin = format_margin(hot.heat);
-    let temp = hot.c.to_string();
-    let fixed = prefix.chars().count() + hot.glyph.chars().count() + 1 + temp.chars().count();
-    let name_len = hot.name.chars().count();
-    let margin_len = margin.chars().count() + 1;
-    let keep_margin = !margin.is_empty() && fixed + name_len + margin_len <= cells;
-    let room = cells.saturating_sub(fixed).max(HOT_NAME_MIN);
-    let name: String = hot.name.chars().take(room).collect();
-    let mut bits = vec![
-        bit(prefix.to_string(), C16::White),
-        bit(format!("{}{name} {temp}", hot.glyph), hot.fg),
-    ];
-    if keep_margin {
-        bits.push(bit(format!(" {margin}"), C16::BrightBlack));
-    }
-    bits
-}
-
-fn format_margin(heat: Option<Heat>) -> String {
-    let Some(heat) = heat else {
-        return String::new();
-    };
-    let deg = (f64::from(heat.margin) / 10.0).round() as i64;
-    format!("{deg:+}")
-}
-
-fn host_meters(model: &TtyModel) -> bool {
-    model.disk_read_bps.is_some()
-        || model.disk_write_bps.is_some()
-        || model.net_rx_bps.is_some()
-        || model.net_tx_bps.is_some()
-        || model.swap_used_gb.is_some()
-        || model.swap_total_gb.is_some()
-        || model.io_psi.is_some()
 }
 
 /// `frac = (log10(v / ceiling) + 3) / 3`. Any non-zero rate stays above
@@ -7187,66 +7022,6 @@ fn psi_text(pct: Option<f64>) -> String {
         Some(pct) if pct >= 10.0 => format!("{} %", pct.round() as i64),
         Some(pct) => format!("{:.1} %", pct),
         None => "--".to_string(),
-    }
-}
-
-fn glance_host(model: &TtyModel, wide: bool, cells: usize) -> Vec<Vec<Bit>> {
-    let gpu = pct_i(model.gpu_pct);
-    let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
-    let vram = percent_of(model.vram_used_gb, model.vram_total_gb);
-    let mem = percent_of(model.mem_used_gb, model.mem_total_gb);
-    let cpu = pct_i(model.cpu_pct);
-    let load = pct_i(model.load_pct);
-    let act = pct_i(model.activity_pct);
-    let hot = hottest(model);
-    // 29 cells (columns 64..=92). "0.4G" keeps SWAP on that line.
-    let swap = match model.swap_used_gb.filter(|v| v.is_finite()) {
-        Some(used) => format!("{used:.1}G"),
-        None => "--".to_string(),
-    };
-    let disk_r = rate_bps_text(model.disk_read_bps);
-    let disk_w = rate_bps_text(model.disk_write_bps);
-    let net = rate_bps_text(combined_rate(model.net_rx_bps, model.net_tx_bps));
-    if wide {
-        vec![
-            gpu_wide(model, &gpu, gpu_fg),
-            vec![
-                bit(format!("VRAM {} %", pct_of(vram)), C16::BrightWhite),
-                bit("  MEM ", C16::White),
-                bit(format!("{} %", pct_of(mem)), C16::BrightWhite),
-                bit(" SWAP ", C16::White),
-                bit(swap, C16::BrightWhite),
-            ],
-            hot_line("HOT ", hot.first(), cells),
-            hot_line("    ", hot.get(1), cells),
-            vec![
-                bit(format!("DISK R {disk_r}"), C16::BrightWhite),
-                bit("  W ", C16::White),
-                bit(disk_w, C16::BrightWhite),
-            ],
-            vec![
-                bit(format!("NET  {net}"), C16::BrightWhite),
-                bit("  ACT ", C16::White),
-                bit(format!("{act} %"), C16::BrightWhite),
-            ],
-            vec![
-                bit(format!("CPU {cpu} %"), C16::BrightWhite),
-                bit("  LOAD ", C16::White),
-                bit(format!("{load} %"), C16::BrightWhite),
-            ],
-            glance_state(model),
-        ]
-    } else {
-        vec![
-            vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
-            vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
-            hot_line("HOT ", hot.first(), cells),
-            hot_line("    ", hot.get(1), cells),
-            vec![bit(format!("DISK {disk_r}"), C16::BrightWhite)],
-            vec![bit(format!("NET {net}"), C16::BrightWhite)],
-            vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
-            vec![bit(format!("ACT {act}%"), C16::BrightWhite)],
-        ]
     }
 }
 
@@ -7633,8 +7408,9 @@ fn capacity_text(used: Option<f64>, total: Option<f64>) -> String {
     }
 }
 
-/// One gauge per TEMPS row: the row's hottest reading, as the TEMPS line
-/// showed it. Nothing with `[temps]` off; a note when there is no input.
+/// One gauge per TEMPS row, labelled with the row's name: the reading
+/// nearest its own limit (#177). Nothing with `[temps]` off; a note when
+/// there is no input.
 fn temp_gauges(grid: &Grid, model: &TtyModel) -> GaugeGroup {
     let Some(panel) = &model.temps else {
         return GaugeGroup::default();
@@ -7646,15 +7422,32 @@ fn temp_gauges(grid: &Grid, model: &TtyModel) -> GaugeGroup {
         gauges: panel
             .groups
             .iter()
-            .filter_map(|group| Some(temp_gauge(grid, &group.name, group.hottest()?)))
+            .filter_map(|group| Some(temp_gauge(grid, &group.name, nearest_limit(group)?)))
             .collect(),
         note: None,
     }
 }
 
-fn temp_gauge(grid: &Grid, name: &str, item: &TempItem) -> Gauge {
+/// The group's reading with the highest gauge percent, each against its
+/// own thresholds ([`TEMP_FALLBACK`] without), so a sensor near a low
+/// limit is not hidden behind a hotter one with a higher limit. Ties go to
+/// the hotter reading, then to the later one, as [`TempGroup::hottest`].
+fn nearest_limit(group: &TempGroup) -> Option<&TempItem> {
+    group.items.iter().max_by(|a, b| {
+        temp_item_percent(a)
+            .total_cmp(&temp_item_percent(b))
+            .then(a.tenths.cmp(&b.tenths))
+    })
+}
+
+/// [`temp_percent`] against the item's own thresholds.
+fn temp_item_percent(item: &TempItem) -> f64 {
     let (warn, crit) = item.thresholds.unwrap_or(TEMP_FALLBACK);
-    let pct = temp_percent(item.tenths, warn, crit);
+    temp_percent(item.tenths, warn, crit)
+}
+
+fn temp_gauge(grid: &Grid, name: &str, item: &TempItem) -> Gauge {
+    let pct = temp_item_percent(item);
     Gauge {
         label: name.to_string(),
         label_fg: C16::White,
@@ -7731,6 +7524,8 @@ fn fan_gauge(fan: &FanReading) -> Gauge {
     }
 }
 
+/// SLOTS under the headline, then SETUP in the rows left when `setup`
+/// (under [`SETUP_BESIDE_COLS`]; from there it is beside the digits).
 fn place_slots_and_setup(
     grid: &mut Grid,
     model: &TtyModel,
@@ -7738,6 +7533,7 @@ fn place_slots_and_setup(
     top: u16,
     height: u16,
     left_end: u16,
+    setup: bool,
 ) {
     let headline = headline_rows(g);
     let slot_top = top + headline;
@@ -7765,6 +7561,9 @@ fn place_slots_and_setup(
     let backend_drawn = u16::try_from(model.backend_lines.len())
         .unwrap_or(u16::MAX)
         .min(backend_room);
+    if !setup {
+        return;
+    }
     let used = (if header { 1 } else { 0 }) + slot_drawn + backend_drawn;
     let setup_at = slot_top + used;
     let room = slot_end.saturating_sub(setup_at);
@@ -7775,23 +7574,19 @@ fn place_slots_and_setup(
     if !matches!(model.state, WatchState::Generating | WatchState::Ready) {
         return;
     }
-    draw_setup_title(
-        grid,
-        view,
-        setup_at,
-        usize::from(left_end.saturating_sub(1)),
-    );
+    let right = usize::from(left_end.saturating_sub(1));
+    let mut cut = 0usize;
     for (drawn, row) in (1u16..).zip(view.rows.iter()) {
         if drawn >= room {
             break;
         }
-        draw_setup_row(
-            grid,
-            row,
-            setup_at + drawn,
-            usize::from(left_end.saturating_sub(1)),
-        );
+        let row = draw_setup_row(grid, row, SETUP_X, setup_at + drawn, right, 1);
+        cut += usize::from(row.cut);
     }
+    // Rows cut short count in `+N` as beside the digits; rows that do not
+    // fit here do not (#177).
+    let more = view.more.saturating_add(cut);
+    draw_setup_title(grid, view, SETUP_X, setup_at, right, more);
 }
 
 fn slot_decoded_col(x: u16, right: u16) -> u16 {
@@ -8603,68 +8398,6 @@ mod tests {
         );
     }
 
-    /// #173: the marks' edges. At the critical point exactly is past
-    /// critical; at the warning point past warning; the `^` window opens at
-    /// 4.0 C under the warning point.
-    #[test]
-    fn sensor_marks_change_exactly_at_their_points() {
-        let mark = |tenths: i32| {
-            let item = TempItem {
-                label: String::new(),
-                tenths,
-                level: Level::Normal,
-                thresholds: Some((800, 900)),
-            };
-            let (glyph, _, heat) = sensor_mark(&item);
-            (glyph, heat.map(|h| h.band))
-        };
-        assert_eq!(mark(900), ("!!", Some(HeatBand::Crit)));
-        assert_eq!(mark(899), ("!", Some(HeatBand::Warn)));
-        assert_eq!(mark(800), ("!", Some(HeatBand::Warn)));
-        assert_eq!(mark(799), ("^", Some(HeatBand::Below)));
-        assert_eq!(mark(760), ("^", Some(HeatBand::Below)));
-        assert_eq!(mark(759), ("", Some(HeatBand::Below)));
-    }
-
-    /// #173: a HOT row that does not fit drops its margin whole, then
-    /// shortens its name down to three characters.
-    #[test]
-    fn hot_line_drops_the_margin_whole_then_shortens_the_name() {
-        let hot = |name: &str, c: i32, band: HeatBand, margin: i32| Hot {
-            name: name.to_owned(),
-            c,
-            heat: Some(Heat { band, margin }),
-            glyph: if band == HeatBand::Crit { "!!" } else { "" },
-            fg: C16::Red,
-        };
-        let text = |bits: Vec<Bit>| bits.iter().map(|b| b.text.as_str()).collect::<String>();
-        let crit = hot("aux1", 92, HeatBand::Crit, 320);
-        assert_eq!(text(hot_line("HOT ", Some(&crit), 17)), "HOT !!aux1 92 +32");
-        assert_eq!(text(hot_line("HOT ", Some(&crit), 16)), "HOT !!aux1 92");
-        assert_eq!(text(hot_line("HOT ", Some(&crit), 13)), "HOT !!aux1 92");
-        assert_eq!(text(hot_line("HOT ", Some(&crit), 12)), "HOT !!aux 92");
-        // The name stops at three characters; the temperature stays whole.
-        let long = hot("sensor", 104, HeatBand::Crit, 240);
-        assert_eq!(text(hot_line("HOT ", Some(&long), 15)), "HOT !!senso 104");
-        assert_eq!(text(hot_line("HOT ", Some(&long), 11)), "HOT !!sen 104");
-        assert_eq!(text(hot_line("    ", Some(&long), 5)), "    !!sen 104");
-        // No thresholds: no margin to drop.
-        let bare = Hot {
-            heat: None,
-            glyph: "",
-            ..hot("bare", 99, HeatBand::Below, 0)
-        };
-        assert_eq!(text(hot_line("    ", Some(&bare), 15)), "    bare 99");
-        // Widths are characters, not bytes: `aéééé` is 5 cells (9 bytes).
-        let wide = hot("aéééé", 92, HeatBand::Crit, 120);
-        assert_eq!(
-            text(hot_line("HOT ", Some(&wide), 18)),
-            "HOT !!aéééé 92 +12"
-        );
-        assert_eq!(text(hot_line("HOT ", Some(&wide), 15)), "HOT !!aéééé 92");
-        assert_eq!(text(hot_line("HOT ", Some(&wide), 12)), "HOT !!aéé 92");
-    }
-
     /// #165: 0 at 20 °C, 100 at the warning point, past it the hot tail:
     /// 120 at the critical point, and on.
     #[test]
@@ -9298,5 +9031,144 @@ mod tests {
         assert_eq!(band.timeline, 14);
         assert_eq!(band.text, 15);
         assert_eq!(band.rate_rows, 2);
+    }
+
+    fn setup_item(text: &str, text_value: bool) -> SetupItem {
+        SetupItem {
+            sep: " \u{00b7} ".to_owned(),
+            text: text.to_owned(),
+            dim: false,
+            text_value,
+        }
+    }
+
+    /// #177: one line keeps what [`setup_items_kept`] keeps. With lines to
+    /// spare whole items wrap; an item wider than the room has a line of
+    /// its own; the last line drops trailing items.
+    #[test]
+    fn setup_lines_wrap_whole_items_while_lines_remain() {
+        let items: Vec<SetupItem> = ["aaaa", "bbbbbbbb", "cccccc", "dddddddddd"]
+            .into_iter()
+            .map(|text| setup_item(text, false))
+            .collect();
+        // `aaaa · bbbbbbbb` is 15 cells, `cccccc · dddddddddd` 19.
+        assert_eq!(setup_lines(&items, 19, 1), vec![0..2]);
+        assert_eq!(setup_lines(&items, 19, 0), vec![0..2]);
+        assert_eq!(setup_lines(&items, 19, 2), vec![0..2, 2..4]);
+        assert_eq!(setup_lines(&items, 19, 5), vec![0..2, 2..4]);
+        assert_eq!(setup_lines(&items, 37, 3), vec![0..4]);
+        let mut long = items.clone();
+        long.push(setup_item(&"e".repeat(30), false));
+        assert_eq!(setup_lines(&long, 19, 2), vec![0..2, 2..4]);
+        assert_eq!(setup_lines(&long, 19, 3), vec![0..2, 2..4, 4..5]);
+        let wide = [setup_item(&"x".repeat(25), false), setup_item("yy", false)];
+        assert_eq!(setup_lines(&wide, 19, 3), vec![0..1, 1..2]);
+        assert_eq!(setup_lines(&[], 19, 4), vec![0..0]);
+        // `kv q8_0 / q8_0` wraps whole: the line breaks at the ` · `.
+        let mut kv = [
+            setup_item("262,144", false),
+            setup_item("kv q8_0", false),
+            setup_item("q8_0", false),
+        ];
+        kv[2].sep = " / ".to_owned();
+        assert_eq!(setup_lines(&kv, 19, 2), vec![0..1, 1..3]);
+        // Glued items wider than the room still break between them.
+        assert_eq!(setup_lines(&kv, 10, 3), vec![0..1, 1..2, 2..3]);
+        // A text value wraps whole while a line remains; on the last line
+        // it is cut to the room (#114).
+        let text = [
+            setup_item("aaaa", false),
+            setup_item("a longer text value", true),
+        ];
+        assert_eq!(setup_lines(&text, 19, 2), vec![0..1, 1..2]);
+        assert_eq!(setup_lines(&text, 19, 1), vec![0..2]);
+    }
+
+    /// #177: the gauge's reading is the one nearest its own limit; ties on
+    /// the percent go to the hotter one, and a reading without thresholds
+    /// is measured against [`TEMP_FALLBACK`].
+    #[test]
+    fn nearest_limit_beats_the_hottest_reading() {
+        let item = |tenths: i32, thresholds: Option<(i32, i32)>| TempItem {
+            label: String::new(),
+            tenths,
+            level: Level::Normal,
+            thresholds,
+        };
+        let pick = |items: Vec<TempItem>| {
+            let group = TempGroup {
+                name: "probe".to_owned(),
+                items,
+            };
+            nearest_limit(&group).map(|item| item.tenths)
+        };
+        // 60 C of 65 is 89 %, 80 C of 100 is 75 %.
+        assert_eq!(
+            pick(vec![
+                item(800, Some((1000, 1100))),
+                item(600, Some((650, 750)))
+            ]),
+            Some(600)
+        );
+        // 70 C against the 80 C fallback is 83 %, 90 C of 120 is 70 %.
+        assert_eq!(
+            pick(vec![item(900, Some((1200, 1300))), item(700, None)]),
+            Some(700)
+        );
+        // Both half way: the hotter wins, in either order.
+        assert_eq!(
+            pick(vec![
+                item(350, Some((500, 600))),
+                item(500, Some((800, 900)))
+            ]),
+            Some(500)
+        );
+        assert_eq!(
+            pick(vec![
+                item(500, Some((800, 900))),
+                item(350, Some((500, 600)))
+            ]),
+            Some(500)
+        );
+        assert_eq!(pick(Vec::new()), None);
+    }
+
+    /// #177: shedding drops the gauge whose chosen reading is coolest by
+    /// its own limit. `near` (60 C of 65, beside 64 C of 100) is 89 % and
+    /// stays; `far` (85 C of 120) is 65 % and goes, though by the hottest
+    /// reading `near` (64 C, 55 %) would have gone.
+    #[test]
+    fn shedding_drops_the_gauge_coolest_by_its_own_limit() {
+        let item = |tenths: i32, warn: i32| TempItem {
+            label: String::new(),
+            tenths,
+            level: Level::Normal,
+            thresholds: Some((warn, warn + 100)),
+        };
+        let groups = [
+            ("near", vec![item(600, 650), item(640, 1000)]),
+            ("far", vec![item(850, 1200)]),
+            ("mid", vec![item(700, 750)]),
+        ];
+        let grid = Grid::new(20, 10);
+        let mut temps = GaugeGroup {
+            gauges: groups
+                .iter()
+                .map(|(name, items)| {
+                    let group = TempGroup {
+                        name: (*name).to_owned(),
+                        items: items.clone(),
+                    };
+                    temp_gauge(&grid, name, nearest_limit(&group).expect("item"))
+                })
+                .collect(),
+            note: None,
+        };
+        let mut fans = GaugeGroup::default();
+        // Six work rows, the blank row and one row of temperatures.
+        shed_gauges(6, &mut temps, &mut fans, 8);
+        let left: Vec<&str> = temps.gauges.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(left, ["near", "mid"]);
+        assert_eq!(temps.gauges[0].value, "60 C");
     }
 }
