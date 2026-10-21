@@ -9027,7 +9027,7 @@ fn state_gpu_held() -> TtyModel {
     model.gpu = Some(HeaderGpu {
         holder: "bakeoff".to_owned(),
         hold_until: Some(at("2026-10-13T21:01:00Z")),
-        hold_reason: "nightly model evals, do not unload".to_owned(),
+        hold_reason: "batch window for queued model runs".to_owned(),
         ..HeaderGpu::default()
     });
     model
@@ -9183,8 +9183,8 @@ fn gpu_claims_text_at_286_and_213() {
     for (state, full, at_213) in [
         (
             state_gpu_held(),
-            "gpu bakeoff · hold until 10-13 21:01 · nightly model evals, do not unload",
-            "gpu bakeoff · hold until 10-13 21:01 · nightly model evals, do not unload",
+            "gpu bakeoff · hold until 10-13 21:01 · batch window for queued model runs",
+            "gpu bakeoff · hold until 10-13 21:01 · batch window for queued model runs",
         ),
         (
             state_served_claim(599),
@@ -9228,7 +9228,7 @@ fn gpu_claims_colours_follow_the_mock_ups() {
     assert_eq!(fg(&held, "gpu bakeoff"), C16::BrightBlack);
     assert_eq!(fg(&held, "bakeoff"), C16::BrightCyan);
     assert_eq!(fg(&held, "hold until"), C16::BrightYellow);
-    assert_eq!(fg(&held, "approved"), C16::White);
+    assert_eq!(fg(&held, "batch"), C16::White);
     let busy = state_in_use_guest_other();
     assert_eq!(fg(&busy, "in use"), C16::BrightGreen);
     assert_eq!(fg(&busy, "guest"), C16::BrightBlack);
@@ -9454,7 +9454,7 @@ fn text_off_keeps_its_tag_beside_the_claims() {
     // Text on, nothing is held back: the row is as before.
     let header = header_line(&state_gpu_held(), 160);
     assert!(
-        header.contains("nightly model evals, do n\u{2026}"),
+        header.contains("batch window for queued m\u{2026}"),
         "{header}"
     );
 }

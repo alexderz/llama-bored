@@ -70,8 +70,8 @@ A harness can write a job status file
 ([`docs/job-status.md`](docs/job-status.md)) to get the job view with its
 own progress instead of this one-line header. After `slots` and `swap`, a
 llama-swap build with model claims shows who holds what (#128, #167): the
-GPU reservation (`gpu bakeoff · hold until 10-21 21:01 · nightly model
-evals, do not unload`, with `external`, `draining`, `in use` or ` 4:12
+GPU reservation (`gpu bakeoff · hold until 10-21 21:01 · batch window
+for queued model runs`, with `external`, `draining`, `in use` or ` 4:12
 left`), then every model claim, the header model's first (`claim
 eval-runner on qwen-27b · in use`, `guest opencode on qwen-27b ·  4:12
 left` for a claim under someone else's reservation, `hold operator on

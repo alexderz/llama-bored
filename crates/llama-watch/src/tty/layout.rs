@@ -8954,7 +8954,7 @@ mod tests {
         other.model = "tiel-coder".to_owned();
         let items = || {
             vec![
-                gpu_item(&gpu_hold("nightly model evals, do not unload"), now, 0),
+                gpu_item(&gpu_hold("batch window for queued model runs"), now, 0),
                 claim_item(&guest, true, now, 0),
                 claim_item(&other, false, now, 0),
             ]
@@ -8963,7 +8963,7 @@ mod tests {
         let full = row(200);
         assert_eq!(
             full,
-            "gpu bakeoff \u{00B7} hold until 01:16 \u{00B7} nightly model evals, do not unload   \
+            "gpu bakeoff \u{00B7} hold until 01:16 \u{00B7} batch window for queued model runs   \
              guest opencode on qwen-27b \u{00B7}  4:12 left   \
              hold eval-runner on tiel-coder \u{00B7} until 00:46 \u{00B7} nightly evals"
         );
@@ -8982,7 +8982,7 @@ mod tests {
                 5
             } else if !text.contains("on qwen-27b") {
                 4
-            } else if !text.contains("nightly") && !text.contains("approved") {
+            } else if !text.contains("nightly") && !text.contains("batch") {
                 3
             } else if text.contains('\u{2026}') || !text.contains("nightly evals") {
                 1
