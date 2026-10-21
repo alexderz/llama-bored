@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-21
+
+A redesigned tty11: disk, network, swap and pressure meters, a uniform two-column gauge grid with per-sensor temperature limits, and the GPU reservation and every model claim in the header, with numbers that keep a fixed width. Nothing in an existing config needs to change. llama-watch now keeps llama-swap's read-only event stream open whenever llama-swap answers, not only while a model is loaded, and each connection starts with one `GET /api/gpu`.
+
 ### Added
 
 - tty11 shows disk, network, swap and pressure (PSI) from `/proc` and `/sys`: DISK R and DISK W and NET meters on a three-decade log bar (`[tty] disk_ceiling_bps`, default 7 GB/s; `[tty] net_ceiling_bps`, default the summed speed of the physical links that are up, 1 Gbit for one without a speed or when none is up), SWAP beside POWER with its label yellow under memory pressure, IO PSI, and `disk`, `net` and `psi` words on the health line, which now sheds healthy words before a DOWN one. Disk and net rates are taken over `collector.cpu_window_s`, as CPU % is. The snapshot's `host` gains optional disk, net, PSI and swap fields, and llama-metrics exports `llamabored_disk_{read,write}_bytes_per_second`, `llamabored_net_{receive,transmit}_bytes_per_second`, `llamabored_pressure_{cpu,io,memory}_ratio` and `llamabored_swap_{used,total}_bytes`. A file that is missing, switched off (`psi=0`) or has nothing to count (no whole disk, no physical interface) is absent, never 0 (#163).
