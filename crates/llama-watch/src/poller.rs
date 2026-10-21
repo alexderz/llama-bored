@@ -97,8 +97,9 @@
 //! row number, and a capture is only fetched for a row of the page just
 //! read.
 //!
-//! **In flight on vLLM and SGLang (#80).** While any model is ready,
-//! llama-swap's `GET /api/events` stream runs on a thread of its own
+//! **In flight on vLLM and SGLang (#80).** While llama-swap answers (until
+//! #167, only while a model was ready), its `GET /api/events` stream runs
+//! on a thread of its own
 //! ([`crate::sources::events`]): its `inflight` frames list the requests
 //! llama-swap is serving, for any engine, and a llama-swap build with
 //! model claims sends `claims` frames on the same stream (#128). Each vLLM
@@ -108,7 +109,9 @@
 //! metrics cadence. Each such request is a [`LiveRequest`] for RECENT, and
 //! each listed model's in-flight count rides [`ModelSeries::inflight`]
 //! while the stream is up. The claims list rides [`LlamaDetail::claims`]
-//! to the tty model; it does not enter the snapshot.
+//! to the tty model, and the GPU reservation and displaced notes
+//! [`LlamaDetail::gpu`] and [`LlamaDetail::displaced`] (#167); none of
+//! them enters the snapshot.
 //!
 //! The thread never touches the console or the snapshot file.
 
@@ -142,7 +145,9 @@ use crate::setup_specs::Specs;
 use crate::sglang_rows::{Claim, SglangBook, Totals};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::KvLayout;
-use crate::sources::events::{Events, EventsView, ModelClaim, claim_model};
+use crate::sources::events::{
+    DisplacedNote, Events, EventsView, GpuReservation, ModelClaim, claim_model,
+};
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
 use crate::tty::grid::Cell;
@@ -230,6 +235,12 @@ pub struct LlamaDetail {
     /// when the stream is down or has not sent a `claims` frame. Not
     /// written to the snapshot.
     pub claims: Vec<ModelClaim>,
+    /// The GPU reservation from the same stream (#167). Not written to the
+    /// snapshot.
+    pub gpu: Option<GpuReservation>,
+    /// Recent displaced notes, newest first (#167). Not written to the
+    /// snapshot.
+    pub displaced: Vec<DisplacedNote>,
 }
 
 /// One vLLM or SGLang request in flight (#80), from llama-swap's
@@ -645,13 +656,15 @@ struct State<L> {
     /// activity row's `input_tokens` is read by its engine, also after the
     /// model unloads.
     row_engines: HashMap<String, Backend>,
-    /// llama-swap's `/api/events` stream while a model is ready (#80, #128),
-    /// and what it said at the start of this round.
+    /// llama-swap's `/api/events` stream while llama-swap answers (#80,
+    /// #128, #167), and what it said at the start of this round.
     events: Option<Events>,
     events_view: EventsView,
     events_failed: bool,
     /// A malformed `claims` frame was logged this session (#128).
     claims_failed: bool,
+    /// A malformed `gpu` frame was logged this session (#167).
+    gpu_failed: bool,
     /// A vLLM or SGLang model was ready on the last good `/running` read.
     /// The inflight snapshot field follows this, not the events thread, so
     /// a llama.cpp-only box does not gain `inflight` when the stream runs
@@ -742,6 +755,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         events_view: EventsView::default(),
         events_failed: false,
         claims_failed: false,
+        gpu_failed: false,
         inflight_engines: false,
         live: LiveBook::default(),
         loads_missing: HashSet::new(),
@@ -1258,11 +1272,12 @@ impl<L: Sink> State<L> {
         self.latencies.metrics = Some(started.elapsed());
     }
 
-    /// Start llama-swap's `/api/events` stream while a model is ready (or
-    /// llama-swap is away and it ran), stop it otherwise, and take what it
-    /// says for this round (#80, #128).
+    /// Start llama-swap's `/api/events` stream while llama-swap answers (or
+    /// is away and it ran), and take what it says for this round (#80,
+    /// #128). It runs with nothing loaded too: the GPU reservation and the
+    /// claims are shown then (#167).
     fn sync_events(&mut self) {
-        let wanted = !self.ready.is_empty() || (!self.running_up && self.events.is_some());
+        let wanted = self.running_up || self.events.is_some();
         if !wanted {
             self.events = None;
         } else if self.events.is_none() {
@@ -1292,6 +1307,18 @@ impl<L: Sink> State<L> {
             }
         } else {
             self.claims_failed = false;
+        }
+        if self.events_view.gpu_error.is_some() {
+            if !self.gpu_failed {
+                log::emit(
+                    &mut self.log,
+                    Priority::Warning,
+                    "events: a gpu frame did not parse",
+                );
+                self.gpu_failed = true;
+            }
+        } else {
+            self.gpu_failed = false;
         }
         self.live.prune(&self.events_view);
     }
@@ -1936,6 +1963,8 @@ impl<L: Sink> State<L> {
             requests: self.live_requests(&events),
             jobs: self.jobs.jobs().into_iter().cloned().collect(),
             claims: events.claims.clone(),
+            gpu: events.gpu.clone(),
+            displaced: events.displaced.clone(),
         };
         if Arc::strong_count(&self.tx.slot) == 1 {
             return Err(());

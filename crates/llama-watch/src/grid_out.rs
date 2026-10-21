@@ -704,6 +704,8 @@ mod tests {
             job_note: None,
             model_id: String::new(),
             claims: Vec::new(),
+            gpu: None,
+            displaced: Vec::new(),
             now: UNIX_EPOCH,
             disk_read_bps: None,
             disk_write_bps: None,

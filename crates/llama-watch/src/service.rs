@@ -33,8 +33,8 @@ use crate::tty::chart::TokenChart;
 use crate::tty::ctx_history::CtxBook;
 use crate::tty::grid::Cell;
 use crate::tty::layout::{
-    self, Activity, HeaderClaim, HealthSeg, HealthStatus, InFlight, SetupView, Slot, TtyModel,
-    WatchState,
+    self, Activity, HeaderClaim, HeaderDisplaced, HeaderGpu, HealthSeg, HealthStatus, InFlight,
+    SetupView, Slot, TtyModel, WatchState,
 };
 use crate::tty::sanitize::sanitize;
 use crate::tty::term::{self, ConsoleBlank, Term};
@@ -513,6 +513,8 @@ impl TickState {
                 requests: Vec::new(),
                 jobs: Vec::new(),
                 claims: Vec::new(),
+                gpu: None,
+                displaced: Vec::new(),
             },
             heard: false,
             published: 0,
@@ -1171,6 +1173,32 @@ fn tty_model(
                     .map(|until| zone.offset_at(unix_secs_of(until)))
                     .unwrap_or(0),
                 hold_reason: claim.hold_reason.clone(),
+                conditional: claim.conditional,
+            })
+            .collect(),
+        gpu: tick.detail.gpu.as_ref().map(|gpu| HeaderGpu {
+            holder: gpu.holder.clone(),
+            external: gpu.external,
+            draining: gpu.draining,
+            in_use: gpu.in_use,
+            expires_at: gpu.expires_at,
+            hold_until: gpu.hold_until,
+            hold_tz_offset_s: gpu
+                .hold_until
+                .map(|until| zone.offset_at(unix_secs_of(until)))
+                .unwrap_or(0),
+            hold_reason: gpu.hold_reason.clone(),
+        }),
+        displaced: tick
+            .detail
+            .displaced
+            .iter()
+            .map(|note| HeaderDisplaced {
+                model: note.model.clone(),
+                to: note.to.clone(),
+                by: note.by.clone(),
+                at: note.at,
+                tz_offset_s: zone.offset_at(unix_secs_of(note.at)),
             })
             .collect(),
         now: wall,
@@ -1602,7 +1630,7 @@ fn model_stuck(
 /// where the engine reports tokens, else `KV 37 %`, its own ratio).
 /// Unknown gauges are `--`. Strata has no ratio of its own: `strata
 /// running 1/1 · queued 0`, plus its KV tokens when it reports them. Engine numbers follow when the server
-/// reports them (#31): `· spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms ·
+/// reports them (#31): `· spec 78 % · 2.9/step · ttft 420ms · itl  31ms ·
 /// e2e 12.5 s · preempt 3` (preemptions only once there are some), then
 /// the engine-measured speeds of the latest window with finished requests
 /// (#35): `· prefill 2,134/s · decode 41.2/s`. A sleeping engine says so
@@ -1804,16 +1832,22 @@ fn live_line(live: &EngineLive) -> Option<String> {
 }
 
 /// `420 ms` below a second, `12.5 s` below 100 s, else whole seconds.
+/// A latency in five cells (#167), for the health line and the engine
+/// lines alike: `  9ms`, ` 10ms` and `312ms` under a second, then ` 1.0s`
+/// to `99.9s`, then whole seconds (` 100s`).
 fn latency_text(us: u32) -> String {
     if us < 999_500 {
-        format!("{} ms", (us + 500) / 1000)
+        format!("{:>3}ms", (us + 500) / 1000)
     } else if us < 99_950_000 {
         let tenths = (us + 50_000) / 100_000;
-        format!("{}.{} s", tenths / 10, tenths % 10)
+        format!("{:>2}.{}s", tenths / 10, tenths % 10)
     } else {
-        format!("{} s", (us + 500_000) / 1_000_000)
+        format!("{:>4}s", (us + 500_000) / 1_000_000)
     }
 }
+
+/// Cells [`latency_text`] takes.
+const LATENCY_CELLS: usize = 5;
 
 fn slots_line(detail: &LlamaDetail, state: WatchState) -> String {
     match state {
@@ -2183,7 +2217,7 @@ fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<
         HealthStatus::Ok
     };
     vec![
-        seg(
+        timed_seg(
             "llama-swap",
             if off {
                 HealthStatus::Absent
@@ -2209,9 +2243,13 @@ fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<
             },
             "",
         ),
-        seg("/slots", slots_status, &ms(detail.latencies.slots)),
-        seg("metrics", metric_status, &ms(detail.latencies.metrics)),
-        seg(
+        // `ok` and `idle` take the same room (#167).
+        HealthSeg {
+            word_cells: "idle".len(),
+            ..timed_seg("/slots", slots_status, &ms(detail.latencies.slots))
+        },
+        timed_seg("metrics", metric_status, &ms(detail.latencies.metrics)),
+        timed_seg(
             "activity",
             if down || off {
                 HealthStatus::Absent
@@ -2267,12 +2305,23 @@ fn seg(name: &str, status: HealthStatus, note: &str) -> HealthSeg {
         name: name.to_owned(),
         status,
         note: note.to_owned(),
+        word_cells: 0,
+        note_cells: 0,
+    }
+}
+
+/// A segment whose note is a latency: it keeps [`LATENCY_CELLS`] for it,
+/// also before the first read (#167).
+fn timed_seg(name: &str, status: HealthStatus, note: &str) -> HealthSeg {
+    HealthSeg {
+        note_cells: LATENCY_CELLS,
+        ..seg(name, status, note)
     }
 }
 
 fn ms(latency: Option<Duration>) -> String {
     match latency {
-        Some(latency) => format!("{}ms", latency.as_millis()),
+        Some(latency) => latency_text(u32::try_from(latency.as_micros()).unwrap_or(u32::MAX)),
         None => String::new(),
     }
 }
@@ -2640,6 +2689,7 @@ mod tests {
             expires_at: None,
             hold_until: None,
             hold_reason: String::new(),
+            conditional: false,
         }
     }
 
@@ -2759,7 +2809,8 @@ mod tests {
 
     /// Two ids equal in their first 60 characters show only their own claim.
     #[test]
-    fn two_ids_equal_in_their_first_60_characters_keep_their_own_claim() {
+    /// #167 draws every claim; the header model's comes first.
+    fn two_ids_equal_in_their_first_60_characters_put_their_own_claim_first() {
         let a = format!("{}A{}", "x".repeat(60), "y".repeat(7));
         let b = format!("{}B{}", "x".repeat(60), "y".repeat(7));
         assert_eq!(&a[..60], &b[..60]);
@@ -2789,8 +2840,11 @@ mod tests {
             let header: String = (0..grid.cols())
                 .map(|c| grid.get(c, 0).unwrap().ch)
                 .collect();
-            assert!(header.contains(keep), "{id}: {header}");
-            assert!(!header.contains(drop), "{id}: {header}");
+            let kept = header.find(keep).expect("own claim");
+            assert!(
+                header.find(drop).is_none_or(|other| other > kept),
+                "{id}: {header}"
+            );
         }
     }
 
@@ -2822,6 +2876,61 @@ mod tests {
             .collect();
         assert!(header.contains("until 08:00"), "end time in EDT: {header}");
         assert!(!header.contains("until 07:00"), "{header}");
+    }
+
+    /// #167: the reservation, a guest claim and a displaced note go from
+    /// [`LlamaDetail`] through `tty_model` to header row 0, with the local
+    /// zone at the hold's end and at the note's time.
+    #[test]
+    fn reservation_guest_and_note_reach_the_header_in_local_time() {
+        let at = |text: &str| {
+            UNIX_EPOCH
+                + Duration::from_secs(
+                    u64::try_from(crate::localtime::parse_rfc3339(text).unwrap()).unwrap(),
+                )
+        };
+        let zone = Zone::from_posix("CST6CDT,M3.2.0,M11.1.0").expect("posix");
+        let now = at("2026-10-20T21:00:00Z");
+        let mut guest = claim_entry("m", "guest-ui");
+        guest.conditional = true;
+        guest.hold_until = Some(at("2026-10-20T22:00:00Z"));
+        let (sample, mut tick, ctx) = claim_tick(vec![guest], "m");
+        tick.detail.gpu = Some(crate::sources::events::GpuReservation {
+            holder: "sample-holder".to_owned(),
+            external: true,
+            draining: true,
+            in_use: false,
+            expires_at: None,
+            hold_until: Some(at("2026-10-20T23:30:00Z")),
+            hold_reason: "invented queue".to_owned(),
+        });
+        tick.detail.displaced = vec![crate::sources::events::DisplacedNote {
+            holder: "former-ui".to_owned(),
+            model: "tiel".to_owned(),
+            to: "m".to_owned(),
+            by: "sample-holder".to_owned(),
+            at: at("2026-10-20T20:55:00Z"),
+        }];
+        let model = tty_model(&sample, &mut tick, Instant::now(), now, &zone, &ctx);
+        let grid = layout::layout(&model, 320, 60);
+        let header: String = (0..grid.cols())
+            .map(|c| grid.get(c, 0).unwrap().ch)
+            .collect();
+        assert!(
+            header.contains(
+                "gpu sample-holder \u{00B7} external \u{00B7} draining \u{00B7} hold until 18:30 \u{00B7} invented queue"
+            ),
+            "{header}"
+        );
+        // `guest` wins the label; the hold's end still shows.
+        assert!(
+            header.contains("guest guest-ui on m \u{00B7} until 17:00"),
+            "{header}"
+        );
+        assert!(
+            header.contains("displaced tiel -> m by sample-holder 15:55"),
+            "{header}"
+        );
     }
 
     /// #35: RECENT takes the engine's speeds only where llama-swap gave
@@ -3602,6 +3711,8 @@ mod tests {
                     requests: Vec::new(),
                     jobs: Vec::new(),
                     claims: Vec::new(),
+                    gpu: None,
+                    displaced: Vec::new(),
                 },
             ))
         }
@@ -3754,6 +3865,8 @@ mod tests {
                     requests: Vec::new(),
                     jobs: Vec::new(),
                     claims: Vec::new(),
+                    gpu: None,
+                    displaced: Vec::new(),
                 },
             ))
         }
@@ -4511,7 +4624,7 @@ mod tests {
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
             vec![
-                "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420 ms · itl 31 ms · e2e 12.5 s · preempt 3 · prefill 2,134/s · decode 41.2/s"
+                "vllm  running 1 · queued 0 · KV 41 % · hit 75 % · spec 78 % · 2.9/step · ttft 420ms · itl  31ms · e2e 12.5s · preempt 3 · prefill 2,134/s · decode 41.2/s"
                     .to_owned()
             ]
         );
@@ -4527,21 +4640,99 @@ mod tests {
         assert_eq!(
             backend_lines(&sample, WatchState::Ready),
             vec![
-                "vllm  sleeping · running 1 · queued 0 · KV 41 % · hit 75 % · e2e 250 s".to_owned()
+                "vllm  sleeping · running 1 · queued 0 · KV 41 % · hit 75 % · e2e  250s".to_owned()
             ]
         );
     }
 
     #[test]
     fn latency_text_units() {
-        assert_eq!(latency_text(0), "0 ms");
-        assert_eq!(latency_text(31_499), "31 ms");
-        assert_eq!(latency_text(999_499), "999 ms");
-        assert_eq!(latency_text(999_500), "1.0 s");
-        assert_eq!(latency_text(12_460_000), "12.5 s");
-        assert_eq!(latency_text(99_940_000), "99.9 s");
-        assert_eq!(latency_text(100_000_000), "100 s");
-        assert_eq!(latency_text(3_600_000_000), "3600 s");
+        // #167: five cells, so a number's growth moves nothing after it.
+        assert_eq!(latency_text(0), "  0ms");
+        assert_eq!(latency_text(9_499), "  9ms");
+        assert_eq!(latency_text(9_500), " 10ms");
+        assert_eq!(latency_text(31_499), " 31ms");
+        assert_eq!(latency_text(99_499), " 99ms");
+        assert_eq!(latency_text(99_500), "100ms");
+        assert_eq!(latency_text(999_499), "999ms");
+        assert_eq!(latency_text(999_500), " 1.0s");
+        assert_eq!(latency_text(12_460_000), "12.5s");
+        assert_eq!(latency_text(99_940_000), "99.9s");
+        assert_eq!(latency_text(100_000_000), " 100s");
+        assert_eq!(latency_text(3_600_000_000), "3600s");
+        for us in (0..4_000_000_000u32).step_by(7_919_111) {
+            assert_eq!(latency_text(us).chars().count(), LATENCY_CELLS, "{us}");
+        }
+        // The health line's notes are the same text.
+        assert_eq!(ms(Some(Duration::from_micros(9_400))), "  9ms");
+        assert_eq!(ms(Some(Duration::from_millis(312))), "312ms");
+        assert_eq!(ms(None), "");
+    }
+
+    /// #167: the health row as the watcher builds it, from 9 to 10 ms and
+    /// 99 to 100 ms on every timed source: only the digits change.
+    #[test]
+    fn health_latencies_keep_their_width_on_the_row() {
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let row = |ms: u64| {
+            let (sample, mut tick, ctx) = claim_tick(Vec::new(), "m");
+            let latency = Some(Duration::from_millis(ms));
+            tick.detail.latencies.running = latency;
+            tick.detail.latencies.slots = latency;
+            tick.detail.latencies.metrics = latency;
+            tick.detail.latencies.activity = latency;
+            let model = tty_model(&sample, &mut tick, Instant::now(), wall, Zone::utc(), &ctx);
+            let grid = layout::layout(&model, 213, 60);
+            (0..grid.cols())
+                .map(|c| grid.get(c, 58).unwrap().ch)
+                .collect::<String>()
+        };
+        for (a, b) in [(9, 10), (99, 100)] {
+            let (ra, rb) = (row(a), row(b));
+            assert!(ra.contains(&format!("llama-swap ok {:>3}ms", a)), "{ra}");
+            let same: Vec<bool> = ra.chars().zip(rb.chars()).map(|(x, y)| x == y).collect();
+            for (col, (x, y)) in ra.chars().zip(rb.chars()).enumerate() {
+                if x != y {
+                    assert!(
+                        x.is_ascii_digit() || y.is_ascii_digit(),
+                        "{a}->{b} col {col}\n{ra}\n{rb}"
+                    );
+                }
+            }
+            assert_eq!(ra.chars().count(), rb.chars().count());
+            // Four sources, at most three cells each.
+            assert!(same.iter().filter(|s| !**s).count() <= 12, "{ra}\n{rb}");
+        }
+    }
+
+    /// #167: `/slots` takes the room of `idle` when it says `ok`, so nothing
+    /// after it moves when a slot starts or stops.
+    #[test]
+    fn slots_ok_and_idle_take_the_same_room() {
+        let wall = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let (sample, mut tick, ctx) = claim_tick(Vec::new(), "m");
+        tick.detail.latencies.slots = Some(Duration::from_millis(9));
+        let idle = tty_model(&sample, &mut tick, Instant::now(), wall, Zone::utc(), &ctx);
+        let slots = |model: &TtyModel| {
+            model
+                .health
+                .iter()
+                .position(|seg| seg.name == "/slots")
+                .expect("/slots")
+        };
+        assert_eq!(idle.health[slots(&idle)].status, HealthStatus::Idle);
+        let mut ok = idle.clone();
+        let at = slots(&ok);
+        ok.health[at].status = HealthStatus::Ok;
+        let row = |model: &TtyModel| {
+            let grid = layout::layout(model, 213, 60);
+            (0..grid.cols())
+                .map(|c| grid.get(c, 58).unwrap().ch)
+                .collect::<String>()
+        };
+        let (ri, ro) = (row(&idle), row(&ok));
+        let after = ri.find("/slots idle").expect("idle") + "/slots idle".len();
+        assert_eq!(&ri[after..], &ro[after..], "\n{ri}\n{ro}");
     }
 
     #[test]

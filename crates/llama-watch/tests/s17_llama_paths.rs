@@ -15,6 +15,11 @@
 //! its own thread by `src/sources/events.rs` with an agent from
 //! `new_agent`. And the upstream leaf `v1/loads?include=core` (SGLang's
 //! live load report), through the same fresh gate.
+//!
+//! #167 adds one on purpose: `GET /api/gpu`, llama-swap's GPU reservation
+//! (like `/api/events`, it names no model path and cannot load one), read
+//! once before each stream session on the same thread and agent. Never a
+//! POST: the reservation's write calls are not this watcher's.
 
 use std::path::PathBuf;
 
@@ -109,15 +114,18 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
     assert!(poller.contains(r#"const LOADS_LEAF: &str = "v1/loads?include=core";"#));
 
     // #80: the event stream is one fixed path, one GET site, on an agent
-    // from `new_agent`.
+    // from `new_agent`; #167: `/api/gpu` the same.
     let events = source("src/sources/events.rs");
-    assert!(events.contains(r#"format!("{}/api/events", url.trim_end_matches('/'))"#));
-    assert_eq!(events.matches("/api/").count(), 1, "one llama-swap path");
+    assert!(events.contains(r#"let base = url.trim_end_matches('/');"#));
+    assert!(events.contains(r#"events: format!("{base}/api/events"),"#));
+    assert!(events.contains(r#"gpu: format!("{base}/api/gpu"),"#));
+    assert_eq!(events.matches("/api/").count(), 2, "two llama-swap paths");
     assert_eq!(
-        events.matches(".get(endpoint)").count(),
+        events.matches(".get(&endpoints.events)").count(),
         1,
         "events GET sites"
     );
+    assert_eq!(events.matches(".get(endpoint)").count(), 1, "gpu GET sites");
     assert!(events.contains("super::llamaswap::new_agent()"));
     assert_eq!(
         events.matches("Agent::").count(),

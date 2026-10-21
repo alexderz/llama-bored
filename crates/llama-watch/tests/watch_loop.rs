@@ -1398,6 +1398,8 @@ fn empty_detail() -> LlamaDetail {
         requests: Vec::new(),
         jobs: Vec::new(),
         claims: Vec::new(),
+        gpu: None,
+        displaced: Vec::new(),
     }
 }
 

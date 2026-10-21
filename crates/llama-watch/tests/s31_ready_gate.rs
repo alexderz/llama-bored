@@ -7,8 +7,9 @@
 //! any other state (no swap in progress). Every upstream request must also
 //! be followed at once by a `/running` read (the self-check). The poller
 //! is one thread making one request at a time, so the order the fake sees
-//! is the order the poller acted in (`/api/events` is another thread and
-//! is ignored for the gate). The script runs models through
+//! is the order the poller acted in (`/api/events` and, since #167, the
+//! `/api/gpu` read before it are another thread and are ignored for the
+//! gate). The script runs models through
 //! starting, ready, stopping, gone, a failed `/running` and back, with
 //! backends that take every upstream read: the `/metrics` detection probe,
 //! vLLM and llama.cpp `/metrics`, and `/slots`.
@@ -135,6 +136,10 @@ fn serve(mut stream: TcpStream, fake: &Mutex<Fake>) {
         if path == "/api/events" {
             // Another thread; it does not sit in the poller's request order.
             (200, Vec::new())
+        } else if path == "/api/gpu" {
+            // The events thread's read before each stream (#167); a build
+            // without reservations.
+            (404, Vec::new())
         } else {
             let fresh = std::mem::replace(&mut fake.fresh, path == "/running");
             if path == "/running" {
@@ -260,10 +265,12 @@ fn upstream_hits(fake: &Fake) -> usize {
         .count()
 }
 
-/// The events thread starts only while a model is ready. Forcing it on
-/// (`wanted = true`) would ask `/api/events` with an empty `/running` list.
+/// #167: the events thread runs while llama-swap answers, with no model
+/// ready too, so the header can say who holds the GPU. It never asks an
+/// upstream path: with nothing ready there is none to ask. Before #167 it
+/// started only while a model was ready.
 #[test]
-fn no_events_request_while_no_model_is_ready() {
+fn events_but_no_upstream_request_while_no_model_is_ready() {
     let server = Server::start(Fake {
         status: 200,
         running: running(&[]),
@@ -285,8 +292,41 @@ fn no_events_request_while_no_model_is_ready() {
         "poller ran: {hits:?}"
     );
     assert!(
-        hits.iter().all(|path| path != "/api/events"),
-        "events while no model is ready: {hits:?}"
+        hits.iter().any(|path| path == "/api/events"),
+        "no events while llama-swap answers: {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|path| !path.starts_with("/upstream/")),
+        "upstream while no model is ready: {hits:?}"
+    );
+}
+
+/// The events thread does not start before llama-swap has answered once.
+#[test]
+fn no_events_request_before_llama_swap_answers() {
+    let server = Server::start(Fake {
+        status: 500,
+        running: running(&[]),
+        ready: HashSet::new(),
+        swapping: false,
+        fresh: false,
+        metrics: HashMap::new(),
+        hits: Vec::new(),
+        violations: Vec::new(),
+    });
+    let config = config(server.port);
+    let (poller, _rx) = poller::spawn(&config, NoLog).expect("spawn");
+    thread::sleep(Duration::from_millis(500));
+    drop(poller);
+    let hits = server.with(|fake| fake.hits.clone());
+    assert!(
+        hits.iter().any(|path| path == "/running"),
+        "poller ran: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|path| path != "/api/events" && path != "/api/gpu"),
+        "events before llama-swap answered: {hits:?}"
     );
 }
 
@@ -404,6 +444,11 @@ fn no_upstream_request_for_a_model_that_is_not_ready() {
         .expect("boot-b read");
     assert!(gone_at < switched, "{hits:?}");
     // The self-check: every upstream request is followed by `/running`.
+    // The events thread's paths may land anywhere in the order (#167).
+    let hits: Vec<String> = hits
+        .into_iter()
+        .filter(|path| path != "/api/events" && path != "/api/gpu")
+        .collect();
     for (i, path) in hits.iter().enumerate() {
         if path.starts_with("/upstream/") {
             assert_eq!(

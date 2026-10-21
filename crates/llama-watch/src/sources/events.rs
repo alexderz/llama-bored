@@ -23,7 +23,31 @@
 //! model are both kept; the header draws the first. A frame whose `data`
 //! does not parse leaves the previous list in place. The list is forgotten
 //! when the stream reconnects, until the first `claims` frame of the new
-//! session.
+//! session. A claim's `conditional` marks a guest under someone else's GPU
+//! reservation (#167).
+//!
+//! The same build sends a `gpu` frame (#167): the GPU reservation after
+//! each change, `null` when there is none, and once on connect right after
+//! the `claims` frame. Only `gpu` is kept; `changes` and `at` are ignored.
+//! A reservation without a usable `holder` is none; a `mode` other than
+//! `external` and a `state` other than `draining` add nothing. A frame
+//! whose `data` does not parse leaves the previous reservation in place.
+//! The reservation is forgotten when the stream reconnects, as the claims
+//! are.
+//!
+//! Displaced notes (#167) come from `claims` frames: each `displaced` change
+//! with the frame's `at`, one note per former holder, newest wins, as
+//! llama-swap keeps them. They outlive a reconnect, since each carries its
+//! own time, and are shown for [`DISPLACED_TTL`]; a note whose former holder
+//! has a claim again is not shown, as llama-swap drops it then.
+//!
+//! The connect snapshot carries the reservation and every claim, but not
+//! the displaced notes. So each session starts with one `GET /api/gpu`
+//! before the stream: its `displaced` map is merged into the notes, and its
+//! `gpu` and `guests` stand in until the session's first `gpu` and `claims`
+//! frames (a build that never sends them keeps those). Its other members
+//! are ignored. A failed or malformed answer changes nothing and is not
+//! logged: a llama-swap without reservations answers 404.
 //!
 //! This is llama-swap's own API, like `/running`: it names no model path
 //! and cannot make llama-swap load one (#70). One long-lived connection on
@@ -76,6 +100,17 @@ const CLAIM_REASON_BYTES: usize = 256;
 const CLAIM_HOLDER_CHARS: usize = 24;
 /// Hold reason as drawn: SETUP's text kind, at most this many characters.
 const CLAIM_REASON_CHARS: usize = 40;
+/// How long a displaced note is shown after its time (#167).
+pub const DISPLACED_TTL: Duration = Duration::from_secs(10 * 60);
+/// Most displaced notes kept, newest first.
+pub const MAX_DISPLACED: usize = 8;
+/// Two notes of one holder with the same model, `to` and `by` this close
+/// in time are one event seen twice: from a `claims` frame and from
+/// `GET /api/gpu`, whose times differ by a moment.
+const NOTE_SAME_WITHIN: Duration = Duration::from_secs(5);
+/// Largest `GET /api/gpu` body read. ureq refuses a body of this many bytes
+/// or more, as for `/running`.
+pub const GPU_BODY_CAP: u64 = 65_536;
 /// How long an ended request is remembered.
 pub const ENDED_TTL: Duration = Duration::from_secs(10);
 /// One connection's longest life; it reconnects at once after.
@@ -138,6 +173,55 @@ pub struct ModelClaim {
     /// Free text from a caller (SETUP's `text` kind, at most 40 characters).
     /// Empty when there is none.
     pub hold_reason: String,
+    /// A guest claim: someone else holds the GPU reservation, and the claim
+    /// ends when that holder switches away from the model (#167).
+    pub conditional: bool,
+}
+
+/// The GPU reservation from a `gpu` frame or `GET /api/gpu` (#167).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuReservation {
+    /// Holder as for a claim: SETUP's `text` kind, at most 24 characters.
+    pub holder: String,
+    /// Mode `external`: the card is for work llama-swap does not run.
+    pub external: bool,
+    /// State `draining`: an external reservation whose models still stop.
+    pub draining: bool,
+    /// The holder has a request running or waiting.
+    pub in_use: bool,
+    /// The idle deadline. `None` while in use, or when omitted.
+    pub expires_at: Option<SystemTime>,
+    /// When an explicit hold ends.
+    pub hold_until: Option<SystemTime>,
+    /// As a claim's: at most 40 characters, empty when there is none.
+    pub hold_reason: String,
+}
+
+/// A claim that ended because the GPU reservation's holder stopped its
+/// model (#167).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplacedNote {
+    /// The claim's former holder; not drawn, it keys the note.
+    pub holder: String,
+    /// The model the claim was on, at the claims cap.
+    pub model: String,
+    /// The model that replaced it. Empty for an unload.
+    pub to: String,
+    /// The reservation's holder, capped as a holder.
+    pub by: String,
+    /// When it happened.
+    pub at: SystemTime,
+}
+
+/// What `GET /api/gpu` says (#167); the members the header does not use
+/// are not kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuApi {
+    pub gpu: Option<GpuReservation>,
+    /// Its `guests`: the conditional claims.
+    pub guests: Vec<ModelClaim>,
+    /// Its `displaced` map, oldest first.
+    pub displaced: Vec<DisplacedNote>,
 }
 
 /// What the stream says now.
@@ -155,6 +239,15 @@ pub struct EventsView {
     /// A `claims` frame this session did not parse. The previous list is
     /// kept. The poller logs this once per session.
     pub claims_error: Option<&'static str>,
+    /// The GPU reservation (#167). `None` when there is none, and after
+    /// reconnect until the session's first `gpu` frame or `GET /api/gpu`.
+    pub gpu: Option<GpuReservation>,
+    /// A `gpu` frame this session did not parse. The previous reservation
+    /// is kept. The poller logs this once per session.
+    pub gpu_error: Option<&'static str>,
+    /// Displaced notes of the last [`DISPLACED_TTL`] whose former holder
+    /// has no claim now, newest first (#167).
+    pub displaced: Vec<DisplacedNote>,
     /// Why the last connect failed, for the poller's log; `None` while a
     /// session runs.
     pub failure: Option<&'static str>,
@@ -374,21 +467,24 @@ impl Inflight {
             connected: self.synced,
             requests: if self.synced { requests } else { Vec::new() },
             ended: self.ended.iter().cloned().collect(),
-            claims: Vec::new(),
-            claims_error: None,
-            failure: None,
+            ..EventsView::default()
         }
     }
 }
 
-/// The claims list one stream has built (#128).
+/// The claims list one stream has built (#128), and the displaced notes
+/// (#167).
 #[derive(Debug, Default)]
 pub struct Claims {
     list: Vec<ModelClaim>,
     /// A `claims` frame was read this session.
     synced: bool,
+    /// The list is `GET /api/gpu`'s guests, until a `claims` frame.
+    stand_in: bool,
     /// A `claims` frame this session did not parse.
     bad: bool,
+    /// Newest first, at most [`MAX_DISPLACED`]; kept across sessions.
+    displaced: Vec<DisplacedNote>,
 }
 
 #[derive(Deserialize)]
@@ -397,14 +493,81 @@ struct ClaimsEvent {
     /// is the same. Any other JSON type fails the frame.
     #[serde(default)]
     claims: Option<Vec<serde_json::Value>>,
+    /// Read for `displaced` changes only (#167). Not an array: no notes.
+    #[serde(default)]
+    changes: serde_json::Value,
+    /// The frame's time, the time of its `displaced` changes.
+    #[serde(default)]
+    at: serde_json::Value,
 }
 
 impl Claims {
-    /// A new session: nothing is known until its first `claims` frame.
+    /// A new session: nothing is known until its first `claims` frame. The
+    /// displaced notes stay: each carries its own time.
     pub fn new_session(&mut self) {
         self.list.clear();
         self.synced = false;
+        self.stand_in = false;
         self.bad = false;
+    }
+
+    /// `GET /api/gpu`'s answer (#167): its displaced notes are merged, and
+    /// its guests stand in for the list until this session's first
+    /// `claims` frame.
+    pub fn stand_in(&mut self, api: &GpuApi) {
+        for note in &api.displaced {
+            self.note(note.clone());
+        }
+        if !self.synced {
+            self.list = api.guests.iter().take(MAX_CLAIMS).cloned().collect();
+            self.stand_in = true;
+        }
+    }
+
+    /// Keep `note`: one per former holder, the newest. The same event seen
+    /// again (within [`NOTE_SAME_WITHIN`]) keeps the time it was first seen
+    /// with; a later displacement of the same shape is a new event.
+    fn note(&mut self, note: DisplacedNote) {
+        if let Some(at) = self.displaced.iter().position(|n| n.holder == note.holder) {
+            let old = &self.displaced[at];
+            let apart = old
+                .at
+                .duration_since(note.at)
+                .or_else(|_| note.at.duration_since(old.at))
+                .unwrap_or(Duration::ZERO);
+            let same = old.model == note.model
+                && old.to == note.to
+                && old.by == note.by
+                && apart <= NOTE_SAME_WITHIN;
+            if same || old.at >= note.at {
+                return;
+            }
+            self.displaced.remove(at);
+        }
+        let at = self
+            .displaced
+            .iter()
+            .position(|n| n.at < note.at)
+            .unwrap_or(self.displaced.len());
+        self.displaced.insert(at, note);
+        self.displaced.truncate(MAX_DISPLACED);
+    }
+
+    /// Notes of the last [`DISPLACED_TTL`] before `wall` whose former holder
+    /// has no claim in the list, newest first. A note from the future (a
+    /// clock step) is kept.
+    #[must_use]
+    pub fn displaced(&self, wall: SystemTime) -> Vec<DisplacedNote> {
+        let (list, _) = self.view();
+        self.displaced
+            .iter()
+            .filter(|note| {
+                wall.duration_since(note.at)
+                    .map_or(true, |age| age < DISPLACED_TTL)
+            })
+            .filter(|note| !list.iter().any(|claim| claim.holder == note.holder))
+            .cloned()
+            .collect()
     }
 
     /// Take one frame's data. Frames other than `claims` are ignored. A
@@ -433,13 +596,23 @@ impl Claims {
             .take(MAX_CLAIMS)
             .collect();
         self.synced = true;
+        self.stand_in = false;
+        let at = event.at.as_str().and_then(rfc3339_time);
+        if let (Some(changes), Some(at)) = (event.changes.as_array(), at) {
+            for change in changes {
+                if let Some(note) = displaced_change(change, at) {
+                    self.note(note);
+                }
+            }
+        }
     }
 
-    /// What is known now. Empty before this session's first `claims` frame.
+    /// What is known now. Empty before this session's first `claims` frame
+    /// (or `GET /api/gpu`'s guests standing in for it).
     #[must_use]
     pub fn view(&self) -> (Vec<ModelClaim>, Option<&'static str>) {
         (
-            if self.synced {
+            if self.synced || self.stand_in {
                 self.list.clone()
             } else {
                 Vec::new()
@@ -447,6 +620,167 @@ impl Claims {
             self.bad.then_some("malformed claims frame"),
         )
     }
+}
+
+/// The GPU reservation one stream has built (#167).
+#[derive(Debug, Default)]
+pub struct Gpu {
+    reservation: Option<GpuReservation>,
+    /// A `gpu` frame was read this session.
+    synced: bool,
+    /// A `gpu` frame this session did not parse.
+    bad: bool,
+}
+
+#[derive(Deserialize)]
+struct GpuEvent {
+    /// `null` or missing: no reservation.
+    #[serde(default)]
+    gpu: serde_json::Value,
+}
+
+impl Gpu {
+    /// A new session: no reservation until its first `gpu` frame or
+    /// `GET /api/gpu`.
+    pub fn new_session(&mut self) {
+        self.reservation = None;
+        self.synced = false;
+        self.bad = false;
+    }
+
+    /// Take one frame's data. Frames other than `gpu` are ignored. A `gpu`
+    /// frame whose `data` does not parse leaves the previous reservation
+    /// and is remembered once for the session.
+    pub fn apply(&mut self, data: &[u8]) {
+        let Ok(kind) = serde_json::from_slice::<Kind>(data) else {
+            return;
+        };
+        if kind.kind != "gpu" {
+            return;
+        }
+        let Ok(envelope) = serde_json::from_slice::<Envelope>(data) else {
+            self.bad = true;
+            return;
+        };
+        let Ok(event) = serde_json::from_str::<GpuEvent>(&envelope.data) else {
+            self.bad = true;
+            return;
+        };
+        self.reservation = keep_gpu(&event.gpu);
+        self.synced = true;
+    }
+
+    /// `GET /api/gpu`'s reservation stands in until this session's first
+    /// `gpu` frame.
+    pub fn stand_in(&mut self, api: &GpuApi) {
+        if !self.synced {
+            self.reservation = api.gpu.clone();
+        }
+    }
+
+    /// What is known now, and whether a frame failed this session.
+    #[must_use]
+    pub fn view(&self) -> (Option<GpuReservation>, Option<&'static str>) {
+        (
+            self.reservation.clone(),
+            self.bad.then_some("malformed gpu frame"),
+        )
+    }
+}
+
+/// `GET /api/gpu`'s body (#167). `None` when it is not a JSON object.
+/// `gpu` is kept as a `gpu` frame's; `guests` as a `claims` frame's list,
+/// entries without a usable model or holder skipped; `displaced` is a map
+/// by former holder, and a note without a usable model, `by` or `at` is
+/// skipped. Every other member, and a member of the wrong type, is ignored.
+#[must_use]
+pub fn parse_gpu_api(body: &[u8]) -> Option<GpuApi> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = value.as_object()?;
+    let gpu = obj.get("gpu").and_then(keep_gpu);
+    let guests = obj
+        .get("guests")
+        .and_then(serde_json::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .cloned()
+                .filter_map(keep_claim)
+                .take(MAX_CLAIMS)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut displaced: Vec<DisplacedNote> = obj
+        .get("displaced")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(holder, note)| {
+                    let at = note
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(rfc3339_time)?;
+                    displaced_note(holder, note, at)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    displaced.sort_by_key(|note| note.at);
+    Some(GpuApi {
+        gpu,
+        guests,
+        displaced,
+    })
+}
+
+/// One `GPUView` as kept: `None` for `null`, a non-object, or no usable
+/// holder.
+fn keep_gpu(value: &serde_json::Value) -> Option<GpuReservation> {
+    let obj = value.as_object()?;
+    let holder = obj.get("holder").and_then(serde_json::Value::as_str)?;
+    let holder = holder_held(holder)?;
+    let text = |key: &str| obj.get(key).and_then(serde_json::Value::as_str);
+    let flag = |key: &str| {
+        obj.get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    Some(GpuReservation {
+        holder,
+        external: text("mode") == Some("external"),
+        draining: text("state") == Some("draining"),
+        in_use: flag("in_use"),
+        expires_at: text("expires_at").and_then(rfc3339_time),
+        hold_until: text("hold_until").and_then(rfc3339_time),
+        hold_reason: text("hold_reason")
+            .and_then(|raw| text_held(take_bytes(raw, CLAIM_REASON_BYTES), CLAIM_REASON_CHARS))
+            .unwrap_or_default(),
+    })
+}
+
+/// A `claims` frame's change, as a note when its action is `displaced`.
+fn displaced_change(change: &serde_json::Value, at: SystemTime) -> Option<DisplacedNote> {
+    if change.get("action").and_then(serde_json::Value::as_str) != Some("displaced") {
+        return None;
+    }
+    let holder = change.get("holder").and_then(serde_json::Value::as_str)?;
+    displaced_note(holder, change, at)
+}
+
+/// A displaced note from a `DisplacedView` or a `displaced` change: `model`,
+/// `to` (optional) and `by`, with `holder` the claim's former holder.
+fn displaced_note(
+    holder: &str,
+    value: &serde_json::Value,
+    at: SystemTime,
+) -> Option<DisplacedNote> {
+    let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str);
+    Some(DisplacedNote {
+        holder: holder_held(holder)?,
+        model: claim_model(text("model")?)?,
+        to: text("to").and_then(claim_model).unwrap_or_default(),
+        by: holder_held(text("by")?)?,
+        at,
+    })
 }
 
 /// One `claims` array entry as kept. An entry without a usable model or
@@ -478,6 +812,10 @@ fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
         .and_then(serde_json::Value::as_str)
         .and_then(|raw| text_held(take_bytes(raw, CLAIM_REASON_BYTES), CLAIM_REASON_CHARS))
         .unwrap_or_default();
+    let conditional = obj
+        .get("conditional")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     Some(ModelClaim {
         model,
         holder,
@@ -486,6 +824,7 @@ fn keep_claim(value: serde_json::Value) -> Option<ModelClaim> {
         expires_at,
         hold_until,
         hold_reason,
+        conditional,
     })
 }
 
@@ -601,12 +940,16 @@ impl Events {
     pub fn spawn(url: &str, timeout: Duration) -> std::io::Result<Self> {
         let shared = Arc::new(Mutex::new(EventsView::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let endpoint = format!("{}/api/events", url.trim_end_matches('/'));
+        let base = url.trim_end_matches('/');
+        let endpoints = Endpoints {
+            events: format!("{base}/api/events"),
+            gpu: format!("{base}/api/gpu"),
+        };
         let thread_shared = Arc::clone(&shared);
         let thread_stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("llama-events".to_owned())
-            .spawn(move || run(&endpoint, timeout, &thread_shared, &thread_stop))?;
+            .spawn(move || run(&endpoints, timeout, &thread_shared, &thread_stop))?;
         Ok(Self { shared, stop })
     }
 
@@ -620,25 +963,36 @@ impl Events {
     }
 }
 
-fn run(endpoint: &str, timeout: Duration, shared: &Mutex<EventsView>, stop: &AtomicBool) {
+/// What one stream builds, all reset together on a reconnect.
+#[derive(Default)]
+struct State {
+    inflight: Inflight,
+    claims: Claims,
+    gpu: Gpu,
+}
+
+impl State {
+    fn new_session(&mut self) {
+        self.inflight.new_session();
+        self.claims.new_session();
+        self.gpu.new_session();
+    }
+}
+
+struct Endpoints {
+    events: String,
+    gpu: String,
+}
+
+fn run(endpoints: &Endpoints, timeout: Duration, shared: &Mutex<EventsView>, stop: &AtomicBool) {
     let agent = super::llamaswap::new_agent();
     let mut backoff = MIN_BACKOFF;
-    let mut inflight = Inflight::default();
-    let mut claims = Claims::default();
+    let mut state = State::default();
     while !stop.load(Ordering::Relaxed) {
         let began = Instant::now();
-        let failure = session(
-            &agent,
-            endpoint,
-            timeout,
-            shared,
-            stop,
-            &mut inflight,
-            &mut claims,
-        );
-        inflight.new_session();
-        claims.new_session();
-        publish(shared, &mut inflight, &claims, failure);
+        let failure = session(&agent, endpoints, timeout, shared, stop, &mut state);
+        state.new_session();
+        publish(shared, &mut state, failure);
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -667,15 +1021,27 @@ fn run(endpoint: &str, timeout: Duration, shared: &Mutex<EventsView>, stop: &Ato
 /// deadline or llama-swap closed it after a good start.
 fn session(
     agent: &ureq::Agent,
-    endpoint: &str,
+    endpoints: &Endpoints,
     timeout: Duration,
     shared: &Mutex<EventsView>,
     stop: &AtomicBool,
-    inflight: &mut Inflight,
-    claims: &mut Claims,
+    state: &mut State,
 ) -> Option<&'static str> {
+    // #167: the displaced notes, and a stand-in until the stream's own
+    // snapshot. Read before the stream opens, so its frames win.
+    if let Some(api) = fetch_gpu(agent, &endpoints.gpu, timeout) {
+        state.claims.stand_in(&api);
+        state.gpu.stand_in(&api);
+        // Only a working stream clears the last failure: the poller would
+        // log `recovered` for a GET that answered while the stream fails.
+        let failure = shared.lock().unwrap_or_else(|err| err.into_inner()).failure;
+        publish(shared, state, failure);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return None;
+    }
     let response = agent
-        .get(endpoint)
+        .get(&endpoints.events)
         .config()
         .timeout_connect(Some(timeout))
         .timeout_recv_response(Some(timeout))
@@ -708,26 +1074,47 @@ fn session(
         let wall = SystemTime::now();
         let mut changed = false;
         parser.feed(&buf[..read], |data| {
-            inflight.apply(data, now, wall);
-            claims.apply(data);
+            state.inflight.apply(data, now, wall);
+            state.claims.apply(data);
+            state.gpu.apply(data);
             changed = true;
         });
         if changed {
-            publish(shared, inflight, claims, None);
+            publish(shared, state, None);
         }
     }
 }
 
-fn publish(
-    shared: &Mutex<EventsView>,
-    inflight: &mut Inflight,
-    claims: &Claims,
-    failure: Option<&'static str>,
-) {
-    let mut view = inflight.view(Instant::now());
-    let (list, claims_error) = claims.view();
+/// One `GET /api/gpu` (#167): `None` on any failure, which is not logged.
+fn fetch_gpu(agent: &ureq::Agent, endpoint: &str, timeout: Duration) -> Option<GpuApi> {
+    let mut response = agent
+        .get(endpoint)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .ok()?;
+    if response.status().as_u16() != 200 {
+        return None;
+    }
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(GPU_BODY_CAP)
+        .read_to_vec()
+        .ok()?;
+    parse_gpu_api(&body)
+}
+
+fn publish(shared: &Mutex<EventsView>, state: &mut State, failure: Option<&'static str>) {
+    let mut view = state.inflight.view(Instant::now());
+    let (list, claims_error) = state.claims.view();
+    let (gpu, gpu_error) = state.gpu.view();
+    view.displaced = state.claims.displaced(SystemTime::now());
     view.claims = list;
     view.claims_error = claims_error;
+    view.gpu = gpu;
+    view.gpu_error = gpu_error;
     view.failure = failure;
     *shared.lock().unwrap_or_else(|err| err.into_inner()) = view;
 }
@@ -1477,5 +1864,434 @@ mod tests {
             }),
         );
         assert_eq!(claims.view().0[0].hold_reason, "seen");
+    }
+
+    // ---- #167: the GPU reservation, guests and displaced notes ----------
+
+    fn apply_gpu(gpu: &mut Gpu, body: serde_json::Value) {
+        let text = frame("gpu", &body);
+        let mut parser = SseParser::default();
+        parser.feed(text.as_bytes(), |data| gpu.apply(data));
+    }
+
+    /// A `GPUView` as llama-swap writes it, invented names.
+    fn gpu_view(holder: &str) -> serde_json::Value {
+        serde_json::json!({
+            "holder": holder,
+            "mode": "models",
+            "state": "active",
+            "in_use": false,
+            "expires_at": "2026-10-20T21:50:00Z",
+            "claimed_at": "2026-10-20T21:40:00.123456789Z",
+            "hold_until": "2026-10-21T21:01:00Z",
+            "hold_reason": "invented queue",
+        })
+    }
+
+    fn unix(text: &str) -> SystemTime {
+        rfc3339_time(text).expect("time")
+    }
+
+    /// Every field of the reservation: holder, mode, state, in_use,
+    /// expires_at, hold_until and hold_reason are kept; claimed_at,
+    /// `changes` and `at` are read past.
+    #[test]
+    fn a_gpu_frame_keeps_every_field() {
+        let mut gpu = Gpu::default();
+        apply_gpu(
+            &mut gpu,
+            serde_json::json!({
+                "changes": [{"action": "reserved", "holder": "sample-holder"}],
+                "gpu": gpu_view("sample-holder"),
+                "at": "2026-10-20T21:40:00Z",
+            }),
+        );
+        let (kept, err) = gpu.view();
+        assert!(err.is_none());
+        let kept = kept.expect("reservation");
+        assert_eq!(
+            kept,
+            GpuReservation {
+                holder: "sample-holder".to_owned(),
+                external: false,
+                draining: false,
+                in_use: false,
+                expires_at: Some(unix("2026-10-20T21:50:00Z")),
+                hold_until: Some(unix("2026-10-21T21:01:00Z")),
+                hold_reason: "invented queue".to_owned(),
+            }
+        );
+
+        let mut view = gpu_view("sample-holder");
+        view["mode"] = "external".into();
+        view["state"] = "draining".into();
+        view["in_use"] = true.into();
+        view["expires_at"] = serde_json::Value::Null;
+        view["hold_until"] = serde_json::Value::Null;
+        view.as_object_mut().unwrap().remove("hold_reason");
+        apply_gpu(&mut gpu, serde_json::json!({"gpu": view}));
+        let kept = gpu.view().0.expect("reservation");
+        assert!(kept.external && kept.draining && kept.in_use);
+        assert!(kept.expires_at.is_none() && kept.hold_until.is_none());
+        assert!(kept.hold_reason.is_empty());
+
+        // Released: `null`.
+        apply_gpu(&mut gpu, serde_json::json!({"changes": [], "gpu": null}));
+        assert!(gpu.view().0.is_none());
+    }
+
+    /// Unknown members are ignored; an unknown mode or state, or a field
+    /// of the wrong type, adds nothing; a missing or unusable holder is no
+    /// reservation, and a missing `gpu` too.
+    #[test]
+    fn unknown_or_missing_gpu_fields_draw_nothing_rather_than_fail() {
+        let mut gpu = Gpu::default();
+        let mut view = gpu_view("sample-holder");
+        view["mode"] = "quantum".into();
+        view["state"] = "melting".into();
+        view["in_use"] = "yes".into();
+        view["expires_at"] = 12.into();
+        view["hold_until"] = "not a time".into();
+        view["hold_reason"] = 7.into();
+        view["future_field"] = serde_json::json!({"deep": [1, 2]});
+        apply_gpu(&mut gpu, serde_json::json!({"gpu": view, "extra": true}));
+        let kept = gpu.view().0.expect("reservation");
+        assert_eq!(kept.holder, "sample-holder");
+        assert!(!kept.external && !kept.draining && !kept.in_use);
+        assert!(kept.expires_at.is_none() && kept.hold_until.is_none());
+        assert!(kept.hold_reason.is_empty());
+        assert!(gpu.view().1.is_none());
+
+        for holderless in [
+            serde_json::json!({"gpu": {"mode": "models"}}),
+            serde_json::json!({"gpu": {"holder": 5}}),
+            serde_json::json!({"gpu": {"holder": "\u{1b}\u{07}"}}),
+            serde_json::json!({"gpu": "sample-holder"}),
+            serde_json::json!({}),
+        ] {
+            apply_gpu(
+                &mut gpu,
+                serde_json::json!({"gpu": gpu_view("sample-holder")}),
+            );
+            apply_gpu(&mut gpu, holderless.clone());
+            assert!(gpu.view().0.is_none(), "{holderless}");
+            assert!(gpu.view().1.is_none(), "{holderless}");
+        }
+    }
+
+    /// A frame whose `data` does not parse keeps the reservation and is
+    /// remembered for the session; a new session forgets both.
+    #[test]
+    fn a_malformed_gpu_frame_keeps_the_reservation_until_reconnect() {
+        let mut gpu = Gpu::default();
+        apply_gpu(
+            &mut gpu,
+            serde_json::json!({"gpu": gpu_view("sample-holder")}),
+        );
+        gpu.apply(br#"{"type":"gpu","data":"{not json"}"#);
+        gpu.apply(br#"{"type":"gpu","data":"[1,2]"}"#);
+        let (kept, err) = gpu.view();
+        assert_eq!(kept.expect("kept").holder, "sample-holder");
+        assert_eq!(err, Some("malformed gpu frame"));
+        // Other frame types are not `gpu` frames.
+        gpu.apply(br#"{"type":"claims","data":"{not json"}"#);
+        gpu.new_session();
+        assert_eq!(gpu.view(), (None, None));
+    }
+
+    /// The holder's and the reason's caps are the claims': 64 and 256
+    /// bytes, then 24 and 40 characters.
+    #[test]
+    fn gpu_holder_and_reason_have_the_claim_caps() {
+        let mut gpu = Gpu::default();
+        let mut view = gpu_view(&"h".repeat(80));
+        view["hold_reason"] = "r".repeat(300).into();
+        apply_gpu(&mut gpu, serde_json::json!({"gpu": view}));
+        let kept = gpu.view().0.expect("reservation");
+        assert_eq!(kept.holder, format!("{}{}", "h".repeat(23), '\u{2026}'));
+        assert_eq!(kept.hold_reason, "r".repeat(40));
+        // 64 bytes of a 4-byte scalar is 16 characters, as for a claim.
+        let mut view = gpu_view(&"\u{10348}".repeat(17));
+        view["hold_reason"] = format!("seen{}tail", "\u{1b}".repeat(252)).into();
+        apply_gpu(&mut gpu, serde_json::json!({"gpu": view}));
+        let kept = gpu.view().0.expect("reservation");
+        assert_eq!(kept.holder, "\u{10348}".repeat(16));
+        assert_eq!(kept.hold_reason, "seen");
+    }
+
+    #[test]
+    fn a_conditional_claim_is_a_guest() {
+        let mut claims = Claims::default();
+        let mut guest = claim_entry("big", "guest-ui", true, false, None, None, None);
+        guest["conditional"] = true.into();
+        let mut odd = claim_entry("small", "other-ui", false, false, None, None, None);
+        odd["conditional"] = "yes".into();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({"claims": [
+                guest,
+                claim_entry("big", "chat-ui", true, true, None, None, None),
+                odd,
+            ]}),
+        );
+        let list = claims.view().0;
+        assert!(list[0].conditional);
+        assert!(!list[1].conditional, "omitted");
+        assert!(!list[2].conditional, "wrong type");
+    }
+
+    fn displaced_json(model: &str, holder: &str, to: Option<&str>, by: &str) -> serde_json::Value {
+        let mut change = serde_json::json!({
+            "action": "displaced", "model": model, "holder": holder, "by": by,
+        });
+        if let Some(to) = to {
+            change["to"] = to.into();
+        }
+        change
+    }
+
+    /// A `displaced` change becomes a note at the frame's `at`; other
+    /// actions, and changes without a model, holder or `by`, do not. One
+    /// note per former holder, newest first; the notes outlive a reconnect.
+    #[test]
+    fn displaced_changes_become_notes_that_outlive_a_reconnect() {
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [
+                    displaced_json("tiel", "guest-a", Some("qwen"), "sample-holder"),
+                    {"action": "claimed", "model": "qwen", "holder": "sample-holder"},
+                    {"action": "displaced", "model": "x", "holder": "guest-c"},
+                    {"action": "displaced", "holder": "guest-d", "by": "sample-holder"},
+                ],
+                "claims": [],
+                "at": "2026-10-20T21:09:00Z",
+            }),
+        );
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("qwen", "guest-b", None, "sample-holder")],
+                "claims": [],
+                "at": "2026-10-20T21:10:00Z",
+            }),
+        );
+        let wall = unix("2026-10-20T21:12:00Z");
+        let notes = claims.displaced(wall);
+        assert_eq!(
+            notes
+                .iter()
+                .map(|n| (
+                    n.holder.as_str(),
+                    n.model.as_str(),
+                    n.to.as_str(),
+                    n.by.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("guest-b", "qwen", "", "sample-holder"),
+                ("guest-a", "tiel", "qwen", "sample-holder"),
+            ]
+        );
+        assert_eq!(notes[1].at, unix("2026-10-20T21:09:00Z"));
+        claims.new_session();
+        assert_eq!(claims.displaced(wall).len(), 2, "kept across sessions");
+        // Ten minutes after it, a note is no longer shown.
+        assert_eq!(claims.displaced(unix("2026-10-20T21:19:00Z")).len(), 1);
+        assert!(claims.displaced(unix("2026-10-20T21:20:00Z")).is_empty());
+        // A frame without `at`, or `changes` of the wrong type, adds none.
+        let mut claims = Claims::default();
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("tiel", "guest-a", None, "sample-holder")],
+                "claims": [],
+            }),
+        );
+        apply_claims(
+            &mut claims,
+            serde_json::json!({"changes": "displaced", "claims": [], "at": "2026-10-20T21:09:00Z"}),
+        );
+        assert!(claims.displaced(wall).is_empty());
+        assert!(claims.view().1.is_none(), "neither fails the frame");
+    }
+
+    /// The same displacement again later is a new event: frames at 21:09
+    /// and 21:30, and at 21:31 the 21:30 note shows. Within five seconds
+    /// it is the same event and keeps its first time.
+    #[test]
+    fn a_later_identical_displacement_shows_again() {
+        let mut claims = Claims::default();
+        for at in ["2026-10-20T21:09:00Z", "2026-10-20T21:30:00Z"] {
+            apply_claims(
+                &mut claims,
+                serde_json::json!({
+                    "changes": [displaced_json("tiel", "guest-a", Some("qwen"), "sample-holder")],
+                    "claims": [],
+                    "at": at,
+                }),
+            );
+        }
+        let notes = claims.displaced(unix("2026-10-20T21:31:00Z"));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].at, unix("2026-10-20T21:30:00Z"));
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("tiel", "guest-a", Some("qwen"), "sample-holder")],
+                "claims": [],
+                "at": "2026-10-20T21:30:05Z",
+            }),
+        );
+        let notes = claims.displaced(unix("2026-10-20T21:31:00Z"));
+        assert_eq!(notes[0].at, unix("2026-10-20T21:30:00Z"), "same event");
+    }
+
+    /// A former holder with a claim again shows no note, as llama-swap
+    /// drops it; a newer note replaces an older one of the same holder.
+    #[test]
+    fn a_note_goes_when_its_holder_claims_again_and_the_newest_wins() {
+        let mut claims = Claims::default();
+        let at = |t: &str| serde_json::Value::from(t);
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("tiel", "guest-a", Some("qwen"), "sample-holder")],
+                "claims": [],
+                "at": at("2026-10-20T21:09:00Z"),
+            }),
+        );
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("qwen", "guest-a", Some("tiel"), "sample-holder")],
+                "claims": [],
+                "at": at("2026-10-20T21:11:00Z"),
+            }),
+        );
+        let wall = unix("2026-10-20T21:12:00Z");
+        let notes = claims.displaced(wall);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].model.as_str(), notes[0].to.as_str()),
+            ("qwen", "tiel")
+        );
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "claims": [claim_entry("tiel", "guest-a", false, true, None, None, None)],
+            }),
+        );
+        assert!(claims.displaced(wall).is_empty());
+    }
+
+    #[test]
+    fn at_most_eight_notes_are_kept() {
+        let mut claims = Claims::default();
+        for i in 0..MAX_DISPLACED + 4 {
+            apply_claims(
+                &mut claims,
+                serde_json::json!({
+                    "changes": [displaced_json("m", &format!("g{i}"), None, "sample-holder")],
+                    "claims": [],
+                    "at": format!("2026-10-20T21:{:02}:00Z", 10 + i),
+                }),
+            );
+        }
+        let notes = claims.displaced(unix("2026-10-20T21:22:00Z"));
+        assert_eq!(notes.len(), MAX_DISPLACED);
+        assert_eq!(notes[0].holder, "g11");
+    }
+
+    /// Every member of `GET /api/gpu`: `gpu`, `guests` and `displaced` are
+    /// kept; `enabled`, `modes`, `loaded` and the three times are read
+    /// past, as are unknown ones.
+    #[test]
+    fn the_gpu_api_body_keeps_gpu_guests_and_displaced() {
+        let mut guest = claim_entry("big", "guest-ui", true, false, None, None, None);
+        guest["conditional"] = true.into();
+        let body = serde_json::json!({
+            "gpu": gpu_view("sample-holder"),
+            "enabled": true,
+            "modes": ["models", "external"],
+            "loaded": [{"model": "big", "state": "ready"}],
+            "guests": [guest, {"model": "big"}],
+            "displaced": {
+                "guest-b": {"model": "qwen", "by": "sample-holder", "at": "2026-10-20T21:10:00Z"},
+                "guest-a": {"model": "tiel", "to": "qwen", "by": "sample-holder", "at": "2026-10-20T21:09:00Z"},
+                "guest-c": {"model": "tiel", "by": "sample-holder"},
+                "guest-d": {"model": "tiel", "by": "sample-holder", "at": "never"},
+            },
+            "idle_timeout_seconds": 300,
+            "max_hold_seconds": 86400,
+            "switch_grace_seconds": 30,
+            "future": {"x": 1},
+        });
+        let api = parse_gpu_api(body.to_string().as_bytes()).expect("parsed");
+        assert_eq!(api.gpu.expect("gpu").holder, "sample-holder");
+        assert_eq!(api.guests.len(), 1, "the entry without a holder is skipped");
+        assert!(api.guests[0].conditional);
+        assert_eq!(
+            api.displaced
+                .iter()
+                .map(|n| (n.holder.as_str(), n.to.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("guest-a", "qwen"), ("guest-b", "")],
+            "oldest first; a note without a usable time is skipped"
+        );
+
+        // No reservation; members of the wrong type; empty maps.
+        let api =
+            parse_gpu_api(br#"{"gpu":null,"guests":{"a":1},"displaced":[1],"enabled":"yes"}"#)
+                .expect("parsed");
+        assert_eq!(api, GpuApi::default());
+        let api = parse_gpu_api(br#"{}"#).expect("parsed");
+        assert_eq!(api, GpuApi::default());
+        // Not a JSON object: nothing.
+        for junk in [&b"[]"[..], b"404 page not found", b"", b"{\"gpu\":"] {
+            assert!(parse_gpu_api(junk).is_none(), "{junk:?}");
+        }
+    }
+
+    /// `GET /api/gpu` stands in only until the session's own frames, and
+    /// its notes merge with the stream's: the same note seen twice keeps
+    /// its first time.
+    #[test]
+    fn the_get_stands_in_until_the_frames_and_merges_notes() {
+        let api = parse_gpu_api(
+            serde_json::json!({
+                "gpu": gpu_view("sample-holder"),
+                "guests": [claim_entry("big", "guest-ui", true, false, None, None, None)],
+                "displaced": {"guest-a": {"model": "tiel", "to": "qwen", "by": "sample-holder", "at": "2026-10-20T21:09:00Z"}},
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("parsed");
+        let mut gpu = Gpu::default();
+        let mut claims = Claims::default();
+        gpu.stand_in(&api);
+        claims.stand_in(&api);
+        assert_eq!(gpu.view().0.expect("stand-in").holder, "sample-holder");
+        assert_eq!(claims.view().0[0].holder, "guest-ui");
+        // The session's own frames replace it, and a later GET does not
+        // replace them.
+        apply_gpu(&mut gpu, serde_json::json!({"gpu": null}));
+        apply_claims(
+            &mut claims,
+            serde_json::json!({
+                "changes": [displaced_json("tiel", "guest-a", Some("qwen"), "sample-holder")],
+                "claims": [],
+                "at": "2026-10-20T21:09:01Z",
+            }),
+        );
+        gpu.stand_in(&api);
+        claims.stand_in(&api);
+        assert!(gpu.view().0.is_none());
+        assert!(claims.view().0.is_empty());
+        let notes = claims.displaced(unix("2026-10-20T21:12:00Z"));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].at, unix("2026-10-20T21:09:00Z"));
     }
 }

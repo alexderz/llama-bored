@@ -27,6 +27,10 @@ struct World {
     /// Event frames, sent in order to every open `/api/events`.
     frames: Vec<String>,
     hits: Vec<String>,
+    /// `GET /api/gpu`'s body (#167). Empty answers 404.
+    gpu: Vec<u8>,
+    /// `/api/events` never answers: the watcher's timeout ends it (#167).
+    events_hang: bool,
 }
 
 struct Fake {
@@ -109,6 +113,14 @@ fn answer(mut stream: TcpStream, world: &Mutex<World>, stop: &AtomicBool) {
                 Some(w.running.clone())
             }
             "/api/metrics/activity" => Some(br#"{"data":[]}"#.to_vec()),
+            "/api/gpu" if !w.gpu.is_empty() => Some(w.gpu.clone()),
+            "/api/events" if w.events_hang => {
+                drop(w);
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                return;
+            }
             "/api/events" => None,
             p if p.ends_with("/metrics") => Some(w.metrics.clone()),
             p if p.ends_with("/v1/loads?include=core") => Some(w.loads.clone()),
@@ -355,7 +367,7 @@ fn sglang_loads_are_read_only_while_a_request_is_in_flight() {
     let hits: Vec<String> = fake
         .hits()
         .into_iter()
-        .filter(|h| h != "/api/events" && h != "/api/metrics/activity")
+        .filter(|h| h != "/api/events" && h != "/api/gpu" && h != "/api/metrics/activity")
         .collect();
     let mut seen = 0;
     for (i, hit) in hits.iter().enumerate() {
@@ -565,4 +577,165 @@ fn a_malformed_claims_frame_is_logged_once_per_session() {
         .filter(|line| line.contains("claims frame did not parse"))
         .count();
     assert_eq!(n, 1, "logged every round: {lines:?}");
+}
+
+/// RFC 3339 for `at`, as llama-swap writes it (UTC).
+fn rfc3339(at: std::time::SystemTime) -> String {
+    let unix = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let text = llama_watch::localtime::format_local(
+        i64::try_from(unix).expect("unix"),
+        &llama_watch::localtime::Zone::fixed(0),
+    );
+    format!("{}Z", text.replace(' ', "T"))
+}
+
+/// #167: the reservation, a guest claim and a displaced note travel from
+/// the stream into [`LlamaDetail`], the poller's hand-off to the tty model.
+#[test]
+fn the_reservation_guests_and_notes_reach_the_detail() {
+    let now = std::time::SystemTime::now();
+    let hold = rfc3339(now + Duration::from_secs(3600));
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        frames: vec![
+            inflight("snapshot", serde_json::json!({"requests": []})),
+            claims_frame(serde_json::json!({
+                "changes": [{
+                    "action": "displaced", "model": "tiel", "holder": "former-ui",
+                    "to": "lcpp", "by": "sample-holder",
+                }],
+                "claims": [{
+                    "model": "lcpp", "holder": "guest-ui", "auto": true,
+                    "in_use": false, "expires_at": null, "hold_until": null,
+                    "conditional": true,
+                }],
+                "at": rfc3339(now - Duration::from_secs(60)),
+            })),
+            frame(
+                "gpu",
+                &serde_json::json!({
+                    "changes": [],
+                    "gpu": {
+                        "holder": "sample-holder", "mode": "models", "state": "active",
+                        "in_use": false, "expires_at": null, "hold_until": hold,
+                        "hold_reason": "invented queue",
+                    },
+                }),
+            ),
+        ],
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), NoLog).expect("spawn");
+    let (_, detail) = wait(&rx, "reservation, guest and note", |_, detail| {
+        detail.gpu.is_some() && !detail.displaced.is_empty() && !detail.claims.is_empty()
+    });
+    let gpu = detail.gpu.expect("gpu");
+    assert_eq!(gpu.holder, "sample-holder");
+    assert!(gpu.hold_until.is_some());
+    assert_eq!(gpu.hold_reason, "invented queue");
+    assert!(detail.claims[0].conditional);
+    let note = &detail.displaced[0];
+    assert_eq!(
+        (
+            note.holder.as_str(),
+            note.model.as_str(),
+            note.to.as_str(),
+            note.by.as_str()
+        ),
+        ("former-ui", "tiel", "lcpp", "sample-holder")
+    );
+}
+
+/// #167: with `GET /api/gpu` answering and `/api/events` failing, the
+/// GET's stand-in does not clear the failure: the poller warns once and
+/// never logs `recovered`.
+#[test]
+fn a_failing_stream_warns_once_even_when_the_gpu_get_answers() {
+    let log = MemLog(std::sync::Arc::new(Mutex::new(Vec::new())));
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        gpu: serde_json::to_vec(&serde_json::json!({
+            "gpu": {"holder": "sample-holder", "mode": "models", "state": "active", "in_use": true},
+            "guests": [],
+            "displaced": {},
+        }))
+        .expect("json"),
+        events_hang: true,
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), log.clone()).expect("spawn");
+    wait(&rx, "the stand-in reservation", |_, detail| {
+        detail.gpu.is_some()
+    });
+    // Three sessions (1 s timeouts, 1 s and 2 s backoff between them); a
+    // loaded host may take longer, so wait for the third GET.
+    let gets = || fake.hits().iter().filter(|h| *h == "/api/gpu").count();
+    let started = Instant::now();
+    while gets() < 3 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "sessions: {}",
+            gets()
+        );
+        let _ = rx.try_recv();
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Rounds go on through the third session's stream attempt.
+    let third = Instant::now();
+    while third.elapsed() < Duration::from_millis(1500) {
+        let _ = rx.try_recv();
+        thread::sleep(Duration::from_millis(20));
+    }
+    let lines = log.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let events: Vec<&String> = lines.iter().filter(|l| l.contains("events: ")).collect();
+    assert!(
+        events.iter().all(|l| !l.contains("recovered")),
+        "{events:?}"
+    );
+    assert_eq!(events.len(), 1, "warned once: {events:?}");
+}
+
+/// #167: after a failed session, a working stream clears the failure: the
+/// poller logs `recovered` once and warns no more.
+#[test]
+fn a_working_stream_after_a_failure_logs_recovered_once() {
+    let log = MemLog(std::sync::Arc::new(Mutex::new(Vec::new())));
+    let fake = Fake::start(World {
+        running: running("lcpp"),
+        frames: vec![inflight("snapshot", serde_json::json!({"requests": []}))],
+        events_hang: true,
+        ..World::default()
+    });
+    let (_poller, rx) =
+        poller::spawn(&config(fake.port, r#""lcpp" = "llamacpp""#), log.clone()).expect("spawn");
+    let lines = || log.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let started = Instant::now();
+    while !lines().iter().any(|l| l.contains("events: ")) {
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", lines());
+        let _ = rx.try_recv();
+        thread::sleep(Duration::from_millis(20));
+    }
+    fake.edit(|w| w.events_hang = false);
+    while !lines().iter().any(|l| l.contains("events: recovered")) {
+        assert!(started.elapsed() < Duration::from_secs(30), "{:?}", lines());
+        let _ = rx.try_recv();
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Some rounds more on the working stream.
+    let after = Instant::now();
+    while after.elapsed() < Duration::from_secs(1) {
+        let _ = rx.try_recv();
+        thread::sleep(Duration::from_millis(20));
+    }
+    let events: Vec<String> = lines()
+        .into_iter()
+        .filter(|l| l.contains("events: "))
+        .collect();
+    assert_eq!(events.len(), 2, "one warning, one recovered: {events:?}");
+    assert!(events[1].contains("recovered"), "{events:?}");
 }
