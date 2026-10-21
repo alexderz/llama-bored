@@ -11,6 +11,7 @@ All notable changes to llama-bored. Versions follow
 - tty11's glance HOT rows list the sensors closest to or past their limits: past critical first, then past warning, then nearest below the warning point, with sensors that have no thresholds last and ties in panel order. They listed the ones furthest below it, so a critical sensor never showed while a cold one did (#173).
 - A HOT row that does not fit the glance drops its margin whole instead of showing a lone `+`, then shortens the sensor name, down to three characters, so the mark and the temperature are never cut: a six-character critical sensor at 100 C or more no longer reads `10` on a 160-column screen (#173).
 - tty11 no longer crashes on a temperature sensor whose label or rename has non-ASCII characters (such as `é`): the glance's HOT row cut names to six bytes, which could split a character; it now cuts six characters (#173).
+- The big rate digits' 7 has a straight right-hand stem again; the stepped 7 from #163 read as broken (#175).
 
 ## 0.7.0 — 2026-10-21
 
