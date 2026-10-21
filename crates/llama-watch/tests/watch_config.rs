@@ -107,6 +107,13 @@ fn packaged_example_parses_and_validates() {
     assert_eq!(cfg.tty.chart_glyphs, ChartGlyphs::Eighths);
     let mut same = (*cfg).clone();
     same.tty.chart_glyphs = ChartGlyphs::Halves;
+    // #163: the example hides junk sensors. The code default stays empty
+    // so a config that never sets `block` is unchanged.
+    assert_eq!(
+        cfg.temps.block,
+        vec!["nvme*:Sensor *".to_owned(), "nct*:AUXTIN2".to_owned(),]
+    );
+    same.temps.block.clear();
     assert_eq!(same, Config::default());
 
     let err = Config::load_validated(&path, 7).expect_err("cpu_top_k 8 is above nproc 7");
@@ -306,6 +313,7 @@ enum Rule {
     OutputTail,
     GenCeiling,
     PromptCeiling,
+    RateCeiling,
     ChartBucket,
     CtxHistory,
     AliasCount,
@@ -346,6 +354,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::OutputTail { .. }) => Rule::OutputTail,
         Err(InvalidWatchConfig::GenCeiling { .. }) => Rule::GenCeiling,
         Err(InvalidWatchConfig::PromptCeiling { .. }) => Rule::PromptCeiling,
+        Err(InvalidWatchConfig::RateCeiling { .. }) => Rule::RateCeiling,
         Err(InvalidWatchConfig::ChartBucket { .. }) => Rule::ChartBucket,
         Err(InvalidWatchConfig::CtxHistory { .. }) => Rule::CtxHistory,
         Err(InvalidWatchConfig::AliasCount { .. }) => Rule::AliasCount,

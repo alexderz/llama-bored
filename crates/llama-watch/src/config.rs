@@ -183,6 +183,14 @@ pub enum InvalidWatchConfig {
         /// Offending ceiling.
         gen_ceiling_tps: f64,
     },
+    /// `tty.disk_ceiling_bps` or `tty.net_ceiling_bps` is not a usable rate.
+    #[error("tty.{field} {bps} must be finite and in 1e6..=1e12")]
+    RateCeiling {
+        /// `disk_ceiling_bps` or `net_ceiling_bps`.
+        field: &'static str,
+        /// Offending bytes/s.
+        bps: f64,
+    },
     /// `tty.chart_bucket_s` is outside 1..=60.
     #[error("tty.chart_bucket_s {chart_bucket_s} is outside 1..=60")]
     ChartBucket {
@@ -535,6 +543,15 @@ pub struct Tty {
     /// kernel's colours (one `ESC ] R` at start).
     #[serde(default)]
     pub palette: Palette,
+    /// Three-decade disk bar ceiling, bytes/s. 7e9 makes 12 MB/s of writes
+    /// a visible bar on a 7 GB/s disk.
+    #[serde(default = "defaults::disk_ceiling_bps")]
+    pub disk_ceiling_bps: f64,
+    /// NET bar ceiling, bytes/s. Unset sums the speeds of the physical
+    /// links that are up (1 Gbit for one without a positive speed), or
+    /// 1 Gbit when none is up.
+    #[serde(default)]
+    pub net_ceiling_bps: Option<f64>,
 }
 
 /// `tty.font`: which bundled Hack console font tty11 loads. All three have
@@ -1264,6 +1281,9 @@ mod defaults {
     pub(super) fn gen_ceiling_tps() -> f64 {
         250.0
     }
+    pub(super) fn disk_ceiling_bps() -> f64 {
+        7e9
+    }
     pub(super) fn prompt_ceiling_tps() -> f64 {
         1500.0
     }
@@ -1372,6 +1392,8 @@ impl Default for Tty {
             font: TtyFont::default(),
             size: None,
             palette: Palette::default(),
+            disk_ceiling_bps: defaults::disk_ceiling_bps(),
+            net_ceiling_bps: None,
         }
     }
 }
@@ -1541,6 +1563,16 @@ impl Config {
             || prompt_ceiling_tps > MAX_RATE_CEILING_TPS
         {
             return Err(InvalidWatchConfig::PromptCeiling { prompt_ceiling_tps });
+        }
+        for (field, bps) in [
+            ("disk_ceiling_bps", Some(self.tty.disk_ceiling_bps)),
+            ("net_ceiling_bps", self.tty.net_ceiling_bps),
+        ] {
+            if let Some(bps) = bps
+                && (!bps.is_finite() || !(1e6..=1e12).contains(&bps))
+            {
+                return Err(InvalidWatchConfig::RateCeiling { field, bps });
+            }
         }
         let chart_bucket_s = self.tty.chart_bucket_s;
         if !(1..=60).contains(&chart_bucket_s) {

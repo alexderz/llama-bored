@@ -1066,16 +1066,15 @@ fn ceiling_rate_caps_the_bar_and_the_digits() {
     let mut model = sample(WatchState::Generating);
     model.gen_tps = Some(300.0);
     let grid = draw(&model, 240, 67);
+    // 240x67 is a short screen: the rate bar is a lower-half cell so it
+    // cannot bridge the blank rows above and below it.
     let row = (0..grid.rows())
-        .find(|row| {
-            let ch = grid.get(2, *row).unwrap().ch;
-            ch == '▐'
-        })
+        .find(|row| grid.get(2, *row).unwrap().ch == '▄')
         .expect("GEN bar");
     assert_eq!(grid.get(2, row).unwrap().fg, C16::Blue, "bar starts cold");
     let last = (2..28)
         .rev()
-        .find(|col| matches!(grid.get(*col, row).unwrap().ch, '█' | '▌' | '▐'))
+        .find(|col| matches!(grid.get(*col, row).unwrap().ch, '█' | '▄'))
         .expect("bar end");
     assert_eq!(
         fg_sgr(grid.get(last, row).unwrap().fg),
@@ -2264,6 +2263,16 @@ fn sample(state: WatchState) -> TtyModel {
         model_id: String::new(),
         claims: Vec::new(),
         now: UNIX_EPOCH,
+        disk_read_bps: None,
+        disk_write_bps: None,
+        net_rx_bps: None,
+        net_tx_bps: None,
+        net_ceiling_bps: None,
+        swap_used_gb: None,
+        swap_total_gb: None,
+        io_psi: None,
+        mem_psi: None,
+        disk_ceiling_bps: 7e9,
         tz_offset_s: 0,
     }
 }
@@ -4699,7 +4708,10 @@ fn setup_block_sits_under_single_spaced_meters_at_160x49() {
 
 #[test]
 fn single_spaced_meters_use_a_short_block_in_whole_cells() {
-    for (glyphs, glyph) in [(ChartGlyphs::Eighths, '▇'), (ChartGlyphs::Halves, '▄')] {
+    // #163: both fonts use a lower-half cell on a short screen. The
+    // seven-eighths block is nearly full height and stacked meters merge.
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        let glyph = '▄';
         let mut model = setup_model();
         model.chart_glyphs = glyphs;
         model.cpu_pct = Some(50.0);
@@ -7497,14 +7509,12 @@ fn skeleton_frames_at_the_four_sizes_and_the_phone_crop() {
         let at = format!("{cols}x{rows}");
         assert_blank_edges(&grid);
         assert_eq!((grid.cols(), grid.rows()), (cols, rows), "{at}");
-        // GEN "54.2" and PROMPT "1212" occupy different columns on row 3.
+        // GEN "54.2" starts on column 2. PROMPT "1212" fits at pixel width 2
+        // inside its 30 columns: digit 1 is `..#`, so columns 32-35 are
+        // blank and the stem is column 36.
         assert_eq!(grid.get(2, 3).unwrap().ch, '█', "{at}: GEN digit");
-        assert_eq!(
-            grid.get(32, 3).unwrap().ch,
-            ' ',
-            "{at}: PROMPT leading blank of 1"
-        );
-        assert_eq!(grid.get(34, 3).unwrap().ch, '█', "{at}: PROMPT digit");
+        assert_eq!(grid.get(32, 3).unwrap().ch, ' ', "{at}: PROMPT digit 1");
+        assert_eq!(grid.get(36, 3).unwrap().ch, '█', "{at}: PROMPT digit");
         let all = whole(&grid);
         assert!(all.contains("ACTIVITY") && all.contains("LOAD"), "{at}");
         assert!(!all.contains("prompt processing (prefill)"), "{at}");
@@ -7604,4 +7614,669 @@ fn skeleton_frames_at_the_four_sizes_and_the_phone_crop() {
         "gamma",
         "boundary space was not consumed"
     );
+}
+
+/// #163: short screens keep the rate digits, the half-height rate bars and
+/// the load-matrix meters from reading as one solid mass.
+#[test]
+fn short_rate_and_meter_bars_do_not_bridge() {
+    for (cols, rows) in [(213u16, 60u16), (192, 60)] {
+        let mut model = sample(WatchState::Generating);
+        // Eighths would previously draw meters as `▇`, nearly a full cell.
+        model.chart_glyphs = ChartGlyphs::Eighths;
+        model.gen_tps = Some(12_400.0);
+        model.prompt_tps = Some(8_888.0);
+        let grid = draw(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        let bar = rate_bar_row(&grid, &at);
+        assert_rate_gaps(&grid, bar, &at);
+        assert_k_suffix(&grid, bar, &at);
+        assert_digit_separation(&grid, bar, &at);
+        assert_meters_do_not_touch(&grid, &at);
+        assert_slot_bar_is_half(&grid, &at);
+    }
+
+    let tall = draw(&sample(WatchState::Generating), 320, 90);
+    let bot = (0..tall.rows())
+        .find(|row| (2..28).any(|col| tall.get(col, *row).unwrap().ch == '▓'))
+        .expect("tall rate bar");
+    assert!(
+        (2..28).any(|col| tall.get(col, bot - 1).unwrap().ch == '█'),
+        "tall rate bar stays full height"
+    );
+    assert!(
+        (2..28).any(|col| tall.get(col, bot - 2).unwrap().ch == '█'),
+        "tall digits stay against the rate bar"
+    );
+}
+
+fn span_text(grid: &llama_watch::tty::grid::Grid, row: u16, x: u16, width: u16) -> String {
+    (x..x + width)
+        .map(|col| grid.get(col, row).unwrap().ch)
+        .collect()
+}
+
+fn span_blank(grid: &llama_watch::tty::grid::Grid, row: u16, x: u16, width: u16) -> bool {
+    (x..x + width).all(|col| grid.get(col, row).unwrap().ch == ' ')
+}
+
+fn rate_bar_row(grid: &llama_watch::tty::grid::Grid, at: &str) -> u16 {
+    let mut found = Vec::new();
+    for row in 1..grid.rows() - 1 {
+        let gen_bar = span_text(grid, row, 2, 26);
+        let prompt_bar = span_text(grid, row, 32, 30);
+        if gen_bar.contains('▄')
+            && prompt_bar.contains('▄')
+            && !gen_bar.contains('█')
+            && !prompt_bar.contains('█')
+            && span_blank(grid, row - 1, 2, 26)
+            && span_blank(grid, row - 1, 32, 30)
+            && span_blank(grid, row + 1, 2, 26)
+            && span_blank(grid, row + 1, 32, 30)
+        {
+            found.push(row);
+        }
+    }
+    assert_eq!(found.len(), 1, "{at}: rate bar rows {found:?}");
+    found[0]
+}
+
+fn assert_rate_gaps(grid: &llama_watch::tty::grid::Grid, bar: u16, at: &str) {
+    for (x, width) in [(2u16, 26u16), (32, 30)] {
+        let text = span_text(grid, bar, x, width);
+        assert!(text.contains('▄'), "{at} {x}: {text}");
+        assert!(!text.contains('█'), "{at} {x}: {text}");
+        assert!(span_blank(grid, bar - 1, x, width), "{at} above {x}");
+        assert!(span_blank(grid, bar + 1, x, width), "{at} below {x}");
+    }
+    let scale = span_text(grid, bar + 2, 2, 26);
+    assert!(
+        scale.chars().any(|ch| ch.is_ascii_digit()),
+        "{at}: scale moved onto the blank row: {scale:?}"
+    );
+}
+
+fn assert_k_suffix(grid: &llama_watch::tty::grid::Grid, bar: u16, at: &str) {
+    let base = bar - 2;
+    let mut cols = Vec::new();
+    for col in 2..28 {
+        if grid.get(col, base).unwrap().ch == 'k' {
+            cols.push(col);
+        }
+    }
+    assert_eq!(cols.len(), 1, "{at}: k columns {cols:?}");
+    let col = cols[0];
+    assert_eq!(grid.get(col - 1, base).unwrap().ch, ' ', "{at}");
+    for above in 1..5 {
+        assert_eq!(
+            grid.get(col, base - above).unwrap().ch,
+            ' ',
+            "{at}: k is a block glyph"
+        );
+    }
+}
+
+fn ink_gaps(text: &str) -> Vec<usize> {
+    let mut gaps = Vec::new();
+    let mut seen_ink = false;
+    let mut in_ink = false;
+    let mut gap = 0usize;
+    for ch in text.chars() {
+        if ch == '█' {
+            if seen_ink && !in_ink {
+                gaps.push(gap);
+            }
+            seen_ink = true;
+            in_ink = true;
+            gap = 0;
+        } else if seen_ink {
+            in_ink = false;
+            gap += 1;
+        }
+    }
+    gaps
+}
+
+fn assert_digit_separation(grid: &llama_watch::tty::grid::Grid, bar: u16, at: &str) {
+    let base = bar - 2;
+    let prompt = span_text(grid, base, 32, 30);
+    let gaps = ink_gaps(&prompt);
+    assert!(
+        gaps.len() >= 3 && gaps.iter().all(|gap| *gap >= 2),
+        "{at}: prompt digit gaps {gaps:?} in {prompt:?}"
+    );
+    let gen_last = (2..32)
+        .rev()
+        .find(|col| grid.get(*col, base).unwrap().ch == '█')
+        .expect("gen ink");
+    let prompt_first = (32..64)
+        .find(|col| grid.get(*col, base).unwrap().ch == '█')
+        .expect("prompt ink");
+    assert!(
+        prompt_first - gen_last > 3,
+        "{at}: fewer than three blank columns between gen ending {gen_last} and prompt starting {prompt_first}"
+    );
+}
+
+fn right_meter_bar(grid: &llama_watch::tty::grid::Grid, label: &str) -> (u16, Vec<(u16, char)>) {
+    let mut hits = Vec::new();
+    for row in 0..grid.rows() {
+        let text = row_string(grid, row);
+        let Some(byte) = text.find(label) else {
+            continue;
+        };
+        let col = u16::try_from(text[..byte].chars().count()).unwrap();
+        if col <= grid.cols() / 2 {
+            continue;
+        }
+        let start = col + u16::try_from(label.chars().count()).unwrap();
+        let mut run = Vec::new();
+        for c in start..grid.cols() - 1 {
+            let ch = grid.get(c, row).unwrap().ch;
+            if matches!(ch, '▄' | '█' | '▇' | '▓' | '▐' | '▌' | '·') {
+                run.push((c, ch));
+            } else if !run.is_empty() {
+                break;
+            }
+        }
+        if run.iter().any(|(_, ch)| matches!(*ch, '▄' | '█' | '▇')) {
+            hits.push((row, run));
+        }
+    }
+    assert_eq!(hits.len(), 1, "{label} bars: {}", hits.len());
+    hits.pop().unwrap()
+}
+
+fn assert_meters_do_not_touch(grid: &llama_watch::tty::grid::Grid, at: &str) {
+    let (activity, activity_bar) = right_meter_bar(grid, "ACTIVITY");
+    let (load, load_bar) = right_meter_bar(grid, "LOAD");
+    assert_eq!(load, activity + 1, "{at}: meters are not stacked");
+    for (name, bar) in [("ACTIVITY", &activity_bar), ("LOAD", &load_bar)] {
+        assert!(
+            bar.iter().any(|(_, ch)| *ch == '▄'),
+            "{at} {name} has no half block: {bar:?}"
+        );
+        assert!(
+            bar.iter()
+                .all(|(_, ch)| !matches!(*ch, '█' | '▇' | '▓' | '▐' | '▌')),
+            "{at} {name} still full height: {bar:?}"
+        );
+    }
+    let load_at: std::collections::HashMap<u16, char> = load_bar.iter().copied().collect();
+    let shared: Vec<(char, char)> = activity_bar
+        .iter()
+        .filter_map(|(col, ch)| load_at.get(col).map(|below| (*ch, *below)))
+        .filter(|(above, below)| *above == '▄' && *below == '▄')
+        .collect();
+    assert!(
+        !shared.is_empty(),
+        "{at}: adjacent meters do not share a lit column"
+    );
+    assert!(
+        shared
+            .iter()
+            .all(|(above, below)| *above == '▄' && *below == '▄'),
+        "{at}: stacked meters touch: {shared:?}"
+    );
+}
+
+fn assert_slot_bar_is_half(grid: &llama_watch::tty::grid::Grid, at: &str) {
+    let row = row_with(grid, "s0 gen");
+    let col = col_of(grid, row, "s0 gen") + u16::try_from("s0 gen".chars().count()).unwrap();
+    let mut cells = Vec::new();
+    for c in col..grid.cols() / 2 {
+        let ch = grid.get(c, row).unwrap().ch;
+        if matches!(ch, '▄' | '█' | '▇' | '·' | '▐' | '▌') {
+            cells.push(ch);
+        } else if !cells.is_empty() {
+            break;
+        }
+    }
+    assert!(cells.contains(&'▄'), "{at}: slot bar {cells:?}");
+    assert!(!cells.contains(&'█'), "{at}: slot bar {cells:?}");
+    // The ctx meter on the same row stacks with the next slot's too.
+    let text = row_string(grid, row);
+    assert!(
+        !text.contains('▇') && !text.contains('█'),
+        "{at}: a full-height bar on the slot row: {text}"
+    );
+}
+
+/// The blank rows around the short rate bar are paid for by IN/OUT. A
+/// screen too short to spare them keeps every SLOTS and SETUP row it had.
+#[test]
+fn short_screens_keep_slots_and_setup() {
+    for cols in [160u16, 213] {
+        for rows in 26u16..=89 {
+            let grid = draw(&sample(WatchState::Generating), cols, rows);
+            let text: String = (0..grid.rows())
+                .map(|row| row_string(&grid, row) + "\n")
+                .collect();
+            let at = format!("{cols}x{rows}");
+            assert!(text.contains("SLOTS"), "{at}: no SLOTS header\n{text}");
+            assert!(text.contains("s0 gen"), "{at}: no s0 row\n{text}");
+            if rows == 26 || rows >= 45 {
+                assert!(text.contains("SETUP"), "{at}: no SETUP\n{text}");
+            }
+            if rows >= 45 {
+                assert!(text.contains("engine"), "{at}: no engine line\n{text}");
+            }
+        }
+    }
+}
+
+/// Two `--` placeholders on a tall screen are the same size, although
+/// PROMPT has four more columns than GEN.
+#[test]
+fn rate_placeholders_match_in_size() {
+    let grid = draw(&sample(WatchState::AiDown), 213, 135);
+    // The digit rows only: row 2 is the label, the tall digits are 10 rows.
+    let ink = |from: u16, to: u16| {
+        (3..13u16)
+            .flat_map(|row| (from..to).map(move |col| (col, row)))
+            .filter(|(col, row)| grid.get(*col, *row).unwrap().ch == '█')
+            .count()
+    };
+    let gen_ink = ink(2, 30);
+    let prompt_ink = ink(32, 64);
+    assert!(gen_ink > 0, "GEN placeholder drawn");
+    assert_eq!(gen_ink, prompt_ink, "GEN and PROMPT `--` differ in size");
+}
+
+fn with_host_rates(zero: bool) -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    if zero {
+        model.disk_read_bps = Some(0.0);
+        model.disk_write_bps = Some(0.0);
+        model.net_rx_bps = Some(0.0);
+        model.net_tx_bps = Some(0.0);
+        model.io_psi = Some(0.0);
+        model.mem_psi = Some(0.0);
+        model.swap_used_gb = Some(0.0);
+        model.swap_total_gb = Some(16.0);
+    } else {
+        model.disk_read_bps = Some(1.8e9);
+        model.disk_write_bps = Some(12e6);
+        model.net_rx_bps = Some(100e6);
+        model.net_tx_bps = Some(18e6);
+        model.io_psi = Some(1.1);
+        model.mem_psi = Some(0.0);
+        model.swap_used_gb = Some(0.4);
+        model.swap_total_gb = Some(16.0);
+    }
+    model.disk_ceiling_bps = 7e9;
+    model.net_ceiling_bps = Some(125_000_000.0);
+    model
+}
+
+/// #163 step 2: 12 MB/s of writes is a lit cell on a 7 GB/s ceiling, and a
+/// real zero is an empty track rather than a dash.
+#[test]
+fn host_meters_show_non_zero_and_zero_byte_rates() {
+    let grid = draw(&with_host_rates(false), 192, 60);
+    let read = row_string(&grid, meter_row(&grid, "DISK R"));
+    let write = row_string(&grid, meter_row(&grid, "DISK W"));
+    let net = row_string(&grid, meter_row(&grid, "NET"));
+    let psi = row_string(&grid, meter_row(&grid, "IO PSI"));
+    let swap = row_string(&grid, meter_row(&grid, "SWAP"));
+    assert!(read.contains("1.8 G/s"), "{read}");
+    assert!(write.contains("12 M/s"), "{write}");
+    assert!(net.contains("118 M/s"), "{net}");
+    assert!(psi.contains("1.1 %"), "{psi}");
+    assert!(swap.contains("0.4/16.0G"), "{swap}");
+    let write_row = meter_row(&grid, "DISK W");
+    let col = meter_bar_col(&grid, write_row, "DISK W");
+    assert_eq!(
+        grid.get(col, write_row).unwrap().ch,
+        '▄',
+        "12 MB/s must light the write bar"
+    );
+    // Below the three-decade floor the start cell still lights.
+    let mut tiny = with_host_rates(false);
+    tiny.disk_read_bps = Some(100.0);
+    let grid = draw(&tiny, 192, 60);
+    let row = meter_row(&grid, "DISK R");
+    let col = meter_bar_col(&grid, row, "DISK R");
+    assert_eq!(
+        grid.get(col, row).unwrap().ch,
+        '▄',
+        "a non-zero trickle lights"
+    );
+
+    let grid = draw(&with_host_rates(true), 192, 60);
+    let write_row = meter_row(&grid, "DISK W");
+    let write = row_string(&grid, write_row);
+    assert!(write.contains("0 B/s"), "{write}");
+    let col = meter_bar_col(&grid, write_row, "DISK W");
+    assert_eq!(
+        grid.get(col, write_row).unwrap().ch,
+        '·',
+        "zero is an empty track"
+    );
+    let net = row_string(&grid, meter_row(&grid, "NET"));
+    assert!(net.contains("0 B/s"), "{net}");
+    let psi = row_string(&grid, meter_row(&grid, "IO PSI"));
+    assert!(psi.contains("0.0 %"), "{psi}");
+}
+
+#[test]
+fn absent_host_meters_leave_the_step1_matrix() {
+    let grid = draw(&sample(WatchState::Generating), 192, 60);
+    let text = whole(&grid);
+    assert!(!text.contains("DISK R"), "{text}");
+    assert!(!text.contains("IO PSI"), "{text}");
+}
+
+#[test]
+fn memory_pressure_turns_the_swap_label_yellow() {
+    let mut model = with_host_rates(false);
+    model.mem_psi = Some(2.5);
+    let grid = draw(&model, 192, 60);
+    let (row, col) = label_hit(&grid, "SWAP");
+    assert_eq!(grid.get(col, row).unwrap().fg, C16::Yellow);
+    model.mem_psi = Some(0.0);
+    let grid = draw(&model, 192, 60);
+    let (row, col) = label_hit(&grid, "SWAP");
+    assert_eq!(grid.get(col, row).unwrap().fg, C16::White);
+}
+
+#[test]
+fn glance_rows_show_disk_and_net_from_the_same_reading() {
+    let grid = draw(&with_host_rates(false), 192, 60);
+    let disk: String = (64..96).map(|col| grid.get(col, 6).unwrap().ch).collect();
+    let net: String = (64..96).map(|col| grid.get(col, 7).unwrap().ch).collect();
+    let vram: String = (64..96).map(|col| grid.get(col, 3).unwrap().ch).collect();
+    assert!(disk.starts_with("DISK R 1.8 G/s"), "{disk}");
+    assert!(disk.contains("12 M/s"), "{disk}");
+    assert!(net.starts_with("NET  118 M/s"), "{net}");
+    assert!(vram.contains("SWAP 0.4G"), "{vram}");
+}
+
+fn glance_rows(grid: &llama_watch::tty::grid::Grid, cols: std::ops::Range<u16>) -> Vec<String> {
+    (2..10)
+        .map(|row| {
+            cols.clone()
+                .map(|col| grid.get(col, row).unwrap().ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// #163: the narrow glance (160 columns) is the approved compact frame,
+/// one fact a row, all inside the 80x28 phone crop: GPU, VRAM, two HOT,
+/// DISK, NET, CPU, ACT. LOAD keeps its meter on the right.
+#[test]
+fn narrow_glance_is_the_approved_compact_frame() {
+    for rows in [26u16, 48] {
+        let grid = draw(&with_host_rates(false), 160, rows);
+        let glance = glance_rows(&grid, 64..80);
+        for (row, label) in [
+            (0, "GPU "),
+            (1, "VRAM "),
+            (2, "HOT"),
+            (4, "DISK 1.8 G/s"),
+            (5, "NET 118 M/s"),
+            (6, "CPU "),
+            (7, "ACT "),
+        ] {
+            assert!(
+                glance[row].starts_with(label),
+                "160x{rows} glance row {row}: {glance:?}"
+            );
+        }
+        let text = whole(&grid);
+        assert!(text.contains("LOAD"), "{text}");
+        // The second hottest sensor sits under the first, as in the mock-up.
+        let mut hot = with_host_rates(false);
+        hot.temps = temps_model().temps;
+        let hot_rows = glance_rows(&draw(&hot, 160, rows), 64..80);
+        let second = &hot_rows[3];
+        assert!(
+            second.starts_with("    ") && !second.trim().is_empty(),
+            "160x{rows}: {hot_rows:?}"
+        );
+        // The rate digits stay in the crop beside the glance.
+        let lit = |cols: std::ops::Range<u16>| {
+            (3..8).any(|row| {
+                cols.clone()
+                    .any(|col| grid.get(col, row).unwrap().ch == '█')
+            })
+        };
+        assert!(lit(2..28), "GEN digits");
+        assert!(lit(32..62), "PROMPT digits");
+    }
+}
+
+#[test]
+fn health_line_shows_disk_net_and_psi() {
+    let mut model = sample(WatchState::Generating);
+    for (name, status) in [
+        ("disk", HealthStatus::Ok),
+        ("net", HealthStatus::Ok),
+        ("psi", HealthStatus::Ok),
+    ] {
+        model.health.push(HealthSeg {
+            name: name.to_owned(),
+            status,
+            note: String::new(),
+        });
+    }
+    let row = row_string(&draw(&model, 240, 67), 65);
+    assert!(row.contains("disk ok"), "{row}");
+    assert!(row.contains("net ok"), "{row}");
+    assert!(row.contains("psi ok"), "{row}");
+
+    model.health.last_mut().unwrap().status = HealthStatus::Down;
+    let row = row_string(&draw(&model, 240, 67), 65);
+    assert!(row.contains("psi DOWN"), "{row}");
+}
+
+/// The new host meters must not push the frame past the 160x26 floor. They
+/// appear only once a reading exists, so the step-1 floor test does not
+/// cover this: draw with real disk, net, PSI and swap values present.
+#[test]
+fn host_meters_fit_the_160x26_floor() {
+    for (cols, rows) in [(160, 26), (160, 48), (192, 60), (213, 60)] {
+        let grid = draw(&with_host_rates(false), cols, rows);
+        let text: String = (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| grid.get(col, row).unwrap().ch)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("too small"),
+            "{cols}x{rows} with host rates must draw, got:\n{text}"
+        );
+    }
+}
+
+/// The tail of the health line with a long snapshot number and uptime.
+fn long_tail(model: &mut TtyModel) -> String {
+    model.snapshot = Some(123_456_789);
+    model.snapshot_age = "12.3s".to_string();
+    model.errors = 12_345;
+    model.uptime = "123d04h12m".to_string();
+    "snapshot #123456789 12.3s   errors 12345   up 123d04h12m".to_string()
+}
+
+fn all_down() -> Vec<HealthSeg> {
+    [
+        "llama-swap",
+        "/running",
+        "/slots",
+        "metrics",
+        "activity",
+        "nvml",
+        "hwmon",
+        "proc",
+        "disk",
+        "net",
+        "psi",
+    ]
+    .into_iter()
+    .map(|name| HealthSeg {
+        name: name.to_owned(),
+        status: HealthStatus::Down,
+        note: if name == "llama-swap" {
+            "refused".to_owned()
+        } else {
+            String::new()
+        },
+    })
+    .collect()
+}
+
+fn with_host_health(disk: HealthStatus, net: HealthStatus, psi: HealthStatus) -> TtyModel {
+    let mut model = sample(WatchState::Generating);
+    for (name, status) in [("disk", disk), ("net", net), ("psi", psi)] {
+        model.health.push(HealthSeg {
+            name: name.to_owned(),
+            status,
+            note: String::new(),
+        });
+    }
+    model
+}
+
+/// #163 M2: at every width from 160 to 480 the words stop at least two
+/// columns before the tail, and every DOWN source stays readable.
+#[test]
+fn health_line_never_overprints_its_tail_and_keeps_every_down() {
+    let mut down = sample(WatchState::AiDown);
+    down.health = all_down();
+    let models = [
+        down,
+        with_host_health(HealthStatus::Ok, HealthStatus::Ok, HealthStatus::Ok),
+        with_host_health(HealthStatus::Down, HealthStatus::Ok, HealthStatus::Down),
+    ];
+    for mut model in models {
+        let tail = long_tail(&mut model);
+        for cols in 160..=480u16 {
+            let grid = draw(&model, cols, 48);
+            let row = row_string(&grid, 46);
+            let at = format!("{cols}: {row}");
+            assert!(row.ends_with(&tail), "{at}");
+            let words = &row[..row.len() - tail.len()];
+            assert!(words.ends_with("  "), "{at}");
+            let tokens: Vec<&str> = words.split_whitespace().collect();
+            for seg in model
+                .health
+                .iter()
+                .filter(|s| s.status == HealthStatus::Down)
+            {
+                assert!(
+                    tokens.contains(&seg.name.as_str()),
+                    "{} hidden at {at}",
+                    seg.name
+                );
+            }
+            assert!(
+                tokens.contains(&"DOWN")
+                    || !model.health.iter().any(|s| s.status == HealthStatus::Down),
+                "{at}"
+            );
+        }
+    }
+}
+
+#[test]
+fn health_line_sheds_healthy_words_before_down_ones_at_160_192_and_213() {
+    let mut model = with_host_health(HealthStatus::Down, HealthStatus::Ok, HealthStatus::Down);
+    let row = row_string(&draw(&model, 160, 26), 24);
+    assert!(
+        row.contains("disk DOWN") && row.contains("psi DOWN"),
+        "{row}"
+    );
+    assert!(
+        row.starts_with("  llama-swap ok 3ms"),
+        "healthy words lead: {row}"
+    );
+
+    model.health = all_down();
+    let tail = long_tail(&mut model);
+    for (cols, rows) in [(160u16, 26u16), (192, 60), (213, 60)] {
+        let row = row_string(&draw(&model, cols, rows), rows - 2);
+        let at = format!("{cols}x{rows}: {row}");
+        assert!(row.ends_with(&tail), "{at}");
+        if cols == 213 {
+            // Room for every word once the note is dropped.
+            assert!(row.contains("disk DOWN   net DOWN   psi DOWN"), "{at}");
+            assert!(!row.contains("refused"), "{at}");
+        } else {
+            // One DOWN badge, then the names.
+            assert!(
+                row.contains(
+                    "DOWN llama-swap /running /slots metrics activity nvml hwmon proc disk net psi"
+                ),
+                "{at}"
+            );
+        }
+    }
+}
+
+/// #163 M3: at 90 rows and more the meters are two rows tall with a gap,
+/// and NET and IO PSI still fit above TEMPS: SWAP sits beside POWER.
+#[test]
+fn host_meters_show_on_tall_screens() {
+    for (cols, rows) in [(213u16, 90u16), (240, 100), (213, 60), (160, 26)] {
+        let grid = draw(&with_host_rates(false), cols, rows);
+        let at = format!("{cols}x{rows}");
+        for label in ["SWAP", "DISK R", "DISK W", "NET", "IO PSI"] {
+            let row = meter_row(&grid, label);
+            assert!(row < timeline_rule(&grid), "{at}: {label}");
+        }
+        assert_eq!(meter_row(&grid, "SWAP"), meter_row(&grid, "POWER"), "{at}");
+        assert!(meter_row(&grid, "DISK R") < meter_row(&grid, "NET"), "{at}");
+    }
+}
+
+fn disk_read_cells(bps: f64) -> (usize, usize) {
+    let mut model = with_host_rates(false);
+    model.disk_read_bps = Some(bps);
+    let grid = draw(&model, 192, 60);
+    let row = meter_row(&grid, "DISK R");
+    let col = meter_bar_col(&grid, row, "DISK R");
+    let cells: Vec<char> = (col..grid.cols())
+        .map(|c| grid.get(c, row).unwrap().ch)
+        .take_while(|ch| matches!(ch, '▄' | '·'))
+        .collect();
+    (cells.iter().filter(|ch| **ch == '▄').count(), cells.len())
+}
+
+/// #163 M11: the disk bar spans three decades: the ceiling fills it, a
+/// tenth of it fills two thirds, a hundredth one third.
+#[test]
+fn byte_rate_bars_span_three_decades() {
+    for (bps, frac) in [(7e9, 1.0), (7e8, 2.0 / 3.0), (7e7, 1.0 / 3.0)] {
+        let (lit, width) = disk_read_cells(bps);
+        let want = frac * width as f64;
+        assert!(
+            (lit as f64 - want).abs() <= 1.0,
+            "{bps} B/s lit {lit} of {width}, want {want:.1}"
+        );
+    }
+}
+
+/// The unit is picked after rounding: nothing reads `1000 K/s`.
+#[test]
+fn byte_rates_roll_over_to_the_next_unit() {
+    for (bps, text) in [
+        (999.6, "1.0 K/s"),
+        (9_960.0, "10 K/s"),
+        (999_600.0, "1.0 M/s"),
+        (999.6e6, "1.0 G/s"),
+        (999.4e6, "999 M/s"),
+        (12.0, "12 B/s"),
+    ] {
+        let mut model = with_host_rates(false);
+        model.disk_read_bps = Some(bps);
+        let grid = draw(&model, 192, 60);
+        let row = row_string(&grid, meter_row(&grid, "DISK R"));
+        assert!(row.contains(&format!("DISK R {text} ")), "{bps}: {row}");
+    }
 }

@@ -23,6 +23,15 @@ fn host_ok() -> Host {
         vram_total_bytes: None,
         mem_used_bytes: None,
         mem_total_bytes: None,
+        disk_read_bps: None,
+        disk_write_bps: None,
+        net_rx_bps: None,
+        net_tx_bps: None,
+        io_psi_pct: None,
+        mem_psi_pct: None,
+        cpu_psi_pct: None,
+        swap_used_bytes: None,
+        swap_total_bytes: None,
     }
 }
 
@@ -206,6 +215,15 @@ fn valid_snapshot_round_trips() {
         vram_total_bytes: None,
         mem_used_bytes: None,
         mem_total_bytes: None,
+        disk_read_bps: None,
+        disk_write_bps: None,
+        net_rx_bps: None,
+        net_tx_bps: None,
+        io_psi_pct: None,
+        mem_psi_pct: None,
+        cpu_psi_pct: None,
+        swap_used_bytes: None,
+        swap_total_bytes: None,
     };
     empty.tokens.decoded_total = None;
     let bytes = to_json(&empty).expect("encode");

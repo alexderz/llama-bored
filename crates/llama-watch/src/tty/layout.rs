@@ -297,6 +297,27 @@ pub struct TtyModel {
     pub now: SystemTime,
     /// Seconds east of UTC, for a hold's `until HH:MM` in local time.
     pub tz_offset_s: i32,
+
+    /// Whole-disk read bytes/s. `None` until two diskstats samples.
+    pub disk_read_bps: Option<f64>,
+    /// Whole-disk write bytes/s.
+    pub disk_write_bps: Option<f64>,
+    /// Physical-interface receive bytes/s.
+    pub net_rx_bps: Option<f64>,
+    /// Physical-interface transmit bytes/s.
+    pub net_tx_bps: Option<f64>,
+    /// NET bar ceiling, bytes/s. Link speed, or `[tty] net_ceiling_bps`.
+    pub net_ceiling_bps: Option<f64>,
+    /// Swap in use, GiB. `None` when meminfo has no swap pair.
+    pub swap_used_gb: Option<f64>,
+    /// Swap total, GiB.
+    pub swap_total_gb: Option<f64>,
+    /// IO PSI `some` avg10, percent.
+    pub io_psi: Option<f64>,
+    /// Memory PSI `some` avg10, percent. Above zero turns the SWAP label warn.
+    pub mem_psi: Option<f64>,
+    /// Three-decade disk bar ceiling, bytes/s (`[tty] disk_ceiling_bps`).
+    pub disk_ceiling_bps: f64,
 }
 
 /// One model claim as the header draws it (#128).
@@ -458,6 +479,9 @@ struct Geom {
     /// Paint the `SLOTS` label row. A short top band skips it so the rows
     /// themselves still fit.
     slot_header: bool,
+    /// Blank rows above and below a short rate bar: 1 only when the band
+    /// reserved them (`reserve_headline_gaps`), else 0. Tall screens 0.
+    headline_gap: u16,
 }
 
 impl Geom {
@@ -501,6 +525,7 @@ impl Geom {
             slot_decoded,
             slot_limit: u16::MAX,
             slot_header: true,
+            headline_gap: 0,
         }
     }
 
@@ -518,9 +543,11 @@ impl Geom {
         self.left_bar + self.left_bar_w - 1
     }
 
-    /// Single-spaced meters draw whole cells of a short block (#52).
+    /// Single-spaced meters draw a lower-half cell. A full block, and the
+    /// seven-eighths block, bridge into the meter above and below (#163).
+    /// Tall screens keep two-row bars (`None`).
     fn meter_cells(&self, glyphs: ChartGlyphs) -> Option<char> {
-        (self.pitch == 1).then_some(meter_glyph(glyphs))
+        (self.pitch == 1).then_some(stacked_cell(self.tall, glyphs))
     }
 }
 
@@ -533,6 +560,17 @@ pub fn meter_glyph(glyphs: ChartGlyphs) -> char {
     match glyphs {
         ChartGlyphs::Eighths => '\u{2587}',
         ChartGlyphs::Halves => '\u{2584}',
+    }
+}
+
+/// Glyph for a one-row bar with another bar directly above or below.
+/// Short screens use the lower half so the rows do not bridge. Tall
+/// screens keep the font's meter glyph.
+fn stacked_cell(tall: bool, glyphs: ChartGlyphs) -> char {
+    if tall {
+        meter_glyph(glyphs)
+    } else {
+        '\u{2584}'
     }
 }
 
@@ -1610,7 +1648,7 @@ fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     let gen_top = rate_top(model.gen_tps, model.gen_ceiling);
     let prompt_top = rate_top(model.prompt_tps, model.prompt_ceiling);
     draw_rate_bar(
-        grid, g.right, bar_row, g.half, gen_frac, g.bar_rows, gen_top,
+        grid, g.right, bar_row, g.half, gen_frac, g.bar_rows, gen_top, None,
     );
     draw_rate_bar(
         grid,
@@ -1620,6 +1658,7 @@ fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         prompt_frac,
         g.bar_rows,
         prompt_top,
+        None,
     );
     let tick_row = bar_row + g.bar_rows;
     draw_ticks(grid, g.right, tick_row, g.half, model.gen_ceiling);
@@ -1678,10 +1717,71 @@ fn format_rate_digits(v: f64) -> String {
     format!("{:.1}", (v * 10.0).round() / 10.0)
 }
 
-/// Pixel columns of a big-digit string. A dot is one pixel; everything else
-/// is the 3-wide glyph plus its gap.
-fn rate_pixels(text: &str) -> u16 {
-    text.chars().map(|ch| if ch == '.' { 1 } else { 4 }).sum()
+/// A unit suffix (`k`, and any later unit) is ordinary text, not a 5-row glyph.
+fn is_unit_suffix(ch: char) -> bool {
+    !matches!(ch, '0'..='9' | '.' | '-')
+}
+
+enum RatePiece {
+    Glyph(&'static [&'static str]),
+    Dot,
+    /// Blank columns. At least two between digit glyphs; one before a suffix.
+    Gap(u16),
+    Suffix(String),
+}
+
+/// Glyphs, the gaps between them, and a trailing unit suffix.
+///
+/// Adjacent digit glyphs keep at least two blank columns. A dot keeps the
+/// gap that belongs to the glyph before it and one blank column before the
+/// next glyph.
+/// A suffix is one column after the last glyph, on the baseline.
+fn rate_pieces(text: &str, pw: u16) -> Vec<RatePiece> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces = Vec::new();
+    for (i, ch) in chars.iter().copied().enumerate() {
+        if is_unit_suffix(ch) {
+            if i > 0 {
+                pieces.push(RatePiece::Gap(1));
+            }
+            pieces.push(RatePiece::Suffix(chars[i..].iter().collect()));
+            break;
+        }
+        if i > 0 {
+            // One blank column after a dot, so the point does not fuse
+            // with the next digit.
+            let gap = if chars[i - 1] == '.' { 1 } else { pw.max(2) };
+            pieces.push(RatePiece::Gap(gap));
+        }
+        match ch {
+            '.' => pieces.push(RatePiece::Dot),
+            '0'..='9' => {
+                pieces.push(RatePiece::Glyph(DIGITS[(ch as u8 - b'0') as usize]));
+            }
+            '-' => pieces.push(RatePiece::Glyph(DIGITS[10])),
+            _ => {}
+        }
+    }
+    pieces
+}
+
+fn rate_piece_cols(piece: &RatePiece, pw: u16) -> u16 {
+    match piece {
+        RatePiece::Glyph(_) => 3 * pw,
+        RatePiece::Dot => pw,
+        RatePiece::Gap(n) => *n,
+        RatePiece::Suffix(text) => u16::try_from(text.chars().count()).unwrap_or(u16::MAX),
+    }
+}
+
+/// Columns from the first glyph through the last ink or suffix cell.
+fn rate_columns(text: &str, pw: u16) -> u16 {
+    if pw == 0 {
+        return 0;
+    }
+    rate_pieces(text, pw).iter().fold(0u16, |sum, piece| {
+        sum.saturating_add(rate_piece_cols(piece, pw))
+    })
 }
 
 /// Largest pixel scale in `start, start/2, …, 1` whose digits fit in `avail`.
@@ -1689,10 +1789,9 @@ fn fit_pixel_for(start: u16, text: &str, avail: u16) -> u16 {
     if text.is_empty() || avail == 0 {
         return 0;
     }
-    let px = rate_pixels(text).max(1);
     let mut pw = start.max(1);
     loop {
-        if u32::from(pw) * u32::from(px) <= u32::from(avail) {
+        if rate_columns(text, pw) <= avail {
             return pw;
         }
         if pw == 1 {
@@ -1702,8 +1801,6 @@ fn fit_pixel_for(start: u16, text: &str, avail: u16) -> u16 {
     }
 }
 
-const DIGIT_K: &[&str] = &["#..", "#..", "##.", "#.#", "#.#"];
-
 /// Ramp position of a rate bar's right edge for the exact colours: full
 /// scale up to the ceiling, and past it the value's own position, the one
 /// the digits above the bar take (#123).
@@ -1711,6 +1808,7 @@ fn rate_top(value: Option<f64>, ceiling: f64) -> f32 {
     value.map_or(color::spectrum::FULL, |v| color::spectrum::rate(v, ceiling))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_rate_bar(
     grid: &mut Grid,
     x: u16,
@@ -1719,6 +1817,7 @@ fn draw_rate_bar(
     frac: Option<f64>,
     rows: u16,
     top: f32,
+    cells: Option<char>,
 ) {
     let hot = frac.is_some_and(|frac| frac >= 1.0);
     draw_h_bar(
@@ -1730,10 +1829,10 @@ fn draw_rate_bar(
             frac,
             ink: BarInk::Spectrum { hot, top },
             rows,
-            // #95: GENERATION and PROMPT each draw one isolated bar (the
-            // tick row sits right below, no other bar directly above or
-            // under it), so the half-cell caps may keep full height here.
-            cells: None,
+            // `Some('▄')` on a short screen: a lower-half cell, so the bar
+            // does not bridge the blank rows above and below it. `None`
+            // keeps the tall two-row bar (and the legacy half-cell caps).
+            cells,
         },
     );
 }
@@ -1785,16 +1884,21 @@ fn tick_label(v: f64) -> String {
 }
 
 const DIGITS: [&[&str]; 11] = [
-    &["###", "#.#", "#.#", "#.#", "###"],
+    // A ring, not a filled rectangle: open corners and a hole on every row.
+    &[".#.", "#.#", "#.#", "#.#", ".#."],
     &["..#", "..#", "..#", "..#", "..#"],
     &["###", "..#", "###", "#..", "###"],
-    &["###", "..#", "###", "..#", "###"],
+    // The middle bar stops short of the left edge so the two bowls stay apart.
+    &["###", "..#", ".##", "..#", "###"],
     &["#.#", "#.#", "###", "..#", "..#"],
     &["###", "#..", "###", "..#", "###"],
     &["###", "#..", "###", "#.#", "###"],
-    &["###", "..#", "..#", "..#", "..#"],
+    // Steps down to the left instead of a solid right-hand stem.
+    &["###", "..#", ".#.", ".#.", "#.."],
     &["###", "#.#", "###", "#.#", "###"],
-    &["###", "#.#", "###", "..#", "###"],
+    // A foot that curls left: not a full-width foot that blobs into the
+    // bowl, and not a straight stem that reads as 4.
+    &["###", "#.#", "###", "..#", ".##"],
     &["...", "...", "###", "...", "..."],
 ];
 
@@ -1839,61 +1943,48 @@ fn draw_digits(
         }
     };
     let mut cx = x;
-    for ch in text.chars() {
-        if ch == '.' {
-            // One font-pixel wide, on the baseline.
-            for dy in 0..ph {
-                for dx in 0..pw {
-                    let y = row + 4 * ph + dy;
-                    paint(grid, cx + dx, y, '█', body, C16::Black);
-                    if let Some(pos) = pos {
-                        let rows = 5 * usize::from(ph);
-                        let at = 4 * usize::from(ph) + usize::from(dy);
-                        grid.set_exact_fg(
-                            cx + dx,
-                            y,
-                            act_color(color::spectrum::shade(pos, at, rows)),
-                        );
+    for piece in rate_pieces(&text, pw) {
+        match piece {
+            RatePiece::Gap(n) => cx = cx.saturating_add(n),
+            RatePiece::Suffix(suffix) => {
+                // Baseline of the 5-row glyph. One blank column was already
+                // inserted; the suffix is normal text, not DIGIT_K.
+                let y = row + 5 * ph - 1;
+                let rows_n = 5 * usize::from(ph);
+                let exact =
+                    pos.map(|pos| act_color(color::spectrum::shade(pos, rows_n - 1, rows_n)));
+                for (i, ch) in suffix.chars().enumerate() {
+                    let col = cx + u16::try_from(i).unwrap_or(0);
+                    paint(grid, col, y, ch, body, C16::Black);
+                    if let Some(exact) = exact {
+                        grid.set_exact_fg(col, y, exact);
                     }
                 }
+                cx = cx.saturating_add(u16::try_from(suffix.chars().count()).unwrap_or(0));
             }
-            cx += pw;
-            continue;
-        }
-        let glyph = match ch {
-            '0'..='9' => DIGITS[(ch as u8 - b'0') as usize],
-            '-' => DIGITS[10],
-            'k' => DIGIT_K,
-            _ => continue,
-        };
-        for (py, bits) in glyph.iter().enumerate() {
-            // The top two pixel rows take the step's cap colour. Below the
-            // ceiling that colour is the same as the body.
-            let colour = if py < 2 { top } else { body };
-            for (px, bit) in bits.chars().enumerate() {
-                if bit != '#' {
-                    continue;
-                }
+            RatePiece::Dot => {
                 for dy in 0..ph {
                     for dx in 0..pw {
-                        let y = row + py as u16 * ph + dy;
-                        paint(grid, cx + px as u16 * pw + dx, y, '█', colour, C16::Black);
-                        // The top console row of the whole digit is 14 ramp
-                        // points above the value, the bottom row 14 below.
+                        let y = row + 4 * ph + dy;
+                        paint(grid, cx + dx, y, '█', body, C16::Black);
                         if let Some(pos) = pos {
-                            let rows = 5 * usize::from(ph);
-                            let at = py * usize::from(ph) + usize::from(dy);
+                            let rows_n = 5 * usize::from(ph);
+                            let at = 4 * usize::from(ph) + usize::from(dy);
                             grid.set_exact_fg(
-                                cx + px as u16 * pw + dx,
+                                cx + dx,
                                 y,
-                                act_color(color::spectrum::shade(pos, at, rows)),
+                                act_color(color::spectrum::shade(pos, at, rows_n)),
                             );
                         }
                     }
                 }
+                cx = cx.saturating_add(pw);
+            }
+            RatePiece::Glyph(glyph) => {
+                paint_digit_glyph(grid, cx, row, glyph, top, body, pos, pw, ph);
+                cx = cx.saturating_add(3 * pw);
             }
         }
-        cx += 3 * pw + pw;
     }
 }
 
@@ -2027,11 +2118,11 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 frac,
                 ink: BarInk::Fixed(fill, fill),
                 rows: 1,
-                // #95: slot rows stack with no blank row between. The
-                // half-cell caps (`▐`/`▌`) are full height and a solid `█`
-                // would merge with the row above or below, so this bar
-                // keeps #52's whole-cell glyph instead.
-                cells: Some(meter_glyph(model.chart_glyphs)),
+                // Short screens stack slot rows with no blank between
+                // them. A full cell would merge with the row above or
+                // below, so the bar is a lower-half cell. Tall screens
+                // keep the font's meter glyph.
+                cells: Some(stacked_cell(g.tall, model.chart_glyphs)),
             },
         );
         let (count, decoded, fg) = if slot.total == 0 && !slot.generating {
@@ -2053,7 +2144,7 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
         let decoded_w = u16::try_from(decoded.chars().count()).unwrap_or(u16::MAX);
         let after_decoded = g.slot_decoded.saturating_add(decoded_w);
         match &spark {
-            Some(plan) => paint_slot_spark(grid, row, after_decoded, plan, slot, model),
+            Some(plan) => paint_slot_spark(grid, row, after_decoded, plan, slot, model, g.tall),
             None => paint_slot_ctx(
                 grid,
                 row,
@@ -2061,6 +2152,7 @@ fn draw_slots(grid: &mut Grid, model: &TtyModel, g: &Geom) {
                 g.slot_right.saturating_add(2),
                 slot,
                 model.chart_glyphs,
+                g.tall,
             ),
         }
     }
@@ -2229,6 +2321,7 @@ fn paint_slot_spark(
     plan: &SparkPlan,
     slot: &Slot,
     model: &TtyModel,
+    tall: bool,
 ) {
     let shift = after_decoded.saturating_add(1).saturating_sub(plan.ctx_x);
     let x = plan.ctx_x.saturating_add(shift);
@@ -2249,8 +2342,8 @@ fn paint_slot_spark(
                 },
                 rows: 1,
                 // #95: one ctx meter per slot row, stacked with no blank
-                // row between, so it needs #52's whole-cell glyph too.
-                cells: Some(meter_glyph(model.chart_glyphs)),
+                // row between, so it takes the stacked glyph too.
+                cells: Some(stacked_cell(tall, model.chart_glyphs)),
             },
         );
     }
@@ -2380,6 +2473,7 @@ fn paint_slot_ctx(
     cols: u16,
     slot: &Slot,
     glyphs: ChartGlyphs,
+    tall: bool,
 ) {
     let right = usize::from(cols.saturating_sub(2));
     let left_limit = usize::from(after_decoded.saturating_add(1));
@@ -2438,7 +2532,7 @@ fn paint_slot_ctx(
                 },
                 rows: 1,
                 // #95: stacks with the slot rows above and below it.
-                cells: Some(meter_glyph(glyphs)),
+                cells: Some(stacked_cell(tall, glyphs)),
             },
         );
         meter_x.saturating_sub(gap + label_w)
@@ -4590,7 +4684,8 @@ fn draw_fan_row(
                 },
                 rows: 1,
                 // #95: one fan per row, stacked with no blank row between.
-                cells: Some(meter_glyph(glyphs)),
+                // Same height test as `Geom::tall`.
+                cells: Some(stacked_cell(grid.rows() >= 90, glyphs)),
             },
         );
         col += col_u16(bar_w) + 1;
@@ -4873,37 +4968,6 @@ fn find_word(chars: &[char], word: &str) -> Option<usize> {
 }
 
 fn draw_health(grid: &mut Grid, model: &TtyModel, g: &Geom, row: u16) {
-    let mut x = 2usize;
-    let stop = usize::from(g.cols.saturating_sub(40));
-    for seg in &model.health {
-        let piece = if seg.note.is_empty() {
-            format!("{} {}", seg.name, status_word(seg.status))
-        } else {
-            format!("{} {} {}", seg.name, status_word(seg.status), seg.note)
-        };
-        let next = x.saturating_add(piece.chars().count());
-        if next >= stop {
-            break;
-        }
-        paint_str(grid, col_u16(x), row, &seg.name, C16::White, C16::Black);
-        let sx = x.saturating_add(seg.name.chars().count()).saturating_add(1);
-        let (fg, bg) = status_colour(seg.status);
-        paint_str(grid, col_u16(sx), row, status_word(seg.status), fg, bg);
-        if !seg.note.is_empty() {
-            let nx = sx
-                .saturating_add(status_word(seg.status).chars().count())
-                .saturating_add(1);
-            paint_str(
-                grid,
-                col_u16(nx),
-                row,
-                &seg.note,
-                C16::BrightBlack,
-                C16::Black,
-            );
-        }
-        x = next.saturating_add(3);
-    }
     let tail = match model.snapshot {
         Some(seq) => format!(
             "snapshot #{seq} {}   errors {}   up {}",
@@ -4915,13 +4979,117 @@ fn draw_health(grid: &mut Grid, model: &TtyModel, g: &Geom, row: u16) {
         ),
     };
     let end = usize::from(g.cols.saturating_sub(2));
-    let start = col_u16(end.saturating_add(1).saturating_sub(tail.chars().count()));
+    let tail_at = end.saturating_add(1).saturating_sub(tail.chars().count());
+    // Words end two columns before the tail (and, as before, 40 from the
+    // edge), so a long snapshot number or uptime cannot overprint them.
+    let stop = usize::from(g.cols.saturating_sub(40)).min(tail_at.saturating_sub(1));
+    let room = stop.saturating_sub(3);
+    let mut x = 2usize;
+    match fit_health(&model.health, room) {
+        HealthFit::Segments(shown, notes) => {
+            for seg in shown {
+                paint_str(grid, col_u16(x), row, &seg.name, C16::White, C16::Black);
+                let sx = x.saturating_add(seg.name.chars().count()).saturating_add(1);
+                let (fg, bg) = status_colour(seg.status);
+                paint_str(grid, col_u16(sx), row, status_word(seg.status), fg, bg);
+                if notes && !seg.note.is_empty() {
+                    let nx = sx
+                        .saturating_add(status_word(seg.status).chars().count())
+                        .saturating_add(1);
+                    paint_str(
+                        grid,
+                        col_u16(nx),
+                        row,
+                        &seg.note,
+                        C16::BrightBlack,
+                        C16::Black,
+                    );
+                }
+                x = x.saturating_add(seg_width(seg, notes)).saturating_add(3);
+            }
+        }
+        HealthFit::DownNames(names) => {
+            let (fg, bg) = status_colour(HealthStatus::Down);
+            let word = status_word(HealthStatus::Down);
+            paint_str(grid, col_u16(x), row, word, fg, bg);
+            let at = x.saturating_add(word.chars().count()).saturating_add(1);
+            let list = names.join(" ");
+            let fit = room.saturating_add(2).saturating_sub(at);
+            paint_fit(grid, col_u16(at), row, &list, C16::White, C16::Black, fit);
+        }
+    }
     let tail_fg = if model.errors > 0 {
         C16::Yellow
     } else {
         C16::BrightBlack
     };
-    paint_str(grid, start, row, &tail, tail_fg, C16::Black);
+    paint_str(grid, col_u16(tail_at), row, &tail, tail_fg, C16::Black);
+}
+
+/// What the health line has room for, in this order of preference: every
+/// word with its note; a prefix of the healthy words plus every DOWN word,
+/// with notes; the same without notes; one DOWN badge and the names behind
+/// it. A DOWN word is never the one that is shed.
+enum HealthFit<'a> {
+    /// The segments to draw in order, and whether notes are drawn.
+    Segments(Vec<&'a HealthSeg>, bool),
+    /// Names of the DOWN segments, after a single `DOWN` badge.
+    DownNames(Vec<&'a str>),
+}
+
+fn fit_health(segs: &[HealthSeg], room: usize) -> HealthFit<'_> {
+    for notes in [true, false] {
+        if let Some(shown) = keep_down(segs, room, notes) {
+            return HealthFit::Segments(shown, notes);
+        }
+    }
+    HealthFit::DownNames(
+        segs.iter()
+            .filter(|seg| seg.status == HealthStatus::Down)
+            .map(|seg| seg.name.as_str())
+            .collect(),
+    )
+}
+
+/// Healthy words while they fit, stopping at the first that does not;
+/// every DOWN word, with room kept for the ones still to come. `None`
+/// when the DOWN words alone do not fit in `room` columns.
+fn keep_down(segs: &[HealthSeg], room: usize, notes: bool) -> Option<Vec<&HealthSeg>> {
+    let gap = 3usize;
+    let mut ahead: usize = segs
+        .iter()
+        .filter(|seg| seg.status == HealthStatus::Down)
+        .map(|seg| seg_width(seg, notes) + gap)
+        .sum();
+    let mut shown = Vec::new();
+    let mut used = 0usize;
+    let mut shedding = false;
+    for seg in segs {
+        let down = seg.status == HealthStatus::Down;
+        let width = seg_width(seg, notes) + if shown.is_empty() { 0 } else { gap };
+        if down {
+            ahead -= seg_width(seg, notes) + gap;
+        }
+        let fits = used + width + ahead <= room;
+        if down && !fits {
+            return None;
+        }
+        if down || (!shedding && fits) {
+            shown.push(seg);
+            used += width;
+        } else {
+            shedding = true;
+        }
+    }
+    Some(shown)
+}
+
+fn seg_width(seg: &HealthSeg, notes: bool) -> usize {
+    let mut width = seg.name.chars().count() + 1 + status_word(seg.status).chars().count();
+    if notes && !seg.note.is_empty() {
+        width += 1 + seg.note.chars().count();
+    }
+    width
 }
 
 fn status_word(status: HealthStatus) -> &'static str {
@@ -5975,6 +6143,22 @@ struct Band {
     timeline: u16,
     recent: u16,
     text: u16,
+    /// Rows moved from IN/OUT into the top band for the short rate bars.
+    /// Text-off keeps them out of the chart so RECENT still receives the spill.
+    rate_rows: u16,
+}
+
+/// Lower-half cells on a short screen. Tall bars keep full-height caps.
+fn rate_bar_cells(tall: bool) -> Option<char> {
+    if tall { None } else { Some('\u{2584}') }
+}
+
+/// Rows the headline occupies: label, digits, the blank rows around a
+/// short rate bar, the bar itself and the scale.
+fn headline_rows(g: &Geom) -> u16 {
+    let ph: u16 = if g.tall { 2 } else { 1 };
+    let gap = g.headline_gap;
+    1 + 5 * ph + gap + g.bar_rows + gap + 1
 }
 
 /// §3.2 waterfall, then the v3 extra RECENT row taken from the timeline
@@ -5999,7 +6183,25 @@ fn band_for(rows: u16) -> Band {
     }
     take_seventh(&mut band, rows);
     band.top = top;
+    // Two blank rows around the short rate bar. Taken from IN/OUT above
+    // its floor, so SLOTS and SETUP keep the rows this band already gave
+    // them. [`release_text`] leaves the same rows out of the chart.
+    reserve_headline_gaps(&mut band, rows);
     band
+}
+
+/// Move two rows into the top band when IN/OUT can spare them.
+fn reserve_headline_gaps(band: &mut Band, rows: u16) {
+    if rows >= 90 {
+        return;
+    }
+    let floor = text_floor(rows);
+    if band.text < floor.saturating_add(2) {
+        return;
+    }
+    band.text -= 2;
+    band.top += 2;
+    band.rate_rows = 2;
 }
 
 /// The seventh RECENT row, once the block has reached six. Spare rows go
@@ -6086,6 +6288,7 @@ fn fill_band(rows: u16, top: u16) -> Band {
         timeline,
         recent,
         text,
+        rate_rows: 0,
     }
 }
 
@@ -6097,11 +6300,19 @@ fn release_text(band: &mut Band) {
     }
     let spare = 2 + band.text;
     band.text = 0;
-    let to_chart = 31u16.saturating_sub(band.timeline).min(spare);
+    // Rows borrowed for the short rate bars stay out of the chart, so the
+    // leftover still reaches RECENT (the in-flight cap is half those rows).
+    let to_chart = 31u16
+        .saturating_sub(band.timeline)
+        .saturating_sub(band.rate_rows)
+        .min(spare);
     band.timeline += to_chart;
     let left = spare - to_chart;
     let to_recent = 12u16.saturating_sub(band.recent).min(left);
     band.recent += to_recent;
+    // RECENT is full: the held-back rows go to the chart after all.
+    let back = 31u16.saturating_sub(band.timeline).min(left - to_recent);
+    band.timeline += back;
 }
 
 fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid {
@@ -6120,6 +6331,9 @@ fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid 
         release_text(&mut band);
     }
     let mut g = Geom::new(cols, rows);
+    // Only rows the band paid for. Below 47 rows IN/OUT cannot spare
+    // them, and taking them anyway pushes SLOTS and SETUP out.
+    g.headline_gap = u16::from(band.rate_rows > 0);
     draw_header(&mut grid, model, &g);
     draw_rule(&mut grid, 1, g.cols);
 
@@ -6128,7 +6342,16 @@ fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid 
     let right_x = cols / 2 + 1;
     let right_end = cols - 3;
     draw_headline(&mut grid, model, &g, top, left_end);
-    draw_right_meters(&mut grid, model, &g, top, right_x, right_end);
+    let reserved = if band.top >= 11 { 2 } else { 0 };
+    draw_right_meters(
+        &mut grid,
+        model,
+        &g,
+        top,
+        right_x,
+        right_end,
+        top + band.top - reserved,
+    );
     draw_side_summaries(&mut grid, model, top, band.top, right_x, right_end);
     place_slots_and_setup(&mut grid, model, &mut g, top, band.top, left_end);
 
@@ -6183,9 +6406,10 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
     let ph: u16 = if g.tall { 2 } else { 1 };
     let pw_start: u16 = if g.tall { 4 } else { 2 };
     let bar_rows = g.bar_rows;
+    let gap = g.headline_gap;
     let digit_row = top + 1;
-    let bar_row = digit_row + 5 * ph;
-    let tick_row = bar_row + bar_rows;
+    let bar_row = digit_row + 5 * ph + gap;
+    let tick_row = bar_row + bar_rows + gap;
     let down = matches!(
         model.state,
         WatchState::AiDown | WatchState::Starting | WatchState::NoLlama
@@ -6224,13 +6448,23 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
     };
     let gen_text = shown_digit_text(gen_value, gen_dim);
     let prompt_text = shown_digit_text(prompt_value, prompt_dim);
+    let mut gen_pw = fit_pixel_for(pw_start, &gen_text, 26);
+    let mut prompt_pw = fit_pixel_for(pw_start, &prompt_text, 30);
+    // A `--` placeholder never draws larger than the number beside it, so
+    // two placeholders are the same size even though PROMPT is wider.
+    if gen_text == "--" {
+        gen_pw = gen_pw.min(prompt_pw);
+    }
+    if prompt_text == "--" {
+        prompt_pw = prompt_pw.min(gen_pw);
+    }
     draw_digits(
         grid,
         2,
         digit_row,
         gen_value,
         model.gen_ceiling,
-        fit_pixel_for(pw_start, &gen_text, 26),
+        gen_pw,
         ph,
         gen_dim,
     );
@@ -6240,7 +6474,7 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
         digit_row,
         prompt_value,
         model.prompt_ceiling,
-        fit_pixel_for(pw_start, &prompt_text, 30),
+        prompt_pw,
         ph,
         prompt_dim,
     );
@@ -6256,6 +6490,7 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
         },
         bar_rows,
         rate_top(model.gen_tps.filter(|_| gen_live), model.gen_ceiling),
+        rate_bar_cells(g.tall),
     );
     draw_rate_bar(
         grid,
@@ -6272,6 +6507,7 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, left_end
             model.prompt_tps.filter(|_| prompt_live),
             model.prompt_ceiling,
         ),
+        rate_bar_cells(g.tall),
     );
     draw_ticks(grid, 2, tick_row, 26, model.gen_ceiling);
     draw_ticks(grid, 32, tick_row, 30, model.prompt_ceiling);
@@ -6358,6 +6594,12 @@ fn paint_bits(grid: &mut Grid, mut col: u16, row: u16, bits: &[Bit], max_col: u1
 }
 
 fn glance_lines(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
+    // Narrow (160 columns) is the approved compact form, one fact a row:
+    // GPU, VRAM, two HOT, DISK, NET, CPU, ACT. LOAD has its own meter on
+    // the right and the state word is in the header.
+    if host_meters(model) {
+        return glance_host(model, wide);
+    }
     let gpu = pct_i(model.gpu_pct);
     let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
     let vram = percent_of(model.vram_used_gb, model.vram_total_gb);
@@ -6394,7 +6636,7 @@ fn glance_lines(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
             vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
             vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
             hot_line("HOT ", hot.first()),
-            hot_line("", hot.get(1)),
+            hot_line("    ", hot.get(1)),
             vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
             vec![bit(format!("ACT {act}%"), C16::BrightWhite)],
             vec![bit(format!("LOAD {load}%"), C16::BrightWhite)],
@@ -6529,7 +6771,15 @@ fn format_margin(tenths: i32) -> String {
     format!("{deg:+}")
 }
 
-fn draw_right_meters(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, x: u16, right: u16) {
+fn draw_right_meters(
+    grid: &mut Grid,
+    model: &TtyModel,
+    g: &Geom,
+    top: u16,
+    x: u16,
+    right: u16,
+    limit: u16,
+) {
     let pitch = g.pitch.max(1);
     let rows = g.bar_rows;
     draw_wide_meter(
@@ -6594,6 +6844,9 @@ fn draw_right_meters(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, x: u
             true,
         ),
     ];
+    // The host rows start on the POWER row: SWAP takes its empty right
+    // cell, so at a pitch of 3 NET and IO PSI still fit above TEMPS.
+    let host_at = matrix + (pairs.len() as u16 - 1) * pitch;
     for (i, (ll, lv, lp, ls, rl, rv, rp, rs)) in pairs.into_iter().enumerate() {
         let row = matrix + i as u16 * pitch;
         draw_pair_meter(grid, model, g, ll, lv, lp, ls, x, x + col_w - 1, row, rows);
@@ -6602,10 +6855,13 @@ fn draw_right_meters(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16, x: u
             draw_pair_meter(grid, model, g, rl, rv, rp, rs, rx, right, row, rows);
         }
     }
+    if host_meters(model) {
+        draw_host_meters(grid, model, g, host_at, pitch, x, right, rows, limit);
+    }
 }
 
-fn meter_shown(model: &TtyModel, value: String) -> (String, C16) {
-    if model.state == WatchState::Starting || value == "--" || value.is_empty() {
+fn meter_shown(blank: bool, value: String) -> (String, C16) {
+    if blank || value == "--" || value.is_empty() {
         ("--".to_string(), C16::BrightBlack)
     } else {
         (value, C16::BrightWhite)
@@ -6627,7 +6883,7 @@ fn draw_wide_meter(
     rows: u16,
 ) {
     paint_str(grid, x, row, label, C16::White, C16::Black);
-    let (shown, fg) = meter_shown(model, value);
+    let (shown, fg) = meter_shown(model.state == WatchState::Starting, value);
     let value_at = x + u16::try_from(label.chars().count()).unwrap_or(8) + 1;
     paint_str(grid, value_at, row, &shown, fg, C16::Black);
     let bar_x = value_at + u16::try_from(shown.chars().count()).unwrap_or(0) + 1;
@@ -6674,7 +6930,7 @@ fn draw_pair_meter(
     rows: u16,
 ) {
     paint_fit(grid, x, row, label, C16::White, C16::Black, 8);
-    let (shown, fg) = meter_shown(model, value);
+    let (shown, fg) = meter_shown(model.state == WatchState::Starting, value);
     let value_at = x + u16::try_from(label.chars().count().min(8)).unwrap_or(4) + 1;
     let room = usize::from(right.saturating_sub(value_at));
     let shown_n = shown.chars().count().min(room);
@@ -6702,6 +6958,314 @@ fn draw_pair_meter(
             row,
             width: right - bar_x + 1,
             frac,
+            ink,
+            rows,
+            cells: g.meter_cells(model.chart_glyphs),
+        },
+    );
+}
+
+fn host_meters(model: &TtyModel) -> bool {
+    model.disk_read_bps.is_some()
+        || model.disk_write_bps.is_some()
+        || model.net_rx_bps.is_some()
+        || model.net_tx_bps.is_some()
+        || model.swap_used_gb.is_some()
+        || model.swap_total_gb.is_some()
+        || model.io_psi.is_some()
+}
+
+/// `frac = (log10(v / ceiling) + 3) / 3`. Any non-zero rate stays above
+/// zero so the bar's start cell lights, including a write under the
+/// three-decade floor. Zero is an empty track.
+fn byte_rate_frac(bps: f64, ceiling: f64) -> f64 {
+    if !bps.is_finite() || bps <= 0.0 {
+        return 0.0;
+    }
+    if !ceiling.is_finite() || ceiling <= 0.0 {
+        return 1.0;
+    }
+    let raw = ((bps / ceiling).log10() + 3.0) / 3.0;
+    if raw <= 0.0 {
+        f64::MIN_POSITIVE
+    } else {
+        raw.min(1.0)
+    }
+}
+
+fn disk_ceiling(model: &TtyModel) -> f64 {
+    if model.disk_ceiling_bps.is_finite() && model.disk_ceiling_bps > 0.0 {
+        model.disk_ceiling_bps
+    } else {
+        7e9
+    }
+}
+
+fn net_ceiling(model: &TtyModel) -> f64 {
+    model
+        .net_ceiling_bps
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .unwrap_or(125_000_000.0)
+}
+
+fn rate_bps_text(bps: Option<f64>) -> String {
+    let Some(bps) = bps.filter(|v| v.is_finite() && *v >= 0.0) else {
+        return "--".to_string();
+    };
+    if bps.round() < 1000.0 {
+        return format!("{} B/s", bps.round() as i64);
+    }
+    // The unit is picked after rounding, so 999.6 K/s reads 1.0 M/s.
+    scaled_rate(bps / 1e3, "K")
+        .or_else(|| scaled_rate(bps / 1e6, "M"))
+        .unwrap_or_else(|| format!("{:.1} G/s", bps / 1e9))
+}
+
+/// One decimal under 10, whole numbers above. `None` when the value
+/// rounds to 1000 or more and belongs to the next unit.
+fn scaled_rate(value: f64, unit: &str) -> Option<String> {
+    if value < 9.95 {
+        Some(format!("{value:.1} {unit}/s"))
+    } else if value.round() < 1000.0 {
+        Some(format!("{} {unit}/s", value.round() as i64))
+    } else {
+        None
+    }
+}
+
+fn combined_rate(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+    }
+}
+
+fn psi_text(pct: Option<f64>) -> String {
+    match pct.filter(|p| p.is_finite() && *p >= 0.0) {
+        Some(pct) if pct >= 10.0 => format!("{} %", pct.round() as i64),
+        Some(pct) => format!("{:.1} %", pct),
+        None => "--".to_string(),
+    }
+}
+
+fn swap_text(used: Option<f64>, total: Option<f64>) -> String {
+    match (used, total) {
+        (Some(used), Some(total)) if used.is_finite() && total.is_finite() => {
+            format!("{:.1}/{:.1}G", used, total)
+        }
+        _ => "--".to_string(),
+    }
+}
+
+fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
+    let gpu = pct_i(model.gpu_pct);
+    let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
+    let vram = percent_of(model.vram_used_gb, model.vram_total_gb);
+    let mem = percent_of(model.mem_used_gb, model.mem_total_gb);
+    let cpu = pct_i(model.cpu_pct);
+    let load = pct_i(model.load_pct);
+    let act = pct_i(model.activity_pct);
+    let hot = hottest(model);
+    // 29 cells (columns 64..=92). "0.4G" keeps SWAP on that line.
+    let swap = match model.swap_used_gb.filter(|v| v.is_finite()) {
+        Some(used) => format!("{used:.1}G"),
+        None => "--".to_string(),
+    };
+    let disk_r = rate_bps_text(model.disk_read_bps);
+    let disk_w = rate_bps_text(model.disk_write_bps);
+    let net = rate_bps_text(combined_rate(model.net_rx_bps, model.net_tx_bps));
+    if wide {
+        vec![
+            gpu_wide(model, &gpu, gpu_fg),
+            vec![
+                bit(format!("VRAM {} %", pct_of(vram)), C16::BrightWhite),
+                bit("  MEM ", C16::White),
+                bit(format!("{} %", pct_of(mem)), C16::BrightWhite),
+                bit(" SWAP ", C16::White),
+                bit(swap, C16::BrightWhite),
+            ],
+            hot_line("HOT ", hot.first()),
+            hot_line("    ", hot.get(1)),
+            vec![
+                bit(format!("DISK R {disk_r}"), C16::BrightWhite),
+                bit("  W ", C16::White),
+                bit(disk_w, C16::BrightWhite),
+            ],
+            vec![
+                bit(format!("NET  {net}"), C16::BrightWhite),
+                bit("  ACT ", C16::White),
+                bit(format!("{act} %"), C16::BrightWhite),
+            ],
+            vec![
+                bit(format!("CPU {cpu} %"), C16::BrightWhite),
+                bit("  LOAD ", C16::White),
+                bit(format!("{load} %"), C16::BrightWhite),
+            ],
+            glance_state(model),
+        ]
+    } else {
+        vec![
+            vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
+            vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
+            hot_line("HOT ", hot.first()),
+            hot_line("    ", hot.get(1)),
+            vec![bit(format!("DISK {disk_r}"), C16::BrightWhite)],
+            vec![bit(format!("NET {net}"), C16::BrightWhite)],
+            vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
+            vec![bit(format!("ACT {act}%"), C16::BrightWhite)],
+        ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_host_meters(
+    grid: &mut Grid,
+    model: &TtyModel,
+    g: &Geom,
+    mut row: u16,
+    pitch: u16,
+    x: u16,
+    right: u16,
+    rows: u16,
+    limit: u16,
+) {
+    let gap = 2u16;
+    let width = right.saturating_sub(x).saturating_add(1);
+    let col_w = width.saturating_sub(gap) / 2;
+    let rx = x + col_w + gap;
+    let disk = disk_ceiling(model);
+    let net = net_ceiling(model);
+    let swap_fg = if model.mem_psi.is_some_and(|p| p > 0.0) {
+        C16::Yellow
+    } else {
+        C16::White
+    };
+    // SWAP has no left cell: it sits beside POWER.
+    let rows_of: Vec<Vec<HostMeter>> = vec![
+        vec![HostMeter {
+            label: "SWAP",
+            value: swap_text(model.swap_used_gb, model.swap_total_gb),
+            frac: capacity_frac(percent_of(model.swap_used_gb, model.swap_total_gb)),
+            level: false,
+            label_fg: swap_fg,
+            side: Side::Right,
+        }],
+        vec![
+            HostMeter {
+                label: "DISK R",
+                value: rate_bps_text(model.disk_read_bps),
+                frac: rate_frac_of(model.disk_read_bps, disk),
+                level: true,
+                label_fg: C16::White,
+                side: Side::Left,
+            },
+            HostMeter {
+                label: "DISK W",
+                value: rate_bps_text(model.disk_write_bps),
+                frac: rate_frac_of(model.disk_write_bps, disk),
+                level: true,
+                label_fg: C16::White,
+                side: Side::Right,
+            },
+        ],
+        vec![
+            HostMeter {
+                label: "NET",
+                value: rate_bps_text(combined_rate(model.net_rx_bps, model.net_tx_bps)),
+                frac: rate_frac_of(combined_rate(model.net_rx_bps, model.net_tx_bps), net),
+                level: true,
+                label_fg: C16::White,
+                side: Side::Left,
+            },
+            HostMeter {
+                label: "IO PSI",
+                value: psi_text(model.io_psi),
+                frac: psi_frac(model.io_psi),
+                level: true,
+                label_fg: C16::White,
+                side: Side::Right,
+            },
+        ],
+    ];
+    for meters in rows_of {
+        if row.saturating_add(rows.saturating_sub(1)) >= limit {
+            break;
+        }
+        for meter in meters {
+            let (at, end) = match meter.side {
+                Side::Left => (x, x + col_w - 1),
+                Side::Right => (rx, right),
+            };
+            draw_host_meter(grid, model, g, &meter, at, end, row, rows);
+        }
+        row = row.saturating_add(pitch);
+    }
+}
+
+struct HostMeter {
+    label: &'static str,
+    value: String,
+    frac: Option<f64>,
+    level: bool,
+    label_fg: C16,
+    side: Side,
+}
+
+fn capacity_frac(pct: Option<f64>) -> Option<f64> {
+    pct.filter(|p| p.is_finite() && *p > 0.0)
+        .map(|p| (p / 100.0).min(1.0))
+}
+
+fn rate_frac_of(bps: Option<f64>, ceiling: f64) -> Option<f64> {
+    let bps = bps.filter(|v| v.is_finite())?;
+    let frac = byte_rate_frac(bps, ceiling);
+    (frac > 0.0).then_some(frac)
+}
+
+fn psi_frac(pct: Option<f64>) -> Option<f64> {
+    let pct = pct.filter(|p| p.is_finite() && *p > 0.0)?;
+    Some((pct / 100.0).min(1.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_host_meter(
+    grid: &mut Grid,
+    model: &TtyModel,
+    g: &Geom,
+    meter: &HostMeter,
+    x: u16,
+    right: u16,
+    row: u16,
+    rows: u16,
+) {
+    if meter.label.is_empty() {
+        return;
+    }
+    paint_fit(grid, x, row, meter.label, meter.label_fg, C16::Black, 8);
+    let (shown, fg) = meter_shown(false, meter.value.clone());
+    let value_at = x + u16::try_from(meter.label.chars().count().min(8)).unwrap_or(4) + 1;
+    let room = usize::from(right.saturating_sub(value_at));
+    let shown: String = shown.chars().take(room).collect();
+    paint_str(grid, value_at, row, &shown, fg, C16::Black);
+    let bar_x = value_at + u16::try_from(shown.chars().count()).unwrap_or(0) + 1;
+    if bar_x >= right {
+        return;
+    }
+    let ink = if meter.level {
+        let pct = meter.frac.map(|f| f * 100.0);
+        level_ink(pct)
+    } else {
+        let pct = meter.frac.map(|f| f * 100.0).unwrap_or(0.0);
+        let (top, bot) = band(pct);
+        BarInk::Fixed(top, bot)
+    };
+    draw_h_bar(
+        grid,
+        HBar {
+            x: bar_x,
+            row,
+            width: right - bar_x + 1,
+            frac: meter.frac,
             ink,
             rows,
             cells: g.meter_cells(model.chart_glyphs),
@@ -6815,8 +7379,7 @@ fn place_slots_and_setup(
     height: u16,
     left_end: u16,
 ) {
-    let ph: u16 = if g.tall { 2 } else { 1 };
-    let headline = 1 + 5 * ph + g.bar_rows + 1;
+    let headline = headline_rows(g);
     let slot_top = top + headline;
     let slot_end = top + height;
     let budget = slot_end.saturating_sub(slot_top);
@@ -7383,6 +7946,7 @@ mod tests {
                     rate_frac(Some(value), ceiling),
                     g.bar_rows,
                     rate_top(Some(value), ceiling),
+                    None,
                 );
                 grid
             };
@@ -7467,16 +8031,18 @@ mod tests {
         assert!((pos - 50.0).abs() < 1.0e-3, "{pos}");
         let mut dim = Grid::with_exact(8, 8);
         draw_digits(&mut dim, 0, 0, Some(0.0), ceiling, 1, 1, false);
-        assert_eq!(dim.get(0, 0).unwrap().fg, C16::BrightBlack);
-        assert!(dim.exact_fg(0, 0).is_none());
+        // 0's top row is `. # .`: the lit pixel is the middle, not column 0.
+        assert_eq!(dim.get(1, 0).unwrap().ch, '█');
+        assert_eq!(dim.get(1, 0).unwrap().fg, C16::BrightBlack);
+        assert!(dim.exact_fg(1, 0).is_none());
         draw_digits(&mut dim, 0, 0, None, ceiling, 1, 1, false);
         assert!(dim.exact_fg(0, 0).is_none());
         // NaN is the dim zero, not a live value on the first stop.
         let mut nan = Grid::with_exact(8, 8);
         draw_digits(&mut nan, 0, 0, Some(f64::NAN), ceiling, 1, 1, false);
-        assert_eq!(nan.get(0, 0).unwrap().ch, '█');
-        assert_eq!(nan.get(0, 0).unwrap().fg, C16::BrightBlack);
-        assert!(nan.exact_fg(0, 0).is_none());
+        assert_eq!(nan.get(1, 0).unwrap().ch, '█');
+        assert_eq!(nan.get(1, 0).unwrap().fg, C16::BrightBlack);
+        assert!(nan.exact_fg(1, 0).is_none());
     }
 
     #[test]
@@ -7994,5 +8560,72 @@ mod tests {
         assert_eq!(fit_reason("a", 6).as_deref(), Some("a"));
         assert_eq!(fit_reason("a b c d e f", 6), None);
         assert_eq!(fit_reason("a b c d e f", 8).as_deref(), Some("a b\u{2026}"));
+    }
+
+    #[test]
+    fn five_row_digits_keep_0_open_and_9_unblobbed() {
+        assert_eq!(DIGITS[0], &[".#.", "#.#", "#.#", "#.#", ".#."][..]);
+        assert!(DIGITS[0].iter().all(|row| row.contains('.')));
+        assert_eq!(DIGITS[3][2], ".##");
+        assert_eq!(DIGITS[7][4], "#..");
+        assert_eq!(DIGITS[9][4], ".##");
+        assert_ne!(DIGITS[9][4], "###");
+        for glyph in DIGITS {
+            assert_eq!(glyph.len(), 5);
+            assert!(glyph.iter().all(|row| row.chars().count() == 3));
+        }
+    }
+
+    #[test]
+    fn headline_digits_keep_two_blank_columns_and_k_is_text() {
+        let mut grid = Grid::new(40, 8);
+        draw_digits(&mut grid, 0, 0, Some(8888.0), 20_000.0, 1, 1, false);
+        let bottom: String = (0..40).map(|col| grid.get(col, 4).unwrap().ch).collect();
+        assert_eq!(bottom.trim_end(), "███  ███  ███  ███");
+
+        let mut kilo = Grid::new(40, 8);
+        draw_digits(&mut kilo, 0, 0, Some(12_400.0), 20_000.0, 2, 1, false);
+        let mut found = None;
+        for row in 0..5 {
+            for col in 0..40 {
+                if kilo.get(col, row).unwrap().ch == 'k' {
+                    assert!(found.is_none(), "one k");
+                    found = Some((col, row));
+                }
+            }
+        }
+        let (col, row) = found.expect("k suffix");
+        assert_eq!(row, 4, "baseline");
+        assert_eq!(kilo.get(col - 1, row).unwrap().ch, ' ');
+        for above in 0..4 {
+            assert_eq!(kilo.get(col, above).unwrap().ch, ' ');
+        }
+        assert!(rate_columns("8888", 1) <= 26);
+        assert!(rate_columns("12k", 2) <= 26);
+        // 5, gap 2, 4, gap 2, dot, gap 1, 2: the point does not touch the 2.
+        assert_eq!(rate_columns("54.2", 2), 6 + 2 + 6 + 2 + 2 + 1 + 6);
+        let differ = DIGITS[4]
+            .iter()
+            .zip(DIGITS[9])
+            .flat_map(|(a, b)| a.chars().zip(b.chars()))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(differ >= 2, "4 and 9 differ in {differ} pixel");
+        // Text off: once RECENT is full the rows held back for the rate
+        // bars go to the chart, which keeps its 31 rows at 67.
+        let mut band = band_for(67);
+        release_text(&mut band);
+        assert_eq!(band.recent, 12);
+        assert_eq!(band.timeline, 31);
+        let mut g = Geom::new(213, 60);
+        assert_eq!(headline_rows(&g), 8, "no gap until the band pays for it");
+        g.headline_gap = 1;
+        assert_eq!(headline_rows(&g), 10);
+        assert_eq!(headline_rows(&Geom::new(213, 135)), 14);
+        let band = band_for(60);
+        assert_eq!(band.top, 14);
+        assert_eq!(band.timeline, 14);
+        assert_eq!(band.text, 15);
+        assert_eq!(band.rate_rows, 2);
     }
 }

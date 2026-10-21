@@ -11,6 +11,12 @@ pub enum SourceId {
     HwmonCpu,
     Gpu,
     Llama,
+    /// `/proc/diskstats` could not be parsed.
+    ProcDisk,
+    /// `/proc/net/dev` could not be parsed.
+    ProcNet,
+    /// `/proc/pressure` could not be parsed.
+    ProcPsi,
 }
 
 impl SourceId {
@@ -22,6 +28,9 @@ impl SourceId {
             Self::HwmonCpu => "hwmon.cpu",
             Self::Gpu => "gpu",
             Self::Llama => "llama",
+            Self::ProcDisk => "proc.disk",
+            Self::ProcNet => "proc.net",
+            Self::ProcPsi => "proc.psi",
         }
     }
 }

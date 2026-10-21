@@ -6,6 +6,14 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- tty11 shows disk, network, swap and pressure (PSI) from `/proc` and `/sys`: DISK R and DISK W and NET meters on a three-decade log bar (`[tty] disk_ceiling_bps`, default 7 GB/s; `[tty] net_ceiling_bps`, default the summed speed of the physical links that are up, 1 Gbit for one without a speed or when none is up), SWAP beside POWER with its label yellow under memory pressure, IO PSI, and `disk`, `net` and `psi` words on the health line, which now sheds healthy words before a DOWN one. Disk and net rates are taken over `collector.cpu_window_s`, as CPU % is. The snapshot's `host` gains optional disk, net, PSI and swap fields, and llama-metrics exports `llamabored_disk_{read,write}_bytes_per_second`, `llamabored_net_{receive,transmit}_bytes_per_second`, `llamabored_pressure_{cpu,io,memory}_ratio` and `llamabored_swap_{used,total}_bytes`. A file that is missing, switched off (`psi=0`) or has nothing to count (no whole disk, no physical interface) is absent, never 0 (#163).
+
+### Changed
+
+- tty rate bars and the load meters are half-height, with a blank row above and below the rate bars on short screens, so neighbouring bars no longer read as one block; the context and fan bars follow. Rate digits get two blank columns between them (three between GEN and PROMPT), 0, 3, 7 and 9 are redrawn, the decimal point has its own gap and thousands read `k` (#163).
+
 ## 0.6.2 — 2026-10-17
 
 Two cooling-guard fixes for false LCD halts: the pump band now covers the firmware curve hunting between two duty steps, and a pump latch clears itself after 10 minutes of normal pump operation. The desktop halt notifier is gone.

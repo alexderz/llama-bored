@@ -340,6 +340,15 @@ fn metrics_extras_reach_the_wire() {
         }),
         suspected_loads: vec![("qwen3.6-35b-a3b".to_owned(), 2)],
         series: Vec::new(),
+        disk_read_bps: None,
+        disk_write_bps: None,
+        net_rx_bps: None,
+        net_tx_bps: None,
+        io_psi: None,
+        mem_psi: None,
+        cpu_psi: None,
+        swap_used_bytes: None,
+        swap_total_bytes: None,
     };
     publisher
         .publish_with(&snap, &llama, &extras)
