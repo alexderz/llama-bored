@@ -282,6 +282,8 @@ pub struct TtyModel {
     pub chart_bucket_s: u64,
     /// Half-block or eighth-block chart (`tty.chart_glyphs`).
     pub chart_glyphs: ChartGlyphs,
+    /// Segmented gauge bars (`tty.bar_segments`, #165); `false` is solid.
+    pub bar_segments: bool,
     /// FANS panel. `None` when `[fans]` is off, and nothing is drawn.
     pub fans: Option<FanPanel>,
     /// TEMPS panel (#74). `None` when `[temps]` is off, and nothing is drawn.
@@ -7251,13 +7253,30 @@ fn gauge_cols(x: u16, right: u16) -> GaugeCols {
     }
 }
 
-/// The bar cell. The grid file always carries the segment (`rich`); the
-/// console draws it only with the llama-hack font (`eighths`), and `▄`
-/// with eurlatgr (`halves`), which lacks it.
-fn gauge_glyph(glyphs: ChartGlyphs) -> char {
-    match glyphs {
-        ChartGlyphs::Eighths => glyph::SEGMENT,
-        ChartGlyphs::Halves => glyph::SEGMENT_PLAIN,
+/// A lit bar cell: the console's glyph and the grid file's.
+#[derive(Clone, Copy, Debug)]
+struct BarCell {
+    console: char,
+    rich: char,
+}
+
+/// The bar cell. Solid `▄` everywhere by default (#170). With
+/// `bar_segments` (#165) the grid file carries the segment; the console
+/// draws it only with the llama-hack font (`eighths`), and `▄` with
+/// eurlatgr (`halves`), which lacks it.
+fn gauge_glyph(glyphs: ChartGlyphs, segments: bool) -> BarCell {
+    if !segments {
+        return BarCell {
+            console: glyph::SEGMENT_PLAIN,
+            rich: glyph::SEGMENT_PLAIN,
+        };
+    }
+    BarCell {
+        console: match glyphs {
+            ChartGlyphs::Eighths => glyph::SEGMENT,
+            ChartGlyphs::Halves => glyph::SEGMENT_PLAIN,
+        },
+        rich: glyph::SEGMENT,
     }
 }
 
@@ -7319,7 +7338,7 @@ impl GaugeGroup {
 /// CLK, PCIE in the #163 design) is two more entries in [`work_gauges`].
 fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, height: u16) {
     let cols = gauge_cols(x, right);
-    let cell = gauge_glyph(model.chart_glyphs);
+    let cell = gauge_glyph(model.chart_glyphs, model.bar_segments);
     let work = GaugeGroup {
         gauges: work_gauges(model),
         note: None,
@@ -7371,7 +7390,7 @@ fn draw_gauge_group(
     grid: &mut Grid,
     group: &GaugeGroup,
     cols: GaugeCols,
-    cell: char,
+    cell: BarCell,
     top: u16,
     end: u16,
 ) {
@@ -7397,7 +7416,7 @@ fn draw_gauge_group(
     }
 }
 
-fn draw_gauge(grid: &mut Grid, gauge: &Gauge, x: u16, row: u16, bar: u16, cell: char) {
+fn draw_gauge(grid: &mut Grid, gauge: &Gauge, x: u16, row: u16, bar: u16, cell: BarCell) {
     let value: String = gauge
         .value
         .chars()
@@ -7432,17 +7451,17 @@ fn draw_gauge(grid: &mut Grid, gauge: &Gauge, x: u16, row: u16, bar: u16, cell: 
             frac: gauge.frac,
             ink: gauge.ink,
             rows: 1,
-            cells: Some(cell),
+            cells: Some(cell.console),
         },
     );
-    // Lit cells are segments in the grid file, whatever the console font.
+    // With segments, lit cells are segments in the grid file whatever the
+    // console font.
+    if cell.rich == cell.console {
+        return;
+    }
     for col in at..at.saturating_add(bar) {
-        if let Some(lit) = grid.get(col, row).filter(|c| c.ch == cell) {
-            grid.put(
-                col,
-                row,
-                Cell::with_rich(lit.ch, glyph::SEGMENT, lit.fg, lit.bg),
-            );
+        if let Some(lit) = grid.get(col, row).filter(|c| c.ch == cell.console) {
+            grid.put(col, row, Cell::with_rich(lit.ch, cell.rich, lit.fg, lit.bg));
         }
     }
 }

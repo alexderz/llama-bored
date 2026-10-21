@@ -214,6 +214,26 @@ fn a_gauge_segment_draws_a_half_block_with_a_one_pixel_gap() {
     }
 }
 
+/// #170: solid bars, the default, reach the cast as `▄`: two cells side by
+/// side in the shipped 9x18 font draw one unbroken bottom half, no gap.
+#[test]
+fn solid_gauge_cells_draw_without_a_gap() {
+    let path = common::workspace_root().join("packaging/fonts/llama-hack-9x18.psfu");
+    let shipped = Psf2::parse(&std::fs::read(path).unwrap()).unwrap();
+    let bytes = file(
+        2,
+        1,
+        1_000,
+        vec![cell('\u{2584}', RED, BLUE), cell('\u{2584}', RED, BLUE)],
+    );
+    let frame = paint(&bytes, &shipped, 1_000, &mut Hold::new());
+    let (x, y) = ((FRAME_WIDTH - 18) / 2, (FRAME_HEIGHT - 18) / 2);
+    for gx in 0..18 {
+        assert_eq!(pixel(&frame, x + gx, y + 17), RED, "bottom row at {gx}");
+        assert_eq!(pixel(&frame, x + gx, y), BLUE, "top row at {gx}");
+    }
+}
+
 #[test]
 fn a_small_grid_is_centred_and_a_large_one_is_cropped_from_the_top_left() {
     let font = letter_and_replacement();

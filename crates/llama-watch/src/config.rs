@@ -507,6 +507,12 @@ pub struct Tty {
     /// Chart resolution. See [`ChartGlyphs`].
     #[serde(default)]
     pub chart_glyphs: ChartGlyphs,
+    /// `true` draws each gauge bar cell as a segment, a half block one pixel
+    /// short of the cell, so a bar shows a hairline between cells (#165):
+    /// U+E584 in the grid file, and on tty11 with a llama-hack font. The
+    /// default `false` draws solid `▄` bars everywhere (#170).
+    #[serde(default)]
+    pub bar_segments: bool,
     /// `false` hides the IN/OUT llama text panels and gives their rows to the
     /// chart and RECENT. The poller then keeps no prompt or generated text
     /// (RR-LV1). `llama-watch run --no-text` forces this off.
@@ -1386,6 +1392,7 @@ impl Default for Tty {
             prompt_ceiling_tps: defaults::prompt_ceiling_tps(),
             chart_bucket_s: defaults::chart_bucket_s(),
             chart_glyphs: ChartGlyphs::default(),
+            bar_segments: false,
             show_text: defaults::show_text(),
             prompt_view: PromptView::default(),
             ctx_history_h: defaults::ctx_history_h(),

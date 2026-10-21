@@ -410,6 +410,7 @@ where
         prompt_ceiling: input.config.tty.prompt_ceiling_tps,
         chart_bucket_s: input.config.tty.chart_bucket_s,
         chart_glyphs: input.config.tty.chart_glyphs,
+        bar_segments: input.config.tty.bar_segments,
         ctx_history_h: input.config.tty.ctx_history_h,
         started: input.started,
         host: host_label(&roots.proc),
@@ -542,6 +543,7 @@ struct FrameCtx {
     prompt_ceiling: f64,
     chart_bucket_s: u64,
     chart_glyphs: ChartGlyphs,
+    bar_segments: bool,
     ctx_history_h: u32,
     started: Instant,
     host: String,
@@ -1148,6 +1150,7 @@ fn tty_model(
         chart: tick.chart.buckets(),
         chart_bucket_s: ctx.chart_bucket_s,
         chart_glyphs: ctx.chart_glyphs,
+        bar_segments: ctx.bar_segments,
         fans: sample.fans.clone(),
         temps: sample
             .temps
@@ -3628,6 +3631,18 @@ mod tests {
         models.first().expect("one drawn frame").clone()
     }
 
+    /// #170: `[tty] bar_segments` reaches the drawn model; solid without it.
+    #[test]
+    fn bar_segments_reach_the_frame() {
+        let model = one_frame("solid-bars", "[llama]\nenabled = false\n");
+        assert!(!model.bar_segments);
+        let model = one_frame(
+            "segment-bars",
+            "[llama]\nenabled = false\n[tty]\nbar_segments = true\n",
+        );
+        assert!(model.bar_segments);
+    }
+
     #[test]
     fn llama_disabled_draws_no_llama_at_once() {
         let model = one_frame("no-llama", "[llama]\nenabled = false\n");
@@ -4075,6 +4090,7 @@ mod tests {
             prompt_ceiling: 1500.0,
             chart_bucket_s: 2,
             chart_glyphs: ChartGlyphs::default(),
+            bar_segments: false,
             ctx_history_h: 6,
             started: Instant::now(),
             host: "box".to_owned(),

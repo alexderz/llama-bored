@@ -420,6 +420,14 @@ stacked bars keep a gap; with `"halves"` (a console font such as eurlatgr,
 which has no `▇`) they use `▄`. 4K screens (90+ rows) keep their two-row
 bars.
 
+The right-hand gauges are solid `▄` bars, the same on tty11, in the grid
+file, in llama-view and in the llama-cast stream (#170). With
+`tty.bar_segments = true` each lit cell is one pixel column short, so a
+hairline shows between cells (#165): the grid file carries U+E584, tty11
+draws it with a llama-hack font (`chart_glyphs = "eighths"`) and `▄` with
+eurlatgr, llama-cast draws the gap itself, and `llama-view --segments`
+draws it for a terminal font that has the glyph (`▄` without the flag).
+
 **Activity** is the bottleneck device's power headroom. For the GPU (NVML) and
 the CPU (zenergy socket energy), `(watts − idle) / (nominal_frac × limit −
 idle)`; the larger wins. 100 is sustained heavy load, spikes reach 125. Idle

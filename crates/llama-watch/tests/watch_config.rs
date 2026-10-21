@@ -24,6 +24,7 @@ fn packaged_example_parses_and_validates() {
     assert!(text.contains("chart_bucket_s"), "{text}");
     assert!(text.contains("ctx_history_h = 6"), "{text}");
     assert!(text.contains("chart_glyphs = \"eighths\""), "{text}");
+    assert!(text.contains("bar_segments = false"), "{text}");
     assert!(text.contains("url = \"http://127.0.0.1:8080\""), "{text}");
     assert!(text.contains("enabled = true"), "{text}");
     // A proxy in front of llama-swap hides /slots. The example says so.
@@ -145,6 +146,27 @@ fn chart_glyphs_default_to_halves_and_parse_both_modes() {
     assert_eq!(cfg.tty.chart_glyphs, ChartGlyphs::Halves);
     for bad in ["\"quarters\"", "\"Eighths\"", "8", "true"] {
         let text = format!("[tty]\nchart_glyphs = {bad}\n");
+        assert!(Config::from_toml(&text).is_err(), "accepted {bad}");
+    }
+}
+
+/// #170: `[tty] bar_segments`, solid gauge bars unless it is `true`.
+#[test]
+fn bar_segments_default_to_solid_and_parse_a_bool_only() {
+    assert!(!Config::default().tty.bar_segments);
+    assert!(
+        !Config::from_toml("[tty]\n")
+            .expect("empty")
+            .tty
+            .bar_segments
+    );
+    let cfg = Config::from_toml("[tty]\nbar_segments = true\n").expect("true");
+    assert!(cfg.tty.bar_segments);
+    cfg.validate(32).expect("valid");
+    let cfg = Config::from_toml("[tty]\nbar_segments = false\n").expect("false");
+    assert!(!cfg.tty.bar_segments);
+    for bad in ["\"true\"", "1", "\"yes\""] {
+        let text = format!("[tty]\nbar_segments = {bad}\n");
         assert!(Config::from_toml(&text).is_err(), "accepted {bad}");
     }
 }
