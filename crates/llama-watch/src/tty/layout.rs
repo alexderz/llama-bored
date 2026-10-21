@@ -6849,10 +6849,12 @@ fn draw_glance(grid: &mut Grid, model: &TtyModel, top: u16, left_end: u16) {
         return;
     }
     let wide = left_end >= 92;
-    let lines = glance_lines(model, wide);
+    let max_col = left_end.min(92);
+    let cells = usize::from(max_col - 64 + 1);
+    let lines = glance_lines(model, wide, cells);
     for (i, line) in lines.iter().enumerate() {
         let Ok(dy) = u16::try_from(i) else { break };
-        paint_bits(grid, 64, top + dy, line, left_end.min(92));
+        paint_bits(grid, 64, top + dy, line, max_col);
     }
 }
 
@@ -6885,12 +6887,13 @@ fn paint_bits(grid: &mut Grid, mut col: u16, row: u16, bits: &[Bit], max_col: u1
     }
 }
 
-fn glance_lines(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
+/// The glance's rows; `cells` is its width, which the HOT rows fit.
+fn glance_lines(model: &TtyModel, wide: bool, cells: usize) -> Vec<Vec<Bit>> {
     // Narrow (160 columns) is the approved compact form, one fact a row:
     // GPU, VRAM, two HOT, DISK, NET, CPU, ACT. LOAD has its own meter on
     // the right and the state word is in the header.
     if host_meters(model) {
-        return glance_host(model, wide);
+        return glance_host(model, wide, cells);
     }
     let gpu = pct_i(model.gpu_pct);
     let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
@@ -6908,8 +6911,8 @@ fn glance_lines(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
                 bit("  MEM ", C16::White),
                 bit(format!("{} %", pct_of(mem)), C16::BrightWhite),
             ],
-            hot_line("HOT ", hot.first()),
-            hot_line("    ", hot.get(1)),
+            hot_line("HOT ", hot.first(), cells),
+            hot_line("    ", hot.get(1), cells),
             vec![
                 bit(format!("CPU {cpu} %"), C16::BrightWhite),
                 bit("  LOAD ", C16::White),
@@ -6927,8 +6930,8 @@ fn glance_lines(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
         vec![
             vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
             vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
-            hot_line("HOT ", hot.first()),
-            hot_line("    ", hot.get(1)),
+            hot_line("HOT ", hot.first(), cells),
+            hot_line("    ", hot.get(1), cells),
             vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
             vec![bit(format!("ACT {act}%"), C16::BrightWhite)],
             vec![bit(format!("LOAD {load}%"), C16::BrightWhite)],
@@ -6994,11 +6997,32 @@ fn step_fg(pct: f64) -> C16 {
 struct Hot {
     name: String,
     c: i32,
-    margin: i32,
+    /// `None` without thresholds: such a sensor ranks after every one
+    /// that has them.
+    heat: Option<Heat>,
     glyph: &'static str,
     fg: C16,
 }
 
+/// Where a reading stands against its warning and critical points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum HeatBand {
+    Below,
+    Warn,
+    Crit,
+}
+
+/// A sensor's rank on the HOT rows, highest first: its band, then the
+/// reading less the warning point (tenths).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Heat {
+    band: HeatBand,
+    margin: i32,
+}
+
+/// The glance's HOT rows (#173): past critical first, then past warning,
+/// then nearest below the warning point; a sensor without thresholds after
+/// all of those. Ties keep panel order.
 fn hottest(model: &TtyModel) -> Vec<Hot> {
     let Some(panel) = &model.temps else {
         return Vec::new();
@@ -7006,60 +7030,80 @@ fn hottest(model: &TtyModel) -> Vec<Hot> {
     let mut rows = Vec::new();
     for group in &panel.groups {
         for item in &group.items {
-            let mut name = if item.label.is_empty() {
-                group.name.clone()
+            let name = if item.label.is_empty() {
+                &group.name
             } else {
-                item.label.clone()
+                &item.label
             };
-            name.truncate(6);
-            let (glyph, fg, margin) = sensor_mark(item);
+            // Six characters, not bytes: a renamed label can be non-ASCII.
+            let name: String = name.chars().take(6).collect();
+            let (glyph, fg, heat) = sensor_mark(item);
             rows.push(Hot {
                 name,
                 c: (f64::from(item.tenths) / 10.0).round() as i32,
-                margin,
+                heat,
                 glyph,
                 fg,
             });
         }
     }
-    rows.sort_by_key(|row| row.margin);
+    // Descending, and stable; `None` is below every `Some`.
+    rows.sort_by_key(|row| std::cmp::Reverse(row.heat));
     rows.truncate(4);
     rows
 }
 
-fn sensor_mark(item: &TempItem) -> (&'static str, C16, i32) {
+fn sensor_mark(item: &TempItem) -> (&'static str, C16, Option<Heat>) {
     let Some((warn, crit)) = item.thresholds else {
-        return ("", level_fg(item.level), i32::MAX / 4);
+        return ("", level_fg(item.level), None);
     };
     let margin = item.tenths - warn;
+    let heat = |band| Some(Heat { band, margin });
     if item.tenths >= crit {
-        ("!!", C16::Red, margin)
+        ("!!", C16::Red, heat(HeatBand::Crit))
     } else if item.tenths >= warn {
-        ("!", C16::Yellow, margin)
+        ("!", C16::Yellow, heat(HeatBand::Warn))
     } else if warn - item.tenths <= 40 {
-        ("^", C16::BrightYellow, margin)
+        ("^", C16::BrightYellow, heat(HeatBand::Below))
     } else {
-        ("", C16::BrightWhite, margin)
+        ("", C16::BrightWhite, heat(HeatBand::Below))
     }
 }
 
-fn hot_line(prefix: &str, hot: Option<&Hot>) -> Vec<Bit> {
+/// The shortest a HOT row's name gets to make room for its temperature.
+const HOT_NAME_MIN: usize = 3;
+
+/// One HOT row in `cells` (#173): prefix, mark, name, temperature and the
+/// margin to the warning point. When it does not fit, the margin goes
+/// whole (never a lone `+`), then the name shortens, down to
+/// [`HOT_NAME_MIN`]; the mark and the temperature are never cut.
+fn hot_line(prefix: &str, hot: Option<&Hot>, cells: usize) -> Vec<Bit> {
     let Some(hot) = hot else {
         return vec![bit(prefix.trim_end().to_string(), C16::White)];
     };
-    let margin = format_margin(hot.margin);
-    vec![
+    let margin = format_margin(hot.heat);
+    let temp = hot.c.to_string();
+    let fixed = prefix.chars().count() + hot.glyph.chars().count() + 1 + temp.chars().count();
+    let name_len = hot.name.chars().count();
+    let margin_len = margin.chars().count() + 1;
+    let keep_margin = !margin.is_empty() && fixed + name_len + margin_len <= cells;
+    let room = cells.saturating_sub(fixed).max(HOT_NAME_MIN);
+    let name: String = hot.name.chars().take(room).collect();
+    let mut bits = vec![
         bit(prefix.to_string(), C16::White),
-        bit(format!("{}{} {}", hot.glyph, hot.name, hot.c), hot.fg),
-        bit(format!(" {margin}"), C16::BrightBlack),
-    ]
+        bit(format!("{}{name} {temp}", hot.glyph), hot.fg),
+    ];
+    if keep_margin {
+        bits.push(bit(format!(" {margin}"), C16::BrightBlack));
+    }
+    bits
 }
 
-fn format_margin(tenths: i32) -> String {
-    if tenths >= i32::MAX / 8 {
+fn format_margin(heat: Option<Heat>) -> String {
+    let Some(heat) = heat else {
         return String::new();
-    }
-    let deg = (f64::from(tenths) / 10.0).round() as i64;
+    };
+    let deg = (f64::from(heat.margin) / 10.0).round() as i64;
     format!("{deg:+}")
 }
 
@@ -7146,7 +7190,7 @@ fn psi_text(pct: Option<f64>) -> String {
     }
 }
 
-fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
+fn glance_host(model: &TtyModel, wide: bool, cells: usize) -> Vec<Vec<Bit>> {
     let gpu = pct_i(model.gpu_pct);
     let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
     let vram = percent_of(model.vram_used_gb, model.vram_total_gb);
@@ -7173,8 +7217,8 @@ fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
                 bit(" SWAP ", C16::White),
                 bit(swap, C16::BrightWhite),
             ],
-            hot_line("HOT ", hot.first()),
-            hot_line("    ", hot.get(1)),
+            hot_line("HOT ", hot.first(), cells),
+            hot_line("    ", hot.get(1), cells),
             vec![
                 bit(format!("DISK R {disk_r}"), C16::BrightWhite),
                 bit("  W ", C16::White),
@@ -7196,8 +7240,8 @@ fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
         vec![
             vec![bit(format!("GPU {gpu}% {}", temp_c(model.gpu_c)), gpu_fg)],
             vec![bit(format!("VRAM {}%", pct_of(vram)), C16::BrightWhite)],
-            hot_line("HOT ", hot.first()),
-            hot_line("    ", hot.get(1)),
+            hot_line("HOT ", hot.first(), cells),
+            hot_line("    ", hot.get(1), cells),
             vec![bit(format!("DISK {disk_r}"), C16::BrightWhite)],
             vec![bit(format!("NET {net}"), C16::BrightWhite)],
             vec![bit(format!("CPU {cpu}%"), C16::BrightWhite)],
@@ -8557,6 +8601,68 @@ mod tests {
             color::spectrum::rate(ceiling / 64.0, ceiling)
                 < color::spectrum::rate(ceiling / 32.0, ceiling)
         );
+    }
+
+    /// #173: the marks' edges. At the critical point exactly is past
+    /// critical; at the warning point past warning; the `^` window opens at
+    /// 4.0 C under the warning point.
+    #[test]
+    fn sensor_marks_change_exactly_at_their_points() {
+        let mark = |tenths: i32| {
+            let item = TempItem {
+                label: String::new(),
+                tenths,
+                level: Level::Normal,
+                thresholds: Some((800, 900)),
+            };
+            let (glyph, _, heat) = sensor_mark(&item);
+            (glyph, heat.map(|h| h.band))
+        };
+        assert_eq!(mark(900), ("!!", Some(HeatBand::Crit)));
+        assert_eq!(mark(899), ("!", Some(HeatBand::Warn)));
+        assert_eq!(mark(800), ("!", Some(HeatBand::Warn)));
+        assert_eq!(mark(799), ("^", Some(HeatBand::Below)));
+        assert_eq!(mark(760), ("^", Some(HeatBand::Below)));
+        assert_eq!(mark(759), ("", Some(HeatBand::Below)));
+    }
+
+    /// #173: a HOT row that does not fit drops its margin whole, then
+    /// shortens its name down to three characters.
+    #[test]
+    fn hot_line_drops_the_margin_whole_then_shortens_the_name() {
+        let hot = |name: &str, c: i32, band: HeatBand, margin: i32| Hot {
+            name: name.to_owned(),
+            c,
+            heat: Some(Heat { band, margin }),
+            glyph: if band == HeatBand::Crit { "!!" } else { "" },
+            fg: C16::Red,
+        };
+        let text = |bits: Vec<Bit>| bits.iter().map(|b| b.text.as_str()).collect::<String>();
+        let crit = hot("aux1", 92, HeatBand::Crit, 320);
+        assert_eq!(text(hot_line("HOT ", Some(&crit), 17)), "HOT !!aux1 92 +32");
+        assert_eq!(text(hot_line("HOT ", Some(&crit), 16)), "HOT !!aux1 92");
+        assert_eq!(text(hot_line("HOT ", Some(&crit), 13)), "HOT !!aux1 92");
+        assert_eq!(text(hot_line("HOT ", Some(&crit), 12)), "HOT !!aux 92");
+        // The name stops at three characters; the temperature stays whole.
+        let long = hot("sensor", 104, HeatBand::Crit, 240);
+        assert_eq!(text(hot_line("HOT ", Some(&long), 15)), "HOT !!senso 104");
+        assert_eq!(text(hot_line("HOT ", Some(&long), 11)), "HOT !!sen 104");
+        assert_eq!(text(hot_line("    ", Some(&long), 5)), "    !!sen 104");
+        // No thresholds: no margin to drop.
+        let bare = Hot {
+            heat: None,
+            glyph: "",
+            ..hot("bare", 99, HeatBand::Below, 0)
+        };
+        assert_eq!(text(hot_line("    ", Some(&bare), 15)), "    bare 99");
+        // Widths are characters, not bytes: `aéééé` is 5 cells (9 bytes).
+        let wide = hot("aéééé", 92, HeatBand::Crit, 120);
+        assert_eq!(
+            text(hot_line("HOT ", Some(&wide), 18)),
+            "HOT !!aéééé 92 +12"
+        );
+        assert_eq!(text(hot_line("HOT ", Some(&wide), 15)), "HOT !!aéééé 92");
+        assert_eq!(text(hot_line("HOT ", Some(&wide), 12)), "HOT !!aéé 92");
     }
 
     /// #165: 0 at 20 °C, 100 at the warning point, past it the hot tail:

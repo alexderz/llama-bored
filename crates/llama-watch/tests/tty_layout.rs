@@ -8911,12 +8911,10 @@ fn starting_blanks_the_level_gauges_even_with_readings() {
     assert!(swap.ends_with("0.4/16.0 G"), "{swap}");
 }
 
-/// #165: the tty hides NVMe Sensor 1 and 2 and the board's AUXTIN2
-/// (`temps::TTY_BLOCK`) from its gauges and TEMPS rows, even when one is
-/// the hottest reading. The glance's HOT rows read the same panel, but this
-/// test cannot guard them yet: `hottest()` sorts the coolest first, so a
-/// hot sensor never reaches a HOT row, blocked or not. The HOT-row check
-/// waits for the separate sort-fix issue.
+/// #165, #173: the tty hides NVMe Sensor 1 and 2 and the board's AUXTIN2
+/// (`temps::TTY_BLOCK`) from its gauges, TEMPS rows and the glance's HOT
+/// rows, even when one is the hottest reading. Without the block the two
+/// hottest lead the HOT rows.
 #[test]
 fn a_tty_blocked_sensor_never_reaches_the_screen() {
     use llama_watch::config::Temps;
@@ -8946,8 +8944,7 @@ fn a_tty_blocked_sensor_never_reaches_the_screen() {
     };
     for (cols, rows) in [(213u16, 60u16), (160, 26), (160, 49)] {
         let all = screen(&TempLook::new(&Temps::default()), cols, rows);
-        // Short labels for the TEMPS rows, values for the gauges. (No
-        // HOT-row check until the hottest() sort is fixed; see above.)
+        // Short labels for the TEMPS and HOT rows, values for the gauges.
         for gone in ["s1", "s2", "aux2", "94 C", "96 C", "99 C"] {
             assert!(!all.contains(gone), "{cols}x{rows}: {gone}\n{all}");
         }
@@ -8959,7 +8956,37 @@ fn a_tty_blocked_sensor_never_reaches_the_screen() {
             open.contains("99 C") && open.contains("96 C"),
             "{cols}x{rows}\n{open}"
         );
+        // The HOT rows (the margin may be cut at 160 columns): blocked,
+        // what is left (the board's SYSTIN alone, so its row name); open,
+        // the critical AUXTIN2 and Sensor 2 first.
+        let blocked = hot_pair(&all);
+        assert!(blocked[0].starts_with("HOT board 40"), "{blocked:?}");
+        let open = hot_pair(&open);
+        assert!(open[0].starts_with("HOT !!aux2 99"), "{open:?}");
+        assert!(open[1].starts_with("    !!s2 96"), "{open:?}");
     }
+}
+
+/// The glance's two HOT rows of a frame's text, 16 cells from `HOT`.
+fn hot_pair(all: &str) -> [String; 2] {
+    let rows: Vec<Vec<char>> = all.lines().map(|r| r.chars().collect()).collect();
+    let at = rows
+        .iter()
+        .position(|r| r.windows(4).any(|w| w == ['H', 'O', 'T', ' ']))
+        .expect("a HOT row");
+    let col = rows[at]
+        .windows(4)
+        .position(|w| w == ['H', 'O', 'T', ' '])
+        .unwrap();
+    [at, at + 1].map(|r| {
+        rows[r]
+            .iter()
+            .skip(col)
+            .take(16)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    })
 }
 
 // ---- #167: the GPU reservation and every claim in the header ------------
@@ -9512,4 +9539,150 @@ fn gauge_bars_are_solid_unless_bar_segments() {
         };
         assert_eq!((cell.ch, cell.rich), (console, SEG), "{glyphs:?}");
     }
+}
+
+// ---- #173: the glance's HOT rows lead with the hottest ----------------------
+
+/// One TEMPS row for [`hot_rows_of`]: name, °C, warning and critical points.
+type HotItem<'a> = (&'a str, i32, Option<(i32, i32)>);
+
+/// The two HOT rows for a TEMPS panel of one item a row, on the narrow
+/// (160-column) glance.
+fn hot_rows_of(items: &[HotItem]) -> [String; 2] {
+    let mut model = with_host_rates(false);
+    model.temps = Some(TempPanel {
+        groups: items
+            .iter()
+            .map(|(name, c, limits)| TempGroup {
+                name: (*name).to_string(),
+                items: vec![temp_marked("", *c, Level::Normal, *limits)],
+            })
+            .collect(),
+    });
+    let grid = draw(&model, 160, 48);
+    let glance = glance_rows(&grid, 64..80);
+    [glance[2].clone(), glance[3].trim_start().to_string()]
+}
+
+/// #173: past critical first, then past warning, then nearest below; the
+/// coldest is not shown. Past critical outranks a bigger margin past the
+/// warning: an NVMe at 86 of 82/85 over a CPU at 89 of 80/90.
+#[test]
+fn hot_rows_lead_with_the_critical_sensor_and_drop_the_cold_one() {
+    let limits = Some((800, 900));
+    let hot = hot_rows_of(&[
+        ("cd", 25, limits),
+        ("wm", 70, limits),
+        ("cr", 92, limits),
+        ("md", 60, limits),
+    ]);
+    assert_eq!(hot, ["HOT !!cr 92 +12", "wm 70 -10"], "{hot:?}");
+    assert!(hot.iter().all(|r| !r.contains("cd")), "{hot:?}");
+    let hot = hot_rows_of(&[("cp", 89, Some((800, 900))), ("nv", 86, Some((820, 850)))]);
+    assert_eq!(hot, ["HOT !!nv 86 +4", "!cp 89 +9"], "{hot:?}");
+}
+
+/// #173: a sensor without thresholds never outranks one with them, even
+/// at 99 C against 30 C.
+#[test]
+fn a_sensor_without_thresholds_ranks_after_every_one_with_them() {
+    let limits = Some((800, 900));
+    let hot = hot_rows_of(&[("ba", 99, None), ("co", 30, limits)]);
+    assert_eq!(hot, ["HOT co 30 -50", "ba 99"], "{hot:?}");
+    let hot = hot_rows_of(&[("ba", 99, None), ("aa", 30, limits), ("bb", 31, limits)]);
+    assert_eq!(hot, ["HOT bb 31 -49", "aa 30 -50"], "{hot:?}");
+}
+
+/// #173: equal heat keeps panel order.
+#[test]
+fn hot_rows_keep_panel_order_on_a_tie() {
+    let limits = Some((800, 900));
+    let hot = hot_rows_of(&[("cd", 25, limits), ("aa", 70, limits), ("bb", 70, limits)]);
+    assert_eq!(hot, ["HOT aa 70 -10", "bb 70 -10"], "{hot:?}");
+    let hot = hot_rows_of(&[("cd", 25, limits), ("bb", 70, limits), ("aa", 70, limits)]);
+    assert_eq!(hot, ["HOT bb 70 -10", "aa 70 -10"], "{hot:?}");
+}
+
+/// #173: at 160 columns the glance is 15 cells. A critical row that does
+/// not fit drops its margin whole, never a lone `+`; a six-character name
+/// at 104 C shortens so the temperature stays whole (it printed `10`).
+#[test]
+fn a_hot_row_that_does_not_fit_drops_its_margin_then_shortens_its_name() {
+    let limits = Some((800, 900));
+    let hot = hot_rows_of(&[("aux1", 92, limits), ("cd", 25, limits)]);
+    assert_eq!(hot[0], "HOT !!aux1 92", "{hot:?}");
+    let hot = hot_rows_of(&[("sensor", 104, limits), ("cd", 25, limits)]);
+    assert_eq!(hot[0], "HOT !!senso 104", "{hot:?}");
+    // The second row the same: `!NVMe0 82`, no `+`.
+    let hot = hot_rows_of(&[("aux1", 92, limits), ("NVMe0", 82, Some((820, 850)))]);
+    assert_eq!(hot, ["HOT !!aux1 92", "!NVMe0 82"], "{hot:?}");
+    // A row that fits keeps its margin.
+    let hot = hot_rows_of(&[("cr", 92, limits), ("cd", 25, limits)]);
+    assert_eq!(hot[0], "HOT !!cr 92 +12", "{hot:?}");
+}
+
+/// #173: a renamed, non-ASCII sensor label (`aééééééx`) draws without a
+/// panic at 160 and 213 columns: the HOT row cuts it to six characters,
+/// not six bytes, and fits the glance; its gauge label keeps seven cells.
+#[test]
+fn a_multi_byte_sensor_label_draws_at_its_width() {
+    let limits = Some((800, 900));
+    let name = "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}x";
+    let six = "a\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}";
+    let hot = hot_rows_of(&[(name, 92, limits), ("cd", 25, limits)]);
+    assert_eq!(hot[0], format!("HOT !!{six} 92"), "{hot:?}");
+    assert_eq!(hot[0].chars().count(), 15, "the 15-cell glance at 160");
+    let mut model = with_host_rates(false);
+    model.temps = Some(TempPanel {
+        groups: vec![
+            TempGroup {
+                name: name.to_string(),
+                items: vec![temp_marked("", 92, Level::Normal, limits)],
+            },
+            TempGroup {
+                name: "cd".to_string(),
+                items: vec![temp_marked("", 25, Level::Normal, limits)],
+            },
+        ],
+    });
+    let grid = draw(&model, 213, 60);
+    let glance = glance_rows(&grid, 64..93);
+    assert_eq!(glance[2], format!("HOT !!{six} 92 +12"), "{glance:?}");
+    // The gauge label is seven cells: the console folds `é` to `e`
+    // (sanitize), the grid file keeps it.
+    let all = whole(&grid);
+    assert!(all.contains("aeeeeee       92 C "), "{all}");
+    let (row, col) = label_hit(&grid, "aeeeeee");
+    let rich: String = (col..col + 8)
+        .map(|c| grid.get(c, row).unwrap().rich)
+        .collect();
+    assert_eq!(
+        rich,
+        format!("{} ", name.chars().take(7).collect::<String>())
+    );
+}
+
+/// #173: ties keep panel order on a long panel too, where an unstable sort
+/// would not: 24 sensors tied at 70 C among 16 cooler ones, in an order
+/// the sort has to work on.
+#[test]
+fn hot_rows_keep_panel_order_on_a_tie_in_a_long_panel() {
+    let limits = Some((800, 900));
+    let names: Vec<String> = (0..40).map(|i| format!("t{i:02}")).collect();
+    let items: Vec<HotItem> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let c = if i % 5 == 1 || i % 5 == 3 {
+                40 + (i as i32 % 7)
+            } else {
+                70
+            };
+            (name.as_str(), c, limits)
+        })
+        .rev()
+        .collect();
+    // Panel order is t39 .. t00; the first tied at 70 are t39 and t37.
+    let hot = hot_rows_of(&items);
+    assert_eq!(hot, ["HOT t39 70 -10", "t37 70 -10"], "{hot:?}");
 }
