@@ -3,6 +3,7 @@ pub mod cmdline;
 pub mod events;
 pub mod fans;
 pub mod gpu;
+pub mod hostio;
 pub mod hwmon;
 pub mod llamaswap;
 pub mod proc;
@@ -45,6 +46,9 @@ mod tests {
             (SourceId::HwmonCpu, "hwmon.cpu"),
             (SourceId::Gpu, "gpu"),
             (SourceId::Llama, "llama"),
+            (SourceId::ProcDisk, "proc.disk"),
+            (SourceId::ProcNet, "proc.net"),
+            (SourceId::ProcPsi, "proc.psi"),
         ];
         for (id, name) in cases {
             assert_eq!(id.as_str(), name);

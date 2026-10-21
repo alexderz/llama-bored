@@ -80,6 +80,8 @@ full_redraw_s = 5                   # >= 1
 # decode and prefill rates.
 gen_ceiling_tps = 250               # decode; finite, (0, 100000]
 prompt_ceiling_tps = 1500           # prefill; finite, (0, 100000]
+disk_ceiling_bps = 7000000000      # three-decade disk bars; 7 GB/s, so 12 MB/s still shows
+#net_ceiling_bps = 312500000       # NET bar; unset sums the up links' speeds (1 Gbit when unknown)
 chart_bucket_s = 2                  # 1..=60; one tty chart column (tokens decoded in that span)
 ctx_history_h = 6                   # 1..=24; hours of per-slot context in the SLOTS sparklines
 chart_glyphs = "eighths"            # "eighths" needs a llama-hack font on tty11; "halves" renders with eurlatgr (code default)
@@ -163,7 +165,9 @@ palette = "llama"
 [temps]
 enabled = true
 #allow = []
-#block = []
+# NVMe controller sensors and the floating AUXTIN2 pin stay hidden
+# here, not in code (#163). A second drive's chip is `nvme-<suffix>`.
+block = ["nvme*:Sensor *", "nct*:AUXTIN2"]
 #defaults = true
 #rename = { "nct6798:SYSTIN" = "board" }
 #warn = { "z53" = 42 }

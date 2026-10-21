@@ -76,6 +76,8 @@ pub const SNAPSHOT_PATH: &str = "/run/llama-watch/snapshot.json";
 pub const MAX_WATTS: f32 = 5000.0;
 /// Top of every byte-count field (VRAM, system memory): 1 PiB.
 pub const MAX_MEM_BYTES: u64 = 1 << 50;
+/// Largest disk or network rate on the wire, bytes/s.
+pub const MAX_BPS: f32 = 1.0e12;
 /// Most slots a model may report.
 pub const MAX_SLOTS: u16 = 1024;
 /// Most fans a snapshot may carry (`[fans] channels` allows 8).
@@ -293,6 +295,34 @@ pub struct Host {
     /// System memory total, bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_total_bytes: Option<u64>,
+
+    /// Whole-disk read bytes/s. Omitted when the rate is not known yet.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub disk_read_bps: Option<f32>,
+    /// Whole-disk write bytes/s.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub disk_write_bps: Option<f32>,
+    /// Physical-interface receive bytes/s.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub net_rx_bps: Option<f32>,
+    /// Physical-interface transmit bytes/s.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub net_tx_bps: Option<f32>,
+    /// IO PSI `some` avg10, percent.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub io_psi_pct: Option<f32>,
+    /// Memory PSI `some` avg10, percent.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub mem_psi_pct: Option<f32>,
+    /// CPU PSI `some` avg10, percent.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub cpu_psi_pct: Option<f32>,
+    /// Swap in use, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_used_bytes: Option<u64>,
+    /// Swap total, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
 }
 
 /// llama-swap state and the models to draw.
@@ -836,11 +866,20 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
     check_range("gpu_w", snapshot.host.gpu_w, 0.0, MAX_WATTS)?;
     check_range("gpu_limit_w", snapshot.host.gpu_limit_w, 0.0, MAX_WATTS)?;
     check_range("cpu_w", snapshot.host.cpu_w, 0.0, MAX_WATTS)?;
+    check_range("disk_read_bps", snapshot.host.disk_read_bps, 0.0, MAX_BPS)?;
+    check_range("disk_write_bps", snapshot.host.disk_write_bps, 0.0, MAX_BPS)?;
+    check_range("net_rx_bps", snapshot.host.net_rx_bps, 0.0, MAX_BPS)?;
+    check_range("net_tx_bps", snapshot.host.net_tx_bps, 0.0, MAX_BPS)?;
+    check_pct("io_psi_pct", snapshot.host.io_psi_pct)?;
+    check_pct("mem_psi_pct", snapshot.host.mem_psi_pct)?;
+    check_pct("cpu_psi_pct", snapshot.host.cpu_psi_pct)?;
     for (field, bytes) in [
         ("vram_used_bytes", snapshot.host.vram_used_bytes),
         ("vram_total_bytes", snapshot.host.vram_total_bytes),
         ("mem_used_bytes", snapshot.host.mem_used_bytes),
         ("mem_total_bytes", snapshot.host.mem_total_bytes),
+        ("swap_used_bytes", snapshot.host.swap_used_bytes),
+        ("swap_total_bytes", snapshot.host.swap_total_bytes),
     ] {
         if bytes.is_some_and(|b| b > MAX_MEM_BYTES) {
             return Err(WireError::OutOfRange { field });
@@ -1111,6 +1150,15 @@ mod tests {
                 vram_total_bytes: None,
                 mem_used_bytes: None,
                 mem_total_bytes: None,
+                disk_read_bps: None,
+                disk_write_bps: None,
+                net_rx_bps: None,
+                net_tx_bps: None,
+                io_psi_pct: None,
+                mem_psi_pct: None,
+                cpu_psi_pct: None,
+                swap_used_bytes: None,
+                swap_total_bytes: None,
             },
             ai: Ai {
                 state: AiWire::Down,

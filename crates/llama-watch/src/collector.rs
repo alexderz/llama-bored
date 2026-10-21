@@ -11,6 +11,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::sources::fans::{FanPanel, FanSource};
 use crate::sources::gpu::{GpuBackend, GpuSource, ProcessRead};
+use crate::sources::hostio::{
+    self, DiskCounters, HostIo, LinkSpeeds, NetCounters, Probe, RateWindow, SourceHealth,
+};
 use crate::sources::proc::{self, CpuSample};
 use crate::sources::temps::{TempReading, TempSource};
 use crate::sources::{self, Roots, SourceId};
@@ -111,6 +114,10 @@ pub struct WatchSample {
     /// Compute processes on the GPU. Read at most once a second. Absent
     /// from [`Snapshot`].
     pub gpu_processes: GpuProcesses,
+    /// Disk, network, swap and PSI from this tick. Rates are over the
+    /// trailing `cpu_window_s` and stay `None` until a stored sample is that
+    /// old; health says whether the file was readable.
+    pub host_io: HostIo,
 }
 
 /// 10 Hz collector. [`Self::sample`] takes the clock and a llama view.
@@ -204,6 +211,12 @@ pub(crate) struct Collector<'a, B, L> {
     /// Last process list. Cleared when the read fails or the session drops.
     gpu_processes: Vec<GpuProcess>,
     processes_failed: bool,
+    /// Whole-disk counters over `cpu_window`, for the byte rate.
+    disk_rates: RateWindow<DiskCounters>,
+    /// Physical-interface counters over `cpu_window`, for the byte rate.
+    net_rates: RateWindow<NetCounters>,
+    /// NET ceiling, re-read every few seconds.
+    links: LinkSpeeds,
     llama: Option<LlamaSeen>,
     /// `[llama] enabled`. When false every view is ignored.
     llama_enabled: bool,
@@ -324,11 +337,12 @@ where
     ///
     fn watch(roots: Roots, backend: B, config: &'a ValidWatchConfig, log: L) -> Self {
         let learn = config.load.idle == IdleMode::Auto;
+        let window = Duration::from_secs_f64(config.collector.cpu_window_s);
         Self {
             roots,
             gpu: GpuSource::new(backend),
             cpu_top_k: config.collector.cpu_top_k as usize,
-            cpu_window: Duration::from_secs_f64(config.collector.cpu_window_s),
+            cpu_window: window,
             cpu_limit_w: config.load.cpu_limit_w,
             nominal_frac: config.load.nominal_frac,
             gpu_idle: IdleFloor::new(config.load.gpu_idle_w, learn, config.load.nominal_frac),
@@ -345,6 +359,9 @@ where
             limit_failed: false,
             gpu_processes: Vec::new(),
             processes_failed: false,
+            disk_rates: RateWindow::new(window),
+            net_rates: RateWindow::new(window),
+            links: LinkSpeeds::default(),
             llama: None,
             llama_enabled: config.llama.enabled,
             fans: FanSource::new(&config.fans),
@@ -384,6 +401,7 @@ where
         self.poll_processes(mono);
         let (ai, models) = self.apply_view(llama, &mut errors);
         let activity = self.activity_load(mono, gpu_pct, cpu_pct, &gpu);
+        let host_io = self.sample_host_io(mono, &mut errors);
         WatchSample {
             snapshot: Snapshot {
                 t_mono: mono,
@@ -412,6 +430,93 @@ where
                 list: self.gpu_processes.clone(),
                 failed: self.processes_failed,
             },
+            host_io,
+        }
+    }
+
+    /// Disk, net, swap and PSI. Missing files stay absent and out of
+    /// `errors`. A present file that does not parse is one error. Disk and
+    /// net rates use the CPU window, so they read as steadily as CPU %.
+    fn sample_host_io(&mut self, mono: Instant, errors: &mut BTreeSet<SourceId>) -> HostIo {
+        let mut io = HostIo::default();
+        match hostio::read_disk(&self.roots) {
+            Probe::Ready(now) => {
+                self.note(SourceId::ProcDisk, Ok(()));
+                if let Some((dt, prev)) = self.disk_rates.push(mono, now) {
+                    io.disk_read_bps = hostio::sector_rate(prev.read_sectors, now.read_sectors, dt);
+                    io.disk_write_bps =
+                        hostio::sector_rate(prev.write_sectors, now.write_sectors, dt);
+                }
+                io.disk = SourceHealth::Ok;
+            }
+            Probe::Missing => {
+                self.clear_source(SourceId::ProcDisk);
+                self.disk_rates.clear();
+                io.disk = SourceHealth::Absent;
+            }
+            Probe::Failed(message) => {
+                errors.insert(SourceId::ProcDisk);
+                self.note(SourceId::ProcDisk, Err(message));
+                self.disk_rates.clear();
+                io.disk = SourceHealth::Down;
+            }
+        }
+        match hostio::read_net(&self.roots, &mut self.links, mono) {
+            Probe::Ready(now) => {
+                self.note(SourceId::ProcNet, Ok(()));
+                if let Some((dt, prev)) = self.net_rates.push(mono, now) {
+                    io.net_rx_bps = hostio::counter_rate(prev.rx_bytes, now.rx_bytes, dt);
+                    io.net_tx_bps = hostio::counter_rate(prev.tx_bytes, now.tx_bytes, dt);
+                }
+                io.net_ceiling_bps = now.ceiling_bps.map(|bps| bps as f64);
+                io.net = SourceHealth::Ok;
+            }
+            Probe::Missing => {
+                self.clear_source(SourceId::ProcNet);
+                self.net_rates.clear();
+                io.net = SourceHealth::Absent;
+            }
+            Probe::Failed(message) => {
+                errors.insert(SourceId::ProcNet);
+                self.note(SourceId::ProcNet, Err(message));
+                self.net_rates.clear();
+                io.net = SourceHealth::Down;
+            }
+        }
+        match hostio::read_swap(&self.roots) {
+            Probe::Ready(swap) => {
+                io.swap_used_bytes = Some(swap.used);
+                io.swap_total_bytes = Some(swap.total);
+            }
+            // Swap rides on meminfo. A bad or missing pair leaves the meter
+            // absent; proc health already covers a missing meminfo.
+            Probe::Missing | Probe::Failed(_) => {}
+        }
+        match hostio::read_psi(&self.roots) {
+            Probe::Ready(psi) => {
+                self.note(SourceId::ProcPsi, Ok(()));
+                io.cpu_psi = psi.cpu;
+                io.io_psi = psi.io;
+                io.mem_psi = psi.memory;
+                io.psi = SourceHealth::Ok;
+            }
+            Probe::Missing => {
+                self.clear_source(SourceId::ProcPsi);
+                io.psi = SourceHealth::Absent;
+            }
+            Probe::Failed(message) => {
+                errors.insert(SourceId::ProcPsi);
+                self.note(SourceId::ProcPsi, Err(message));
+                io.psi = SourceHealth::Down;
+            }
+        }
+        io
+    }
+
+    /// A source that was down and is now simply absent stops being an error.
+    fn clear_source(&mut self, id: SourceId) {
+        if self.failed.contains(&id) {
+            self.note(id, Ok(()));
         }
     }
 

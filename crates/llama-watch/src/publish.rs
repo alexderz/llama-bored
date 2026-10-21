@@ -88,6 +88,19 @@ pub struct Extras {
     /// Each model's id and cumulative numbers (#71), in the order of the
     /// snapshot's models; the display name confirms the match.
     pub series: Vec<ModelSeries>,
+    /// Whole-disk read and write, bytes/s.
+    pub disk_read_bps: Option<f64>,
+    pub disk_write_bps: Option<f64>,
+    /// Physical-interface receive and transmit, bytes/s.
+    pub net_rx_bps: Option<f64>,
+    pub net_tx_bps: Option<f64>,
+    /// PSI `some` avg10, percent.
+    pub io_psi: Option<f32>,
+    pub mem_psi: Option<f32>,
+    pub cpu_psi: Option<f32>,
+    /// Swap used and total, bytes.
+    pub swap_used_bytes: Option<u64>,
+    pub swap_total_bytes: Option<u64>,
 }
 
 /// One shown fan: `(chip, channel, label, rpm, pwm 0..=255)` (#74).
@@ -303,6 +316,15 @@ pub fn build(
             vram_total_bytes: mem_bytes(extras.vram_total),
             mem_used_bytes: mem_bytes(extras.mem_used),
             mem_total_bytes: mem_bytes(extras.mem_total),
+            disk_read_bps: bps(extras.disk_read_bps),
+            disk_write_bps: bps(extras.disk_write_bps),
+            net_rx_bps: bps(extras.net_rx_bps),
+            net_tx_bps: bps(extras.net_tx_bps),
+            io_psi_pct: psi(extras.io_psi),
+            mem_psi_pct: psi(extras.mem_psi),
+            cpu_psi_pct: psi(extras.cpu_psi),
+            swap_used_bytes: mem_bytes(extras.swap_used_bytes),
+            swap_total_bytes: mem_bytes(extras.swap_total_bytes),
         },
         ai: ai_of(snapshot, extras),
         tokens: Tokens {
@@ -317,6 +339,19 @@ pub fn build(
         sources: extras.sources.map(sources_of),
         suspected_loads: suspected_of(&extras.suspected_loads),
     }
+}
+
+fn bps(value: Option<f64>) -> Option<f32> {
+    value
+        .filter(|v| v.is_finite() && (0.0..=f64::from(wire::MAX_BPS)).contains(v))
+        .map(|v| v as f32)
+}
+
+/// PSI percent, clamped into the wire's 0..=100. A non-finite reading is absent.
+fn psi(value: Option<f32>) -> Option<f32> {
+    value
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v.min(100.0))
 }
 
 fn watts(value: Option<f64>) -> Option<f32> {

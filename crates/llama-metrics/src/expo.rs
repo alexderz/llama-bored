@@ -726,6 +726,51 @@ fn host(out: &mut Out, snap: &WireSnapshot) {
         "System memory total, bytes.",
         host.mem_total_bytes,
     );
+    out.gauge_opt(
+        "llamabored_disk_read_bytes_per_second",
+        "Whole-disk read throughput, bytes per second.",
+        host.disk_read_bps,
+    );
+    out.gauge_opt(
+        "llamabored_disk_write_bytes_per_second",
+        "Whole-disk write throughput, bytes per second.",
+        host.disk_write_bps,
+    );
+    out.gauge_opt(
+        "llamabored_net_receive_bytes_per_second",
+        "Physical network interfaces, receive bytes per second.",
+        host.net_rx_bps,
+    );
+    out.gauge_opt(
+        "llamabored_net_transmit_bytes_per_second",
+        "Physical network interfaces, transmit bytes per second.",
+        host.net_tx_bps,
+    );
+    out.gauge_opt(
+        "llamabored_pressure_io_ratio",
+        "IO pressure, some avg10, 0 to 1.",
+        ratio_of_pct(host.io_psi_pct),
+    );
+    out.gauge_opt(
+        "llamabored_pressure_memory_ratio",
+        "Memory pressure, some avg10, 0 to 1.",
+        ratio_of_pct(host.mem_psi_pct),
+    );
+    out.gauge_opt(
+        "llamabored_pressure_cpu_ratio",
+        "CPU pressure, some avg10, 0 to 1.",
+        ratio_of_pct(host.cpu_psi_pct),
+    );
+    out.bytes_opt(
+        "llamabored_swap_used_bytes",
+        "Swap in use, bytes.",
+        host.swap_used_bytes,
+    );
+    out.bytes_opt(
+        "llamabored_swap_total_bytes",
+        "Swap total, bytes.",
+        host.swap_total_bytes,
+    );
 }
 
 /// Every per-model family (#71), labelled `model` and `engine`.

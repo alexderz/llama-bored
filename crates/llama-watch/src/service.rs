@@ -420,6 +420,8 @@ where
         setup: Rules::compile(&input.config.setup).unwrap_or_default(),
         temps_look: crate::sources::temps::TempLook::new(&input.config.temps),
         jobs_stale_s: input.config.jobs.stale_s,
+        disk_ceiling_bps: input.config.tty.disk_ceiling_bps,
+        net_ceiling_bps: input.config.tty.net_ceiling_bps,
     };
     let mut state = TickState::new(
         input.config.tty.chart_bucket_s,
@@ -553,6 +555,10 @@ struct FrameCtx {
     temps_look: crate::sources::temps::TempLook,
     /// `[jobs] stale_s`.
     jobs_stale_s: u64,
+    /// `[tty] disk_ceiling_bps`.
+    disk_ceiling_bps: f64,
+    /// `[tty] net_ceiling_bps`. `None` uses the sampled link speed.
+    net_ceiling_bps: Option<f64>,
 }
 
 fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
@@ -1168,6 +1174,16 @@ fn tty_model(
             })
             .collect(),
         now: wall,
+        disk_read_bps: sample.host_io.disk_read_bps,
+        disk_write_bps: sample.host_io.disk_write_bps,
+        net_rx_bps: sample.host_io.net_rx_bps,
+        net_tx_bps: sample.host_io.net_tx_bps,
+        net_ceiling_bps: ctx.net_ceiling_bps.or(sample.host_io.net_ceiling_bps),
+        swap_used_gb: sample.host_io.swap_used_bytes.map(gib),
+        swap_total_gb: sample.host_io.swap_total_bytes.map(gib),
+        io_psi: sample.host_io.io_psi.map(f64::from),
+        mem_psi: sample.host_io.mem_psi.map(f64::from),
+        disk_ceiling_bps: ctx.disk_ceiling_bps,
         tz_offset_s: zone.offset_at(unix_secs_of(wall)),
     }
 }
@@ -2143,6 +2159,9 @@ fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<
             "nvml",
             "hwmon",
             "proc",
+            "disk",
+            "net",
+            "psi",
         ]
         .into_iter()
         .map(|name| seg(name, HealthStatus::Pending, ""))
@@ -2228,7 +2247,19 @@ fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<
             },
             "",
         ),
+        host_seg("disk", sample.host_io.disk),
+        host_seg("net", sample.host_io.net),
+        host_seg("psi", sample.host_io.psi),
     ]
+}
+
+fn host_seg(name: &str, health: crate::sources::hostio::SourceHealth) -> HealthSeg {
+    let status = match health {
+        crate::sources::hostio::SourceHealth::Ok => HealthStatus::Ok,
+        crate::sources::hostio::SourceHealth::Down => HealthStatus::Down,
+        crate::sources::hostio::SourceHealth::Absent => HealthStatus::Absent,
+    };
+    seg(name, status, "")
 }
 
 fn seg(name: &str, status: HealthStatus, note: &str) -> HealthSeg {
@@ -2351,6 +2382,15 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
         sources: wire_sources(&health(sample, &tick.detail, watch), &tick.detail.latencies),
         suspected_loads: tick.detail.suspected_loads.clone(),
         series: tick.detail.series.clone(),
+        disk_read_bps: sample.host_io.disk_read_bps,
+        disk_write_bps: sample.host_io.disk_write_bps,
+        net_rx_bps: sample.host_io.net_rx_bps,
+        net_tx_bps: sample.host_io.net_tx_bps,
+        io_psi: sample.host_io.io_psi,
+        mem_psi: sample.host_io.mem_psi,
+        cpu_psi: sample.host_io.cpu_psi,
+        swap_used_bytes: sample.host_io.swap_used_bytes,
+        swap_total_bytes: sample.host_io.swap_total_bytes,
     }
 }
 
@@ -3932,6 +3972,8 @@ mod tests {
             setup: Rules::builtin(),
             temps_look: crate::sources::temps::TempLook::default(),
             jobs_stale_s: 180,
+            disk_ceiling_bps: 7e9,
+            net_ceiling_bps: None,
         }
     }
 
@@ -4020,6 +4062,206 @@ mod tests {
         assert_eq!(sources.running.and_then(|s| s.latency_s), Some(0.003));
         assert_eq!(sources.slots.and_then(|s| s.latency_s), Some(0.007));
         assert_eq!(sources.gpu.and_then(|s| s.latency_s), None);
+    }
+
+    /// #163: a distinct number in every host field, so a swap between two
+    /// of them shows.
+    fn host_io_sample() -> WatchSample {
+        let mut sample = backend_sample(vec![served("m", "ready", None)]);
+        sample.host_io = crate::sources::hostio::HostIo {
+            disk_read_bps: Some(1.0e9),
+            disk_write_bps: Some(2.0e6),
+            net_rx_bps: Some(3.0e6),
+            net_tx_bps: Some(4.0e3),
+            net_ceiling_bps: Some(312_500_000.0),
+            swap_used_bytes: Some(1 << 30),
+            swap_total_bytes: Some(16 << 30),
+            cpu_psi: Some(5.0),
+            io_psi: Some(6.0),
+            mem_psi: Some(7.0),
+            ..Default::default()
+        };
+        sample
+    }
+
+    fn idle_view() -> LlamaView {
+        LlamaView {
+            ai: AiState::Loaded,
+            models: Vec::new(),
+            decoded_total: None,
+            prompt_total: None,
+        }
+    }
+
+    /// #163: each host number reaches the frame, the extras and the wire
+    /// under its own name.
+    #[test]
+    fn host_io_reaches_the_frame_and_the_wire_field_by_field() {
+        let sample = host_io_sample();
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let ctx = frame_ctx(None, true);
+        let model = tty_model(
+            &sample,
+            &mut tick,
+            Instant::now(),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        assert_eq!(
+            (model.disk_read_bps, model.disk_write_bps),
+            (Some(1.0e9), Some(2.0e6))
+        );
+        assert_eq!(
+            (model.net_rx_bps, model.net_tx_bps),
+            (Some(3.0e6), Some(4.0e3))
+        );
+        assert_eq!(model.net_ceiling_bps, Some(312_500_000.0));
+        assert_eq!(
+            (model.swap_used_gb, model.swap_total_gb),
+            (Some(1.0), Some(16.0))
+        );
+        assert_eq!((model.io_psi, model.mem_psi), (Some(6.0), Some(7.0)));
+
+        let extras = publish_extras(&sample, &tick, &ctx);
+        assert_eq!(
+            (extras.io_psi, extras.mem_psi, extras.cpu_psi),
+            (Some(6.0), Some(7.0), Some(5.0))
+        );
+        let host = crate::publish::build(&sample.snapshot, &idle_view(), &extras, 1, 1).host;
+        assert_eq!(
+            (host.disk_read_bps, host.disk_write_bps),
+            (Some(1.0e9), Some(2.0e6))
+        );
+        assert_eq!(
+            (host.net_rx_bps, host.net_tx_bps),
+            (Some(3.0e6), Some(4.0e3))
+        );
+        assert_eq!(
+            (host.io_psi_pct, host.mem_psi_pct, host.cpu_psi_pct),
+            (Some(6.0), Some(7.0), Some(5.0))
+        );
+        assert_eq!(
+            (host.swap_used_bytes, host.swap_total_bytes),
+            (Some(1 << 30), Some(16 << 30))
+        );
+    }
+
+    /// An absent host reading is absent on the frame and the wire, never 0.
+    #[test]
+    fn absent_host_io_is_absent_on_the_frame_and_the_wire() {
+        let mut sample = host_io_sample();
+        sample.host_io = crate::sources::hostio::HostIo::default();
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let ctx = frame_ctx(None, true);
+        let model = tty_model(
+            &sample,
+            &mut tick,
+            Instant::now(),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        assert_eq!(
+            (
+                model.disk_read_bps,
+                model.disk_write_bps,
+                model.net_rx_bps,
+                model.net_tx_bps,
+                model.net_ceiling_bps,
+            ),
+            (None, None, None, None, None)
+        );
+        assert_eq!((model.swap_used_gb, model.swap_total_gb), (None, None));
+        assert_eq!((model.io_psi, model.mem_psi), (None, None));
+        let extras = publish_extras(&sample, &tick, &ctx);
+        let host = crate::publish::build(&sample.snapshot, &idle_view(), &extras, 1, 1).host;
+        assert_eq!(
+            (
+                host.disk_read_bps,
+                host.disk_write_bps,
+                host.net_rx_bps,
+                host.net_tx_bps,
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            (host.io_psi_pct, host.mem_psi_pct, host.cpu_psi_pct),
+            (None, None, None)
+        );
+        assert_eq!((host.swap_used_bytes, host.swap_total_bytes), (None, None));
+    }
+
+    /// `[tty] net_ceiling_bps` wins over the sampled link speed; unset, the
+    /// link speed is used. `[tty] disk_ceiling_bps` reaches the frame.
+    #[test]
+    fn configured_ceilings_win_over_the_sampled_link_speed() {
+        let sample = host_io_sample();
+        let mut tick = TickState::new(2, 6);
+        let mut ctx = frame_ctx(None, true);
+        ctx.net_ceiling_bps = Some(5.0e7);
+        ctx.disk_ceiling_bps = 2.0e9;
+        let model = tty_model(
+            &sample,
+            &mut tick,
+            Instant::now(),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        assert_eq!(model.net_ceiling_bps, Some(5.0e7));
+        assert_eq!(model.disk_ceiling_bps, 2.0e9);
+        ctx.net_ceiling_bps = None;
+        let model = tty_model(
+            &sample,
+            &mut tick,
+            Instant::now(),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        assert_eq!(model.net_ceiling_bps, Some(312_500_000.0));
+
+        let model = one_frame(
+            "ceilings",
+            "[tty]\ndisk_ceiling_bps = 2000000000\nnet_ceiling_bps = 50000000\n",
+        );
+        assert_eq!(model.disk_ceiling_bps, 2.0e9);
+        assert_eq!(model.net_ceiling_bps, Some(5.0e7));
+    }
+
+    /// #163: the disk, net and psi health words each read their own
+    /// source.
+    #[test]
+    fn host_health_words_follow_their_own_source() {
+        use crate::sources::hostio::SourceHealth;
+        let mut sample = host_io_sample();
+        sample.host_io.disk = SourceHealth::Down;
+        sample.host_io.net = SourceHealth::Ok;
+        sample.host_io.psi = SourceHealth::Absent;
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let ctx = frame_ctx(None, true);
+        let model = tty_model(
+            &sample,
+            &mut tick,
+            Instant::now(),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        let word = |name: &str| {
+            model
+                .health
+                .iter()
+                .find(|seg| seg.name == name)
+                .map(|seg| &seg.status)
+        };
+        assert_eq!(word("disk"), Some(&HealthStatus::Down));
+        assert_eq!(word("net"), Some(&HealthStatus::Ok));
+        assert_eq!(word("psi"), Some(&HealthStatus::Absent));
     }
 
     #[test]
@@ -5396,6 +5638,7 @@ mod tests {
                 fans: None,
                 temps: None,
                 gpu_processes: crate::collector::GpuProcesses::default(),
+                host_io: crate::sources::hostio::HostIo::default(),
             }
         }
     }

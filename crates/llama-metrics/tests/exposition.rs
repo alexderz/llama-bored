@@ -1539,3 +1539,86 @@ fn kv_ratio_is_used_over_capacity_else_the_engines_own() {
         None
     );
 }
+
+fn set_host_gauge(metric: &str, want: &str, set: impl FnOnce(&mut llama_core::wire::Host)) {
+    let mut snap = load("snapshot-loaded.json");
+    set(&mut snap.host);
+    let text = render(&Ok(snap), T0);
+    let line = format!("{metric} {want}\n");
+    assert!(text.contains(&line), "missing {line:?}\n{text}");
+}
+
+#[test]
+fn disk_read_bytes_per_second_is_exported() {
+    set_host_gauge(
+        "llamabored_disk_read_bytes_per_second",
+        "12000000",
+        |host| {
+            host.disk_read_bps = Some(12_000_000.0);
+        },
+    );
+}
+
+#[test]
+fn disk_write_bytes_per_second_is_exported() {
+    set_host_gauge("llamabored_disk_write_bytes_per_second", "512000", |host| {
+        host.disk_write_bps = Some(512_000.0);
+    });
+}
+
+#[test]
+fn net_receive_bytes_per_second_is_exported() {
+    set_host_gauge(
+        "llamabored_net_receive_bytes_per_second",
+        "1000000",
+        |host| {
+            host.net_rx_bps = Some(1_000_000.0);
+        },
+    );
+}
+
+#[test]
+fn net_transmit_bytes_per_second_is_exported() {
+    set_host_gauge(
+        "llamabored_net_transmit_bytes_per_second",
+        "2000000",
+        |host| {
+            host.net_tx_bps = Some(2_000_000.0);
+        },
+    );
+}
+
+#[test]
+fn pressure_io_ratio_is_exported() {
+    set_host_gauge("llamabored_pressure_io_ratio", "0.25", |host| {
+        host.io_psi_pct = Some(25.0);
+    });
+}
+
+#[test]
+fn pressure_memory_ratio_is_exported() {
+    set_host_gauge("llamabored_pressure_memory_ratio", "0.5", |host| {
+        host.mem_psi_pct = Some(50.0);
+    });
+}
+
+#[test]
+fn pressure_cpu_ratio_is_exported() {
+    set_host_gauge("llamabored_pressure_cpu_ratio", "0.125", |host| {
+        host.cpu_psi_pct = Some(12.5);
+    });
+}
+
+#[test]
+fn swap_used_bytes_is_exported() {
+    set_host_gauge("llamabored_swap_used_bytes", "4194304", |host| {
+        host.swap_used_bytes = Some(4_194_304);
+    });
+}
+
+#[test]
+fn swap_total_bytes_is_exported() {
+    set_host_gauge("llamabored_swap_total_bytes", "16777216", |host| {
+        host.swap_total_bytes = Some(16_777_216);
+    });
+}

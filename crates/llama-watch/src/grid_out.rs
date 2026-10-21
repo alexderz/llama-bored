@@ -704,6 +704,16 @@ mod tests {
             model_id: String::new(),
             claims: Vec::new(),
             now: UNIX_EPOCH,
+            disk_read_bps: None,
+            disk_write_bps: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
+            net_ceiling_bps: None,
+            swap_used_gb: None,
+            swap_total_gb: None,
+            io_psi: None,
+            mem_psi: None,
+            disk_ceiling_bps: 7e9,
             tz_offset_s: 0,
         }
     }
