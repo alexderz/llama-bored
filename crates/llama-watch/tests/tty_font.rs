@@ -123,6 +123,17 @@ fn committed_fonts_have_every_glyph_term_may_emit() {
     }
 }
 
+/// #165: the gauge segment U+E584, appended last by `build-psf.py`, is in
+/// every font the console may load.
+#[test]
+fn the_gauge_segment_is_mapped_in_every_font() {
+    for (name, _) in FONTS {
+        let psf = font(name);
+        assert!(psf.mapped.contains(&'\u{e584}'), "{name}");
+        assert!(psf.mapped.contains(&'\u{2248}'), "{name}");
+    }
+}
+
 #[test]
 fn parser_rejects_a_table_that_is_short_an_entry() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

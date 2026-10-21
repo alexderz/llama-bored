@@ -7,6 +7,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use llama_core::color::{self, Rgb, act_color};
+use llama_core::glyph;
 
 use super::chart::{self, ChartBucket, Ink};
 use super::ctx_history::{self, CtxPoint};
@@ -1456,7 +1457,8 @@ fn level_ink(pct: Option<f64>) -> BarInk {
 }
 
 /// LCD ring bands on a percent: quiet, light, busy, flat-out, then red
-/// over 100. Only the capacity meters (VRAM, MEM) still use them.
+/// over 100. Only the job view's capacity meters still use them; the
+/// dashboard's gauges are spectrum (#165).
 fn band(percent: f64) -> (C16, C16) {
     if percent > 100.0 {
         (C16::BrightRed, C16::Red)
@@ -6342,17 +6344,7 @@ fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid 
     let right_x = cols / 2 + 1;
     let right_end = cols - 3;
     draw_headline(&mut grid, model, &g, top, left_end);
-    let reserved = if band.top >= 11 { 2 } else { 0 };
-    draw_right_meters(
-        &mut grid,
-        model,
-        &g,
-        top,
-        right_x,
-        right_end,
-        top + band.top - reserved,
-    );
-    draw_side_summaries(&mut grid, model, top, band.top, right_x, right_end);
+    draw_gauges(&mut grid, model, top, right_x, right_end, band.top);
     place_slots_and_setup(&mut grid, model, &mut g, top, band.top, left_end);
 
     let band_rule = top + band.top;
@@ -6771,200 +6763,6 @@ fn format_margin(tenths: i32) -> String {
     format!("{deg:+}")
 }
 
-fn draw_right_meters(
-    grid: &mut Grid,
-    model: &TtyModel,
-    g: &Geom,
-    top: u16,
-    x: u16,
-    right: u16,
-    limit: u16,
-) {
-    let pitch = g.pitch.max(1);
-    let rows = g.bar_rows;
-    draw_wide_meter(
-        grid,
-        model,
-        g,
-        "ACTIVITY",
-        activity_value(model),
-        model.activity_pct,
-        true,
-        x,
-        right,
-        top,
-        rows,
-    );
-    draw_wide_meter(
-        grid,
-        model,
-        g,
-        "LOAD",
-        pct_value(model.load_pct),
-        model.load_pct,
-        true,
-        x,
-        right,
-        top + pitch,
-        rows,
-    );
-    let matrix = top + 2 * pitch;
-    let gap = 2u16;
-    let width = right.saturating_sub(x).saturating_add(1);
-    let col_w = width.saturating_sub(gap) / 2;
-    let pairs = [
-        (
-            "GPU",
-            pct_value(model.gpu_pct),
-            model.gpu_pct,
-            true,
-            "CPU",
-            cpu_value(model),
-            model.cpu_pct,
-            true,
-        ),
-        (
-            "VRAM",
-            gb_value(model.vram_used_gb, model.vram_total_gb),
-            percent_of(model.vram_used_gb, model.vram_total_gb),
-            false,
-            "MEM",
-            gb_value(model.mem_used_gb, model.mem_total_gb),
-            percent_of(model.mem_used_gb, model.mem_total_gb),
-            false,
-        ),
-        (
-            "POWER",
-            power_value(model),
-            percent_of(model.power_w, model.power_limit_w),
-            true,
-            "",
-            String::new(),
-            None,
-            true,
-        ),
-    ];
-    // The host rows start on the POWER row: SWAP takes its empty right
-    // cell, so at a pitch of 3 NET and IO PSI still fit above TEMPS.
-    let host_at = matrix + (pairs.len() as u16 - 1) * pitch;
-    for (i, (ll, lv, lp, ls, rl, rv, rp, rs)) in pairs.into_iter().enumerate() {
-        let row = matrix + i as u16 * pitch;
-        draw_pair_meter(grid, model, g, ll, lv, lp, ls, x, x + col_w - 1, row, rows);
-        if !rl.is_empty() {
-            let rx = x + col_w + gap;
-            draw_pair_meter(grid, model, g, rl, rv, rp, rs, rx, right, row, rows);
-        }
-    }
-    if host_meters(model) {
-        draw_host_meters(grid, model, g, host_at, pitch, x, right, rows, limit);
-    }
-}
-
-fn meter_shown(blank: bool, value: String) -> (String, C16) {
-    if blank || value == "--" || value.is_empty() {
-        ("--".to_string(), C16::BrightBlack)
-    } else {
-        (value, C16::BrightWhite)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_wide_meter(
-    grid: &mut Grid,
-    model: &TtyModel,
-    g: &Geom,
-    label: &str,
-    value: String,
-    percent: Option<f64>,
-    level: bool,
-    x: u16,
-    right: u16,
-    row: u16,
-    rows: u16,
-) {
-    paint_str(grid, x, row, label, C16::White, C16::Black);
-    let (shown, fg) = meter_shown(model.state == WatchState::Starting, value);
-    let value_at = x + u16::try_from(label.chars().count()).unwrap_or(8) + 1;
-    paint_str(grid, value_at, row, &shown, fg, C16::Black);
-    let bar_x = value_at + u16::try_from(shown.chars().count()).unwrap_or(0) + 1;
-    if bar_x >= right {
-        return;
-    }
-    let pct = (model.state != WatchState::Starting)
-        .then_some(percent)
-        .flatten()
-        .map(f64::round);
-    let frac = pct.and_then(|p| (p > 0.0).then_some((p / 100.0).min(1.0)));
-    let ink = if level {
-        level_ink(pct)
-    } else {
-        let (top, bot) = band(pct.unwrap_or(0.0));
-        BarInk::Fixed(top, bot)
-    };
-    draw_h_bar(
-        grid,
-        HBar {
-            x: bar_x,
-            row,
-            width: right - bar_x + 1,
-            frac,
-            ink,
-            rows,
-            cells: g.meter_cells(model.chart_glyphs),
-        },
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_pair_meter(
-    grid: &mut Grid,
-    model: &TtyModel,
-    g: &Geom,
-    label: &str,
-    value: String,
-    percent: Option<f64>,
-    level: bool,
-    x: u16,
-    right: u16,
-    row: u16,
-    rows: u16,
-) {
-    paint_fit(grid, x, row, label, C16::White, C16::Black, 8);
-    let (shown, fg) = meter_shown(model.state == WatchState::Starting, value);
-    let value_at = x + u16::try_from(label.chars().count().min(8)).unwrap_or(4) + 1;
-    let room = usize::from(right.saturating_sub(value_at));
-    let shown_n = shown.chars().count().min(room);
-    let shown: String = shown.chars().take(shown_n).collect();
-    paint_str(grid, value_at, row, &shown, fg, C16::Black);
-    let bar_x = value_at + u16::try_from(shown.chars().count()).unwrap_or(0) + 1;
-    if bar_x >= right {
-        return;
-    }
-    let pct = (model.state != WatchState::Starting)
-        .then_some(percent)
-        .flatten()
-        .map(f64::round);
-    let frac = pct.and_then(|p| (p > 0.0).then_some((p / 100.0).min(1.0)));
-    let ink = if level {
-        level_ink(pct)
-    } else {
-        let (top, bot) = band(pct.unwrap_or(0.0));
-        BarInk::Fixed(top, bot)
-    };
-    draw_h_bar(
-        grid,
-        HBar {
-            x: bar_x,
-            row,
-            width: right - bar_x + 1,
-            frac,
-            ink,
-            rows,
-            cells: g.meter_cells(model.chart_glyphs),
-        },
-    );
-}
-
 fn host_meters(model: &TtyModel) -> bool {
     model.disk_read_bps.is_some()
         || model.disk_write_bps.is_some()
@@ -7048,15 +6846,6 @@ fn psi_text(pct: Option<f64>) -> String {
     }
 }
 
-fn swap_text(used: Option<f64>, total: Option<f64>) -> String {
-    match (used, total) {
-        (Some(used), Some(total)) if used.is_finite() && total.is_finite() => {
-            format!("{:.1}/{:.1}G", used, total)
-        }
-        _ => "--".to_string(),
-    }
-}
-
 fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
     let gpu = pct_i(model.gpu_pct);
     let gpu_fg = model.gpu_pct.map(step_fg).unwrap_or(C16::BrightBlack);
@@ -7117,105 +6906,6 @@ fn glance_host(model: &TtyModel, wide: bool) -> Vec<Vec<Bit>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_host_meters(
-    grid: &mut Grid,
-    model: &TtyModel,
-    g: &Geom,
-    mut row: u16,
-    pitch: u16,
-    x: u16,
-    right: u16,
-    rows: u16,
-    limit: u16,
-) {
-    let gap = 2u16;
-    let width = right.saturating_sub(x).saturating_add(1);
-    let col_w = width.saturating_sub(gap) / 2;
-    let rx = x + col_w + gap;
-    let disk = disk_ceiling(model);
-    let net = net_ceiling(model);
-    let swap_fg = if model.mem_psi.is_some_and(|p| p > 0.0) {
-        C16::Yellow
-    } else {
-        C16::White
-    };
-    // SWAP has no left cell: it sits beside POWER.
-    let rows_of: Vec<Vec<HostMeter>> = vec![
-        vec![HostMeter {
-            label: "SWAP",
-            value: swap_text(model.swap_used_gb, model.swap_total_gb),
-            frac: capacity_frac(percent_of(model.swap_used_gb, model.swap_total_gb)),
-            level: false,
-            label_fg: swap_fg,
-            side: Side::Right,
-        }],
-        vec![
-            HostMeter {
-                label: "DISK R",
-                value: rate_bps_text(model.disk_read_bps),
-                frac: rate_frac_of(model.disk_read_bps, disk),
-                level: true,
-                label_fg: C16::White,
-                side: Side::Left,
-            },
-            HostMeter {
-                label: "DISK W",
-                value: rate_bps_text(model.disk_write_bps),
-                frac: rate_frac_of(model.disk_write_bps, disk),
-                level: true,
-                label_fg: C16::White,
-                side: Side::Right,
-            },
-        ],
-        vec![
-            HostMeter {
-                label: "NET",
-                value: rate_bps_text(combined_rate(model.net_rx_bps, model.net_tx_bps)),
-                frac: rate_frac_of(combined_rate(model.net_rx_bps, model.net_tx_bps), net),
-                level: true,
-                label_fg: C16::White,
-                side: Side::Left,
-            },
-            HostMeter {
-                label: "IO PSI",
-                value: psi_text(model.io_psi),
-                frac: psi_frac(model.io_psi),
-                level: true,
-                label_fg: C16::White,
-                side: Side::Right,
-            },
-        ],
-    ];
-    for meters in rows_of {
-        if row.saturating_add(rows.saturating_sub(1)) >= limit {
-            break;
-        }
-        for meter in meters {
-            let (at, end) = match meter.side {
-                Side::Left => (x, x + col_w - 1),
-                Side::Right => (rx, right),
-            };
-            draw_host_meter(grid, model, g, &meter, at, end, row, rows);
-        }
-        row = row.saturating_add(pitch);
-    }
-}
-
-struct HostMeter {
-    label: &'static str,
-    value: String,
-    frac: Option<f64>,
-    level: bool,
-    label_fg: C16,
-    side: Side,
-}
-
-fn capacity_frac(pct: Option<f64>) -> Option<f64> {
-    pct.filter(|p| p.is_finite() && *p > 0.0)
-        .map(|p| (p / 100.0).min(1.0))
-}
-
 fn rate_frac_of(bps: Option<f64>, ceiling: f64) -> Option<f64> {
     let bps = bps.filter(|v| v.is_finite())?;
     let frac = byte_rate_frac(bps, ceiling);
@@ -7227,147 +6917,456 @@ fn psi_frac(pct: Option<f64>) -> Option<f64> {
     Some((pct / 100.0).min(1.0))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_host_meter(
-    grid: &mut Grid,
-    model: &TtyModel,
-    g: &Geom,
-    meter: &HostMeter,
-    x: u16,
-    right: u16,
-    row: u16,
-    rows: u16,
-) {
-    if meter.label.is_empty() {
-        return;
+/// Cells of a gauge label, left-aligned (#165). `DISK R` and `IO PSI` fit,
+/// with a blank before the value field.
+const GAUGE_LABEL_W: u16 = 7;
+/// Cells of a gauge value, right-aligned: `22.6/24.0 G`.
+const GAUGE_VALUE_W: u16 = 11;
+/// Label, value and the blank before the bar.
+const GAUGE_TEXT_W: u16 = GAUGE_LABEL_W + GAUGE_VALUE_W + 1;
+/// Blank cells between the two columns of gauges.
+const GAUGE_GAP: u16 = 4;
+/// Blank cells kept right of the second column.
+const GAUGE_MARGIN: u16 = 2;
+/// 0 % of a temperature gauge, tenths of a degree: 20 °C.
+const TEMP_FLOOR: i32 = 200;
+/// Ramp points past full scale at a sensor's critical point: past its
+/// warning the bar climbs into the hot tail, hot orange at critical.
+const TEMP_HOT_SPAN: f64 = 20.0;
+/// Warning and critical points of a reading with none (the TEMPS default).
+const TEMP_FALLBACK: (i32, i32) = (800, 900);
+
+/// Where the two columns of gauges start and how long every bar is.
+#[derive(Clone, Copy, Debug)]
+struct GaugeCols {
+    x: [u16; 2],
+    bar: u16,
+}
+
+/// The bar is sized from the space: 30 cells at 213 columns, 16 at 160.
+fn gauge_cols(x: u16, right: u16) -> GaugeCols {
+    let avail = right.saturating_sub(x).saturating_add(1);
+    let bar = avail.saturating_sub(2 * GAUGE_TEXT_W + GAUGE_GAP + GAUGE_MARGIN) / 2;
+    GaugeCols {
+        x: [x, x + GAUGE_TEXT_W + bar + GAUGE_GAP],
+        bar,
     }
-    paint_fit(grid, x, row, meter.label, meter.label_fg, C16::Black, 8);
-    let (shown, fg) = meter_shown(false, meter.value.clone());
-    let value_at = x + u16::try_from(meter.label.chars().count().min(8)).unwrap_or(4) + 1;
-    let room = usize::from(right.saturating_sub(value_at));
-    let shown: String = shown.chars().take(room).collect();
-    paint_str(grid, value_at, row, &shown, fg, C16::Black);
-    let bar_x = value_at + u16::try_from(shown.chars().count()).unwrap_or(0) + 1;
-    if bar_x >= right {
-        return;
+}
+
+/// The bar cell. The grid file always carries the segment (`rich`); the
+/// console draws it only with the llama-hack font (`eighths`), and `▄`
+/// with eurlatgr (`halves`), which lacks it.
+fn gauge_glyph(glyphs: ChartGlyphs) -> char {
+    match glyphs {
+        ChartGlyphs::Eighths => glyph::SEGMENT,
+        ChartGlyphs::Halves => glyph::SEGMENT_PLAIN,
     }
-    let ink = if meter.level {
-        let pct = meter.frac.map(|f| f * 100.0);
-        level_ink(pct)
-    } else {
-        let pct = meter.frac.map(|f| f * 100.0).unwrap_or(0.0);
-        let (top, bot) = band(pct);
-        BarInk::Fixed(top, bot)
+}
+
+/// One gauge: label, value and bar.
+struct Gauge {
+    label: String,
+    label_fg: C16,
+    value: String,
+    value_fg: C16,
+    /// A temperature's threshold colour for the grid file.
+    value_exact: Option<Rgb>,
+    frac: Option<f64>,
+    ink: BarInk,
+    /// The bar's percent of full scale. The coolest temperatures shed first.
+    heat: f64,
+}
+
+/// A group of gauges, or a one-row note when its source has nothing.
+#[derive(Default)]
+struct GaugeGroup {
+    gauges: Vec<Gauge>,
+    note: Option<(&'static str, String)>,
+}
+
+impl GaugeGroup {
+    fn noted(name: &'static str, text: impl Into<String>) -> Self {
+        Self {
+            gauges: Vec::new(),
+            note: Some((name, text.into())),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.gauges.is_empty() && self.note.is_none()
+    }
+
+    /// Rows the group takes: two gauges a row.
+    fn rows(&self) -> u16 {
+        if self.note.is_some() {
+            return 1;
+        }
+        u16::try_from(self.gauges.len().div_ceil(2)).unwrap_or(u16::MAX)
+    }
+
+    /// Rows with the blank row above it; none when empty.
+    fn block(&self) -> u16 {
+        if self.is_empty() { 0 } else { 1 + self.rows() }
+    }
+}
+
+/// The right-hand block (#165): one grid of gauges in two columns. A gauge
+/// is its label (left, [`GAUGE_LABEL_W`] cells), its value (right-aligned
+/// in [`GAUGE_VALUE_W`]) and a bar of one length that starts at the same
+/// column within its column. Three groups with a blank row between: the
+/// work gauges, one per TEMPS row, one per fan. Short of rows the fans go
+/// first, then the coolest temperatures; the work gauges always stay.
+///
+/// A further pair of work gauges (MEMBW beside SWAP, CPU W beside POWER,
+/// CLK, PCIE in the #163 design) is two more entries in [`work_gauges`].
+fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, height: u16) {
+    let cols = gauge_cols(x, right);
+    let cell = gauge_glyph(model.chart_glyphs);
+    let work = GaugeGroup {
+        gauges: work_gauges(model),
+        note: None,
     };
+    let mut temps = temp_gauges(grid, model);
+    let mut fans = fan_gauges(model);
+    shed_gauges(work.rows(), &mut temps, &mut fans, height);
+    let end = top.saturating_add(height);
+    let mut row = top;
+    for (i, group) in [&work, &temps, &fans].into_iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        if i > 0 {
+            row = row.saturating_add(1);
+        }
+        draw_gauge_group(grid, group, cols, cell, row, end);
+        row = row.saturating_add(group.rows());
+    }
+}
+
+/// Drop fans from the end, then the coolest temperatures, until the groups
+/// fit `height` rows. The work gauges are never dropped.
+fn shed_gauges(work: u16, temps: &mut GaugeGroup, fans: &mut GaugeGroup, height: u16) {
+    let need = |t: &GaugeGroup, f: &GaugeGroup| work + t.block() + f.block();
+    while need(temps, fans) > height && !fans.is_empty() {
+        if fans.gauges.pop().is_none() {
+            fans.note = None;
+        }
+    }
+    while need(temps, fans) > height && !temps.is_empty() {
+        let coolest = temps.gauges.iter().enumerate().fold(
+            None::<(usize, f64)>,
+            |low, (i, gauge)| match low {
+                Some((_, heat)) if heat < gauge.heat => low,
+                _ => Some((i, gauge.heat)),
+            },
+        );
+        match coolest {
+            Some((i, _)) => {
+                temps.gauges.remove(i);
+            }
+            None => temps.note = None,
+        }
+    }
+}
+
+fn draw_gauge_group(
+    grid: &mut Grid,
+    group: &GaugeGroup,
+    cols: GaugeCols,
+    cell: char,
+    top: u16,
+    end: u16,
+) {
+    // Shedding makes every group fit; the guards below only clip, and a
+    // clipped gauge would hide a shedding bug.
+    if let Some((name, text)) = &group.note {
+        debug_assert!(top < end, "gauge note at row {top} past the band end {end}");
+        if top < end {
+            paint_str(grid, cols.x[0], top, name, C16::White, C16::Black);
+            let at = cols.x[0] + GAUGE_LABEL_W;
+            let room = usize::from((cols.x[1] + GAUGE_TEXT_W + cols.bar).saturating_sub(at));
+            paint_fit(grid, at, top, text, C16::BrightBlack, C16::Black, room);
+        }
+        return;
+    }
+    for (i, gauge) in group.gauges.iter().enumerate() {
+        let row = top.saturating_add(u16::try_from(i / 2).unwrap_or(u16::MAX));
+        debug_assert!(row < end, "gauge at row {row} past the band end {end}");
+        if row >= end {
+            break;
+        }
+        draw_gauge(grid, gauge, cols.x[i % 2], row, cols.bar, cell);
+    }
+}
+
+fn draw_gauge(grid: &mut Grid, gauge: &Gauge, x: u16, row: u16, bar: u16, cell: char) {
+    let value: String = gauge
+        .value
+        .chars()
+        .take(usize::from(GAUGE_VALUE_W))
+        .collect();
+    // A full label (`coolant`) keeps a blank before the longest values.
+    let room = usize::from(GAUGE_LABEL_W + GAUGE_VALUE_W - 1).saturating_sub(value.chars().count());
+    paint_fit(
+        grid,
+        x,
+        row,
+        &gauge.label,
+        gauge.label_fg,
+        C16::Black,
+        room.min(usize::from(GAUGE_LABEL_W)),
+    );
+    let end = x + GAUGE_LABEL_W + GAUGE_VALUE_W - 1;
+    right_align(grid, end, row, &value, gauge.value_fg, C16::Black);
+    if let Some(rgb) = gauge.value_exact.filter(|_| grid.records_exact()) {
+        let len = u16::try_from(value.chars().count()).unwrap_or(0);
+        for col in end + 1 - len..=end {
+            grid.set_exact_fg(col, row, rgb);
+        }
+    }
+    let at = x + GAUGE_TEXT_W;
     draw_h_bar(
         grid,
         HBar {
-            x: bar_x,
+            x: at,
             row,
-            width: right - bar_x + 1,
-            frac: meter.frac,
-            ink,
-            rows,
-            cells: g.meter_cells(model.chart_glyphs),
+            width: bar,
+            frac: gauge.frac,
+            ink: gauge.ink,
+            rows: 1,
+            cells: Some(cell),
         },
     );
-}
-
-fn draw_side_summaries(
-    grid: &mut Grid,
-    model: &TtyModel,
-    top: u16,
-    height: u16,
-    x: u16,
-    right: u16,
-) {
-    if height == 0 || right <= x {
-        return;
-    }
-    let last = top + height - 1;
-    let mut cursor = last;
-    if height >= 11
-        && let Some(panel) = &model.fans
-    {
-        draw_fans_line(grid, panel, x, right, cursor);
-        cursor = cursor.saturating_sub(1);
-    }
-    if let Some(panel) = &model.temps
-        && cursor > top
-    {
-        draw_temps_line(grid, panel, x, right, cursor);
+    // Lit cells are segments in the grid file, whatever the console font.
+    for col in at..at.saturating_add(bar) {
+        if let Some(lit) = grid.get(col, row).filter(|c| c.ch == cell) {
+            grid.put(
+                col,
+                row,
+                Cell::with_rich(lit.ch, glyph::SEGMENT, lit.fg, lit.bg),
+            );
+        }
     }
 }
 
-fn draw_fans_line(grid: &mut Grid, panel: &FanPanel, x: u16, right: u16, row: u16) {
-    paint_str(grid, x, row, "FANS", C16::White, C16::Black);
+fn shown_fg(value: &str) -> C16 {
+    if value == "--" || value.is_empty() {
+        C16::BrightBlack
+    } else {
+        C16::BrightWhite
+    }
+}
+
+/// A level or capacity gauge: the bar is `pct` of full scale, past 100 a
+/// full bar in the hot tail. `blank` (llama-watch starting) draws `--`.
+fn level_gauge(label: &str, value: String, pct: Option<f64>, blank: bool) -> Gauge {
+    let pct = pct.filter(|p| !blank && p.is_finite()).map(f64::round);
+    let value = if blank { "--".to_string() } else { value };
+    Gauge {
+        label: label.to_string(),
+        label_fg: C16::White,
+        value_fg: shown_fg(&value),
+        value,
+        value_exact: None,
+        frac: pct.and_then(|p| (p > 0.0).then_some((p / 100.0).min(1.0))),
+        ink: level_ink(pct),
+        heat: pct.unwrap_or(0.0),
+    }
+}
+
+/// A gauge whose fraction is already worked out (rates, IO PSI).
+fn frac_gauge(label: &str, value: String, frac: Option<f64>) -> Gauge {
+    Gauge {
+        label: label.to_string(),
+        label_fg: C16::White,
+        value_fg: shown_fg(&value),
+        value,
+        value_exact: None,
+        frac,
+        ink: level_ink(frac.map(|f| f * 100.0)),
+        heat: frac.map_or(0.0, |f| f * 100.0),
+    }
+}
+
+/// Work gauges, two a row: ACT and LOAD, GPU and CPU, VRAM and MEM, POWER
+/// and SWAP, DISK R and DISK W, NET and IO PSI.
+fn work_gauges(model: &TtyModel) -> Vec<Gauge> {
+    let starting = model.state == WatchState::Starting;
+    let disk = disk_ceiling(model);
+    let net = net_ceiling(model);
+    let net_bps = combined_rate(model.net_rx_bps, model.net_tx_bps);
+    let mut swap = level_gauge(
+        "SWAP",
+        capacity_text(model.swap_used_gb, model.swap_total_gb),
+        percent_of(model.swap_used_gb, model.swap_total_gb),
+        false,
+    );
+    if model.mem_psi.is_some_and(|p| p > 0.0) {
+        swap.label_fg = C16::Yellow;
+    }
+    vec![
+        level_gauge("ACT", act_value(model), model.activity_pct, starting),
+        level_gauge("LOAD", pct_value(model.load_pct), model.load_pct, starting),
+        level_gauge("GPU", pct_value(model.gpu_pct), model.gpu_pct, starting),
+        level_gauge("CPU", cpu_value(model), model.cpu_pct, starting),
+        level_gauge(
+            "VRAM",
+            capacity_text(model.vram_used_gb, model.vram_total_gb),
+            percent_of(model.vram_used_gb, model.vram_total_gb),
+            starting,
+        ),
+        level_gauge(
+            "MEM",
+            capacity_text(model.mem_used_gb, model.mem_total_gb),
+            percent_of(model.mem_used_gb, model.mem_total_gb),
+            starting,
+        ),
+        level_gauge(
+            "POWER",
+            power_value(model),
+            percent_of(model.power_w, model.power_limit_w),
+            starting,
+        ),
+        swap,
+        frac_gauge(
+            "DISK R",
+            rate_bps_text(model.disk_read_bps),
+            rate_frac_of(model.disk_read_bps, disk),
+        ),
+        frac_gauge(
+            "DISK W",
+            rate_bps_text(model.disk_write_bps),
+            rate_frac_of(model.disk_write_bps, disk),
+        ),
+        frac_gauge("NET", rate_bps_text(net_bps), rate_frac_of(net_bps, net)),
+        frac_gauge("IO PSI", psi_text(model.io_psi), psi_frac(model.io_psi)),
+    ]
+}
+
+/// `42 % gpu`: the level and the device that set it. Its watts are
+/// POWER's (or the CPU's), so the gauge leaves them out.
+fn act_value(model: &TtyModel) -> String {
+    let Some(pct) = model.activity_pct else {
+        return "--".to_string();
+    };
+    match model.activity_src {
+        Some(src) => format!("{} % {}", pct_num(pct), src.label()),
+        None => format!("{} %", pct_num(pct)),
+    }
+}
+
+/// `22.6/24.0 G` while that fits the value field below 100, else whole
+/// numbers: `13/126 G`.
+fn capacity_text(used: Option<f64>, total: Option<f64>) -> String {
+    let (Some(used), Some(total)) = (
+        used.filter(|v| v.is_finite()),
+        total.filter(|v| v.is_finite()),
+    ) else {
+        return "--".to_string();
+    };
+    let fine = format!("{used:.1}/{total:.1} G");
+    if total < 100.0 && fine.chars().count() <= usize::from(GAUGE_VALUE_W) {
+        fine
+    } else {
+        format!("{}/{} G", used.round() as i64, total.round() as i64)
+    }
+}
+
+/// One gauge per TEMPS row: the row's hottest reading, as the TEMPS line
+/// showed it. Nothing with `[temps]` off; a note when there is no input.
+fn temp_gauges(grid: &Grid, model: &TtyModel) -> GaugeGroup {
+    let Some(panel) = &model.temps else {
+        return GaugeGroup::default();
+    };
+    if panel.groups.is_empty() {
+        return GaugeGroup::noted("TEMPS", "no temperature inputs found");
+    }
+    GaugeGroup {
+        gauges: panel
+            .groups
+            .iter()
+            .filter_map(|group| Some(temp_gauge(grid, &group.name, group.hottest()?)))
+            .collect(),
+        note: None,
+    }
+}
+
+fn temp_gauge(grid: &Grid, name: &str, item: &TempItem) -> Gauge {
+    let (warn, crit) = item.thresholds.unwrap_or(TEMP_FALLBACK);
+    let pct = temp_percent(item.tenths, warn, crit);
+    Gauge {
+        label: name.to_string(),
+        label_fg: C16::White,
+        value: format!("{} C", celsius(item.tenths)),
+        value_fg: level_fg(item.level),
+        value_exact: temp_exact(grid, item),
+        frac: (pct > 0.0).then_some(pct / 100.0),
+        ink: level_ink(Some(pct)),
+        heat: pct,
+    }
+}
+
+/// Percent of a temperature gauge: 0 at 20 °C, 100 at the sensor's warning
+/// point (a full bar, red at its end). Past the warning the full bar runs
+/// on into the hot tail: [`TEMP_HOT_SPAN`] points more at the critical
+/// point (hot orange), and on from there to the end of the ramp.
+fn temp_percent(tenths: i32, warn: i32, crit: i32) -> f64 {
+    let (t, w, c) = (f64::from(tenths), f64::from(warn), f64::from(crit));
+    if warn <= TEMP_FLOOR {
+        return if tenths >= warn { 100.0 } else { 0.0 };
+    }
+    if t <= w {
+        return (100.0 * (t - f64::from(TEMP_FLOOR)) / (w - f64::from(TEMP_FLOOR))).max(0.0);
+    }
+    let span = if c > w { c - w } else { 10.0 };
+    100.0 + TEMP_HOT_SPAN * (t - w) / span
+}
+
+/// One gauge per fan: the bar is its duty (pwm), the value its rpm. A
+/// stalled fan is red. Nothing with `[fans]` off; a note when the chip is
+/// absent.
+fn fan_gauges(model: &TtyModel) -> GaugeGroup {
+    let Some(panel) = &model.fans else {
+        return GaugeGroup::default();
+    };
     if !panel.present {
         let note = if panel.chip.is_empty() {
             "no fan inputs found".to_owned()
         } else {
             format!("no single hwmon named {}", panel.chip)
         };
-        paint_fit(
-            grid,
-            x + 6,
-            row,
-            &note,
-            C16::BrightBlack,
-            C16::Black,
-            usize::from(right.saturating_sub(x + 5)),
-        );
-        return;
+        return GaugeGroup::noted("FANS", note);
     }
-    if right <= x + 6 {
-        return;
+    GaugeGroup {
+        gauges: panel.fans.iter().map(fan_gauge).collect(),
+        note: None,
     }
-    paint_fit(
-        grid,
-        x + 6,
-        row,
-        &panel.chip,
-        C16::BrightBlack,
-        C16::Black,
-        usize::from(right - x - 5),
-    );
-    let mut col = x + 6 + u16::try_from(panel.chip.chars().count()).unwrap_or(0);
-    for fan in &panel.fans {
-        let pct = fan.pwm.map(|pwm| f64::from(pwm) / 255.0);
-        let stalled = fan_stalled(fan);
-        let rpm = fan
-            .rpm
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "--".into());
-        let pct_text = if stalled {
-            "!0".to_string()
-        } else {
-            pct.map(|f| format!("{}%", (f * 100.0).round() as i64))
-                .unwrap_or_else(|| "--".into())
-        };
-        let piece = format!(" {} {rpm} {pct_text}", fan.label);
-        if col >= right {
-            break;
-        }
-        let fg = if stalled { C16::Red } else { C16::BrightWhite };
-        let room = usize::from(right - col + 1);
-        paint_fit(grid, col, row, &piece, fg, C16::Black, room);
-        let n = piece.chars().count().min(room);
-        col += u16::try_from(n).unwrap_or(0);
-        if let (false, Some(frac)) = (stalled, pct) {
-            // The percent is the last token. Recolour it by its fraction.
-            let pct_len = pct_text.chars().count();
-            if n >= pct_len {
-                let start = col - u16::try_from(pct_len).unwrap_or(0);
-                let colour = step_fg(frac * 100.0);
-                for dx in 0..pct_len {
-                    let at = start + u16::try_from(dx).unwrap_or(0);
-                    if let Some(cell) = grid.get(at, row) {
-                        let ch = cell.ch;
-                        paint(grid, at, row, ch, colour, C16::Black);
-                    }
-                }
-            }
-        }
+}
+
+fn fan_gauge(fan: &FanReading) -> Gauge {
+    let stalled = fan_stalled(fan);
+    let frac = fan.pwm.map(|pwm| f64::from(pwm) / 255.0);
+    let value = fan
+        .rpm
+        .map_or_else(|| "--".to_owned(), |rpm| format!("{rpm} rpm"));
+    let (label_fg, value_fg, ink) = if stalled {
+        (C16::Red, C16::Red, BarInk::Fixed(C16::Red, C16::Red))
+    } else {
+        (
+            C16::White,
+            shown_fg(&value),
+            level_ink(frac.map(|f| f * 100.0)),
+        )
+    };
+    Gauge {
+        label: fan.label.clone(),
+        label_fg,
+        value,
+        value_fg,
+        value_exact: None,
+        frac: frac.filter(|f| *f > 0.0),
+        ink,
+        heat: frac.map_or(0.0, |f| f * 100.0),
     }
 }
 
@@ -8241,6 +8240,64 @@ mod tests {
             color::spectrum::rate(ceiling / 64.0, ceiling)
                 < color::spectrum::rate(ceiling / 32.0, ceiling)
         );
+    }
+
+    /// #165: 0 at 20 °C, 100 at the warning point, past it the hot tail:
+    /// 120 at the critical point, and on.
+    #[test]
+    fn temperature_percent_runs_from_20_c_to_the_warning_point() {
+        assert_eq!(temp_percent(200, 800, 900), 0.0);
+        assert_eq!(temp_percent(150, 800, 900), 0.0, "below 20 C is empty");
+        assert_eq!(temp_percent(500, 800, 900), 50.0);
+        assert_eq!(temp_percent(800, 800, 900), 100.0);
+        assert_eq!(temp_percent(850, 800, 900), 110.0);
+        assert_eq!(temp_percent(900, 800, 900), 120.0);
+        assert_eq!(temp_percent(950, 800, 900), 130.0);
+        // Coolant: full at 45, hot orange at 50.
+        assert_eq!(temp_percent(450, 450, 500), 100.0);
+        assert_eq!(temp_percent(500, 450, 500), 120.0);
+        // A warning at or under the floor: full from the warning.
+        assert_eq!(temp_percent(190, 150, 200), 100.0);
+        // A warning exactly at the floor is full at the floor.
+        assert_eq!(temp_percent(200, 200, 250), 100.0);
+        // Critical at or under the warning: hot orange 1 °C past it.
+        assert_eq!(temp_percent(805, 800, 800), 110.0);
+        assert_eq!(temp_percent(810, 800, 700), 120.0);
+        // The bar is the percent; its colour past 100 is the hot tail.
+        let BarInk::Spectrum { hot, top } = level_ink(Some(temp_percent(900, 800, 900))) else {
+            panic!("spectrum");
+        };
+        assert!(hot);
+        assert_eq!(top, 120.0);
+    }
+
+    /// #165: two columns, one bar length, sized from the right half: 30
+    /// cells at 213 columns, 16 at 160; the second column ends inside it.
+    #[test]
+    fn gauge_columns_and_bar_length_follow_the_width() {
+        for (cols, bar) in [(160u16, 16u16), (192, 24), (200, 26), (213, 30), (240, 36)] {
+            let (x, right) = (cols / 2 + 1, cols - 3);
+            let g = gauge_cols(x, right);
+            assert_eq!(g.bar, bar, "{cols}");
+            assert_eq!(g.x[0], x);
+            assert_eq!(g.x[1], x + GAUGE_TEXT_W + bar + GAUGE_GAP, "{cols}");
+            assert!(g.x[1] + GAUGE_TEXT_W + bar - 1 <= right, "{cols}");
+        }
+        let g = gauge_cols(107, 210);
+        assert_eq!(
+            (g.x, g.bar),
+            ([107, 160], 30),
+            "the mock-up's columns at 213"
+        );
+    }
+
+    #[test]
+    fn capacity_values_fit_the_field() {
+        assert_eq!(capacity_text(Some(22.6), Some(24.0)), "22.6/24.0 G");
+        assert_eq!(capacity_text(Some(13.3), Some(125.7)), "13/126 G");
+        assert_eq!(capacity_text(Some(0.4), Some(16.0)), "0.4/16.0 G");
+        assert_eq!(capacity_text(None, Some(16.0)), "--");
+        assert_eq!(capacity_text(Some(f64::NAN), Some(16.0)), "--");
     }
 
     #[test]

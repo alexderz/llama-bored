@@ -40,6 +40,9 @@ pub struct Options {
     pub source: Option<SourceKind>,
     /// `--grid`: the grid file (#107). `None`: [`DEFAULT_GRID_PATH`].
     pub grid: Option<PathBuf>,
+    /// `--segments`: the terminal's font draws the gauge segment U+E584
+    /// (#165), so grid cells keep it. Off: they show `▄`.
+    pub segments: bool,
 }
 
 /// Where the cells come from.
@@ -113,6 +116,7 @@ impl Default for Options {
             kiosk: false,
             source: None,
             grid: None,
+            segments: false,
         }
     }
 }
@@ -162,6 +166,10 @@ Keys: q or Ctrl-C quits and restores the terminal.
                   inside tmux, also name the window after the model (ESC k);
                   needs `set -g allow-rename on`; env LLAMA_VIEW_TMUX_WINDOW=1
   --once          paint one frame, restore the terminal, and exit
+  --segments      grid source: draw the gauge segment U+E584 (#165) as itself,
+                  for a terminal whose font has that private-use glyph (a
+                  half block one pixel column short); without it a segment
+                  is drawn as the plain half block
   --kiosk         run as the only program on a dedicated console (#104): keys
                   do nothing, focus reporting stays off, and a missing or
                   unreadable console source shows a status line and retries
@@ -304,6 +312,7 @@ where
             }
             "--tmux-window-name" => opts.tmux_window_name = true,
             "--kiosk" => opts.kiosk = true,
+            "--segments" => opts.segments = true,
             "--colors" => {
                 let value = need(&mut args, "--colors")?;
                 opts.colors = Some(ColorChoice::parse(&value).ok_or_else(|| {
@@ -520,6 +529,14 @@ mod tests {
         assert_eq!(glyphs.font_glyphs, Some(AttrLayout::Glyphs512));
         let glyphs = parse_args(["llama-view", "--font-glyphs", "auto"]).unwrap();
         assert_eq!(glyphs.font_glyphs, None);
+    }
+
+    /// #165: `--segments` keeps the gauge segment; off by default.
+    #[test]
+    fn segments_flag_is_off_by_default() {
+        assert!(!parse_args(["llama-view"]).unwrap().segments);
+        assert!(parse_args(["llama-view", "--segments"]).unwrap().segments);
+        assert!(HELP.contains("--segments"));
     }
 
     #[test]

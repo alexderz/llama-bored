@@ -6,7 +6,7 @@
 
 use std::io;
 
-use llama_core::glyph::is_showable;
+use llama_core::glyph::{self, is_carried};
 use llama_core::gridfile::{
     self, CELL_LEN, GridError, HEADER_LEN, MAGIC, MAX_COLS, MAX_ROWS, STALE_AFTER,
 };
@@ -79,7 +79,7 @@ impl<'a> GridView<'a> {
         let raw = &self.cells[at..at + CELL_LEN];
         let scalar = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         let scalar = char::from_u32(scalar)
-            .filter(|&ch| is_showable(ch))
+            .filter(|&ch| is_carried(ch))
             .map_or(u32::from(gridfile::REPLACEMENT), u32::from);
         (scalar, [raw[4], raw[5], raw[6]], [raw[7], raw[8], raw[9]])
     }
@@ -271,6 +271,21 @@ fn blit_cell(
     }
 }
 
+/// The gauge segment (#165, `llama_core::glyph::SEGMENT`): the font's own
+/// glyph when it has one, else its plain half block. Either way the last
+/// pixel column is the background, so a font that predates the segment
+/// still shows the hairline between two segments, and never tofu.
+fn blit_segment(frame: &mut [u8], font: &Psf2, x0: usize, y0: usize, fg: [u8; 3], bg: [u8; 3]) {
+    let glyph = font
+        .glyph_for(u32::from(glyph::SEGMENT))
+        .or_else(|| font.glyph_for(u32::from(glyph::SEGMENT_PLAIN)));
+    blit_cell(frame, font, glyph, x0, y0, fg, bg);
+    let x = x0 + font.width().saturating_sub(1);
+    for gy in 0..font.height() {
+        put(frame, x, y0 + gy, bg);
+    }
+}
+
 fn paint_view(view: &GridView<'_>, font: &Psf2, frame: &mut [u8]) {
     frame[..FRAME_BYTES].fill(0);
     let (off_x, off_y) = origin(view.cols, view.rows, font);
@@ -288,7 +303,11 @@ fn paint_view(view: &GridView<'_>, font: &Psf2, frame: &mut [u8]) {
                 break;
             }
             let (scalar, fg, bg) = view.cell(row * cols + col);
-            blit_cell(frame, font, font.glyph_for_cell(scalar), x0, y0, fg, bg);
+            if scalar == u32::from(glyph::SEGMENT) {
+                blit_segment(frame, font, x0, y0, fg, bg);
+            } else {
+                blit_cell(frame, font, font.glyph_for_cell(scalar), x0, y0, fg, bg);
+            }
         }
     }
 }

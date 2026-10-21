@@ -176,11 +176,15 @@ const GLYPHS: &[char] = &[
     '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
-/// Printable ASCII and [`GLYPHS`] stay. Every other scalar, including ESC,
-/// C1, DEL, and Latin-1 such as `Û`, becomes `?`.
+/// Printable ASCII and [`GLYPHS`] stay. The gauge segment U+E584 (#165),
+/// which tty11's llama-hack font draws, is the plain `▄` here: a terminal
+/// font does not have it. Every other scalar, including ESC, C1, DEL, and
+/// Latin-1 such as `Û`, becomes `?`.
 fn screen_char(ch: char) -> char {
     if ('\u{20}'..='\u{7e}').contains(&ch) || GLYPHS.contains(&ch) {
         ch
+    } else if ch == llama_core::glyph::SEGMENT {
+        llama_core::glyph::SEGMENT_PLAIN
     } else {
         '?'
     }
@@ -491,6 +495,16 @@ mod tests {
             chars(&screen),
             ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '?', '?']
         );
+    }
+
+    /// #165: tty11 draws the gauge segment with llama-hack; a terminal
+    /// font has no such glyph, so the mirror shows the plain half block.
+    #[test]
+    fn vcsu_gauge_segment_is_the_plain_half_block() {
+        let bytes = vcsa(1, 2, 0, 0, &[(b'x', 0x07); 2]);
+        let vcsu = u32s(&[0xe584, 0xe585]);
+        let screen = decode_screen(&bytes, None, Some(&vcsu)).expect("vcsu decodes");
+        assert_eq!(chars(&screen), ['\u{2584}', '?']);
     }
 
     #[test]

@@ -41,9 +41,15 @@ const MAX_ROWS: u16 = 512;
 /// `chart_glyphs = "eighths"` draws them: the chart, and since #52 the
 /// single-spaced meter bars (`▇`; `▄` in halves mode). `▔` (U+2594) is in that font too but
 /// is not drawn, so it is not here.
+///
+/// The very last is the gauge segment U+E584 (#165,
+/// `llama_core::glyph::SEGMENT`): a private-use scalar only llama-hack
+/// carries (`packaging/fonts/build-psf.py` appends it, `tests/tty_font.rs`
+/// checks it). Like the eighths, only `chart_glyphs = "eighths"` draws it;
+/// halves mode draws `▄` in its place.
 pub const GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
+    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 /// Columns and rows reported for the terminal.

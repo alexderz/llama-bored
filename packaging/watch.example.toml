@@ -157,17 +157,19 @@ palette = "llama"
 #   block    always hidden; beats allow
 #   defaults built-in rules: hide the Super-I/O PCH_*, TSI*, SMBUSMASTER*
 #            and PECI* inputs (nct*, w83*), and an input unchanged for ten
-#            minutes while its chip's others move
+#            minutes while its chip's others move; and on the tty only,
+#            an NVMe drive's Sensor 1 and 2 and nct6798:AUXTIN2 (the
+#            snapshot and metrics keep those)
 # Below 5 C or at 127 C and above is never shown, allowed or not.
 # rename "chip:sensor" (an item) or "chip" (a row), <= 12 characters;
-# warn / crit in C by pattern override the chip's own max / crit (default
-# 80 / 90, 45 / 55 for a coolant).
+# warn / crit in C by pattern override the chip's own max / crit, else the
+# kind's defaults: coolant 45 / 50, CPU 80 / 90, GPU 88 / 92, NVMe 82 / 85,
+# board and memory 60 / 75, Wi-Fi 70 / 85, disks 50 / 60, the rest 70 / 90.
+# A block here hides a sensor from the snapshot and metrics too.
 [temps]
 enabled = true
 #allow = []
-# NVMe controller sensors and the floating AUXTIN2 pin stay hidden
-# here, not in code (#163). A second drive's chip is `nvme-<suffix>`.
-block = ["nvme*:Sensor *", "nct*:AUXTIN2"]
+#block = []
 #defaults = true
 #rename = { "nct6798:SYSTIN" = "board" }
 #warn = { "z53" = 42 }

@@ -90,10 +90,16 @@ fn constructors_default_rich_to_ch() {
 }
 
 /// Every console glyph tty11 draws is one the grid file may carry, except
-/// those the shared predicate leaves out (reported by name).
+/// those the shared predicate leaves out (reported by name). The gauge
+/// segment (#165) is the one private-use glyph: carried, not showable.
 #[test]
 fn console_glyphs_are_showable() {
     for &ch in GLYPHS {
+        if ch == llama_core::glyph::SEGMENT {
+            assert!(llama_core::glyph::is_carried(ch));
+            assert!(!llama_core::glyph::is_showable(ch));
+            continue;
+        }
         assert!(
             llama_core::glyph::is_showable(ch),
             "{ch:?} U+{:04X}",
@@ -110,8 +116,9 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The file as written: gauge segments (#165) kept, not made plain.
 fn read(path: &Path) -> gridfile::GridImage {
-    gridfile::decode(&std::fs::read(path).expect("read")).expect("decode")
+    gridfile::decode_segments(&std::fs::read(path).expect("read")).expect("decode")
 }
 
 fn frame(text: &str) -> Grid {
@@ -512,6 +519,43 @@ fn exact_off_matches_the_palette_file_and_exact_on_matches_the_ramp() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #165: the gauge cells reach the file as the segment U+E584, whatever
+/// the console font; `gridfile::decode` gives a reader that does not ask
+/// for segments the plain half block, never U+FFFD.
+#[test]
+fn gauge_cells_reach_the_file_as_segments_and_decode_plain() {
+    let model = busy_frame();
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        let mut model = model.clone();
+        model.chart_glyphs = glyphs;
+        let image = llama_watch::grid_out::image_of(
+            &layout::layout_exact(&model, 192, 60),
+            Palette::Llama,
+            1,
+            0,
+        );
+        let segments = image
+            .cells
+            .iter()
+            .filter(|c| c.ch == llama_core::glyph::SEGMENT)
+            .count();
+        assert!(segments > 20, "{glyphs:?}: {segments} segment cells");
+        let mut bytes = Vec::new();
+        gridfile::encode(&image, &mut bytes).expect("encode");
+        let kept = gridfile::decode_segments(&bytes).expect("decode");
+        assert_eq!(kept.cells, image.cells, "{glyphs:?}");
+        let plain = gridfile::decode(&bytes).expect("decode");
+        assert!(
+            plain
+                .cells
+                .iter()
+                .all(|c| c.ch != llama_core::glyph::SEGMENT && c.ch != '\u{fffd}')
+        );
+        let halves = plain.cells.iter().filter(|c| c.ch == '\u{2584}').count();
+        assert!(halves >= segments, "{glyphs:?}");
+    }
+}
+
 /// #116: `[grid]` is what the tap writes. [`GridTap::spawn`] leaves exact
 /// colours off, and the service does not call [`GridTap::with_exact`]
 /// itself: it calls [`GridTap::from_config`]. The default config (exact
@@ -565,12 +609,12 @@ fn the_grid_config_is_what_the_tap_writes() {
 /// Today's palette RGB, built without [`image_of`], so an exact colour
 /// cannot sneak into the "off" comparison.
 fn palette_cells(grid: &Grid) -> Vec<llama_core::gridfile::GridCell> {
-    use llama_core::glyph::is_showable;
+    use llama_core::glyph::is_carried;
     use llama_core::gridfile::GridCell;
     grid.cells()
         .iter()
         .map(|cell| GridCell {
-            ch: if is_showable(cell.rich) {
+            ch: if is_carried(cell.rich) {
                 cell.rich
             } else {
                 cell.ch
@@ -657,7 +701,7 @@ fn encoded(dir: &Path, grid: &Grid) -> GridImage {
 }
 
 fn read_ok(path: &Path) -> Option<GridImage> {
-    gridfile::decode(&std::fs::read(path).ok()?).ok()
+    gridfile::decode_segments(&std::fs::read(path).ok()?).ok()
 }
 
 fn wait_cells(path: &Path, want: &GridImage) {

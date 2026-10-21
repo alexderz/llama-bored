@@ -15,7 +15,7 @@ use llama_watch::sources::Roots;
 use llama_watch::sources::chips::Kind;
 use llama_watch::sources::fans::FanSource;
 use llama_watch::sources::temps::{
-    self, Level, READ_EVERY, REDISCOVER, STUCK_AFTER, TempLook, TempReading, TempSource,
+    self, Level, READ_EVERY, REDISCOVER, STUCK_AFTER, TempItem, TempLook, TempReading, TempSource,
 };
 
 struct Scratch(PathBuf);
@@ -421,9 +421,9 @@ fn panel_groups_by_device_with_short_labels() {
             "CPU | Tctl 68 · CCD1 64 · CCD2 62",
             "GPU | 71",
             "coolant | 40",
-            "NVMe0 | 50 · s1 50 · s2 67",
-            "NVMe1 | 57 · s1 57 · s2 66",
-            "board | sys 51 · cpu 51 · aux0 27 · aux1 72 · aux2 16 · aux3 27 · aux4 50",
+            "NVMe0 | 50",
+            "NVMe1 | 57",
+            "board | sys 51 · cpu 51 · aux0 27 · aux1 72 · aux3 27 · aux4 50",
             "NIC | 51",
             "Wi-Fi | 39",
         ]
@@ -433,30 +433,39 @@ fn panel_groups_by_device_with_short_labels() {
          \"nvme-842p\" = \"scratch\", \"iwlwifi_1\" = \"radio\" }\n",
     );
     let rows = panel_rows(&renamed, &scratch);
-    assert!(
-        rows.contains(&"NVMe0 | 50 · s1 50 · s2 67".to_owned()),
-        "{rows:?}"
-    );
-    assert!(
-        rows.contains(&"scratch | 57 · s1 57 · s2 66".to_owned()),
-        "{rows:?}"
-    );
+    assert!(rows.contains(&"NVMe0 | 50".to_owned()), "{rows:?}");
+    assert!(rows.contains(&"scratch | 57".to_owned()), "{rows:?}");
     assert!(
         rows.iter()
             .any(|r| r.starts_with("board | 51 · socket 51 · aux0")),
         "{rows:?}"
     );
     assert!(rows.contains(&"radio | 39".to_owned()), "{rows:?}");
+    // `allow` shows the tty's hidden inputs again; `defaults = false` too.
+    let allowed = temps_from("[temps]\nallow = [\"nvme-317k\", \"nct6798:AUXTIN*\"]\n");
+    let rows = panel_rows(&allowed, &scratch);
+    assert!(
+        rows.contains(&"NVMe0 | 50 · s1 50 · s2 67".to_owned()),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|r| r.contains("aux2 16")), "{rows:?}");
+    let raw = panel_rows(&temps_from("[temps]\ndefaults = false\n"), &scratch);
+    assert!(
+        raw.contains(&"NVMe1 | 57 · s1 57 · s2 66".to_owned()),
+        "{raw:?}"
+    );
 }
 
 #[test]
 fn colours_come_from_config_then_the_chip_then_defaults() {
     let scratch = Scratch::reference("levels");
-    scratch.set(3, "temp1_input", "91000"); // Tctl: default crit 90
-    scratch.set(3, "temp3_input", "80000"); // Tccd1: default warn 80
-    scratch.set(2, "temp1_input", "80000"); // SYSTIN: its max 80
-    scratch.set(0, "temp1_input", "84850"); // Composite: its crit 84.85
-    scratch.set(0, "temp3_input", "81000"); // Sensor 2: no limits, warn 80
+    // #165: the defaults of each kind (temps::kind_limits); a chip's own
+    // max and crit count only as a pair that rises.
+    scratch.set(3, "temp1_input", "91000"); // Tctl: CPU crit 90
+    scratch.set(3, "temp3_input", "80000"); // Tccd1: die warn 80
+    scratch.set(2, "temp1_input", "70000"); // SYSTIN: max 80 alone, board 60/75
+    scratch.set(0, "temp1_input", "85000"); // Composite: max = crit, NVMe crit 85
+    scratch.set(0, "temp3_input", "83000"); // Sensor 2: no limits, NVMe warn 82
     scratch.set(5, "temp1_input", "46000"); // coolant: warn 45
     let level = |temps: &Temps, chip: &str, sensor: &str| {
         let readings = read_once(&scratch, temps);
@@ -478,16 +487,183 @@ fn colours_come_from_config_then_the_chip_then_defaults() {
     assert_eq!(level(&d, "k10temp", "Tccd2"), Level::Normal);
     assert_eq!(level(&d, "nct6798", "SYSTIN"), Level::Warn);
     assert_eq!(level(&d, "nvme-317k", "Composite"), Level::Crit);
-    assert_eq!(level(&d, "nvme-317k", "Sensor 2"), Level::Warn);
+    // Sensor 2 shows only when allowed (the tty hides it by default).
+    let s2 = temps_from("[temps]\nallow = [\"nvme-317k\"]\n");
+    assert_eq!(level(&s2, "nvme-317k", "Sensor 2"), Level::Warn);
     assert_eq!(level(&d, "z53", "Coolant temp"), Level::Warn);
     // Overrides: the chip:sensor pattern beats the chip pattern.
     let o = temps_from(
-        "[temps]\nwarn = { \"z53\" = 50, \"k10temp\" = 85, \"k10temp:Tccd*\" = 75 }\n\
-         crit = { \"k10temp\" = 95 }\n",
+        "[temps]\nwarn = { \"z53\" = 48, \"k10temp\" = 85, \"k10temp:Tccd*\" = 75 }\n\
+         crit = { \"k10temp\" = 97 }\n",
     );
     assert_eq!(level(&o, "z53", "Coolant temp"), Level::Normal);
     assert_eq!(level(&o, "k10temp", "Tctl"), Level::Warn);
     assert_eq!(level(&o, "k10temp", "Tccd1"), Level::Warn);
+}
+
+/// #165: the tty never shows NVMe Sensor 1 and 2 or the board's AUXTIN2,
+/// even as the hottest reading; the readings (snapshot JSON, metrics)
+/// keep them.
+#[test]
+fn a_tty_blocked_sensor_is_never_shown_even_when_hottest() {
+    let scratch = Scratch::reference("tty-block");
+    scratch.set(0, "temp3_input", "96400"); // nvme-317k Sensor 2
+    scratch.set(1, "temp2_input", "97000"); // nvme-842p Sensor 1
+    scratch.set(2, "temp5_input", "98600"); // nct6798 AUXTIN2
+    let d = Temps::default();
+    let readings = read_once(&scratch, &d);
+    let got = shown(&readings);
+    for (chip, sensor, tenths) in [
+        ("nvme-317k", "Sensor 2", 964),
+        ("nvme-842p", "Sensor 1", 970),
+        ("nct6798", "AUXTIN2", 986),
+    ] {
+        assert!(
+            got.contains(&(chip.to_owned(), sensor.to_owned(), tenths)),
+            "exported: {got:?}"
+        );
+    }
+    let panel = temps::panel(&readings, &TempLook::new(&d));
+    let all: Vec<i32> = panel
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter().map(|i| i.tenths))
+        .collect();
+    for hidden in [964, 970, 986] {
+        assert!(!all.contains(&hidden), "{all:?}");
+    }
+    let hottest = |name: &str| {
+        panel
+            .groups
+            .iter()
+            .find(|g| g.name == name)
+            .and_then(|g| g.hottest())
+            .map(|i| i.tenths)
+    };
+    assert_eq!(hottest("NVMe0"), Some(499), "Composite");
+    assert_eq!(hottest("NVMe1"), Some(569), "Composite");
+    assert_eq!(hottest("board"), Some(715), "AUXTIN1");
+}
+
+/// One reading's TEMPS item: its level and its warning and critical points.
+fn item_of(scratch: &Scratch, temps: &Temps, chip: &str, sensor: &str) -> TempItem {
+    let readings = read_once(scratch, temps);
+    let look = TempLook::new(temps);
+    let one: Vec<TempReading> = readings
+        .into_iter()
+        .filter(|r| r.chip == chip && r.sensor == sensor)
+        .collect();
+    temps::panel(&one, &look).groups[0].items[0].clone()
+}
+
+#[test]
+fn a_board_chips_register_defaults_give_way_to_the_board_limits() {
+    let scratch = Scratch::reference("board-pair");
+    let d = Temps::default();
+    // Titan's nct6798: 80/125 on SYSTIN, CPUTIN, AUXTIN1; 80/100 on AUXTIN3.
+    scratch.set(2, "temp1_crit", "125000");
+    assert_eq!(
+        item_of(&scratch, &d, "nct6798", "SYSTIN").thresholds,
+        Some((600, 750))
+    );
+    scratch.set(2, "temp1_crit", "100000");
+    assert_eq!(
+        item_of(&scratch, &d, "nct6798", "SYSTIN").thresholds,
+        Some((600, 750))
+    );
+    // Within 15 °C of the board's 75 the chip's pair counts; 16 °C past
+    // it, not.
+    scratch.set(2, "temp1_crit", "90000");
+    assert_eq!(
+        item_of(&scratch, &d, "nct6798", "SYSTIN").thresholds,
+        Some((800, 900))
+    );
+    scratch.set(2, "temp1_crit", "91000");
+    assert_eq!(
+        item_of(&scratch, &d, "nct6798", "SYSTIN").thresholds,
+        Some((600, 750))
+    );
+    // Other kinds keep any rising pair: the slack is for board chips,
+    // whose limits are register defaults. NVMe 81.8/84.8, and an NVMe
+    // 80/125 as the drive reports it.
+    scratch.set(0, "temp1_max", "81800");
+    scratch.set(0, "temp1_crit", "84800");
+    assert_eq!(
+        item_of(&scratch, &d, "nvme-317k", "Composite").thresholds,
+        Some((818, 848))
+    );
+    scratch.set(0, "temp1_max", "80000");
+    scratch.set(0, "temp1_crit", "125000");
+    assert_eq!(
+        item_of(&scratch, &d, "nvme-317k", "Composite").thresholds,
+        Some((800, 1250))
+    );
+}
+
+#[test]
+fn a_configured_warning_at_the_critical_point_moves_critical_above_it() {
+    let scratch = Scratch::reference("warn-at-crit");
+    scratch.set(5, "temp1_input", "52000");
+    // Coolant's critical point is 50: a warning of 50 keeps its scale.
+    let o = temps_from("[temps]\nwarn = { \"z53\" = 50 }\n");
+    let item = item_of(&scratch, &o, "z53", "Coolant temp");
+    assert_eq!(item.thresholds, Some((500, 550)));
+    assert_eq!(item.level, Level::Warn);
+    // Past it too. (A configured pair must rise: config validation.)
+    let o = temps_from("[temps]\nwarn = { \"z53\" = 55 }\n");
+    let item = item_of(&scratch, &o, "z53", "Coolant temp");
+    assert_eq!(item.thresholds, Some((550, 600)));
+    assert_eq!(item.level, Level::Normal);
+}
+
+#[test]
+fn a_configured_critical_point_at_the_warning_moves_the_warning_below_it() {
+    let scratch = Scratch::reference("crit-at-warn");
+    scratch.set(5, "temp1_input", "42000");
+    // Coolant warns at 45: a critical point of 40 keeps its scale, 35/40.
+    let o = temps_from("[temps]\ncrit = { \"z53\" = 40 }\n");
+    let item = item_of(&scratch, &o, "z53", "Coolant temp");
+    assert_eq!(item.thresholds, Some((350, 400)));
+    assert_eq!(item.level, Level::Crit);
+    // At the warning point exactly, too: 40/45 at 42 is a warning.
+    let o = temps_from("[temps]\ncrit = { \"z53\" = 45 }\n");
+    let item = item_of(&scratch, &o, "z53", "Coolant temp");
+    assert_eq!(item.thresholds, Some((400, 450)));
+    assert_eq!(item.level, Level::Warn);
+    // Above the warning nothing moves.
+    let o = temps_from("[temps]\ncrit = { \"z53\" = 48 }\n");
+    assert_eq!(
+        item_of(&scratch, &o, "z53", "Coolant temp").thresholds,
+        Some((450, 480))
+    );
+    // Both configured, on different keys, and meeting: the critical point
+    // wins and the warning moves below it, so 42 C is critical.
+    let o = temps_from("[temps]\nwarn = { \"z53\" = 48 }\ncrit = { \"z53:Coolant temp\" = 40 }\n");
+    let item = item_of(&scratch, &o, "z53", "Coolant temp");
+    assert_eq!(item.thresholds, Some((350, 400)));
+    assert_eq!(item.level, Level::Crit);
+}
+
+#[test]
+fn every_kind_has_its_design_limits() {
+    let table = [
+        (Kind::Coolant, "Coolant temp", (450, 500)),
+        (Kind::Cpu, "Tctl", (800, 900)),
+        (Kind::Cpu, "Tccd1", (800, 900)),
+        (Kind::Cpu, "Tccd8", (800, 900)),
+        (Kind::Gpu, "gpu", (880, 920)),
+        (Kind::Nvme, "Composite", (820, 850)),
+        (Kind::Board, "SYSTIN", (600, 750)),
+        (Kind::Memory, "temp1", (600, 750)),
+        (Kind::Wifi, "temp1", (700, 850)),
+        (Kind::Disk, "temp1", (500, 600)),
+        (Kind::Nic, "temp1", (700, 900)),
+        (Kind::Acpi, "temp1", (700, 900)),
+        (Kind::Other, "temp1", (700, 900)),
+    ];
+    for (kind, sensor, limits) in table {
+        assert_eq!(temps::kind_limits(kind), limits, "{kind:?} {sensor}");
+    }
 }
 
 // ---- #74: FANS discovery ---------------------------------------------------

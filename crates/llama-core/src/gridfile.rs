@@ -17,13 +17,18 @@
 //! the file as untrusted (it is group-readable and a tmpfs file, but llama-view
 //! draws it on a terminal): [`decode`] rejects a bad magic, a size over the
 //! caps or a length that does not match, and maps every scalar that is
-//! invalid or not [`is_showable`] to U+FFFD, so no control or escape byte can
+//! invalid or not [`is_showable`](crate::glyph::is_showable) to U+FFFD, so no control or escape byte can
 //! reach the viewer's terminal from here.
+//!
+//! One private-use scalar is carried as well: [`SEGMENT`](crate::glyph::SEGMENT), the gauge
+//! segment (#165). [`decode`] turns it into its plain half block, so a
+//! reader that does not draw it shows `▄`, never a replacement glyph;
+//! [`decode_segments`] keeps it for a reader that draws it.
 
 use std::time::Duration;
 
 use crate::color::Rgb;
-use crate::glyph::is_showable;
+use crate::glyph::{is_carried, plain};
 
 /// First eight bytes of every grid file.
 pub const MAGIC: &[u8; 8] = b"LBGRID1\n";
@@ -113,7 +118,7 @@ pub fn file_len(cols: u16, rows: u16) -> usize {
 }
 
 /// Replace `out` with the file for `image`. Refuses a size over the caps or a
-/// cell count that does not match; a scalar that is not [`is_showable`] is
+/// cell count that does not match; a scalar that is not [`is_carried`] is
 /// written as [`REPLACEMENT`], the same as the decoder would read it.
 pub fn encode(image: &GridImage, out: &mut Vec<u8>) -> Result<(), GridError> {
     let (cols, rows) = (image.cols, image.rows);
@@ -135,7 +140,7 @@ pub fn encode(image: &GridImage, out: &mut Vec<u8>) -> Result<(), GridError> {
     out.extend_from_slice(&image.seq.to_le_bytes());
     out.extend_from_slice(&image.unix_ms.to_le_bytes());
     for cell in &image.cells {
-        let ch = if is_showable(cell.ch) {
+        let ch = if is_carried(cell.ch) {
             cell.ch
         } else {
             REPLACEMENT
@@ -148,8 +153,19 @@ pub fn encode(image: &GridImage, out: &mut Vec<u8>) -> Result<(), GridError> {
     Ok(())
 }
 
-/// Read a grid file. Every check is on the bytes, nothing is trusted.
+/// Read a grid file. Every check is on the bytes, nothing is trusted. A
+/// [`SEGMENT`](crate::glyph::SEGMENT) cell comes back as its plain half block.
 pub fn decode(bytes: &[u8]) -> Result<GridImage, GridError> {
+    decode_with(bytes, false)
+}
+
+/// [`decode`], keeping [`SEGMENT`](crate::glyph::SEGMENT) cells for a reader
+/// that draws them.
+pub fn decode_segments(bytes: &[u8]) -> Result<GridImage, GridError> {
+    decode_with(bytes, true)
+}
+
+fn decode_with(bytes: &[u8], segments: bool) -> Result<GridImage, GridError> {
     let header = bytes.get(..HEADER_LEN).ok_or(GridError::Truncated)?;
     if &header[..8] != MAGIC {
         return Err(GridError::BadMagic);
@@ -178,8 +194,8 @@ pub fn decode(bytes: &[u8]) -> Result<GridImage, GridError> {
         .map(|raw| {
             let scalar = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let ch = char::from_u32(scalar)
-                .filter(|&c| is_showable(c))
-                .unwrap_or(REPLACEMENT);
+                .filter(|&c| is_carried(c))
+                .map_or(REPLACEMENT, |c| if segments { c } else { plain(c) });
             GridCell {
                 ch,
                 fg: Rgb {
@@ -207,6 +223,7 @@ pub fn decode(bytes: &[u8]) -> Result<GridImage, GridError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyph::SEGMENT;
 
     fn rgb(r: u8, g: u8, b: u8) -> Rgb {
         Rgb { r, g, b }
@@ -350,6 +367,25 @@ mod tests {
         let back = decode(&bytes(&img)).expect("decode");
         assert_eq!(back.cells[0].ch, REPLACEMENT);
         assert_eq!(back.cells[1].ch, 'x');
+    }
+
+    /// #165: the gauge segment is carried byte for byte. A reader that
+    /// does not draw it gets the plain half block, never U+FFFD; one that
+    /// asks for segments keeps it. Other private-use scalars are refused.
+    #[test]
+    fn the_segment_is_carried_and_plain_unless_kept() {
+        let raw = bytes(&image(1, 1, SEGMENT));
+        assert_eq!(&raw[24..28], &0xe584u32.to_le_bytes());
+        assert_eq!(decode(&raw).expect("decode").cells[0].ch, '\u{2584}');
+        assert_eq!(decode_segments(&raw).expect("decode").cells[0].ch, SEGMENT);
+        let other = bytes(&image(1, 1, '\u{e585}'));
+        assert_eq!(&other[24..28], &u32::from(REPLACEMENT).to_le_bytes());
+        let mut planted = raw.clone();
+        planted[24..28].copy_from_slice(&0xe585u32.to_le_bytes());
+        assert_eq!(
+            decode_segments(&planted).expect("decode").cells[0].ch,
+            REPLACEMENT
+        );
     }
 
     #[test]

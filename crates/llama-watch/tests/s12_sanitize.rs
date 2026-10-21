@@ -693,7 +693,7 @@ fn parse_number(bytes: &[u8]) -> Option<(u16, usize)> {
 /// allowlist has to change this test too.
 const ALLOWED_GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
+    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 fn match_glyph(bytes: &[u8]) -> Option<usize> {

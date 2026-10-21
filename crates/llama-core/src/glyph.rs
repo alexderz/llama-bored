@@ -80,6 +80,34 @@ const SHOWABLE: &[(u32, u32)] = &[
     (0xfffd, 0xfffd),
 ];
 
+/// llama-bored's gauge segment (#165): the lower half block `▄` with its last
+/// pixel column blank, so a row of them reads as separate segments with a
+/// hairline between. No standard scalar draws that, so it is a private-use
+/// one, and only a reader that knows it draws it: tty11's llama-hack font
+/// carries the glyph, and llama-cast's rasteriser draws the gap itself.
+/// Every other reader shows [`SEGMENT_PLAIN`] in its place ([`plain`]).
+///
+/// It is not [`is_showable`]: a terminal font may draw anything there. The
+/// grid file carries it ([`is_carried`]), and [`crate::gridfile::decode`]
+/// turns it back into [`SEGMENT_PLAIN`] unless the caller asks to keep it.
+pub const SEGMENT: char = '\u{e584}';
+
+/// What a reader without the segment glyph draws instead: the lower half
+/// block, the same bar without the hairline.
+pub const SEGMENT_PLAIN: char = '\u{2584}';
+
+/// `c`, with [`SEGMENT`] as [`SEGMENT_PLAIN`].
+#[must_use]
+pub fn plain(c: char) -> char {
+    if c == SEGMENT { SEGMENT_PLAIN } else { c }
+}
+
+/// A scalar the grid file may carry: [`is_showable`], or [`SEGMENT`].
+#[must_use]
+pub fn is_carried(c: char) -> bool {
+    c == SEGMENT || is_showable(c)
+}
+
 /// Whether `c` is safe to draw as one cell on a full-Unicode terminal. See
 /// the module doc for what is left out and why.
 #[must_use]
@@ -149,6 +177,24 @@ mod tests {
             '\u{2192}', '\u{d7}', '\u{2248}', '\u{2500}', '\u{2588}', '\u{2587}', '\u{fffd}',
         ] {
             assert!(is_showable(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn the_segment_is_carried_but_not_showable_and_plain_is_the_half_block() {
+        assert!(
+            !is_showable(SEGMENT),
+            "a terminal font may draw anything there"
+        );
+        assert!(is_carried(SEGMENT));
+        assert!(is_showable(SEGMENT_PLAIN) && is_carried(SEGMENT_PLAIN));
+        assert_eq!(plain(SEGMENT), '\u{2584}');
+        assert_eq!(plain('a'), 'a');
+        assert_eq!(plain('\u{2584}'), '\u{2584}');
+        // Any other private-use scalar is neither.
+        for n in [0xe000, 0xe583, 0xe585, 0xf584, 0xf8ff] {
+            let c = char::from_u32(n).expect("scalar");
+            assert!(!is_carried(c), "{n:x}");
         }
     }
 

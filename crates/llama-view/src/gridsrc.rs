@@ -9,6 +9,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use llama_core::glyph;
 use llama_core::gridfile::{self, GridImage, MAX_COLS, MAX_ROWS, STALE_AFTER};
 
 use crate::screen::{Cell, Color, Screen};
@@ -18,7 +19,8 @@ use crate::screen::{Cell, Color, Screen};
 pub const STALE_AFTER_MS: u64 = STALE_AFTER.as_millis() as u64;
 
 /// Open `path` afresh (the writer replaces it with a rename), read at most one
-/// maximum-size grid and decode it. Every failure is an `io::Error` whose text
+/// maximum-size grid and decode it. Gauge segments (#165) are kept; whether
+/// they are drawn is [`screen_of`]'s choice. Every failure is an `io::Error` whose text
 /// names the path or the reason, ready for a status line or stderr.
 pub fn load_grid(path: &Path) -> io::Result<GridImage> {
     let mut file = File::open(path)
@@ -26,7 +28,7 @@ pub fn load_grid(path: &Path) -> io::Result<GridImage> {
     let cap = u64::try_from(gridfile::file_len(MAX_COLS, MAX_ROWS)).unwrap_or(u64::MAX) + 1;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file).take(cap).read_to_end(&mut bytes)?;
-    gridfile::decode(&bytes)
+    gridfile::decode_segments(&bytes)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
@@ -45,8 +47,11 @@ pub fn stale_secs(written_ms: u64, now_ms: u64) -> Option<u64> {
     (age > STALE_AFTER_MS).then_some(age / 1000)
 }
 
-/// The grid's cells as a screen, every colour exact.
-pub fn screen_of(image: &GridImage) -> Screen {
+/// The grid's cells as a screen, every colour exact. A gauge segment
+/// (`llama_core::glyph::SEGMENT`, #165) stays itself with `segments`
+/// (`--segments`: the terminal font has it), else it is the plain `▄`, so
+/// a font without it never shows a replacement glyph.
+pub fn screen_of(image: &GridImage, segments: bool) -> Screen {
     Screen {
         cols: image.cols,
         rows: image.rows,
@@ -57,7 +62,11 @@ pub fn screen_of(image: &GridImage) -> Screen {
             .iter()
             .map(|cell| {
                 Cell::new(
-                    cell.ch,
+                    if segments {
+                        cell.ch
+                    } else {
+                        glyph::plain(cell.ch)
+                    },
                     Color::Rgb(cell.fg.r, cell.fg.g, cell.fg.b),
                     Color::Rgb(cell.bg.r, cell.bg.g, cell.bg.b),
                 )
@@ -105,12 +114,31 @@ mod tests {
 
     #[test]
     fn screen_keeps_characters_and_exact_colours() {
-        let screen = screen_of(&image(0));
+        let screen = screen_of(&image(0), false);
         assert_eq!((screen.cols, screen.rows), (2, 1));
         assert_eq!(screen.cells[0].ch, '\u{e9}');
         assert_eq!(screen.cells[1].ch, '\u{2192}');
         assert_eq!(screen.cells[0].fg, Color::Rgb(1, 2, 3));
         assert_eq!(screen.cells[0].bg, Color::Rgb(4, 5, 6));
+    }
+
+    /// #165: a gauge segment survives the file and is drawn as itself only
+    /// with `--segments`; otherwise it is the plain half block, never U+FFFD.
+    #[test]
+    fn a_segment_is_a_half_block_unless_the_font_has_it() {
+        let dir = scratch("segment");
+        let path = dir.join("grid");
+        let mut img = image(0);
+        img.cells[0].ch = glyph::SEGMENT;
+        let mut bytes = Vec::new();
+        encode(&img, &mut bytes).expect("encode");
+        std::fs::write(&path, &bytes).expect("write");
+        let loaded = load_grid(&path).expect("load");
+        assert_eq!(loaded.cells[0].ch, glyph::SEGMENT);
+        assert_eq!(screen_of(&loaded, false).cells[0].ch, '\u{2584}');
+        assert_eq!(screen_of(&loaded, true).cells[0].ch, glyph::SEGMENT);
+        assert_eq!(screen_of(&loaded, false).cells[1].ch, '\u{2192}');
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

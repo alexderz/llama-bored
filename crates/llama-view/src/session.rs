@@ -39,6 +39,7 @@ pub struct Session {
     vt: u8,
     fps: u8,
     kiosk: bool,
+    segments: bool,
 }
 
 impl Session {
@@ -67,6 +68,7 @@ impl Session {
             vt: opts.vt,
             fps: opts.fps,
             kiosk,
+            segments: opts.segments,
         }
     }
 
@@ -94,7 +96,7 @@ impl Session {
     /// [`Self::frame`] for the grid source (#107): the cells and exact
     /// colours of a decoded grid file, fitted, titled and diffed the same way.
     pub fn frame_grid(&mut self, pane: (u16, u16), image: &GridImage, out: &mut Vec<u8>) {
-        self.paint(screen_of(image), pane, out);
+        self.paint(screen_of(image, self.segments), pane, out);
     }
 
     fn paint(&mut self, screen: Screen, pane: (u16, u16), out: &mut Vec<u8>) {
