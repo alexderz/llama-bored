@@ -958,15 +958,19 @@ shrinks; it shows `tty too small` only below 160x26.
 every temperature the host exposes, found in `/sys/class/hwmon` (read only,
 found again every 30 s, read at most once a second) plus the GPU, one row
 per device with short labels, values coloured at the chip's own
-`tempN_max` / `tempN_crit` (else 80 / 90 °C; 45 / 55 for a coolant):
+`tempN_max` / `tempN_crit` when that pair rises (on a board chip only
+within 15 °C of the board's limits), else at the defaults of the sensor's
+kind: coolant 45 / 50 °C, CPU (Tctl and its dies) 80 / 90, GPU 88 / 92,
+NVMe 82 / 85, board and memory 60 / 75, Wi-Fi 70 / 85, disks 50 / 60, NIC,
+ACPI and the rest 70 / 90:
 
 ```text
 TEMPS  warn crit
 CPU      Tctl 68 · CCD1 64 · CCD2 62
 GPU      71
 coolant  40
-NVMe0    50 · s1 50 · s2 67
-board    sys 51 · cpu 51 · aux0 27 · aux1 72 · aux2 16 · aux3 27 · aux4 50
+NVMe0    50
+board    sys 51 · cpu 51 · aux0 27 · aux1 72 · aux3 27 · aux4 50
 NIC      51
 Wi-Fi    39
 ```
@@ -985,9 +989,11 @@ Which sensors and fans show, the same way for both:
   so `allow` can force an entry in. TEMPS hides the Super-I/O inputs
   that are unwired or repeat the CPU (`PCH_*`, `TSI*`, `SMBUSMASTER*`,
   `PECI*` on `nct*` / `w83*` chips) and any input that has not changed for
-  ten minutes while another on its chip has. FANS hides a discovered fan
-  that has never turned this run (an empty header); once it has spun it
-  stays, so a stall shows.
+  ten minutes while another on its chip has. The tty also hides an NVMe
+  drive's `Sensor 1` and `Sensor 2` (its `Composite` sums them up) and
+  `nct6798:AUXTIN2`; the snapshot and the metrics still export them.
+  FANS hides a discovered fan that has never turned this run (an empty
+  header); once it has spun it stays, so a stall shows.
 - A reading below 5 °C or at 127 °C and above is never a temperature
   (unwired inputs read 0, -62 or 127) and is always dropped, even when
   allowed.

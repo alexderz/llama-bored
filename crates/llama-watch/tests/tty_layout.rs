@@ -2361,39 +2361,29 @@ fn no_llama_and_no_gpu_draw_dashes_and_a_quiet_note() {
     }
 }
 
+/// #165: ACT and LOAD share the first gauge row. ACT keeps its source; the
+/// device watts are POWER's.
 #[test]
-fn activity_bar_sits_under_load_with_percent_source_and_device_watts() {
+fn act_and_load_share_the_first_gauge_row_and_act_names_its_source() {
     let model = sample(WatchState::Generating);
     let grid = draw(&model, 240, 67);
-    let load_row = row_with(&grid, "LOAD");
-    let activity_row = row_with(&grid, "ACTIVITY");
-    assert_eq!(load_row, activity_row + 1, "LOAD is the row under ACTIVITY");
-    let load = row_string(&grid, load_row);
-    let activity = row_string(&grid, activity_row);
-    assert!(load.contains("70 %"), "{load}");
-    assert!(!load.contains("ACTIVITY"), "{load}");
-    assert!(
-        activity.contains("ACTIVITY 42 % gpu 312 W"),
-        "percent, source and the winning device's watts: {activity}"
-    );
-    let power = row_string(&grid, row_with(&grid, "POWER"));
+    let row = meter_row(&grid, "ACT");
+    assert_eq!(meter_row(&grid, "LOAD"), row, "LOAD is beside ACT");
+    let text = row_string(&grid, row);
+    assert!(text.contains("ACT       42 % gpu"), "{text}");
+    assert!(text.contains("LOAD          70 %"), "{text}");
+    let power = row_string(&grid, meter_row(&grid, "POWER"));
     assert!(power.contains("312/350 W"), "{power}");
-    assert!(!load.contains("gpu"), "LOAD is unchanged: {load}");
 }
 
 #[test]
-fn activity_label_names_each_source_and_drops_watts_before_the_label() {
+fn act_value_names_each_source_and_keeps_its_field() {
     let cases: [(f64, LoadSource, Option<f64>, &str); 5] = [
-        (
-            78.0,
-            LoadSource::Gpu,
-            Some(340.0),
-            "ACTIVITY  78 % gpu 340 W",
-        ),
-        (100.0, LoadSource::Cpu, Some(230.0), "ACTIVITY  100 % cpu"),
-        (5.0, LoadSource::Cpu, Some(31.0), "ACTIVITY  5 % cpu 31 W"),
-        (12.0, LoadSource::Util, None, "ACTIVITY  12 % util"),
-        (99.6, LoadSource::Gpu, Some(349.0), "ACTIVITY  100 % gpu"),
+        (78.0, LoadSource::Gpu, Some(340.0), "78 % gpu"),
+        (100.0, LoadSource::Cpu, Some(230.0), "100 % cpu"),
+        (5.0, LoadSource::Cpu, Some(31.0), "5 % cpu"),
+        (12.0, LoadSource::Util, None, "12 % util"),
+        (99.6, LoadSource::Gpu, Some(349.0), "100 % gpu"),
     ];
     for (pct, src, watts, want) in cases {
         let mut model = sample(WatchState::Generating);
@@ -2401,18 +2391,16 @@ fn activity_label_names_each_source_and_drops_watts_before_the_label() {
         model.activity_src = Some(src);
         model.activity_w = watts;
         let grid = draw(&model, 240, 67);
-        let row = row_string(&grid, row_with(&grid, "ACTIVITY"));
-        let at = row.find("ACTIVITY").expect("ACTIVITY");
-        let text: String = row[at..].chars().take(40).collect();
+        let (row, col) = label_hit(&grid, "ACT");
+        let text: String = (col..col + 19)
+            .map(|c| grid.get(c, row).unwrap().ch)
+            .collect();
         assert_eq!(
-            text.split_whitespace()
-                .take(want.split_whitespace().count())
-                .collect::<Vec<_>>(),
-            want.split_whitespace().collect::<Vec<_>>(),
-            "{row}"
+            text,
+            format!("ACT{want:>15} "),
+            "{}",
+            row_string(&grid, row)
         );
-        let gap = row[at..].chars().nth("ACTIVITY".len());
-        assert_eq!(gap, Some(' '), "a blank after the label: {row}");
     }
 }
 
@@ -2426,13 +2414,14 @@ fn activity_over_100_is_a_full_bar_with_a_hot_top_step_and_the_real_number() {
         model.activity_src = Some(LoadSource::Gpu);
         model.activity_w = Some(340.0);
         let grid = draw(&model, 240, 67);
-        let row = row_with(&grid, "ACTIVITY");
+        let row = meter_row(&grid, "ACT");
         let full = row_string(&grid, row);
-        let at = full.find("ACTIVITY").expect("ACTIVITY");
+        let at = full.find("ACT ").expect("ACT");
         let text: String = full[at..].chars().take_while(|ch| ch.is_ascii()).collect();
-        let cells: Vec<_> = (meter_bar_col(&grid, row, "ACTIVITY")..grid.cols())
+        let bar = meter_bar_col(&grid, row, "ACT");
+        let cells: Vec<_> = (bar..bar + 36)
             .map(|col| grid.get(col, row).expect("cell"))
-            .filter(|cell| matches!(cell.ch, '█' | '░' | '▉'..='▏' | '▄' | '▇'))
+            .filter(|cell| matches!(cell.ch, '█' | '░' | '▉'..='▏' | '▄' | '▇' | SEG))
             .collect();
         (text, cells)
     };
@@ -2441,7 +2430,7 @@ fn activity_over_100_is_a_full_bar_with_a_hot_top_step_and_the_real_number() {
     let (pinned_text, pinned) = bar(125.0);
     assert_eq!(
         hot_text.split_whitespace().collect::<Vec<_>>(),
-        ["ACTIVITY", "118", "%", "gpu"],
+        ["ACT", "118", "%", "gpu"],
         "{hot_text}"
     );
     assert!(full_text.contains("100 %"), "{full_text}");
@@ -3065,19 +3054,30 @@ fn fans_off_draws_no_fans_panel() {
 }
 
 #[test]
-fn wide_screen_puts_fans_right_of_in_out() {
+fn fan_gauges_at_the_fans_golden_sizes() {
     for (_, cols, rows) in FANS_GOLDENS {
         let at = format!("{cols}x{rows}");
         let grid = draw(&fans_model(), cols, rows);
-        let header = row_with(&grid, "FANS  nct6798");
-        assert!(
-            header < timeline_rule(&grid),
-            "{at}: fans stay in the top band"
-        );
-        let text = row_string(&grid, header);
-        for part in ["front1", "1939", "88%", "front2", "rear", "top", "100%"] {
-            assert!(text.contains(part), "{at}: {part} missing in {text}");
+        for (fan, rpm) in [
+            ("front1", "1939"),
+            ("front2", "1877"),
+            ("rear", "3026"),
+            ("top", "1272"),
+        ] {
+            let row = meter_row(&grid, fan);
+            assert!(
+                row < timeline_rule(&grid),
+                "{at}: fans stay in the top band"
+            );
+            let text = row_string(&grid, row);
+            assert!(text.contains(&format!("{rpm} rpm")), "{at}: {text}");
         }
+        // `top` runs at pwm 255: a full bar.
+        let row = meter_row(&grid, "top");
+        let col = meter_bar_col(&grid, row, "top");
+        let lit = bar_from(&grid, row, col).len();
+        let after = grid.get(col + u16::try_from(lit).unwrap(), row).unwrap().ch;
+        assert_eq!(after, ' ', "{at}: a full fan bar has no track");
         assert_blank_edges(&grid);
     }
 }
@@ -3123,26 +3123,17 @@ fn meter_cells(grid: &llama_watch::tty::grid::Grid, row: u16) -> Vec<C16> {
         .collect()
 }
 
+/// #165: a fan is a gauge: its rpm, and its duty as a spectrum bar.
 #[test]
-fn fan_meter_uses_the_step_palette() {
+fn fan_gauge_shows_rpm_and_a_duty_spectrum() {
     let grid = draw(&fans_model(), 240, 67);
-    let header = row_with(&grid, "FANS  nct6798");
-    let text = row_string(&grid, header);
-    assert!(text.contains("88%"), "{text}");
-    let pct = col_of(&grid, header, "88%");
-    let fg = grid.get(pct, header).unwrap().fg;
-    assert!(
-        matches!(
-            fg,
-            C16::Blue
-                | C16::BrightBlue
-                | C16::Magenta
-                | C16::BrightMagenta
-                | C16::BrightRed
-                | C16::BrightWhite
-        ),
-        "fan percent uses the spectrum, got {fg:?}"
-    );
+    let row = meter_row(&grid, "front1");
+    let text = row_string(&grid, row);
+    assert!(text.contains("front1    1939 rpm"), "{text}");
+    let bar = bar_from(&grid, row, meter_bar_col(&grid, row, "front1"));
+    // pwm 224 of 255 is 88 % of 36 cells.
+    assert_eq!(bar.len(), 32, "{bar:?}");
+    assert_eq!(steps_of(&bar), STEPS, "{bar:?}");
 }
 
 #[test]
@@ -3153,25 +3144,18 @@ fn stalled_fan_is_dim_red_and_others_are_not() {
     panel.fans[3].rpm = Some(0);
     panel.fans[3].pwm = Some(0);
     let grid = draw(&model, 240, 67);
-    let header = row_with(&grid, "FANS  nct6798");
-    let stalled = col_of(&grid, header, "rear");
-    assert_eq!(
-        grid.get(stalled, header).unwrap().fg,
-        C16::Red,
-        "stalled label"
-    );
-    let resting = col_of(&grid, header, "top");
+    let (row, col) = label_hit(&grid, "rear");
+    assert_eq!(grid.get(col, row).unwrap().fg, C16::Red, "stalled label");
+    let bar = meter_bar_col(&grid, row, "rear");
+    assert_eq!(grid.get(bar, row).unwrap().fg, C16::Red, "stalled bar");
+    let (row, col) = label_hit(&grid, "top");
     assert_ne!(
-        grid.get(resting, header).unwrap().fg,
+        grid.get(col, row).unwrap().fg,
         C16::Red,
         "0 pwm is not a stall"
     );
-    let turning = col_of(&grid, header, "front1");
-    assert_ne!(
-        grid.get(turning, header).unwrap().fg,
-        C16::Red,
-        "turning fan"
-    );
+    let (row, col) = label_hit(&grid, "front1");
+    assert_ne!(grid.get(col, row).unwrap().fg, C16::Red, "turning fan");
 }
 
 #[test]
@@ -3179,8 +3163,15 @@ fn missing_values_draw_dashes_and_absent_chip_says_so() {
     let mut model = fans_model();
     model.fans.as_mut().unwrap().fans[1] = fan(3, "front2", None, None, None);
     let grid = draw(&model, 240, 67);
-    let text = row_string(&grid, row_with(&grid, "FANS  nct6798"));
-    assert!(text.contains("front2 -- --"), "{text}");
+    let row = meter_row(&grid, "front2");
+    let text = row_string(&grid, row);
+    assert!(text.contains("front2          --"), "{text}");
+    let col = meter_bar_col(&grid, row, "front2");
+    assert_eq!(
+        grid.get(col, row).unwrap().ch,
+        '·',
+        "no duty, an empty track"
+    );
     model.fans = Some(FanPanel {
         chip: "nct6798".to_string(),
         present: false,
@@ -3188,33 +3179,44 @@ fn missing_values_draw_dashes_and_absent_chip_says_so() {
     });
     let grid = draw(&model, 240, 67);
     let text = row_string(&grid, row_with(&grid, "FANS"));
-    assert!(text.contains("no single hwmon named nct6798"), "{text}");
+    assert!(
+        text.contains("FANS   no single hwmon named nct6798"),
+        "{text}"
+    );
+    assert!(row_with(&grid, "FANS") < timeline_rule(&grid));
 }
 
 #[test]
-fn narrow_screen_puts_fans_under_in_out_when_rows_allow() {
+fn fan_gauges_sit_in_the_top_band_and_fans_off_draws_none() {
     let model = fans_model();
     for (cols, rows) in [(160u16, 67u16), (160u16, 48u16)] {
         let grid = draw(&model, cols, rows);
-        let header = row_with(&grid, "FANS  nct6798");
-        assert!(header < timeline_rule(&grid), "{cols}x{rows}");
+        for fan in ["front1", "front2", "rear", "top"] {
+            assert!(
+                meter_row(&grid, fan) < timeline_rule(&grid),
+                "{cols}x{rows} {fan}"
+            );
+        }
         assert_blank_edges(&grid);
     }
     let mut off = model.clone();
     off.fans = None;
     let grid = draw(&off, 160, 48);
-    assert!(!whole(&grid).contains("FANS"), "fans off draws no line");
+    let all = whole(&grid);
+    assert!(
+        !all.contains("FANS") && !all.contains("rpm"),
+        "fans off draws nothing\n{all}"
+    );
 }
 
 #[test]
-fn text_off_gives_fans_the_bottom_of_the_freed_rows() {
+fn text_off_keeps_the_fan_gauges_in_the_top_band() {
     for (cols, rows, _, _) in TEXT_OFF_SIZES {
         let at = format!("{cols}x{rows}");
         let mut model = text_off_model(WatchState::Generating);
         model.fans = Some(ref_fans());
         let grid = draw(&model, cols, rows);
-        let header = row_with(&grid, "FANS  nct6798");
-        assert!(header < timeline_rule(&grid), "{at}");
+        assert!(meter_row(&grid, "front1") < timeline_rule(&grid), "{at}");
         assert!(!whole(&grid).contains("prompt tail"), "{at}");
         assert_blank_edges(&grid);
     }
@@ -3471,6 +3473,9 @@ fn sparkline_hides_below_twelve_columns_and_the_panel_keeps_its_height() {
 }
 
 /// The tty's five console steps, low to high.
+/// The gauge segment (#165): a lit gauge cell with the llama-hack font.
+const SEG: char = '\u{e584}';
+
 const STEPS: [C16; 5] = [
     C16::Blue,
     C16::BrightBlue,
@@ -3494,7 +3499,7 @@ fn steps_of(fgs: &[C16]) -> Vec<C16> {
 fn bar_from(grid: &llama_watch::tty::grid::Grid, row: u16, col: u16) -> Vec<C16> {
     (col..grid.cols())
         .map(|c| grid.get(c, row).expect("cell"))
-        .take_while(|cell| matches!(cell.ch, '█' | '▓' | '▐' | '▌' | '▄' | '▇'))
+        .take_while(|cell| matches!(cell.ch, '█' | '▓' | '▐' | '▌' | '▄' | '▇' | SEG))
         .map(|cell| cell.fg)
         .collect()
 }
@@ -3540,7 +3545,7 @@ fn bar_after_near(grid: &llama_watch::tty::grid::Grid, row: u16, from: u16) -> O
     (from..from.saturating_add(22).min(grid.cols())).find(|col| {
         matches!(
             grid.get(*col, row).expect("cell").ch,
-            '█' | '▓' | '▐' | '▌' | '▄' | '▇' | '·' | '░'
+            '█' | '▓' | '▐' | '▌' | '▄' | '▇' | '·' | '░' | SEG
         )
     })
 }
@@ -3581,9 +3586,11 @@ fn full_level_meter_shows_every_step_in_order() {
         let (top, bottom, track) = cpu_bar(100.0, cols, rows);
         assert_eq!(top.len(), track, "{cols}x{rows} a full bar has no track");
         assert_eq!(steps_of(&top), STEPS, "{cols}x{rows} {top:?}");
-        if rows >= 135 {
-            assert_eq!(steps_of(&bottom), STEPS, "{cols}x{rows} {bottom:?}");
-        }
+        // #165: one-row gauges at every size; the row under is the next gauge.
+        assert!(
+            steps_of(&bottom).len() < STEPS.len(),
+            "{cols}x{rows} {bottom:?}"
+        );
         // Each step covers about a fifth of the bar.
         for step in STEPS {
             let n = top.iter().filter(|fg| **fg == step).count();
@@ -3610,10 +3617,10 @@ fn thirty_percent_level_meter_holds_only_the_low_steps() {
     }
 }
 
-/// T63: the spectrum applies to every level meter; VRAM and MEM are capacity
-/// and keep one colour for the whole bar.
+/// T63, #165: every gauge is a spectrum, capacity (VRAM, MEM) too: each
+/// lit cell takes the step of its own position.
 #[test]
-fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
+fn every_gauge_is_a_spectrum_capacity_too() {
     let mut model = sample(WatchState::Generating);
     model.cpu_pct = Some(90.0);
     model.gpu_pct = Some(90.0);
@@ -3626,15 +3633,10 @@ fn level_meters_are_spectra_and_capacity_meters_are_one_colour() {
     model.mem_used_gb = Some(90.0);
     model.mem_total_gb = Some(100.0);
     let grid = draw(&model, 240, 67);
-    for label in ["CPU", "GPU", "POWER", "LOAD", "ACTIVITY"] {
+    for label in ["CPU", "GPU", "POWER", "LOAD", "ACT", "VRAM", "MEM"] {
         let row = meter_row(&grid, label);
         let bar = bar_from(&grid, row, meter_bar_col(&grid, row, label));
         assert_eq!(steps_of(&bar), STEPS, "{label} {bar:?}");
-    }
-    for label in ["VRAM", "MEM"] {
-        let row = meter_row(&grid, label);
-        let bar = bar_from(&grid, row, meter_bar_col(&grid, row, label));
-        assert_eq!(steps_of(&bar), [C16::BrightWhite], "{label} {bar:?}");
     }
 }
 
@@ -4156,10 +4158,7 @@ fn assert_dashboard(grid: &llama_watch::tty::grid::Grid, at: &str) {
     assert!(!all.contains("too small"), "{at}: refused\n{all}");
     assert!(row_string(grid, 0).contains("GENERATING"), "{at}\n{all}");
     if grid.rows() > 26 {
-        assert!(
-            row_with(grid, "ACTIVITY") < row_with(grid, "RECENT"),
-            "{at}"
-        );
+        assert!(meter_row(grid, "ACT") < row_with(grid, "RECENT"), "{at}");
     } else {
         assert!(whole(grid).contains("TIMELINE"), "{at}");
     }
@@ -4206,16 +4205,21 @@ fn short_160x40_drops_in_out_first_and_keeps_recent_and_the_chart() {
     assert_eq!(chart_rows_below_recent(&grid), 9, "{all}");
 }
 
+/// #165: at 160x45 the fans fit as gauges; at the 160x26 floor they are
+/// the first to go and the work gauges stay.
 #[test]
 fn short_screens_drop_fans_after_in_out_then_shrink_the_chart() {
     let mut model = short_model();
     model.fans = Some(ref_fans());
     let grid = draw(&model, 160, 45);
-    assert!(row_with(&grid, "FANS") < timeline_rule(&grid));
+    assert!(meter_row(&grid, "front1") < timeline_rule(&grid));
     assert!(whole(&grid).contains("prompt body"), "{}", whole(&grid));
+    model.temps = Some(ref_temps());
     let grid = draw(&model, 160, 26);
     assert_eq!(recent_rows_shown(&grid), 0);
     assert!(whole(&grid).contains("TIMELINE"));
+    assert!(!whole(&grid).contains("rpm"), "fans went first");
+    assert!(meter_row(&grid, "IO PSI") < timeline_rule(&grid));
 }
 
 #[test]
@@ -4676,12 +4680,13 @@ fn left_rows(grid: &llama_watch::tty::grid::Grid, top: u16, count: u16) -> Vec<S
         .collect()
 }
 
-/// #52: one meter per row, ACTIVITY right under LOAD, a blank row, then
-/// SETUP: the title with `+1`, and as many rows as fit (six at 160x49).
+/// #52: SETUP under the headline: the title with `+1`, and as many rows as
+/// fit (six at 160x49). Since #165 the meters are the gauge grid on the
+/// right, ACT and LOAD on its first row.
 #[test]
 fn setup_block_sits_under_single_spaced_meters_at_160x49() {
     let grid = draw(&setup_model(), 160, 49);
-    let labels: Vec<u16> = ["CPU", "GPU", "VRAM", "MEM", "POWER", "LOAD", "ACTIVITY"]
+    let labels: Vec<u16> = ["CPU", "GPU", "VRAM", "MEM", "POWER", "LOAD", "ACT"]
         .into_iter()
         .map(|label| meter_row(&grid, label))
         .collect();
@@ -4690,7 +4695,7 @@ fn setup_block_sits_under_single_spaced_meters_at_160x49() {
         labels.iter().all(|row| *row < timeline),
         "meters stay in the top band: {labels:?}"
     );
-    assert_eq!(labels[6] + 1, labels[5], "LOAD sits under ACTIVITY");
+    assert_eq!(labels[6], labels[5], "LOAD sits beside ACT (#165)");
     let rows = left_rows(&grid, setup_at(&grid), 6);
     assert!(
         rows[0].starts_with("  SETUP  qwen3.6-35b-a3b · Qwen 35B"),
@@ -4706,40 +4711,37 @@ fn setup_block_sits_under_single_spaced_meters_at_160x49() {
     assert!(!whole(&grid).contains("temp 0.6"));
 }
 
+/// #163, #165: every gauge is one row of whole cells: the segment with the
+/// llama-hack font, `▄` with eurlatgr; never a half-cell end. The grid
+/// file carries the segment either way.
 #[test]
-fn single_spaced_meters_use_a_short_block_in_whole_cells() {
-    // #163: both fonts use a lower-half cell on a short screen. The
-    // seven-eighths block is nearly full height and stacked meters merge.
-    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
-        let glyph = '▄';
+fn gauges_are_whole_segment_cells_in_every_font() {
+    for (glyphs, glyph) in [(ChartGlyphs::Eighths, SEG), (ChartGlyphs::Halves, '▄')] {
         let mut model = setup_model();
         model.chart_glyphs = glyphs;
         model.cpu_pct = Some(50.0);
         let grid = draw(&model, 160, 49);
-        let (row, at) = label_hit(&grid, "CPU");
-        let col = (at..grid.cols())
-            .find(|c| grid.get(*c, row).unwrap().ch == glyph)
-            .unwrap_or_else(|| panic!("no {glyph} on {}", row_string(&grid, row)));
+        let row = meter_row(&grid, "CPU");
+        let col = meter_bar_col(&grid, row, "CPU");
         let cells: Vec<char> = (col..grid.cols())
             .map(|c| grid.get(c, row).unwrap().ch)
-            .take_while(|ch| *ch == glyph || *ch == '·' || *ch == '░')
+            .take_while(|ch| *ch == glyph || *ch == '·')
             .collect();
+        assert_eq!(cells.len(), 16, "{glyphs:?}: 16 cells at 160 columns");
         let lit = cells.iter().filter(|ch| **ch == glyph).count();
-        let want = ((cells.len() as f64) * 0.5).round() as usize;
-        let want = want.clamp(1, cells.len());
-        assert!(
-            (lit as i32 - want as i32).abs() <= 1,
-            "{glyphs:?}: lit {lit} vs {want} of {} cells",
-            cells.len()
-        );
-        assert!(
-            cells
-                .iter()
-                .all(|ch| *ch == glyph || *ch == '·' || *ch == '░'),
-            "{glyphs:?}: no half-cell ends {cells:?}"
-        );
+        assert_eq!(lit, 8, "{glyphs:?}: half of 16");
         assert_eq!(cells[0], glyph, "lit from the first cell");
         assert_eq!(grid.get(col, row).unwrap().fg, C16::Blue);
+        assert_eq!(
+            grid.get(col, row).unwrap().rich,
+            SEG,
+            "{glyphs:?}: the file's glyph"
+        );
+        assert_eq!(
+            grid.get(col + 8, row).unwrap().rich,
+            '·',
+            "the track stays a dot"
+        );
         assert!(GLYPHS.contains(&glyph), "term may emit {glyph}");
     }
     // A tiny value still lights one cell.
@@ -4748,29 +4750,18 @@ fn single_spaced_meters_use_a_short_block_in_whole_cells() {
     let grid = draw(&model, 160, 49);
     let gpu = meter_row(&grid, "GPU");
     let ch = grid.get(meter_bar_col(&grid, gpu, "GPU"), gpu).unwrap().ch;
-    assert!(
-        matches!(ch, '▇' | '▄' | '▐' | '█'),
-        "a 1% bar lights a cell, got {ch}"
-    );
-    // 4K keeps its two-row bars. GPU and CPU share a matrix row.
+    assert_eq!(ch, SEG, "a 1% bar lights a cell");
+    // 4K too: one row a gauge, GPU and CPU on one row, the row under it
+    // the next pair.
     let mut tall = setup_model();
     tall.cpu_pct = Some(100.0);
     let grid = draw(&tall, 480, 135);
     let cpu = meter_row(&grid, "CPU");
-    assert_eq!(
-        meter_row(&grid, "GPU"),
-        cpu,
-        "GPU and CPU share a matrix row"
-    );
+    assert_eq!(meter_row(&grid, "GPU"), cpu, "GPU and CPU share a row");
+    assert_eq!(meter_row(&grid, "VRAM"), cpu + 1);
     let col = meter_bar_col(&grid, cpu, "CPU");
-    let top = grid.get(col, cpu).unwrap().ch;
-    assert!(matches!(top, '█' | '▐' | '▌'), "tall bar {top}");
-    let bot = grid.get(col, cpu + 1).unwrap().ch;
-    assert_eq!(
-        bot,
-        if top == '█' { '▓' } else { top },
-        "tall lower row {bot}"
-    );
+    assert_eq!(grid.get(col, cpu).unwrap().ch, SEG);
+    assert!(!matches!(grid.get(col, cpu + 1).unwrap().ch, '█' | '▓'));
 }
 
 /// #52: a wide screen from 60 rows shows up to nine SETUP rows (#114, one
@@ -5307,22 +5298,10 @@ fn ref_temps() -> TempPanel {
                 "coolant",
                 vec![temp_marked("", 40, Normal, Some((450, 550)))],
             ),
-            group(
-                "NVMe0",
-                vec![
-                    temp_item("", 50, Normal),
-                    temp_item("s1", 50, Normal),
-                    temp_item("s2", 82, Warn),
-                ],
-            ),
-            group(
-                "NVMe1",
-                vec![
-                    temp_item("", 57, Normal),
-                    temp_item("s1", 57, Normal),
-                    temp_item("s2", 66, Normal),
-                ],
-            ),
+            // Composite only: the tty hides an NVMe's Sensor 1 and 2, and
+            // the board's AUXTIN2 (#165, temps::TTY_BLOCK).
+            group("NVMe0", vec![temp_item("", 82, Warn)]),
+            group("NVMe1", vec![temp_item("", 66, Normal)]),
             group(
                 "board",
                 vec![
@@ -5330,7 +5309,6 @@ fn ref_temps() -> TempPanel {
                     temp_item("cpu", 51, Normal),
                     temp_item("aux0", 27, Normal),
                     temp_item("aux1", 92, Crit),
-                    temp_item("aux2", 16, Normal),
                     temp_item("aux3", 27, Normal),
                     temp_item("aux4", 50, Normal),
                 ],
@@ -5533,7 +5511,7 @@ fn truecolor_view_writes_more_for_the_ramps() {
 }
 
 fn truecolor_frame(image: &llama_core::gridfile::GridImage) -> (usize, usize) {
-    let screen = llama_view::screen_of(image);
+    let screen = llama_view::screen_of(image, false);
     let mut renderer = llama_view::Renderer::with_colors(
         llama_view::ColorMode::Truecolor,
         llama_view::Palette::Llama,
@@ -5562,59 +5540,76 @@ fn dump_temps_goldens() {
 }
 
 #[test]
-fn wide_screens_stack_fans_then_temps_right_of_in_out() {
+fn every_temps_row_is_one_gauge_at_240x67() {
     let grid = draw(&temps_model(), 240, 67);
-    let line = row_with(&grid, "TEMPS");
-    assert!(line < timeline_rule(&grid), "temps stay in the top band");
+    let mut rows = Vec::new();
+    for name in ["GPU", "coolant", "NVMe0", "NVMe1", "board", "NIC", "Wi-Fi"] {
+        rows.push(meter_row(&grid, name));
+    }
     assert!(
-        row_string(&grid, line).contains("CPU"),
-        "{}",
-        row_string(&grid, line)
+        rows.iter().all(|row| *row < timeline_rule(&grid)),
+        "{rows:?}"
     );
+    // CPU is the temperature gauge under the work gauges, beside GPU.
+    let gpu = meter_row(&grid, "GPU");
+    let cpu_temp = row_string(&grid, gpu);
+    assert!(cpu_temp.contains("CPU           68 C"), "{cpu_temp}");
     assert_blank_edges(&grid);
 }
 
 #[test]
 fn temps_values_take_their_level_colours() {
     let grid = draw(&temps_model(), 240, 67);
-    let line = row_with(&grid, "TEMPS");
-    let text = row_string(&grid, line);
-    assert!(
-        text.contains("CPU") || text.contains("GPU") || text.contains("NVMe"),
-        "{text}"
-    );
+    for (name, value, fg) in [
+        ("NVMe1", "66 C", C16::BrightWhite),
+        ("NVMe0", "82 C", C16::Yellow),
+        ("board", "92 C", C16::BrightRed),
+    ] {
+        let row = meter_row(&grid, name);
+        let text = row_string(&grid, row);
+        assert!(text.contains(&format!("{name}{value:>13}")), "{text}");
+        let col = col_of(&grid, row, value);
+        assert_eq!(grid.get(col, row).unwrap().fg, fg, "{name}");
+    }
     assert_blank_edges(&grid);
 }
 
 #[test]
-fn at_160x49_temps_is_one_line_above_the_health_rule_and_fans_hide() {
+fn at_160x49_temps_and_fans_are_gauges_in_the_top_band() {
     let grid = draw(&temps_model(), 160, 49);
-    let line = row_with(&grid, "TEMPS");
-    assert!(line < timeline_rule(&grid));
-    let text = row_string(&grid, line);
-    assert!(text.contains("TEMPS") && text.contains("CPU"), "{text}");
-    // Fans stay on the top band too; the old under-IN/OUT block is gone.
-    assert!(whole(&grid).contains("FANS"), "fans line");
+    for name in ["coolant", "NVMe0", "Wi-Fi", "front1", "top"] {
+        assert!(meter_row(&grid, name) < timeline_rule(&grid), "{name}");
+    }
+    assert!(!whole(&grid).contains("TEMPS"), "no TEMPS line");
     assert_blank_edges(&grid);
 }
 
+/// #165: the temperature gauges, a blank row, then the fan gauges.
 #[test]
-fn narrow_tall_screens_put_fans_and_temps_side_by_side_under_in_out() {
-    let grid = draw(&temps_model(), 160, 67);
-    let fans = row_with(&grid, "FANS");
-    let temps = row_with(&grid, "TEMPS");
-    assert!(fans.max(temps) < timeline_rule(&grid));
-    assert_blank_edges(&grid);
+fn temperature_gauges_come_before_fan_gauges() {
+    for (cols, rows) in [(160u16, 67u16), (240, 67)] {
+        let grid = draw(&temps_model(), cols, rows);
+        let temps = meter_row(&grid, "Wi-Fi");
+        let fans = meter_row(&grid, "front1");
+        assert_eq!(fans, temps + 2, "{cols}x{rows}: one blank row between");
+        let blank: String = row_string(&grid, temps + 1)
+            .chars()
+            .skip(usize::from(cols / 2))
+            .collect();
+        assert!(blank.trim().is_empty(), "{cols}x{rows}: {blank}");
+        assert!(fans < timeline_rule(&grid), "{cols}x{rows}");
+        assert_blank_edges(&grid);
+    }
 }
 
 #[test]
-fn text_off_short_of_rows_cuts_temps_to_the_fans_height_with_a_summary() {
+fn text_off_keeps_the_temperature_gauges_in_the_top_band() {
     let mut model = temps_model();
     model.show_text = false;
     let grid = draw(&model, 160, 49);
-    let line = row_with(&grid, "TEMPS");
-    assert!(line < timeline_rule(&grid));
-    assert!(row_string(&grid, line).contains("CPU") || row_string(&grid, line).contains("NVMe"));
+    for name in ["coolant", "NVMe0", "board"] {
+        assert!(meter_row(&grid, name) < timeline_rule(&grid), "{name}");
+    }
     assert_blank_edges(&grid);
 }
 
@@ -5623,14 +5618,22 @@ fn temps_alone_and_temps_off() {
     let mut model = temps_model();
     model.fans = None;
     let grid = draw(&model, 192, 60);
-    assert!(row_with(&grid, "TEMPS") < timeline_rule(&grid));
+    assert!(meter_row(&grid, "Wi-Fi") < timeline_rule(&grid));
     model.temps = Some(TempPanel::default());
     let grid = draw(&model, 192, 60);
-    assert!(row_string(&grid, row_with(&grid, "TEMPS")).contains("no temperature inputs found"));
+    let note = row_string(&grid, row_with(&grid, "TEMPS"));
+    assert!(
+        note.contains("TEMPS  no temperature inputs found"),
+        "{note}"
+    );
     model.temps = None;
     for (cols, rows) in [(160u16, 49u16), (192, 60), (240, 67)] {
         let grid = draw(&model, cols, rows);
-        assert!(!whole(&grid).contains("TEMPS"), "{cols}x{rows}");
+        let all = whole(&grid);
+        assert!(
+            !all.contains("TEMPS") && !all.contains("coolant"),
+            "{cols}x{rows}"
+        );
     }
 }
 
@@ -6334,13 +6337,9 @@ fn stacked_bars_never_merge_into_one_block() {
                 let grid = draw(&model, cols, rows);
                 let at = format!("{cols}x{rows} {glyphs:?} text_on={text_on}");
 
-                let fans_header = row_with(&grid, "FANS  nct6798");
-                let fans_count = u16::try_from(model.fans.as_ref().unwrap().fans.len()).unwrap();
-                assert_no_hairline(
-                    &grid,
-                    fans_header + 1..fans_header + 1 + fans_count,
-                    &format!("{at} FANS"),
-                );
+                // #165: the fan gauges, two to a row.
+                let first = meter_row(&grid, "front1");
+                assert_no_hairline(&grid, first..first + 2, &format!("{at} FANS"));
 
                 let slot_rows: Vec<u16> = (0..model.slots.len())
                     .map(|id| row_with(&grid, &format!("s{id}")))
@@ -6400,7 +6399,7 @@ fn the_grid_file_carries_the_original_characters_to_the_viewer() {
     let mut bytes = Vec::new();
     encode(&image, &mut bytes).expect("encode");
     let decoded = decode(&bytes).expect("decode");
-    let screen = screen_of(&decoded);
+    let screen = screen_of(&decoded, false);
     let out = Renderer::with_colors(ColorMode::Truecolor, palette)
         .render(screen.cols, screen.rows, &screen.cells)
         .to_vec();
@@ -7516,7 +7515,7 @@ fn skeleton_frames_at_the_four_sizes_and_the_phone_crop() {
         assert_eq!(grid.get(32, 3).unwrap().ch, ' ', "{at}: PROMPT digit 1");
         assert_eq!(grid.get(36, 3).unwrap().ch, '█', "{at}: PROMPT digit");
         let all = whole(&grid);
-        assert!(all.contains("ACTIVITY") && all.contains("LOAD"), "{at}");
+        assert!(all.contains("ACT ") && all.contains("LOAD"), "{at}");
         assert!(!all.contains("prompt processing (prefill)"), "{at}");
         // Ceilings sit in the left margin, right-aligned to column 7.
         let start = timeline_rule(&grid) + 1;
@@ -7766,15 +7765,15 @@ fn right_meter_bar(grid: &llama_watch::tty::grid::Grid, label: &str) -> (u16, Ve
             continue;
         };
         let col = u16::try_from(text[..byte].chars().count()).unwrap();
-        if col <= grid.cols() / 2 {
+        if col <= grid.cols() / 2 || !text[byte + label.len()..].starts_with(' ') {
             continue;
         }
         let start = col + u16::try_from(label.chars().count()).unwrap();
         let mut run = Vec::new();
         for c in start..grid.cols() - 1 {
             let ch = grid.get(c, row).unwrap().ch;
-            if matches!(ch, '▄' | '█' | '▇' | '▓' | '▐' | '▌' | '·') {
-                run.push((c, ch));
+            if matches!(ch, '▄' | '█' | '▇' | '▓' | '▐' | '▌' | '·' | SEG) {
+                run.push((c, llama_core::glyph::plain(ch)));
             } else if !run.is_empty() {
                 break;
             }
@@ -7788,10 +7787,11 @@ fn right_meter_bar(grid: &llama_watch::tty::grid::Grid, label: &str) -> (u16, Ve
 }
 
 fn assert_meters_do_not_touch(grid: &llama_watch::tty::grid::Grid, at: &str) {
-    let (activity, activity_bar) = right_meter_bar(grid, "ACTIVITY");
-    let (load, load_bar) = right_meter_bar(grid, "LOAD");
+    // #165: ACT and, under it, GPU in the first column of gauges.
+    let (activity, activity_bar) = right_meter_bar(grid, "ACT");
+    let (load, load_bar) = right_meter_bar(grid, "GPU");
     assert_eq!(load, activity + 1, "{at}: meters are not stacked");
-    for (name, bar) in [("ACTIVITY", &activity_bar), ("LOAD", &load_bar)] {
+    for (name, bar) in [("ACT", &activity_bar), ("GPU", &load_bar)] {
         assert!(
             bar.iter().any(|(_, ch)| *ch == '▄'),
             "{at} {name} has no half block: {bar:?}"
@@ -7923,7 +7923,7 @@ fn host_meters_show_non_zero_and_zero_byte_rates() {
     assert!(write.contains("12 M/s"), "{write}");
     assert!(net.contains("118 M/s"), "{net}");
     assert!(psi.contains("1.1 %"), "{psi}");
-    assert!(swap.contains("0.4/16.0G"), "{swap}");
+    assert!(swap.contains("0.4/16.0 G"), "{swap}");
     let write_row = meter_row(&grid, "DISK W");
     let col = meter_bar_col(&grid, write_row, "DISK W");
     assert_eq!(
@@ -7959,12 +7959,26 @@ fn host_meters_show_non_zero_and_zero_byte_rates() {
     assert!(psi.contains("0.0 %"), "{psi}");
 }
 
+/// #165: the work gauges always show. A host reading not taken yet is a
+/// dash and an empty track, in its usual place.
 #[test]
-fn absent_host_meters_leave_the_step1_matrix() {
+fn absent_host_readings_keep_their_gauges_as_dashes() {
     let grid = draw(&sample(WatchState::Generating), 192, 60);
-    let text = whole(&grid);
-    assert!(!text.contains("DISK R"), "{text}");
-    assert!(!text.contains("IO PSI"), "{text}");
+    for label in ["SWAP", "DISK R", "DISK W", "NET", "IO PSI"] {
+        let row = meter_row(&grid, label);
+        let (_, col) = label_hit(&grid, label);
+        let text: String = (col..col + 19)
+            .map(|c| grid.get(c, row).unwrap().ch)
+            .collect();
+        assert!(text.trim_end().ends_with("--"), "{label}: {text}");
+        let bar = meter_bar_col(&grid, row, label);
+        assert_eq!(bar, col + 19, "{label}");
+        assert_eq!(
+            grid.get(bar, row).unwrap().ch,
+            '·',
+            "{label}: an empty track"
+        );
+    }
 }
 
 #[test]
@@ -8278,5 +8292,595 @@ fn byte_rates_roll_over_to_the_next_unit() {
         let grid = draw(&model, 192, 60);
         let row = row_string(&grid, meter_row(&grid, "DISK R"));
         assert!(row.contains(&format!("DISK R {text} ")), "{bps}: {row}");
+    }
+}
+
+// ---- #165: the uniform gauge grid --------------------------------------------
+
+/// Everything the right-hand grid shows: host rates, the reference TEMPS
+/// rows and fans, and a hold on the header model (#128).
+fn gauge_model() -> TtyModel {
+    let claimed = header_claim_model(hold_claim());
+    let mut model = with_host_rates(false);
+    model.model_id = claimed.model_id;
+    model.now = claimed.now;
+    model.tz_offset_s = claimed.tz_offset_s;
+    model.claims = claimed.claims;
+    model.temps = Some(ref_temps());
+    model.fans = Some(ref_fans());
+    model
+}
+
+/// The right half of rows `0..rows` as text; a lit gauge cell (`▄` or the
+/// segment) is `▄`.
+fn right_half(grid: &llama_watch::tty::grid::Grid, rows: u16) -> String {
+    let from = grid.cols() / 2 + 1;
+    (0..rows)
+        .map(|row| {
+            let line: String = (from..grid.cols() - 1)
+                .map(|col| llama_core::glyph::plain(grid.get(col, row).unwrap().ch))
+                .collect();
+            format!("{row:>2} {}\n", line.trim_end())
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "prints the #165 right half at 213x60 and 160x26 for review"]
+fn print_gauge_frames() {
+    let model = gauge_model();
+    for (cols, rows) in [
+        (213u16, 60u16),
+        (192, 60),
+        (160, 26),
+        (160, 48),
+        (200, 28),
+        (240, 100),
+    ] {
+        let grid = draw(&model, cols, rows);
+        let rule = timeline_rule(&grid);
+        println!("== {cols}x{rows}\n{}", right_half(&grid, rule + 1));
+    }
+}
+
+/// Every console size the dashboard is tested at (#163), with the bar
+/// length the right half gives it.
+const GAUGE_SIZES: [(u16, u16, u16); 9] = [
+    (160, 26, 16),
+    (160, 45, 16),
+    (160, 48, 16),
+    (192, 60, 24),
+    (200, 28, 26),
+    (213, 60, 30),
+    (213, 90, 30),
+    (240, 67, 36),
+    (240, 100, 36),
+];
+
+const WORK_GAUGES: [[&str; 2]; 6] = [
+    ["ACT", "LOAD"],
+    ["GPU", "CPU"],
+    ["VRAM", "MEM"],
+    ["POWER", "SWAP"],
+    ["DISK R", "DISK W"],
+    ["NET", "IO PSI"],
+];
+
+/// Where a gauge's label starts: the topmost row at or under `from` whose
+/// gauge column `col` (first or second) begins with `label` and a blank.
+fn gauge_row(grid: &llama_watch::tty::grid::Grid, label: &str, col: u16, from: u16) -> Option<u16> {
+    (from..timeline_rule(grid)).find(|row| {
+        let text: String = (col..col + 8)
+            .map(|c| grid.get(c, *row).unwrap().ch)
+            .collect();
+        text.starts_with(label) && text[label.len()..].starts_with(' ')
+    })
+}
+
+/// The cells of one bar: lit (`▄` or the segment), then dots.
+fn gauge_cells(grid: &llama_watch::tty::grid::Grid, row: u16, at: u16) -> Vec<char> {
+    (at..grid.cols())
+        .map(|c| grid.get(c, row).unwrap().ch)
+        .take_while(|ch| matches!(*ch, '▄' | '·' | SEG))
+        .collect()
+}
+
+/// #165: at every size the work gauges are the first six rows of the right
+/// half, two to a row, every bar the same length and starting at the same
+/// column in its column, nothing past it but a blank.
+#[test]
+fn gauge_bars_line_up_at_every_size() {
+    let model = gauge_model();
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        let mut model = model.clone();
+        model.chart_glyphs = glyphs;
+        for (cols, rows, bar) in GAUGE_SIZES {
+            let grid = draw(&model, cols, rows);
+            let at = format!("{cols}x{rows} {glyphs:?}");
+            let x = [cols / 2 + 1, cols / 2 + 1 + 19 + bar + 4];
+            for (i, pair) in WORK_GAUGES.iter().enumerate() {
+                let row = 2 + u16::try_from(i).unwrap();
+                for (side, label) in pair.iter().enumerate() {
+                    assert_eq!(
+                        gauge_row(&grid, label, x[side], 2),
+                        Some(row),
+                        "{at}: {label}"
+                    );
+                    let cells = gauge_cells(&grid, row, x[side] + 19);
+                    assert_eq!(cells.len(), usize::from(bar), "{at}: {label} {cells:?}");
+                    let end = x[side] + 19 + bar;
+                    assert_eq!(grid.get(end, row).unwrap().ch, ' ', "{at}: {label} ends");
+                    assert_eq!(
+                        grid.get(x[side] + 18, row).unwrap().ch,
+                        ' ',
+                        "{at}: {label} gap"
+                    );
+                }
+            }
+            // The groups below keep the same columns and length.
+            for (label, side) in [("coolant", 0), ("NVMe0", 1)] {
+                if let Some(row) = gauge_row(&grid, label, x[side], 9) {
+                    let cells = gauge_cells(&grid, row, x[side] + 19);
+                    assert_eq!(cells.len(), usize::from(bar), "{at}: {label}");
+                }
+            }
+            assert_blank_edges(&grid);
+        }
+    }
+}
+
+/// #165: work, a blank row, temperatures, a blank row, fans. Short of rows
+/// the fans go first, then the coolest temperatures; the work gauges stay.
+#[test]
+fn gauge_groups_shed_fans_then_the_coolest_temperatures() {
+    let model = gauge_model();
+    // 213x60: all three groups, 14 rows.
+    let grid = draw(&model, 213, 60);
+    assert_eq!(meter_row(&grid, "coolant"), 10);
+    assert_eq!(meter_row(&grid, "Wi-Fi"), 12);
+    assert_eq!(meter_row(&grid, "front1"), 14);
+    assert_eq!(meter_row(&grid, "top"), 15);
+    for blank in [8u16, 13] {
+        let text: String = (107..211).map(|c| grid.get(c, blank).unwrap().ch).collect();
+        assert!(text.trim().is_empty(), "row {blank}: {text}");
+    }
+    assert_eq!(timeline_rule(&grid), 16);
+    // 160x26: eleven rows; the fans go, every temperature stays.
+    let grid = draw(&model, 160, 26);
+    let all = whole(&grid);
+    assert!(!all.contains("rpm"), "{all}");
+    for name in ["coolant", "NVMe0", "NVMe1", "board", "NIC", "Wi-Fi"] {
+        assert!(meter_row(&grid, name) < timeline_rule(&grid), "{name}");
+    }
+    // 200x28: ten rows; the fans, then the two coolest (Wi-Fi 39 C and
+    // NIC 51 C against 80 C), go. The hotter ones keep their order.
+    let grid = draw(&model, 200, 28);
+    let all = whole(&grid);
+    assert!(
+        !all.contains("rpm") && !all.contains("Wi-Fi") && !all.contains("NIC "),
+        "{all}"
+    );
+    assert_eq!(meter_row(&grid, "coolant"), 10);
+    assert_eq!(meter_row(&grid, "board"), 11);
+    assert_eq!(timeline_rule(&grid), 12);
+    // The coolest by the bar, not the reading: of seven rows one goes, and
+    // it is NIC (51 C of 80), not the coolant (40 C of 45).
+    let mut cool = model.clone();
+    cool.temps
+        .as_mut()
+        .unwrap()
+        .groups
+        .retain(|g| g.name != "Wi-Fi");
+    let grid = draw(&cool, 200, 28);
+    let all = whole(&grid);
+    assert!(all.contains("coolant") && !all.contains("NIC "), "{all}");
+    // Fans go from the end, a row at a time: eight fans need four rows,
+    // three fit, the last two go.
+    let mut fans = model.clone();
+    fans.temps = None;
+    let panel = fans.fans.as_mut().unwrap();
+    for n in 7..=10u32 {
+        panel
+            .fans
+            .push(fan(n, &format!("fan{n}"), Some(900), Some(100), Some(5)));
+    }
+    let grid = draw(&fans, 200, 28);
+    assert_eq!(meter_row(&grid, "front1"), 9);
+    assert_eq!(meter_row(&grid, "fan8"), 11);
+    let all = whole(&grid);
+    assert!(!all.contains("fan9") && !all.contains("fan10"), "{all}");
+}
+
+/// #128, #165: the claim and the hold in the header still draw beside the
+/// gauge grid at 213x60, 192x60 and 160x26.
+#[test]
+fn a_claim_still_draws_with_the_gauge_grid() {
+    let claimed = |in_use: bool| {
+        let mut model = gauge_model();
+        model.claims = vec![HeaderClaim {
+            model: "qwen3.6-35b-a3b".to_owned(),
+            holder: "eval-runner".to_owned(),
+            in_use,
+            expires_at: (!in_use).then(|| claim_now() + Duration::from_secs(4 * 60 + 5)),
+            ..HeaderClaim::default()
+        }];
+        model
+    };
+    for (cols, rows) in [(213u16, 60u16), (192, 60), (160, 26)] {
+        let at = format!("{cols}x{rows}");
+        let hold = draw(&gauge_model(), cols, rows);
+        let header = row_string(&hold, 0);
+        assert!(
+            header.contains("hold operator · until 21:30"),
+            "{at}: {header}"
+        );
+        let in_use = draw(&claimed(true), cols, rows);
+        let header = row_string(&in_use, 0);
+        assert!(
+            header.contains("claim eval-runner · in use"),
+            "{at}: {header}"
+        );
+        let idle = draw(&claimed(false), cols, rows);
+        let header = row_string(&idle, 0);
+        assert!(
+            header.contains("claim eval-runner · 4:05 left"),
+            "{at}: {header}"
+        );
+        for grid in [&hold, &in_use, &idle] {
+            assert_eq!(meter_row(grid, "IO PSI"), 7, "{at}");
+            assert!(is_rule_row(grid, 1), "{at}");
+        }
+    }
+}
+
+/// #163's 80x28 phone crop of the left edge holds the headline and the
+/// glance; no gauge reaches into it, at any size.
+#[test]
+fn no_gauge_reaches_the_phone_crop() {
+    for (cols, rows, _) in GAUGE_SIZES {
+        let grid = draw(&gauge_model(), cols, rows);
+        for row in 2..timeline_rule(&grid) {
+            for col in 0..80u16.min(cols / 2 + 1) {
+                let cell = grid.get(col, row).unwrap();
+                assert_ne!(cell.rich, SEG, "{cols}x{rows}: a gauge at {col},{row}");
+            }
+        }
+        let first = (0..cols)
+            .find(|c| (2..8).any(|row| grid.get(*c, row).unwrap().rich == SEG))
+            .expect("a lit gauge");
+        assert!(first >= 80, "{cols}x{rows}: {first}");
+    }
+}
+
+fn one_temp(c: i32, warn: i32, crit: i32) -> TtyModel {
+    let mut model = gauge_model();
+    model.fans = None;
+    model.temps = Some(TempPanel {
+        groups: vec![TempGroup {
+            name: "probe".to_string(),
+            items: vec![temp_marked(
+                "",
+                c,
+                Level::Normal,
+                Some((warn * 10, crit * 10)),
+            )],
+        }],
+    });
+    model
+}
+
+/// #165: a temperature gauge is empty at 20 C and full at the sensor's
+/// warning point. Past it the bar stays full and its colour runs on into
+/// the hot tail: red at the warning, hot orange at the critical point.
+#[test]
+fn temperature_gauge_runs_from_20_c_to_the_warning_point() {
+    let lit = |c: i32, warn: i32, crit: i32| {
+        let grid = draw(&one_temp(c, warn, crit), 213, 60);
+        let row = meter_row(&grid, "probe");
+        let cells = gauge_cells(&grid, row, meter_bar_col(&grid, row, "probe"));
+        assert_eq!(cells.len(), 30);
+        cells.iter().filter(|ch| **ch != '·').count()
+    };
+    assert_eq!(lit(20, 80, 90), 0);
+    assert_eq!(lit(50, 80, 90), 15);
+    assert_eq!(lit(80, 80, 90), 30);
+    assert_eq!(lit(85, 80, 90), 30);
+    assert_eq!(lit(33, 45, 50), 16, "coolant: 13 of 25 degrees");
+    assert_eq!(lit(45, 45, 50), 30);
+    let last = |c: i32| {
+        let grid = layout_exact(&one_temp(c, 80, 90), 213, 60);
+        let image =
+            llama_watch::grid_out::image_of(&grid, llama_core::palette::Palette::Llama, 1, 0);
+        let console = draw(&one_temp(c, 80, 90), 213, 60);
+        let row = meter_row(&console, "probe");
+        let end = meter_bar_col(&console, row, "probe") + 29;
+        let cell = image.cells[usize::from(row) * 213 + usize::from(end)];
+        (cell.fg, console.get(end, row).unwrap().fg)
+    };
+    let (at_warn, warn_fg) = last(80);
+    let (at_crit, crit_fg) = last(90);
+    assert_eq!(
+        at_warn,
+        llama_core::color::act_color(100.0),
+        "red at the warning"
+    );
+    assert_eq!(
+        at_crit,
+        llama_core::color::act_color(120.0),
+        "hot orange at critical"
+    );
+    assert_eq!(warn_fg, C16::BrightRed);
+    assert_eq!(crit_fg, C16::BrightWhite, "the console's hot top step");
+}
+
+// ---- #165 review: sizes, shedding, fallbacks -----------------------------------
+
+/// From a phone-sized 80x28 to 512x200 nothing panics (the shedding guard's
+/// debug assertion included), no segment leaves the right half, and every
+/// console that draws the dashboard shows all twelve work gauges.
+#[test]
+fn gauges_draw_at_every_size_and_stay_in_the_right_half() {
+    let work: Vec<&str> = WORK_GAUGES.iter().flatten().copied().collect();
+    let mut fails = Vec::new();
+    for (cols, rows) in [
+        (80u16, 28u16),
+        (100, 30),
+        (120, 30),
+        (150, 40),
+        (159, 26),
+        (160, 26),
+        (160, 24),
+        (160, 20),
+        (160, 16),
+        (160, 12),
+        (160, 8),
+        (161, 26),
+        (161, 60),
+        (213, 10),
+        (213, 20),
+        (213, 26),
+        (300, 80),
+        (300, 30),
+        (512, 200),
+    ] {
+        let model = gauge_model();
+        let drawn =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw(&model, cols, rows)));
+        let Ok(grid) = drawn else {
+            fails.push(format!("{cols}x{rows}: panic"));
+            continue;
+        };
+        let (gc, gr) = (grid.cols(), grid.rows());
+        let segs: Vec<u16> = (0..gr)
+            .flat_map(|r| (0..gc).map(move |c| (c, r)))
+            .filter(|&(c, r)| {
+                let cell = grid.get(c, r).unwrap();
+                cell.rich == SEG || cell.ch == SEG
+            })
+            .map(|(c, _)| c)
+            .collect();
+        if gc < 160 {
+            continue;
+        }
+        if segs.iter().any(|c| *c < gc / 2 + 1) {
+            fails.push(format!("{cols}x{rows}: a segment left of the right half"));
+        }
+        if segs.iter().any(|c| *c > gc - 3) {
+            fails.push(format!("{cols}x{rows}: a segment past the right margin"));
+        }
+        // Under 26 rows the console shows its too-small screen (#163).
+        if gr >= 26 {
+            let rh = right_half(&grid, 9);
+            let missing: Vec<&str> = work.iter().copied().filter(|l| !rh.contains(l)).collect();
+            if !missing.is_empty() {
+                fails.push(format!("{cols}x{rows}: missing {missing:?}"));
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// A fan with rpm but no duty shows its rpm over an empty track, not red.
+#[test]
+fn a_fan_with_rpm_but_no_duty_is_an_empty_track() {
+    let mut model = gauge_model();
+    model.temps = None;
+    model.fans.as_mut().unwrap().fans[0] = fan(2, "front1", Some(1500), None, Some(5));
+    let grid = draw(&model, 213, 60);
+    let row = meter_row(&grid, "front1");
+    let text = row_string(&grid, row);
+    assert!(text.contains("front1    1500 rpm"), "{text}");
+    let (_, col) = label_hit(&grid, "front1");
+    assert_ne!(grid.get(col, row).unwrap().fg, C16::Red);
+    let cells = gauge_cells(&grid, row, meter_bar_col(&grid, row, "front1"));
+    assert_eq!(cells.len(), 30);
+    assert!(cells.iter().all(|c| *c == '·'), "{cells:?}");
+}
+
+/// A reading without thresholds runs on the TEMPS default, full at 80 C.
+#[test]
+fn a_temperature_without_thresholds_is_full_at_80_c() {
+    let lit = |c: i32| {
+        let mut model = one_temp(c, 45, 50);
+        model.temps.as_mut().unwrap().groups[0].items[0].thresholds = None;
+        let grid = draw(&model, 213, 60);
+        let row = meter_row(&grid, "probe");
+        let cells = gauge_cells(&grid, row, meter_bar_col(&grid, row, "probe"));
+        cells.iter().filter(|c| **c != '·').count()
+    };
+    assert_eq!(lit(50), 15, "30 of 60 degrees");
+    assert_eq!(lit(80), 30);
+}
+
+/// Each percent rounds to whole cells: 30 cells at 213, 1 % is 0.3 cells.
+#[test]
+fn a_gauge_fill_rounds_to_whole_cells() {
+    for (pct, lit) in [
+        (1.0, 1usize),
+        (2.0, 1),
+        (50.0, 15),
+        (98.0, 29),
+        (99.0, 30),
+        (100.0, 30),
+        (130.0, 30),
+    ] {
+        let mut model = gauge_model();
+        model.gpu_pct = Some(pct);
+        let grid = draw(&model, 213, 60);
+        let cells = gauge_cells(&grid, 3, 107 + 19);
+        assert_eq!(cells.len(), 30);
+        assert_eq!(
+            cells.iter().filter(|c| **c != '·').count(),
+            lit,
+            "{pct}: {cells:?}"
+        );
+    }
+}
+
+fn temp_rows(names: &[(&str, i32)]) -> TempPanel {
+    TempPanel {
+        groups: names
+            .iter()
+            .map(|(name, c)| TempGroup {
+                name: (*name).to_string(),
+                items: vec![temp_marked("", *c, Level::Normal, Some((800, 900)))],
+            })
+            .collect(),
+    }
+}
+
+/// Of two equally cool temperatures the later goes; the rest keep order.
+#[test]
+fn a_shed_tie_drops_the_later_and_keeps_the_order() {
+    let mut model = gauge_model();
+    model.fans = None;
+    model.temps = Some(temp_rows(&[
+        ("t1", 60),
+        ("t2", 30),
+        ("t3", 70),
+        ("t4", 30),
+        ("t5", 65),
+        ("t6", 75),
+        ("t7", 66),
+    ]));
+    let grid = draw(&model, 200, 28);
+    let rh = right_half(&grid, timeline_rule(&grid));
+    assert!(rh.contains("t2 ") && !rh.contains("t4 "), "{rh}");
+}
+
+/// The coolest temperature goes wherever it sits, here first: the hotter
+/// ones after it stay, in order, and the fans go whole, not clipped.
+#[test]
+fn the_coolest_temperature_goes_even_when_it_comes_first() {
+    let mut model = gauge_model();
+    model.temps = Some(temp_rows(&[
+        ("cold", 25),
+        ("w1", 60),
+        ("w2", 70),
+        ("w3", 65),
+        ("w4", 75),
+        ("w5", 66),
+        ("hot", 79),
+    ]));
+    let grid = draw(&model, 200, 28);
+    // 200x28: ten rows, so work, a blank and three rows of temperatures.
+    let x = [101u16, 101 + 19 + 26 + 4];
+    for side in x {
+        assert_eq!(gauge_row(&grid, "cold", side, 2), None, "{}", whole(&grid));
+    }
+    for (label, side, row) in [
+        ("w1", 0, 9),
+        ("w2", 1, 9),
+        ("w3", 0, 10),
+        ("w4", 1, 10),
+        ("w5", 0, 11),
+        ("hot", 1, 11),
+    ] {
+        assert_eq!(gauge_row(&grid, label, x[side], 2), Some(row), "{label}");
+    }
+    assert!(!whole(&grid).contains("rpm"));
+    assert_eq!(timeline_rule(&grid), 12, "no second blank row, no fans");
+}
+
+/// While llama-watch starts, its own level gauges draw `--` over an empty
+/// track even when readings are there; SWAP's reading stays.
+#[test]
+fn starting_blanks_the_level_gauges_even_with_readings() {
+    let mut model = gauge_model();
+    model.state = WatchState::Starting;
+    let grid = draw(&model, 213, 60);
+    let x = [107u16, 107 + 19 + 30 + 4];
+    for (label, side, row) in [
+        ("ACT", 0, 2),
+        ("LOAD", 1, 2),
+        ("GPU", 0, 3),
+        ("CPU", 1, 3),
+        ("VRAM", 0, 4),
+        ("MEM", 1, 4),
+        ("POWER", 0, 5),
+    ] {
+        assert_eq!(gauge_row(&grid, label, x[side], 2), Some(row), "{label}");
+        let field: String = (x[side]..x[side] + 18)
+            .map(|c| grid.get(c, row).unwrap().ch)
+            .collect();
+        assert!(field.trim_end().ends_with(" --"), "{label}: {field}");
+        let cells = gauge_cells(&grid, row, x[side] + 19);
+        assert_eq!(cells.len(), 30, "{label}");
+        assert!(cells.iter().all(|c| *c == '·'), "{label}: {cells:?}");
+    }
+    let swap: String = (x[1]..x[1] + 18)
+        .map(|c| grid.get(c, 5).unwrap().ch)
+        .collect();
+    assert!(swap.ends_with("0.4/16.0 G"), "{swap}");
+}
+
+/// #165: the tty hides NVMe Sensor 1 and 2 and the board's AUXTIN2
+/// (`temps::TTY_BLOCK`) from its gauges and TEMPS rows, even when one is
+/// the hottest reading. The glance's HOT rows read the same panel, but this
+/// test cannot guard them yet: `hottest()` sorts the coolest first, so a
+/// hot sensor never reaches a HOT row, blocked or not. The HOT-row check
+/// waits for the separate sort-fix issue.
+#[test]
+fn a_tty_blocked_sensor_never_reaches_the_screen() {
+    use llama_watch::config::Temps;
+    use llama_watch::sources::chips::Kind;
+    use llama_watch::sources::temps::{self, TempLook, TempReading};
+    let reading = |chip: &str, sensor: &str, input: &str, kind: Kind, tenths: i32| TempReading {
+        chip: chip.to_owned(),
+        sensor: sensor.to_owned(),
+        input: input.to_owned(),
+        labelled: true,
+        kind,
+        tenths,
+        max_tenths: None,
+        crit_tenths: None,
+    };
+    let readings = [
+        reading("nvme-317k", "Composite", "temp1", Kind::Nvme, 450),
+        reading("nvme-317k", "Sensor 1", "temp2", Kind::Nvme, 940),
+        reading("nvme-317k", "Sensor 2", "temp3", Kind::Nvme, 964),
+        reading("nct6798", "SYSTIN", "temp1", Kind::Board, 400),
+        reading("nct6798", "AUXTIN2", "temp5", Kind::Board, 986),
+    ];
+    let screen = |look: &TempLook, cols: u16, rows: u16| {
+        let mut model = gauge_model();
+        model.temps = Some(temps::panel(&readings, look));
+        whole(&draw(&model, cols, rows))
+    };
+    for (cols, rows) in [(213u16, 60u16), (160, 26), (160, 49)] {
+        let all = screen(&TempLook::new(&Temps::default()), cols, rows);
+        // Short labels for the TEMPS rows, values for the gauges. (No
+        // HOT-row check until the hottest() sort is fixed; see above.)
+        for gone in ["s1", "s2", "aux2", "94 C", "96 C", "99 C"] {
+            assert!(!all.contains(gone), "{cols}x{rows}: {gone}\n{all}");
+        }
+        assert!(all.contains("NVMe0         45 C"), "{cols}x{rows}\n{all}");
+        assert!(all.contains("board         40 C"), "{cols}x{rows}\n{all}");
+        // Without the block the same readings do reach the screen.
+        let open = screen(&TempLook::default(), cols, rows);
+        assert!(
+            open.contains("99 C") && open.contains("96 C"),
+            "{cols}x{rows}\n{open}"
+        );
     }
 }

@@ -36,13 +36,24 @@
 //! The GPU (NVML, chip `gpu`, sensor `gpu`) joins the list under the same
 //! rules.
 //!
+//! The tty also hides [`TTY_BLOCK`] (NVMe `Sensor 1` and `Sensor 2`, the
+//! board's AUXTIN2) under the same `defaults` and `allow`; those still go
+//! to snapshots and metrics.
+//!
 //! # Display
 //!
 //! [`panel`] groups the shown inputs by chip into TEMPS rows with short
-//! labels (`CPU  Tctl 68 · CCD1 64 · CCD2 62`, `NVMe0  50 · s1 50 · s2 67`)
-//! and colours each value by its thresholds: `[temps] crit` / `warn`, else
-//! the chip's `tempN_crit` / `tempN_max`, else 90 / 80 °C (55 / 45 for a
-//! coolant).
+//! labels (`CPU  Tctl 68 · CCD1 64 · CCD2 62`, `NVMe0  50`), leaving out
+//! the inputs the tty hides ([`TTY_BLOCK`]; snapshots and metrics keep
+//! them), and colours each value by its thresholds: `[temps] warn` /
+//! `crit`, else the chip's `tempN_max` / `tempN_crit` when that pair rises
+//! (on a board chip, only with its critical point at most 15 °C past the
+//! board's), else the defaults of its kind ([`kind_limits`], the #163
+//! design's table). A configured `crit` at or below the warning point
+//! moves the warning to 5 °C below it; a configured `warn` at or past the
+//! critical point, with no `crit` configured, moves critical to 5 °C above
+//! it. When both are configured and meet, `crit` wins. The tty's gauge for
+//! the row runs from 20 °C to the warning point (#165).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -80,6 +91,11 @@ pub const DEFAULT_BLOCK: [&str; 8] = [
     "w83*:SMBUSMASTER*",
     "w83*:PECI*",
 ];
+/// Inputs the tty hides by default (the #163 design), though snapshots and
+/// metrics keep them: an NVMe drive's `Sensor 1` and `Sensor 2`, which its
+/// `Composite` already sums up, and the board's AUXTIN2. Like
+/// [`DEFAULT_BLOCK`], part of `[temps] defaults`; `allow` shows them again.
+pub const TTY_BLOCK: [&str; 3] = ["nvme*:Sensor 1", "nvme*:Sensor 2", "nct6798:AUXTIN2"];
 /// The GPU's chip and sensor name.
 pub const GPU_CHIP: &str = "gpu";
 
@@ -451,12 +467,14 @@ pub struct TempPanel {
     pub groups: Vec<TempGroup>,
 }
 
-/// The display half of `[temps]`: renames and thresholds.
+/// The display half of `[temps]`: renames, thresholds and [`TTY_BLOCK`].
 #[derive(Clone, Debug, Default)]
 pub struct TempLook {
     rename: BTreeMap<String, String>,
     warn: Vec<(Pattern, i32)>,
     crit: Vec<(Pattern, i32)>,
+    tty_block: Vec<Pattern>,
+    allow: Vec<Pattern>,
 }
 
 impl TempLook {
@@ -480,7 +498,26 @@ impl TempLook {
                 .collect(),
             warn: thresholds(&config.warn),
             crit: thresholds(&config.crit),
+            tty_block: if config.defaults {
+                TTY_BLOCK.iter().filter_map(|p| Pattern::parse(p)).collect()
+            } else {
+                Vec::new()
+            },
+            allow: config
+                .allow
+                .iter()
+                .filter_map(|p| Pattern::parse(p))
+                .collect(),
         }
+    }
+
+    /// Whether the tty hides this reading ([`TTY_BLOCK`]); an `allow`
+    /// pattern naming it shows it.
+    #[must_use]
+    pub fn tty_hidden(&self, reading: &TempReading) -> bool {
+        let names = [reading.sensor.as_str(), reading.input.as_str()];
+        let named = |list: &[Pattern]| list.iter().any(|p| p.matches(&reading.chip, &names));
+        named(&self.tty_block) && !named(&self.allow)
     }
 
     fn renamed(&self, key: &str) -> Option<&str> {
@@ -496,13 +533,40 @@ impl TempLook {
                 .find(|(p, _)| p.matches(&reading.chip, &names))
                 .map(|(_, t)| *t)
         };
-        let coolant = reading.kind == Kind::Coolant;
-        let crit = find(&self.crit)
-            .or(reading.crit_tenths)
-            .unwrap_or(if coolant { 550 } else { 900 });
-        let warn = find(&self.warn)
-            .or(reading.max_tenths.filter(|max| *max < crit))
-            .unwrap_or(if coolant { 450 } else { 800 });
+        let (kind_warn, kind_crit) = kind_limits(reading.kind);
+        // The chip's own limits only as a pair that rises: NVMe drives
+        // often give the same number for both. A board chip's pair counts
+        // only near the board's own: nct6798 reports its register defaults
+        // (80/125, 80/100), not the board's limits.
+        let chip = match (reading.max_tenths, reading.crit_tenths) {
+            (Some(max), Some(crit))
+                if max < crit
+                    && (reading.kind != Kind::Board || crit <= kind_crit + BOARD_CHIP_SLACK) =>
+            {
+                Some((max, crit))
+            }
+            _ => None,
+        };
+        let configured_warn = find(&self.warn);
+        let configured_crit = find(&self.crit);
+        let mut crit = configured_crit
+            .or(chip.map(|(_, crit)| crit))
+            .unwrap_or(kind_crit);
+        let mut warn = configured_warn
+            .or(chip.map(|(max, _)| max))
+            .unwrap_or(kind_warn);
+        // A configured point that meets the other keeps its word and the
+        // other moves past it, so the gauge keeps its scale: warning just
+        // below a configured critical point, else critical just above a
+        // configured warning. When both are configured (on different keys)
+        // and meet, the critical point wins: it is the earlier alarm.
+        if warn >= crit {
+            if configured_crit.is_some() {
+                warn = crit - CONFIGURED_GAP;
+            } else if configured_warn.is_some() {
+                crit = warn + CONFIGURED_GAP;
+            }
+        }
         let level = if reading.tenths >= crit {
             Level::Crit
         } else if reading.tenths >= warn {
@@ -517,11 +581,40 @@ impl TempLook {
     }
 }
 
-/// Group shown readings into TEMPS rows (module docs).
+/// How far above a board's default critical point (tenths) a board chip's
+/// own critical point may lie and still count.
+const BOARD_CHIP_SLACK: i32 = 150;
+
+/// How far a configured warning or critical point pushes the other when
+/// they meet: 5 °C.
+const CONFIGURED_GAP: i32 = 50;
+
+/// Default warning and critical points of a sensor, tenths of a degree
+/// (the #163 design's table): coolant 45/50, CPU 80/90 (Tctl and its dies
+/// `Tccd*` alike; a Zen 3 throttles at 90), GPU 88/92, NVMe 82/85, board
+/// 60/75, NIC 70/90, Wi-Fi 70/85, memory 60/75, disks 50/60, ACPI and
+/// anything else 70/90.
+#[must_use]
+pub fn kind_limits(kind: Kind) -> (i32, i32) {
+    match kind {
+        Kind::Coolant => (450, 500),
+        Kind::Cpu => (800, 900),
+        Kind::Gpu => (880, 920),
+        Kind::Nvme => (820, 850),
+        Kind::Board | Kind::Memory => (600, 750),
+        Kind::Wifi => (700, 850),
+        Kind::Disk => (500, 600),
+        Kind::Nic | Kind::Acpi | Kind::Other => (700, 900),
+    }
+}
+
+/// Group shown readings into TEMPS rows (module docs), without the ones
+/// the tty hides ([`TempLook::tty_hidden`]).
 #[must_use]
 pub fn panel(readings: &[TempReading], look: &TempLook) -> TempPanel {
+    let readings: Vec<&TempReading> = readings.iter().filter(|r| !look.tty_hidden(r)).collect();
     let mut chips: Vec<(&str, Kind)> = Vec::new();
-    for r in readings {
+    for r in &readings {
         if !chips.iter().any(|(c, _)| *c == r.chip) {
             chips.push((&r.chip, r.kind));
         }
@@ -543,7 +636,11 @@ pub fn panel(readings: &[TempReading], look: &TempLook) -> TempPanel {
                 (None, Some(word)) => word.to_owned(),
                 (None, None) => chip.chars().take(8).collect(),
             };
-            let rows: Vec<&TempReading> = readings.iter().filter(|r| r.chip == *chip).collect();
+            let rows: Vec<&TempReading> = readings
+                .iter()
+                .copied()
+                .filter(|r| r.chip == *chip)
+                .collect();
             let single = rows.len() == 1;
             let items = rows
                 .iter()

@@ -134,7 +134,7 @@ fn hostile_fonts_do_not_panic() {
 /// are U+2581..=U+2588, which this list already contains.
 const DRAWN: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
+    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 fn shipped(size: &str) -> Psf2 {
@@ -164,5 +164,24 @@ fn every_shipped_font_has_the_glyphs_the_dashboard_draws() {
             Some(first) => assert_eq!(full, first, "{size} moved the full-block slot"),
         }
         assert_eq!(font.glyph_for(u32::from('A')), Some(usize::from(b'A')));
+    }
+}
+
+/// #165: every shipped font's gauge segment is its lower half block with
+/// the last pixel column blank, and nothing else differs.
+#[test]
+fn every_shipped_font_draws_the_segment_as_a_half_block_one_column_short() {
+    for size in ["12x24", "12x22", "10x18", "9x18"] {
+        let font = shipped(size);
+        let half = font.glyph_for(0x2584).expect("half block");
+        let seg = font.glyph_for(0xe584).expect("segment");
+        let last = font.width() - 1;
+        for y in 0..font.height() {
+            for x in 0..font.width() {
+                let want = x != last && font.pixel(half, x, y);
+                assert_eq!(font.pixel(seg, x, y), want, "{size} at ({x}, {y})");
+            }
+            assert!(!font.pixel(seg, last, y), "{size}: the hairline at row {y}");
+        }
     }
 }

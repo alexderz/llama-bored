@@ -169,7 +169,7 @@ fn a_grid_of_palette_colours_renders_like_the_vcsa_cells() {
             rows: 1,
             cells: grid_cells,
         };
-        let screen = screen_of(&image);
+        let screen = screen_of(&image, false);
         let a = Renderer::with_colors(mode, palette)
             .render(16, 1, &screen.cells)
             .to_vec();
@@ -384,7 +384,7 @@ fn a_grid_file_is_shown_at_its_own_size() {
         rows: 60,
         cells: wide_cells,
     };
-    let screen = screen_of(&wide);
+    let screen = screen_of(&wide, false);
     assert_eq!((screen.cols, screen.rows), (213, 60));
 
     let mut out = Vec::new();
@@ -471,7 +471,7 @@ fn a_grid_file_centres_when_fit_is_center() {
         rows: 60,
         cells: wide_cells,
     };
-    let centred = place(&screen_of(&wide), 192, 60, 0, 0, Fit::Center, 11);
+    let centred = place(&screen_of(&wide, false), 192, 60, 0, 0, Fit::Center, 11);
     assert_eq!(
         centred.cells[0].ch, '\u{2020}',
         "column 10 of the file is the pane's first column"
@@ -503,7 +503,7 @@ fn a_grid_file_centres_when_fit_is_center() {
         rows: 49,
         cells: narrow_cells,
     };
-    let centred = place(&screen_of(&narrow), 192, 60, 0, 0, Fit::Center, 11);
+    let centred = place(&screen_of(&narrow, false), 192, 60, 0, 0, Fit::Center, 11);
     assert_eq!(
         centred.cells.len(),
         192 * 60,
@@ -520,4 +520,28 @@ fn a_grid_file_centres_when_fit_is_center() {
         !text.contains("tty11 is"),
         "a larger pane draws the file: {text}"
     );
+}
+
+/// #165: `--segments` reaches the frame. On, the gauge segment goes out as
+/// U+E584 for a font that has it; off (the default), as `▄`.
+#[test]
+fn segments_option_reaches_the_grid_frame() {
+    let image = image_of("ab\u{e584}\u{e584}cd", ORANGE, TEAL, 0);
+    for (segments, sent, not) in [
+        (true, "\u{e584}", "\u{2584}"),
+        (false, "\u{2584}", "\u{e584}"),
+    ] {
+        let opts = Options {
+            segments,
+            ..Options::default()
+        };
+        let colors = ColorSettings {
+            mode: ColorMode::Truecolor,
+            palette: Palette::Llama,
+        };
+        let mut out = Vec::new();
+        Session::new(&opts, colors, "box", false, false).frame_grid((40, 3), &image, &mut out);
+        assert!(contains(&out, sent.as_bytes()), "{segments}: {out:?}");
+        assert!(!contains(&out, not.as_bytes()), "{segments}: {out:?}");
+    }
 }

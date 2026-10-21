@@ -145,6 +145,75 @@ fn a_cells_foreground_and_background_are_the_bytes_in_the_file() {
     assert_eq!(pixel(&frame, x + 7, y), RED);
 }
 
+/// 8x8 with a full block `█` (glyph 0, every pixel lit) and `▄` (glyph 1,
+/// rows 4-7 lit), and no gauge segment: a font from before #165.
+fn blocks_without_segment() -> Psf2 {
+    let mut glyphs = vec![0_u8; 2 * 8];
+    glyphs[..8].fill(0xFF);
+    glyphs[8 + 4..16].fill(0xFF);
+    let table = [
+        0xE2, 0x96, 0x88, 0xFF, // U+2588
+        0xE2, 0x96, 0x84, 0xFF, // U+2584
+    ];
+    let mut bytes = Vec::new();
+    for word in [0x864A_B572_u32, 0, 32, 1, 2, 8, 8, 8] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&glyphs);
+    bytes.extend_from_slice(&table);
+    Psf2::parse(&bytes).unwrap()
+}
+
+/// #165: a gauge segment is the lower half one pixel column short. With a
+/// font that predates it, the cast draws the font's `▄` and blanks the last
+/// column itself, so the hairline shows and the cell is never U+FFFD. With
+/// the shipped 9x18 font, the font's own segment glyph draws.
+#[test]
+fn a_gauge_segment_draws_a_half_block_with_a_one_pixel_gap() {
+    let old = blocks_without_segment();
+    let seg = llama_core::glyph::SEGMENT;
+    let bytes = file(
+        2,
+        1,
+        1_000,
+        vec![cell(seg, RED, BLUE), cell(seg, GREEN, BLUE)],
+    );
+    let frame = paint(&bytes, &old, 1_000, &mut Hold::new());
+    let x = (FRAME_WIDTH - 16) / 2;
+    let y = (FRAME_HEIGHT - 8) / 2;
+    for gx in 0..8 {
+        assert_eq!(pixel(&frame, x + gx, y + 3), BLUE, "upper half at {gx}");
+        let want = if gx == 7 { BLUE } else { RED };
+        assert_eq!(pixel(&frame, x + gx, y + 4), want, "lower half at {gx}");
+        let want = if gx == 7 { BLUE } else { GREEN };
+        assert_eq!(
+            pixel(&frame, x + 8 + gx, y + 7),
+            want,
+            "second cell at {gx}"
+        );
+    }
+    // A plain `▄` keeps its last column.
+    let plain = file(1, 1, 1_000, vec![cell('\u{2584}', RED, BLUE)]);
+    let frame = paint(&plain, &old, 1_000, &mut Hold::new());
+    let x = (FRAME_WIDTH - 8) / 2;
+    assert_eq!(pixel(&frame, x + 7, y + 7), RED);
+
+    let path = common::workspace_root().join("packaging/fonts/llama-hack-9x18.psfu");
+    let shipped = Psf2::parse(&std::fs::read(path).unwrap()).unwrap();
+    let bytes = file(1, 1, 1_000, vec![cell(seg, RED, BLUE)]);
+    let frame = paint(&bytes, &shipped, 1_000, &mut Hold::new());
+    let (x, y) = ((FRAME_WIDTH - 9) / 2, (FRAME_HEIGHT - 18) / 2);
+    for gx in 0..9 {
+        let want = if gx == 8 { BLUE } else { RED };
+        assert_eq!(
+            pixel(&frame, x + gx, y + 17),
+            want,
+            "9x18 bottom row at {gx}"
+        );
+        assert_eq!(pixel(&frame, x + gx, y), BLUE, "9x18 top row at {gx}");
+    }
+}
+
 #[test]
 fn a_small_grid_is_centred_and_a_large_one_is_cropped_from_the_top_left() {
     let font = letter_and_replacement();

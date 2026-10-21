@@ -9,10 +9,12 @@ All notable changes to llama-bored. Versions follow
 ### Added
 
 - tty11 shows disk, network, swap and pressure (PSI) from `/proc` and `/sys`: DISK R and DISK W and NET meters on a three-decade log bar (`[tty] disk_ceiling_bps`, default 7 GB/s; `[tty] net_ceiling_bps`, default the summed speed of the physical links that are up, 1 Gbit for one without a speed or when none is up), SWAP beside POWER with its label yellow under memory pressure, IO PSI, and `disk`, `net` and `psi` words on the health line, which now sheds healthy words before a DOWN one. Disk and net rates are taken over `collector.cpu_window_s`, as CPU % is. The snapshot's `host` gains optional disk, net, PSI and swap fields, and llama-metrics exports `llamabored_disk_{read,write}_bytes_per_second`, `llamabored_net_{receive,transmit}_bytes_per_second`, `llamabored_pressure_{cpu,io,memory}_ratio` and `llamabored_swap_{used,total}_bytes`. A file that is missing, switched off (`psi=0`) or has nothing to count (no whole disk, no physical interface) is absent, never 0 (#163).
+- `llama-view --segments` draws tty bar segments as U+E584 (the lower half block with a one-pixel gap) for a console font that has it; without the flag they stay `▄`. The llama-hack fonts carry the glyph and llama-cast draws the gap itself (#165).
 
 ### Changed
 
 - tty rate bars and the load meters are half-height, with a blank row above and below the rate bars on short screens, so neighbouring bars no longer read as one block; the context and fan bars follow. Rate digits get two blank columns between them (three between GEN and PROMPT), 0, 3, 7 and 9 are redrawn, the decimal point has its own gap and thousands read `k` (#163).
+- tty11's right-hand block is two columns of uniform gauges: a label, a fixed-width value and one bar length and start column per column, bars segmented by a one-pixel gap. Temperatures run from 20 C to the sensor's warning point, with defaults per kind (coolant 45/50, CPU 80/90, GPU 88/92, NVMe 82/85, board 60/75, NIC 70/90, Wi-Fi 70/85, memory 60/75, disks 50/60, else 70/90); a board chip's own pair counts only near the board's limits, and a configured `warn` or `crit` that meets the other pushes it 5 C away. Fans show duty, with rpm as the value. Small screens drop fans first, then the coolest temperatures. The tty hides NVMe `Sensor 1`/`Sensor 2` and `nct6798:AUXTIN2`; snapshots and metrics keep every sensor (#165).
 
 ## 0.6.2 — 2026-10-17
 

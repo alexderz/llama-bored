@@ -107,13 +107,10 @@ fn packaged_example_parses_and_validates() {
     assert_eq!(cfg.tty.chart_glyphs, ChartGlyphs::Eighths);
     let mut same = (*cfg).clone();
     same.tty.chart_glyphs = ChartGlyphs::Halves;
-    // #163: the example hides junk sensors. The code default stays empty
-    // so a config that never sets `block` is unchanged.
-    assert_eq!(
-        cfg.temps.block,
-        vec!["nvme*:Sensor *".to_owned(), "nct*:AUXTIN2".to_owned(),]
-    );
-    same.temps.block.clear();
+    // #165: the example blocks nothing. A `block` hides a sensor from the
+    // snapshot and metrics too; the tty hides NVMe Sensor 1/2 and AUXTIN2
+    // on its own (temps::TTY_BLOCK).
+    assert!(cfg.temps.block.is_empty(), "{:?}", cfg.temps.block);
     assert_eq!(same, Config::default());
 
     let err = Config::load_validated(&path, 7).expect_err("cpu_top_k 8 is above nproc 7");

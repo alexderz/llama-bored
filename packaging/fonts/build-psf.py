@@ -44,7 +44,9 @@ Layout:
 - Every other glyph fills slots 0-31, then 0x7F-0x9F, then 0x100 upward, in
   the order of EXTRA below.
 - Block elements U+2580-2595 are drawn as exact rectangles, so the eighth
-  blocks the tty chart uses tile a cell with no gaps. Other glyphs are
+  blocks the tty chart uses tile a cell with no gaps. U+E584 (#165, private
+  use) is the lower half without its last pixel column: the gauge segment,
+  which leaves a one-pixel hairline before the next cell. Other glyphs are
   rendered from the TTF at the largest pixel size whose ascent + descent fits
   the cell height and whose advance fits the width, then thresholded.
 
@@ -66,6 +68,10 @@ EXTRA = (
     + list("─│┌┐└┘├┤┬┴┼═║•…–—‘’“”�")
     # #79: tty11 marks an approximate KV count with it.
     + list("≈")
+    # #165: the gauge segment, a lower half block one pixel column short,
+    # so a row of them is a row of segments. Private use: only this font
+    # (and llama-cast's rasteriser) draws it; llama_core::glyph::SEGMENT.
+    + ["\ue584"]
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -139,6 +145,8 @@ def block_image(Image, ImageDraw, ch, width, height):
         fill(0, 0, width, max(1, height // 8))
     elif c == 0x2595:  # right 1/8
         fill(width - max(1, width // 8), 0, width, height)
+    elif c == 0xE584:  # #165 gauge segment: the lower half, last column blank
+        fill(0, height - round(height * 4 / 8), width - 1, height)
     else:
         return None
     return img

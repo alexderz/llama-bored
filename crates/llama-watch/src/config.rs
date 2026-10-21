@@ -864,11 +864,13 @@ pub struct Temps {
     pub rename: BTreeMap<String, String>,
     /// Warning colour from this many °C, by pattern; the most specific
     /// (`chip:sensor`) match wins. Default: the chip's `tempN_max`, else
-    /// 80 (45 for coolant).
+    /// the kind's ([`crate::sources::temps::kind_limits`]: 80 for a CPU,
+    /// 45 for a coolant).
     #[serde(default)]
     pub warn: BTreeMap<String, f64>,
     /// Critical colour from this many °C, by pattern. Default: the chip's
-    /// `tempN_crit`, else 90 (55 for coolant).
+    /// `tempN_crit`, else the kind's ([`crate::sources::temps::kind_limits`]:
+    /// 90 for a CPU, 50 for a coolant).
     #[serde(default)]
     pub crit: BTreeMap<String, f64>,
 }

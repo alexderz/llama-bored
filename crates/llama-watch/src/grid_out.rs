@@ -43,7 +43,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use llama_core::color::Rgb;
-use llama_core::glyph::is_showable;
+use llama_core::glyph::is_carried;
 use llama_core::gridfile::{self, GridCell, GridImage, HEARTBEAT};
 use llama_core::log::{self, Priority, Sink};
 use llama_core::palette::Palette;
@@ -67,7 +67,8 @@ fn rgb_bg(palette: Palette, color: C16) -> Rgb {
 }
 
 /// `grid` as a file image. A cell shows its `rich` scalar when that is safe
-/// as one cell (`is_showable`), else its console `ch`. An exact colour, when
+/// as one cell (`is_showable`) or is the gauge segment (#165, `is_carried`),
+/// else its console `ch`. An exact colour, when
 /// the cell has one, replaces the palette RGB. The format is unchanged.
 ///
 /// Public for the grid tests. The writer is the production caller.
@@ -87,7 +88,7 @@ pub fn image_of(grid: &Grid, palette: Palette, seq: u32, unix_ms: u64) -> GridIm
                 let col = u16::try_from(i % cols.max(1)).unwrap_or(0);
                 let row = u16::try_from(i / cols.max(1)).unwrap_or(0);
                 GridCell {
-                    ch: if is_showable(cell.rich) {
+                    ch: if is_carried(cell.rich) {
                         cell.rich
                     } else {
                         cell.ch

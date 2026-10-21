@@ -34,10 +34,32 @@ const EURLATGR: &[char] = &[
 /// llama-hack-12x24 by `tests/tty_font.rs`; absent from eurlatgr.
 const LOWER_EIGHTHS: &[char] = &['▁', '▂', '▃', '▅', '▆', '▇'];
 
+/// The gauge segment (#165): private use, only in llama-hack.
+const SEGMENT: char = '\u{e584}';
+
 #[test]
-fn term_non_ascii_glyphs_are_eurlatgr_plus_the_lower_eighths() {
-    let want: Vec<char> = EURLATGR.iter().chain(LOWER_EIGHTHS).copied().collect();
+fn term_non_ascii_glyphs_are_eurlatgr_plus_the_lower_eighths_and_the_segment() {
+    let want: Vec<char> = EURLATGR
+        .iter()
+        .chain(LOWER_EIGHTHS)
+        .chain(&[SEGMENT])
+        .copied()
+        .collect();
     assert_eq!(GLYPHS, want.as_slice());
+    assert_eq!(SEGMENT, llama_core::glyph::SEGMENT);
+}
+
+#[test]
+fn the_gauge_segment_is_emitted_as_utf8() {
+    let t0 = Instant::now();
+    let mut term = start(4, 1, Duration::from_secs(30), t0);
+    let mut grid = Grid::blank(4, 1);
+    grid.put(0, 0, Cell::new(SEGMENT, C16::Blue, C16::Black));
+    let bytes = paint(&mut term, &grid, t0);
+    assert!(
+        bytes.windows(3).any(|w| w == [0xee, 0x96, 0x84]),
+        "the segment became '?': {bytes:?}"
+    );
 }
 
 #[test]
