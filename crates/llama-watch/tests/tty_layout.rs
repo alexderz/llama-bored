@@ -2251,6 +2251,7 @@ fn sample(state: WatchState) -> TtyModel {
         chart: Vec::new(),
         chart_bucket_s: 2,
         chart_glyphs: ChartGlyphs::Halves,
+        bar_segments: false,
         fans: None,
         temps: None,
         ctx_history_h: 6,
@@ -4715,14 +4716,21 @@ fn setup_block_sits_under_single_spaced_meters_at_160x49() {
     assert!(!whole(&grid).contains("temp 0.6"));
 }
 
-/// #163, #165: every gauge is one row of whole cells: the segment with the
-/// llama-hack font, `▄` with eurlatgr; never a half-cell end. The grid
-/// file carries the segment either way.
+/// #163, #165, #170: every gauge is one row of whole cells, never a
+/// half-cell end. Solid `▄` by default, in the console and the grid file.
+/// With `bar_segments` the segment with the llama-hack font, `▄` with
+/// eurlatgr, and the grid file carries the segment either way.
 #[test]
 fn gauges_are_whole_segment_cells_in_every_font() {
-    for (glyphs, glyph) in [(ChartGlyphs::Eighths, SEG), (ChartGlyphs::Halves, '▄')] {
+    for (segments, glyphs, glyph, rich) in [
+        (true, ChartGlyphs::Eighths, SEG, SEG),
+        (true, ChartGlyphs::Halves, '▄', SEG),
+        (false, ChartGlyphs::Eighths, '▄', '▄'),
+        (false, ChartGlyphs::Halves, '▄', '▄'),
+    ] {
         let mut model = setup_model();
         model.chart_glyphs = glyphs;
+        model.bar_segments = segments;
         model.cpu_pct = Some(50.0);
         let grid = draw(&model, 160, 49);
         let row = meter_row(&grid, "CPU");
@@ -4738,8 +4746,8 @@ fn gauges_are_whole_segment_cells_in_every_font() {
         assert_eq!(grid.get(col, row).unwrap().fg, C16::Blue);
         assert_eq!(
             grid.get(col, row).unwrap().rich,
-            SEG,
-            "{glyphs:?}: the file's glyph"
+            rich,
+            "{segments} {glyphs:?}: the file's glyph"
         );
         assert_eq!(
             grid.get(col + 8, row).unwrap().rich,
@@ -4750,6 +4758,7 @@ fn gauges_are_whole_segment_cells_in_every_font() {
     }
     // A tiny value still lights one cell.
     let mut model = setup_model();
+    model.bar_segments = true;
     model.gpu_pct = Some(1.0);
     let grid = draw(&model, 160, 49);
     let gpu = meter_row(&grid, "GPU");
@@ -4758,6 +4767,7 @@ fn gauges_are_whole_segment_cells_in_every_font() {
     // 4K too: one row a gauge, GPU and CPU on one row, the row under it
     // the next pair.
     let mut tall = setup_model();
+    tall.bar_segments = true;
     tall.cpu_pct = Some(100.0);
     let grid = draw(&tall, 480, 135);
     let cpu = meter_row(&grid, "CPU");
@@ -8600,8 +8610,11 @@ fn a_claim_still_draws_with_the_gauge_grid() {
 /// glance; no gauge reaches into it, at any size.
 #[test]
 fn no_gauge_reaches_the_phone_crop() {
+    // Segments mark the gauge cells apart from the chart's blocks.
+    let mut model = gauge_model();
+    model.bar_segments = true;
     for (cols, rows, _) in GAUGE_SIZES {
-        let grid = draw(&gauge_model(), cols, rows);
+        let grid = draw(&model, cols, rows);
         for row in 2..timeline_rule(&grid) {
             for col in 0..80u16.min(cols / 2 + 1) {
                 let cell = grid.get(col, row).unwrap();
@@ -8706,7 +8719,8 @@ fn gauges_draw_at_every_size_and_stay_in_the_right_half() {
         (300, 30),
         (512, 200),
     ] {
-        let model = gauge_model();
+        let mut model = gauge_model();
+        model.bar_segments = true;
         let drawn =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| draw(&model, cols, rows)));
         let Ok(grid) = drawn else {
@@ -9457,4 +9471,45 @@ fn text_off_keeps_its_tag_beside_the_claims() {
         header.contains("batch window for queued m\u{2026}"),
         "{header}"
     );
+}
+
+/// #170: by default the bars are solid everywhere: no cell of the console
+/// or of the grid file is the segment, in either font, and the lit gauge
+/// cells are `▄` in both. `bar_segments` brings the segment back.
+#[test]
+fn gauge_bars_are_solid_unless_bar_segments() {
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        let mut model = gauge_model();
+        model.chart_glyphs = glyphs;
+        assert!(!model.bar_segments, "solid is the default");
+        let grid = layout_exact(&model, 213, 60);
+        let segs = (0..60u16)
+            .flat_map(|r| (0..213u16).map(move |c| (c, r)))
+            .filter(|&(c, r)| {
+                let cell = grid.get(c, r).unwrap();
+                cell.ch == SEG || cell.rich == SEG
+            })
+            .count();
+        assert_eq!(segs, 0, "{glyphs:?}");
+        let image =
+            llama_watch::grid_out::image_of(&grid, llama_core::palette::Palette::Llama, 1, 0);
+        assert!(image.cells.iter().all(|c| c.ch != SEG), "{glyphs:?}");
+        let row = meter_row(&grid, "GPU");
+        let col = meter_bar_col(&grid, row, "GPU");
+        let cell = grid.get(col, row).unwrap();
+        assert_eq!((cell.ch, cell.rich), ('▄', '▄'), "{glyphs:?}");
+        assert_eq!(
+            image.cells[usize::from(row) * 213 + usize::from(col)].ch,
+            '▄'
+        );
+        model.bar_segments = true;
+        let grid = layout_exact(&model, 213, 60);
+        let cell = grid.get(col, row).unwrap();
+        let console = if glyphs == ChartGlyphs::Eighths {
+            SEG
+        } else {
+            '▄'
+        };
+        assert_eq!((cell.ch, cell.rich), (console, SEG), "{glyphs:?}");
+    }
 }

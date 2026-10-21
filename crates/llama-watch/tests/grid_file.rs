@@ -519,15 +519,17 @@ fn exact_off_matches_the_palette_file_and_exact_on_matches_the_ramp() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// #165: the gauge cells reach the file as the segment U+E584, whatever
-/// the console font; `gridfile::decode` gives a reader that does not ask
-/// for segments the plain half block, never U+FFFD.
+/// #165: with `bar_segments` the gauge cells reach the file as the
+/// segment U+E584, whatever the console font; `gridfile::decode` gives a
+/// reader that does not ask for segments the plain half block, never
+/// U+FFFD.
 #[test]
 fn gauge_cells_reach_the_file_as_segments_and_decode_plain() {
     let model = busy_frame();
     for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
         let mut model = model.clone();
         model.chart_glyphs = glyphs;
+        model.bar_segments = true;
         let image = llama_watch::grid_out::image_of(
             &layout::layout_exact(&model, 192, 60),
             Palette::Llama,
@@ -553,6 +555,35 @@ fn gauge_cells_reach_the_file_as_segments_and_decode_plain() {
         );
         let halves = plain.cells.iter().filter(|c| c.ch == '\u{2584}').count();
         assert!(halves >= segments, "{glyphs:?}");
+    }
+}
+
+/// #170: by default the file has no segment at all, so every reader, a
+/// `--segments` llama-view and llama-cast included, draws solid bars.
+#[test]
+fn gauge_cells_reach_the_file_solid_by_default() {
+    for glyphs in [ChartGlyphs::Eighths, ChartGlyphs::Halves] {
+        let mut model = busy_frame();
+        model.chart_glyphs = glyphs;
+        model.bar_segments = false;
+        let image = llama_watch::grid_out::image_of(
+            &layout::layout_exact(&model, 192, 60),
+            Palette::Llama,
+            1,
+            0,
+        );
+        assert!(
+            image
+                .cells
+                .iter()
+                .all(|c| c.ch != llama_core::glyph::SEGMENT),
+            "{glyphs:?}"
+        );
+        let mut bytes = Vec::new();
+        gridfile::encode(&image, &mut bytes).expect("encode");
+        let kept = gridfile::decode_segments(&bytes).expect("decode");
+        let halves = kept.cells.iter().filter(|c| c.ch == '\u{2584}').count();
+        assert!(halves > 20, "{glyphs:?}: {halves} solid cells");
     }
 }
 
@@ -983,6 +1014,7 @@ fn busy_frame() -> TtyModel {
             .collect(),
         chart_bucket_s: 2,
         chart_glyphs: ChartGlyphs::Eighths,
+        bar_segments: false,
         fans: None,
         temps: None,
         ctx_history_h: 6,

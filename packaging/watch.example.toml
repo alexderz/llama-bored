@@ -85,6 +85,7 @@ disk_ceiling_bps = 7000000000      # three-decade disk bars; 7 GB/s, so 12 MB/s 
 chart_bucket_s = 2                  # 1..=60; one tty chart column (tokens decoded in that span)
 ctx_history_h = 6                   # 1..=24; hours of per-slot context in the SLOTS sparklines
 chart_glyphs = "eighths"            # "eighths" needs a llama-hack font on tty11; "halves" renders with eurlatgr (code default)
+bar_segments = false                # true: a 1 px gap between gauge bar cells (U+E584, #165); false: solid bars (default)
 # Console font and size, applied to tty11 before the watcher starts by the
 # unit's root pre-step (`llama-watch tty-setup`, which reads only these two
 # keys and runs setfont, then stty). Every display on a GPU shows the same

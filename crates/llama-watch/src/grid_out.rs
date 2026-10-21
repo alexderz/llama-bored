@@ -696,6 +696,7 @@ mod tests {
             chart: Vec::new(),
             chart_bucket_s: 2,
             chart_glyphs: ChartGlyphs::Halves,
+            bar_segments: false,
             fans: None,
             temps: None,
             ctx_history_h: 6,
