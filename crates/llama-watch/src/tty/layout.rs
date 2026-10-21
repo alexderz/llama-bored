@@ -52,6 +52,12 @@ pub struct HealthSeg {
     pub name: String,
     pub status: HealthStatus,
     pub note: String,
+    /// Cells the status word keeps at least, so a segment that can say
+    /// `ok` or `idle` keeps the width of its widest form (#167). 0: its own.
+    pub word_cells: usize,
+    /// Cells the note keeps at least while notes are drawn, also when it
+    /// is empty (#167). 0: its own.
+    pub note_cells: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -290,10 +296,16 @@ pub struct TtyModel {
     /// One-line job note in the header when the inference view is showing.
     pub job_note: Option<String>,
     /// llama-swap id of the model the header names. Empty when the header
-    /// names no model; the claim is then not drawn (#128).
+    /// names no model. Its claims come first, and shed `on <model>` first
+    /// (#167).
     pub model_id: String,
-    /// Latest model claims from llama-swap's `/api/events` (#128).
+    /// Latest model claims from llama-swap's `/api/events` (#128), every
+    /// one drawn (#167).
     pub claims: Vec<HeaderClaim>,
+    /// The GPU reservation (#167). `None` draws nothing.
+    pub gpu: Option<HeaderGpu>,
+    /// Displaced notes; those of the last ten minutes are drawn (#167).
+    pub displaced: Vec<HeaderDisplaced>,
     /// Wall clock for the claim countdown. Tests inject this.
     pub now: SystemTime,
     /// Seconds east of UTC, for a hold's `until HH:MM` in local time.
@@ -337,6 +349,39 @@ pub struct HeaderClaim {
     pub hold_tz_offset_s: i32,
     /// Already sanitised. Empty when there is none.
     pub hold_reason: String,
+    /// A guest claim under someone else's GPU reservation: `guest` (#167).
+    pub conditional: bool,
+}
+
+/// The GPU reservation as the header draws it (#167).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderGpu {
+    /// Already sanitised, at most 24 characters. Empty draws nothing.
+    pub holder: String,
+    /// Mode `external`: drawn `external`.
+    pub external: bool,
+    /// State `draining`: drawn `draining` in the orange slot.
+    pub draining: bool,
+    pub in_use: bool,
+    pub expires_at: Option<SystemTime>,
+    pub hold_until: Option<SystemTime>,
+    /// Seconds east of UTC at [`Self::hold_until`].
+    pub hold_tz_offset_s: i32,
+    /// Already sanitised. Empty when there is none.
+    pub hold_reason: String,
+}
+
+/// A displaced note as the header draws it (#167):
+/// `displaced <model> -> <to> by <by> HH:MM`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderDisplaced {
+    pub model: String,
+    /// Empty for an unload: the arrow and `to` are not drawn.
+    pub to: String,
+    pub by: String,
+    pub at: SystemTime,
+    /// Seconds east of UTC at [`Self::at`].
+    pub tz_offset_s: i32,
 }
 
 /// The job shown in place of the inference panels.
@@ -670,19 +715,26 @@ fn draw_header(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     );
     let after_slots = x;
     let after_swap = paint_field(grid, x, 0, "swap", &model.swap_line, name_fg(model), limit);
-    // The claim sits after `swap`. When `swap` itself was not drawn, the
-    // claim is not drawn either: it must not take that field's place.
-    // Two claims on the same model: the first is shown.
-    let tag_at = if after_swap == after_slots || model.model_id.is_empty() {
-        after_swap
-    } else if let Some(claim) = model
-        .claims
-        .iter()
-        .find(|claim| claim.model == model.model_id)
+    // The claims sit after `swap` (#128, #167). When `swap` itself was not
+    // drawn, they are not drawn either: they must not take that field's
+    // place.
+    // `text off` keeps its room: the claims area stops short of it, so a
+    // cut reason cannot push it out (#167). Only when it fits at all.
+    let tag_cells = TEXT_OFF_TAG.chars().count();
+    let claims_limit = if !model.show_text
+        && usize::from(after_swap)
+            .saturating_add(tag_cells)
+            .saturating_add(2)
+            <= usize::from(start)
     {
-        paint_claim(grid, after_swap, claim, model.now, model.tz_offset_s, limit)
+        limit.saturating_sub(tag_cells + ITEM_GAP)
     } else {
+        limit
+    };
+    let tag_at = if after_swap == after_slots {
         after_swap
+    } else {
+        paint_claims_area(grid, after_swap, model, claims_limit)
     };
     let mut note_at = tag_at;
     if !model.show_text {
@@ -865,105 +917,345 @@ fn paint_field(
 }
 
 const SEP_CELLS: usize = 3;
+/// Cells between two items of the claims area (#167), as between header
+/// fields.
+const ITEM_GAP: usize = 3;
+/// Longest model id an item draws (#167); a longer one is cut with `…`.
+const ITEM_MODEL_CELLS: usize = 32;
+/// How long a displaced note is drawn after it happened (#167).
+const DISPLACED_SHOWN: Duration = Duration::from_secs(10 * 60);
 
-/// Header claim for the model the header names (#128). Sheds in order:
-/// full; reason cut with the ellipsis (only when at least two cells of
-/// reason text remain before the ellipsis); no reason; no label word;
-/// nothing. The reason is never drawn once the label is dropped. Never
-/// cuts the holder; if the holder alone does not fit, draws nothing.
-fn paint_claim(
-    grid: &mut Grid,
-    x: u16,
-    claim: &HeaderClaim,
-    now: SystemTime,
-    tz_offset_s: i32,
-    limit: usize,
-) -> u16 {
-    let hold = claim.hold_until.is_some();
-    let label = if hold { "hold" } else { "claim" };
-    let holder = claim.holder.as_str();
-    if holder.is_empty() {
-        return x;
-    }
-    let status = claim_status(claim, now, tz_offset_s);
-    let reason = claim.hold_reason.as_str();
-    let holder_w = holder.chars().count();
-    let status_w = status
-        .as_ref()
-        .map(|s| SEP_CELLS + s.text.chars().count())
-        .unwrap_or(0);
-    let core = holder_w.saturating_add(status_w);
-    let room = limit.saturating_sub(usize::from(x));
-    if core > room {
-        return x;
-    }
-    let label_w = label.chars().count().saturating_add(1);
-    let keep_label = label_w.saturating_add(core) <= room;
-    let used = if keep_label {
-        label_w.saturating_add(core)
-    } else {
-        core
-    };
-    let leftover = room.saturating_sub(used);
-    // The reason rides with the label. Once the label is dropped, the
-    // reason is gone too. A cut needs at least two cells of reason text
-    // before the ellipsis, so a one-cell leftover is not a lone `…`.
-    let shown_reason = if !keep_label || reason.is_empty() {
-        None
-    } else {
-        fit_reason(reason, leftover)
-    };
+/// Text in one colour.
+struct Run {
+    text: String,
+    fg: C16,
+}
 
-    let mut col = usize::from(x);
-    if keep_label {
-        let fg = if hold { C16::Yellow } else { C16::BrightBlack };
-        paint_fit(
-            grid,
-            col_u16(col),
-            0,
-            label,
+impl Run {
+    fn new(text: impl Into<String>, fg: C16) -> Self {
+        Self {
+            text: text.into(),
             fg,
-            C16::Black,
-            label.chars().count(),
-        );
-        col += label.chars().count() + 1;
+        }
     }
-    paint_fit(
-        grid,
-        col_u16(col),
-        0,
-        holder,
-        C16::BrightCyan,
-        C16::Black,
-        holder_w,
-    );
-    col += holder_w;
-    if let Some(status) = &status {
-        col += paint_sep(grid, col);
-        paint_fit(
-            grid,
-            col_u16(col),
-            0,
-            &status.text,
-            status.fg,
-            C16::Black,
-            status.text.chars().count(),
-        );
-        col += status.text.chars().count();
+
+    fn cells(&self) -> usize {
+        self.text.chars().count()
     }
-    if let Some(reason) = shown_reason.as_deref().filter(|r| !r.is_empty()) {
-        col += paint_sep(grid, col);
-        let n = paint_detail_fg(
-            grid,
-            col,
-            0,
-            reason,
-            leftover.saturating_sub(SEP_CELLS),
-            C16::White,
-        );
-        col += n;
+}
+
+/// One item of the header's claims area (#167): the GPU reservation, a
+/// model claim, or a displaced note.
+struct Item {
+    /// `gpu`, `claim`, `hold`, `guest` or `displaced`, and a blank after.
+    label: Run,
+    /// Never cut: the holder, or a displaced note's text.
+    core: Vec<Run>,
+    /// A claim's model, drawn ` on <model>`.
+    on_model: Option<String>,
+    /// The claim is on the model the header names: its ` on <model>` goes
+    /// before any label word.
+    served: bool,
+    /// After the core, each after ` · `.
+    parts: Vec<Run>,
+    /// The hold reason, last, after ` · `. Empty: none.
+    reason: String,
+}
+
+/// What an item keeps at one step of the shedding order (#167).
+#[derive(Clone, Copy, Debug)]
+struct Shed {
+    reasons: bool,
+    served_on: bool,
+    labels: bool,
+}
+
+/// Reasons (cut, then dropped, in the room they get); then the served
+/// model's `on <model>`; then the label words. Folding trailing items into
+/// `+N` comes after all three.
+const SHEDS: [Shed; 3] = [
+    Shed {
+        reasons: true,
+        served_on: true,
+        labels: true,
+    },
+    Shed {
+        reasons: false,
+        served_on: false,
+        labels: true,
+    },
+    Shed {
+        reasons: false,
+        served_on: false,
+        labels: false,
+    },
+];
+
+impl Item {
+    fn shows_on(&self, shed: Shed) -> bool {
+        self.on_model.is_some() && (!self.served || shed.served_on)
+    }
+
+    /// Cells without the reason.
+    fn width(&self, shed: Shed) -> usize {
+        let mut width: usize = self.core.iter().map(Run::cells).sum();
+        if shed.labels {
+            width += self.label.cells() + 1;
+        }
+        if self.shows_on(shed) {
+            width += " on ".len() + self.on_model.as_deref().map_or(0, |m| m.chars().count());
+        }
+        width
+            + self
+                .parts
+                .iter()
+                .map(|p| SEP_CELLS + p.cells())
+                .sum::<usize>()
+    }
+}
+
+/// How the claims area is drawn: the first `kept` items at `shed`, the
+/// reasons that got room, and the `+N` for the rest.
+struct ItemPlan {
+    kept: usize,
+    shed: Shed,
+    reasons: Vec<Option<String>>,
+    fold: String,
+}
+
+/// The fullest form of `items` that fits in `room` cells. Every item at the
+/// first step of [`SHEDS`] that fits; only when none does, the last items
+/// fold into `+N more` (or `+N`), and the ones kept take the first step
+/// that fits beside it. The first item always stays: with no room for it
+/// at the last step, nothing is drawn.
+fn plan_items(items: &[Item], room: usize) -> Option<ItemPlan> {
+    for kept in (1..=items.len()).rev() {
+        let folded = items.len() - kept;
+        let folds = if folded == 0 {
+            vec![String::new()]
+        } else {
+            vec![format!("+{folded} more"), format!("+{folded}")]
+        };
+        for shed in SHEDS {
+            for fold in &folds {
+                let fold_w = if fold.is_empty() {
+                    0
+                } else {
+                    ITEM_GAP + fold.chars().count()
+                };
+                let fixed = items[..kept]
+                    .iter()
+                    .map(|item| item.width(shed))
+                    .sum::<usize>()
+                    + ITEM_GAP * (kept - 1)
+                    + fold_w;
+                let Some(mut leftover) = room.checked_sub(fixed) else {
+                    continue;
+                };
+                // Reasons take the room left, first item first.
+                let reasons = items[..kept]
+                    .iter()
+                    .map(|item| {
+                        if !shed.reasons || item.reason.is_empty() {
+                            return None;
+                        }
+                        let shown = fit_reason(&item.reason, leftover)?;
+                        leftover -= SEP_CELLS + shown.chars().count();
+                        Some(shown)
+                    })
+                    .collect();
+                return Some(ItemPlan {
+                    kept,
+                    shed,
+                    reasons,
+                    fold: fold.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The header's claims area (#167), from `x` to column `limit`
+/// (exclusive): the GPU reservation, every model claim (the header model's
+/// first), then the displaced notes of the last ten minutes, newest
+/// first. Sheds as [`plan_items`] says; a holder is never cut. Nothing
+/// claimed or reserved draws nothing. Returns where the next header text
+/// may start: `x` when nothing was drawn.
+fn paint_claims_area(grid: &mut Grid, x: u16, model: &TtyModel, limit: usize) -> u16 {
+    paint_header_items(grid, x, &header_items(model), limit)
+}
+
+/// [`paint_claims_area`] for `items`.
+fn paint_header_items(grid: &mut Grid, x: u16, items: &[Item], limit: usize) -> u16 {
+    if items.is_empty() {
+        return x;
+    }
+    let room = limit.saturating_sub(usize::from(x));
+    let Some(plan) = plan_items(items, room) else {
+        return x;
+    };
+    let mut col = usize::from(x);
+    for (i, item) in items[..plan.kept].iter().enumerate() {
+        if i > 0 {
+            col += ITEM_GAP;
+        }
+        if plan.shed.labels {
+            col += paint_run(grid, col, &item.label) + 1;
+        }
+        for run in &item.core {
+            col += paint_run(grid, col, run);
+        }
+        if item.shows_on(plan.shed)
+            && let Some(name) = &item.on_model
+        {
+            col += paint_run(grid, col, &Run::new(" on ", C16::BrightBlack));
+            col += paint_run(grid, col, &Run::new(name.as_str(), C16::White));
+        }
+        for part in &item.parts {
+            col += paint_sep(grid, col);
+            col += paint_run(grid, col, part);
+        }
+        if let Some(reason) = plan.reasons[i].as_deref() {
+            col += paint_sep(grid, col);
+            col += paint_detail_fg(grid, col, 0, reason, reason.chars().count(), C16::White);
+        }
+    }
+    if !plan.fold.is_empty() {
+        col += ITEM_GAP;
+        col += paint_run(grid, col, &Run::new(plan.fold.as_str(), C16::White));
     }
     col_u16(col.saturating_add(3))
+}
+
+fn paint_run(grid: &mut Grid, col: usize, run: &Run) -> usize {
+    let cells = run.cells();
+    paint_fit(grid, col_u16(col), 0, &run.text, run.fg, C16::Black, cells);
+    cells
+}
+
+/// The claims area's items in drawing order (#167).
+fn header_items(model: &TtyModel) -> Vec<Item> {
+    let mut items = Vec::new();
+    if let Some(gpu) = model.gpu.as_ref().filter(|gpu| !gpu.holder.is_empty()) {
+        items.push(gpu_item(gpu, model.now, model.tz_offset_s));
+    }
+    let served = |claim: &&HeaderClaim| !model.model_id.is_empty() && claim.model == model.model_id;
+    let claims = model.claims.iter().filter(|claim| !claim.holder.is_empty());
+    let (mine, others): (Vec<_>, Vec<_>) = claims.partition(served);
+    for claim in mine {
+        items.push(claim_item(claim, true, model.now, model.tz_offset_s));
+    }
+    for claim in others {
+        items.push(claim_item(claim, false, model.now, model.tz_offset_s));
+    }
+    let mut notes: Vec<&HeaderDisplaced> = model
+        .displaced
+        .iter()
+        .filter(|note| {
+            model
+                .now
+                .duration_since(note.at)
+                .map_or(true, |age| age < DISPLACED_SHOWN)
+        })
+        .collect();
+    notes.sort_by_key(|note| std::cmp::Reverse(note.at));
+    items.extend(notes.into_iter().map(displaced_item));
+    items
+}
+
+fn gpu_item(gpu: &HeaderGpu, now: SystemTime, tz_offset_s: i32) -> Item {
+    let mut parts = Vec::new();
+    if gpu.external {
+        parts.push(Run::new("external", C16::White));
+    }
+    if gpu.draining {
+        // Slot 6, the palette's orange (#167).
+        parts.push(Run::new("draining", C16::Cyan));
+    }
+    if let Some(until) = gpu.hold_until {
+        let text = format_until(until, now, tz_offset_s, gpu.hold_tz_offset_s);
+        parts.push(Run::new(format!("hold {text}"), C16::BrightYellow));
+    } else if gpu.in_use {
+        parts.push(Run::new("in use", C16::BrightGreen));
+    } else if let Some(expires) = gpu.expires_at {
+        parts.push(left_run(expires, now));
+    }
+    Item {
+        label: Run::new("gpu", C16::BrightBlack),
+        core: vec![Run::new(gpu.holder.as_str(), C16::BrightCyan)],
+        on_model: None,
+        served: false,
+        parts,
+        reason: gpu.hold_reason.clone(),
+    }
+}
+
+fn claim_item(claim: &HeaderClaim, served: bool, now: SystemTime, tz_offset_s: i32) -> Item {
+    let label = if claim.conditional {
+        Run::new("guest", C16::BrightBlack)
+    } else if claim.hold_until.is_some() {
+        Run::new("hold", C16::Yellow)
+    } else {
+        Run::new("claim", C16::BrightBlack)
+    };
+    let parts = claim_status(claim, now, tz_offset_s)
+        .map(|status| Run::new(status.text, status.fg))
+        .into_iter()
+        .collect();
+    Item {
+        label,
+        core: vec![Run::new(claim.holder.as_str(), C16::BrightCyan)],
+        on_model: (!claim.model.is_empty()).then(|| cut_text(&claim.model, ITEM_MODEL_CELLS)),
+        served,
+        parts,
+        reason: claim.hold_reason.clone(),
+    }
+}
+
+fn displaced_item(note: &HeaderDisplaced) -> Item {
+    let mut core = vec![Run::new(
+        cut_text(&note.model, ITEM_MODEL_CELLS),
+        C16::White,
+    )];
+    if !note.to.is_empty() {
+        core.push(Run::new(" -> ", C16::BrightBlack));
+        core.push(Run::new(cut_text(&note.to, ITEM_MODEL_CELLS), C16::White));
+    }
+    core.push(Run::new(" by ", C16::BrightBlack));
+    core.push(Run::new(note.by.as_str(), C16::BrightCyan));
+    let local = crate::localtime::format_local(
+        unix_secs(note.at),
+        &crate::localtime::Zone::fixed(note.tz_offset_s),
+    );
+    core.push(Run::new(
+        format!(" {}", local.get(11..16).unwrap_or("--:--")),
+        C16::White,
+    ));
+    Item {
+        label: Run::new("displaced", C16::BrightBlack),
+        core,
+        on_model: None,
+        served: false,
+        parts: Vec::new(),
+        reason: String::new(),
+    }
+}
+
+/// `M:SS left` in five cells up to `99:59` (#167); yellow under a minute.
+fn left_run(expires: SystemTime, now: SystemTime) -> Run {
+    let secs = expires
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    Run::new(
+        format!("{} left", format_left(secs)),
+        if secs < 60 {
+            C16::Yellow
+        } else {
+            C16::BrightWhite
+        },
+    )
 }
 
 struct ClaimStatus {
@@ -998,7 +1290,8 @@ fn claim_status(claim: &HeaderClaim, now: SystemTime, tz_offset_s: i32) -> Optio
     if let Some(until) = claim.hold_until {
         return Some(ClaimStatus {
             text: format_until(until, now, tz_offset_s, claim.hold_tz_offset_s),
-            fg: C16::BrightWhite,
+            // #167: a hold's end is the mock-ups' bright yellow.
+            fg: C16::BrightYellow,
         });
     }
     if claim.in_use {
@@ -1007,22 +1300,18 @@ fn claim_status(claim: &HeaderClaim, now: SystemTime, tz_offset_s: i32) -> Optio
             fg: C16::BrightGreen,
         });
     }
-    let expires = claim.expires_at?;
-    let left = expires.duration_since(now).unwrap_or(Duration::ZERO);
-    let secs = left.as_secs();
+    let run = left_run(claim.expires_at?, now);
     Some(ClaimStatus {
-        text: format!("{} left", format_left(secs)),
-        fg: if secs < 60 {
-            C16::Yellow
-        } else {
-            C16::BrightWhite
-        },
+        text: run.text,
+        fg: run.fg,
     })
 }
 
+/// Time left: `M:SS` right-aligned in five cells up to `99:59`, so `9:59`
+/// to `10:00` moves nothing after it (#167); `H h MM min` from 100 minutes.
 fn format_left(secs: u64) -> String {
-    if secs < 3600 {
-        format!("{}:{:02}", secs / 60, secs % 60)
+    if secs < 100 * 60 {
+        format!("{:>2}:{:02}", secs / 60, secs % 60)
     } else {
         format!("{} h {:02} min", secs / 3600, (secs % 3600) / 60)
     }
@@ -4969,17 +5258,23 @@ fn find_word(chars: &[char], word: &str) -> Option<usize> {
     })
 }
 
-fn draw_health(grid: &mut Grid, model: &TtyModel, g: &Geom, row: u16) {
-    let tail = match model.snapshot {
-        Some(seq) => format!(
-            "snapshot #{seq} {}   errors {}   up {}",
-            model.snapshot_age, model.errors, model.uptime
-        ),
-        None => format!(
-            "snapshot --   errors {}   up {}",
-            model.errors, model.uptime
-        ),
+/// The health line's right-hand tail. Its numbers keep fixed widths
+/// (#167): the snapshot number seven digits (11.6 days at 10 Hz), the age
+/// six cells, the errors two, the uptime nine; a longer value takes the
+/// cells it needs.
+fn health_tail(model: &TtyModel) -> String {
+    let seq = match model.snapshot {
+        Some(seq) => format!("#{seq:>7}"),
+        None => format!("{:>8}", "--"),
     };
+    format!(
+        "snapshot {seq} {:>6}   errors {:>2}   up {:>9}",
+        model.snapshot_age, model.errors, model.uptime
+    )
+}
+
+fn draw_health(grid: &mut Grid, model: &TtyModel, g: &Geom, row: u16) {
+    let tail = health_tail(model);
     let end = usize::from(g.cols.saturating_sub(2));
     let tail_at = end.saturating_add(1).saturating_sub(tail.chars().count());
     // Words end two columns before the tail (and, as before, 40 from the
@@ -4995,9 +5290,7 @@ fn draw_health(grid: &mut Grid, model: &TtyModel, g: &Geom, row: u16) {
                 let (fg, bg) = status_colour(seg.status);
                 paint_str(grid, col_u16(sx), row, status_word(seg.status), fg, bg);
                 if notes && !seg.note.is_empty() {
-                    let nx = sx
-                        .saturating_add(status_word(seg.status).chars().count())
-                        .saturating_add(1);
+                    let nx = sx.saturating_add(word_width(seg)).saturating_add(1);
                     paint_str(
                         grid,
                         col_u16(nx),
@@ -5087,11 +5380,16 @@ fn keep_down(segs: &[HealthSeg], room: usize, notes: bool) -> Option<Vec<&Health
 }
 
 fn seg_width(seg: &HealthSeg, notes: bool) -> usize {
-    let mut width = seg.name.chars().count() + 1 + status_word(seg.status).chars().count();
-    if notes && !seg.note.is_empty() {
-        width += 1 + seg.note.chars().count();
+    let mut width = seg.name.chars().count() + 1 + word_width(seg);
+    if notes && (!seg.note.is_empty() || seg.note_cells > 0) {
+        width += 1 + seg.note.chars().count().max(seg.note_cells);
     }
     width
+}
+
+/// The status word's cells: its own, or [`HealthSeg::word_cells`].
+fn word_width(seg: &HealthSeg) -> usize {
+    status_word(seg.status).chars().count().max(seg.word_cells)
 }
 
 fn status_word(status: HealthStatus) -> &'static str {
@@ -8463,9 +8761,13 @@ mod tests {
     }
 
     fn claim_row(claim: &HeaderClaim, now: SystemTime, tz: i32, limit: usize) -> String {
-        let mut grid = Grid::new(80, 2);
-        paint_claim(&mut grid, 0, claim, now, tz, limit);
-        (0..80).map(|c| grid.get(c, 0).unwrap().ch).collect()
+        items_row(&[claim_item(claim, true, now, tz)], limit)
+    }
+
+    fn items_row(items: &[Item], limit: usize) -> String {
+        let mut grid = Grid::new(240, 2);
+        paint_header_items(&mut grid, 0, items, limit);
+        (0..240).map(|c| grid.get(c, 0).unwrap().ch).collect()
     }
 
     fn idle_claim(holder: &str, expires_in: u64, now: SystemTime) -> HeaderClaim {
@@ -8477,22 +8779,30 @@ mod tests {
             hold_until: None,
             hold_tz_offset_s: 0,
             hold_reason: String::new(),
+            conditional: false,
         }
     }
 
+    /// #167: five cells up to `99:59`, right-aligned, then the hour form.
     #[test]
     fn claim_time_left_is_m_ss_then_h_min() {
-        assert_eq!(format_left(0), "0:00");
-        assert_eq!(format_left(41), "0:41");
-        assert_eq!(format_left(4 * 60 + 12), "4:12");
-        assert_eq!(format_left(59), "0:59");
-        assert_eq!(format_left(60), "1:00");
+        assert_eq!(format_left(0), " 0:00");
+        assert_eq!(format_left(41), " 0:41");
+        assert_eq!(format_left(4 * 60 + 12), " 4:12");
+        assert_eq!(format_left(59), " 0:59");
+        assert_eq!(format_left(60), " 1:00");
+        assert_eq!(format_left(599), " 9:59");
+        assert_eq!(format_left(600), "10:00");
         assert_eq!(format_left(3599), "59:59");
-        assert_eq!(format_left(3600), "1 h 00 min");
-        assert_eq!(format_left(3600 + 5 * 60), "1 h 05 min");
+        assert_eq!(format_left(3600), "60:00");
+        assert_eq!(format_left(3600 + 5 * 60), "65:00");
+        assert_eq!(format_left(5999), "99:59");
+        assert_eq!(format_left(6000), "1 h 40 min");
         assert_eq!(format_left(10 * 3600 + 12 * 60), "10 h 12 min");
+        for secs in 0..6000 {
+            assert_eq!(format_left(secs).chars().count(), 5, "{secs}");
+        }
     }
-
     fn from_rfc(text: &str) -> SystemTime {
         let unix = crate::localtime::parse_rfc3339(text).expect("rfc3339");
         UNIX_EPOCH + Duration::from_secs(u64::try_from(unix).unwrap())
@@ -8551,16 +8861,18 @@ mod tests {
         let s59 = claim_status(&under, now, 0).expect("status");
         let s60 = claim_status(&on, now, 0).expect("status");
         let s0 = claim_status(&past, now, 0).expect("status");
-        assert_eq!(s59.text, "0:59 left");
+        assert_eq!(s59.text, " 0:59 left");
         assert_eq!(s59.fg, C16::Yellow);
-        assert_eq!(s60.text, "1:00 left");
+        assert_eq!(s60.text, " 1:00 left");
         assert_eq!(s60.fg, C16::BrightWhite);
-        assert_eq!(s0.text, "0:00 left");
+        assert_eq!(s0.text, " 0:00 left");
         assert_eq!(s0.fg, C16::Yellow);
     }
 
+    /// One claim on the served model sheds: reason cut, reason dropped,
+    /// `on <model>`, the label, then nothing (#128, #167).
     #[test]
-    fn claim_sheds_reason_then_label_then_nothing() {
+    fn claim_sheds_reason_then_on_model_then_label_then_nothing() {
         let now = t(1_000);
         let claim = HeaderClaim {
             model: "big".to_owned(),
@@ -8570,38 +8882,215 @@ mod tests {
             hold_until: Some(now + Duration::from_secs(3600)),
             hold_tz_offset_s: 0,
             hold_reason: "overnight eval, do not unload".to_owned(),
+            conditional: false,
         };
-        let full = claim_row(&claim, now, 0, 80);
+        let full = claim_row(&claim, now, 0, 120);
         assert!(
-            full.contains("hold operator") && full.contains("overnight eval"),
+            full.contains("hold operator on big \u{00B7} until 01:16 \u{00B7} overnight eval"),
             "{full:?}"
         );
 
-        // `hold operator · until HH:MM · ` is 4+1+8+3+11+3 = 30, plus reason.
-        let cut = claim_row(&claim, now, 0, 30 + 8);
+        // `hold operator on big · until HH:MM` is 4+1+8+7+3+11 = 34.
+        let cut = claim_row(&claim, now, 0, 34 + 3 + 8);
         let cut: String = cut.trim_end().chars().collect();
-        assert!(cut.contains("hold operator"), "{cut:?}");
+        assert!(cut.contains("hold operator on big"), "{cut:?}");
         assert!(cut.contains('\u{2026}'), "{cut:?}");
         assert!(!cut.contains("unload"), "{cut:?}");
 
-        let no_reason = claim_row(&claim, now, 0, 30);
+        let no_reason = claim_row(&claim, now, 0, 34);
         let no_reason: String = no_reason.trim_end().chars().collect();
-        assert!(no_reason.starts_with("hold operator"), "{no_reason:?}");
-        assert!(!no_reason.contains("overnight"), "{no_reason:?}");
-        assert!(!no_reason.contains('\u{2026}'), "{no_reason:?}");
+        assert_eq!(no_reason, "hold operator on big \u{00B7} until 01:16");
+
+        let no_on = claim_row(&claim, now, 0, 33);
+        let no_on: String = no_on.trim_end().chars().collect();
+        assert_eq!(no_on, "hold operator \u{00B7} until 01:16");
 
         // holder (8) + sep (3) + until HH:MM (11) = 22. Label does not fit.
         let no_label = claim_row(&claim, now, 0, 22);
         let no_label: String = no_label.trim_end().chars().collect();
-        assert!(no_label.starts_with("operator"), "{no_label:?}");
-        assert!(!no_label.contains("hold"), "{no_label:?}");
-        assert!(
-            !no_label.contains("overnight"),
-            "reason without label: {no_label:?}"
-        );
+        assert_eq!(no_label, "operator \u{00B7} until 01:16");
 
-        let nothing = claim_row(&claim, now, 0, 7);
+        let nothing = claim_row(&claim, now, 0, 21);
         assert!(nothing.chars().all(|c| c == ' '), "{nothing:?}");
+    }
+
+    /// A claim on another model keeps `on <model>` until the labels go.
+    #[test]
+    fn another_models_claim_keeps_on_model_past_the_labels_step() {
+        let now = t(1_000);
+        let claim = idle_claim("eval-runner", 4 * 60 + 12, now);
+        let row = items_row(&[claim_item(&claim, false, now, 0)], 120);
+        assert_eq!(
+            row.trim_end(),
+            "claim eval-runner on big \u{00B7}  4:12 left"
+        );
+        // Short of room the label goes; `on big` stays.
+        let row = items_row(&[claim_item(&claim, false, now, 0)], 34);
+        assert_eq!(row.trim_end(), "eval-runner on big \u{00B7}  4:12 left");
+    }
+
+    fn gpu_hold(reason: &str) -> HeaderGpu {
+        HeaderGpu {
+            holder: "bakeoff".to_owned(),
+            hold_until: Some(t(1_000 + 3600)),
+            hold_reason: reason.to_owned(),
+            ..HeaderGpu::default()
+        }
+    }
+
+    /// Several items: reasons first (cut, then dropped), then the served
+    /// claim's `on <model>`, then every label, then `+N more`, `+N`. The
+    /// first item always stays; a holder is never cut.
+    #[test]
+    fn items_shed_in_the_order_of_167() {
+        let now = t(1_000);
+        let mut guest = idle_claim("opencode", 4 * 60 + 12, now);
+        guest.conditional = true;
+        guest.model = "qwen-27b".to_owned();
+        let mut other = idle_claim("eval-runner", 0, now);
+        other.expires_at = None;
+        other.hold_until = Some(t(1_000 + 1800));
+        other.hold_reason = "nightly evals".to_owned();
+        other.model = "tiel-coder".to_owned();
+        let items = || {
+            vec![
+                gpu_item(&gpu_hold("nightly model evals, do not unload"), now, 0),
+                claim_item(&guest, true, now, 0),
+                claim_item(&other, false, now, 0),
+            ]
+        };
+        let row = |limit| items_row(&items(), limit).trim_end().to_owned();
+        let full = row(200);
+        assert_eq!(
+            full,
+            "gpu bakeoff \u{00B7} hold until 01:16 \u{00B7} nightly model evals, do not unload   \
+             guest opencode on qwen-27b \u{00B7}  4:12 left   \
+             hold eval-runner on tiel-coder \u{00B7} until 00:46 \u{00B7} nightly evals"
+        );
+        let widths: Vec<usize> = (0..200).map(|limit| row(limit).chars().count()).collect();
+        // Never wider than the room.
+        for (limit, width) in widths.iter().enumerate() {
+            assert!(*width <= limit, "{limit}: {}", row(limit));
+        }
+        // Each stage, from the widest room down, in order.
+        let stage = |text: &str| {
+            if text.is_empty() {
+                9
+            } else if text.contains('+') {
+                if text.contains("more") { 6 } else { 7 }
+            } else if !text.starts_with("gpu ") {
+                5
+            } else if !text.contains("on qwen-27b") {
+                4
+            } else if !text.contains("nightly") && !text.contains("approved") {
+                3
+            } else if text.contains('\u{2026}') || !text.contains("nightly evals") {
+                1
+            } else {
+                0
+            }
+        };
+        let mut last = 0;
+        for limit in (0..200).rev() {
+            let text = row(limit);
+            let now_stage = stage(&text);
+            // Folding can bring a label back for the items kept, so only the
+            // steps before the first fold must be monotonic.
+            if last < 6 {
+                assert!(now_stage >= last, "{limit}: {text} after stage {last}");
+            }
+            last = now_stage;
+            for holder in ["bakeoff", "opencode", "eval-runner"] {
+                let cut: String = holder.chars().take(holder.len() - 1).collect();
+                assert!(
+                    text.contains(holder) || !text.contains(&cut),
+                    "{limit}: {holder} cut in {text}"
+                );
+            }
+        }
+        // The labels go before anything folds.
+        let bare = "bakeoff \u{00B7} hold until 01:16   opencode \u{00B7}  4:12 left   \
+                    eval-runner on tiel-coder \u{00B7} until 00:46";
+        assert_eq!(row(bare.chars().count()), bare);
+        // One cell less folds the last item, and the kept ones get the
+        // first step that fits beside the fold.
+        let folded = row(bare.chars().count() - 1);
+        assert!(folded.ends_with("+1 more"), "{folded}");
+        assert!(folded.starts_with("gpu bakeoff"), "{folded}");
+        assert!(!folded.contains("eval-runner"), "{folded}");
+        // Only the first item: `bakeoff · hold until 01:16` and `+2`.
+        assert_eq!(row(26 + 3 + 2), "bakeoff \u{00B7} hold until 01:16   +2");
+        assert_eq!(row(26 + 3 + 1), "");
+    }
+
+    /// The GPU item's parts in order, with the mock-ups' colours (#167).
+    #[test]
+    fn gpu_item_parts_and_colours() {
+        let now = t(1_000);
+        let gpu = HeaderGpu {
+            holder: "bakeoff".to_owned(),
+            external: true,
+            draining: true,
+            expires_at: Some(t(1_042)),
+            ..HeaderGpu::default()
+        };
+        let mut grid = Grid::new(120, 2);
+        paint_header_items(&mut grid, 0, &[gpu_item(&gpu, now, 0)], 120);
+        let text: String = (0..120).map(|c| grid.get(c, 0).unwrap().ch).collect();
+        assert_eq!(
+            text.trim_end(),
+            "gpu bakeoff \u{00B7} external \u{00B7} draining \u{00B7}  0:42 left"
+        );
+        let fg = |at: usize| grid.get(col_u16(at), 0).unwrap().fg;
+        assert_eq!(fg(0), C16::BrightBlack);
+        assert_eq!(fg(4), C16::BrightCyan);
+        assert_eq!(fg(14), C16::White);
+        assert_eq!(fg(25), C16::Cyan, "draining in the orange slot");
+        assert_eq!(fg(37), C16::Yellow, "under a minute");
+        let in_use = HeaderGpu {
+            in_use: true,
+            ..gpu_hold("")
+        };
+        let row = items_row(&[gpu_item(&in_use, now, 0)], 120);
+        assert_eq!(
+            row.trim_end(),
+            "gpu bakeoff \u{00B7} hold until 01:16",
+            "a hold wins"
+        );
+        let in_use = HeaderGpu {
+            holder: "bakeoff".to_owned(),
+            in_use: true,
+            ..HeaderGpu::default()
+        };
+        let row = items_row(&[gpu_item(&in_use, now, 0)], 120);
+        assert_eq!(row.trim_end(), "gpu bakeoff \u{00B7} in use");
+    }
+
+    #[test]
+    fn displaced_item_reads_model_to_by_and_time() {
+        let note = HeaderDisplaced {
+            model: "tiel-coder".to_owned(),
+            to: "qwen-27b".to_owned(),
+            by: "bakeoff".to_owned(),
+            at: t(21 * 3600 + 9 * 60),
+            tz_offset_s: 0,
+        };
+        let row = items_row(&[displaced_item(&note)], 120);
+        assert_eq!(
+            row.trim_end(),
+            "displaced tiel-coder -> qwen-27b by bakeoff 21:09"
+        );
+        let unload = HeaderDisplaced {
+            to: String::new(),
+            ..note
+        };
+        let row = items_row(&[displaced_item(&unload)], 120);
+        assert_eq!(row.trim_end(), "displaced tiel-coder by bakeoff 21:09");
+        // Its label goes; the rest is never cut.
+        let row = items_row(&[displaced_item(&unload)], 30);
+        assert_eq!(row.trim_end(), "tiel-coder by bakeoff 21:09");
+        let row = items_row(&[displaced_item(&unload)], 26);
+        assert_eq!(row.trim_end(), "");
     }
 
     #[test]

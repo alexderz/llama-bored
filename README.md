@@ -69,10 +69,19 @@ under 256 MiB is ignored.
 A harness can write a job status file
 ([`docs/job-status.md`](docs/job-status.md)) to get the job view with its
 own progress instead of this one-line header. After `slots` and `swap`, a
-llama-swap build with model claims shows the holder:
-`claim eval-runner · in use`, `claim chat-ui · 4:12 left`, or `hold
-operator · until 21:30 · overnight eval, do not unload`. No claim, or a
-llama-swap that never sends one, leaves the header as it is. The LCD
+llama-swap build with model claims shows who holds what (#128, #167): the
+GPU reservation (`gpu bakeoff · hold until 10-21 21:01 · nightly model
+evals, do not unload`, with `external`, `draining`, `in use` or ` 4:12
+left`), then every model claim, the header model's first (`claim
+eval-runner on qwen-27b · in use`, `guest opencode on qwen-27b ·  4:12
+left` for a claim under someone else's reservation, `hold operator on
+tiel-coder · until 21:30 · overnight eval`), then for ten minutes each
+claim the reservation's holder displaced (`displaced tiel-coder ->
+qwen-27b by bakeoff 21:09`). Short of room, the reasons are cut, then
+dropped; then the header model's `on <model>`; then the label words; then
+the last items fold into `+N more`. A holder is never cut. The countdown
+keeps five cells up to `99:59`. Nothing claimed or reserved, or a
+llama-swap that never says, leaves the header as it is. The LCD
 starts the line under the model name with the short name (`llama.cpp`,
 `sglang`, `vllm`, `strata`, `openai`) and drops the quant first when space
 is short.
@@ -238,8 +247,8 @@ it decodes. The row holds the latest poll's numbers, nothing in between.
 OpenAI-compatible servers report no per-request progress: their newest
 finished row is marked `gen` while the model generates, as before.
 
-**vLLM and SGLang in flight** (#80). While a model is loaded, llama-watch
-keeps one connection to llama-swap's `GET /api/events` (Server-Sent
+**vLLM and SGLang in flight** (#80). While llama-swap answers (since
+#167; before, while a model was loaded), llama-watch keeps one connection to llama-swap's `GET /api/events` (Server-Sent
 Events, on a thread of its own so it never holds the poller; lines and
 frames capped at 256 KiB, the ~100 KB log history v256 sends on connect
 read through and dropped; reconnect after 1 s, doubling to 30 s; one

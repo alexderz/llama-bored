@@ -15,8 +15,8 @@ use llama_watch::setup_rules::{LiveCtx, Rules};
 use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
-    Activity, HeaderClaim, HealthSeg, HealthStatus, JobView, SetupItem, SetupRow, SetupView, Slot,
-    TtyModel, WatchState, layout, layout_exact, replay_shown,
+    Activity, HeaderClaim, HeaderDisplaced, HeaderGpu, HealthSeg, HealthStatus, JobView, SetupItem,
+    SetupRow, SetupView, Slot, TtyModel, WatchState, layout, layout_exact, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -2262,6 +2262,8 @@ fn sample(state: WatchState) -> TtyModel {
         job_note: None,
         model_id: String::new(),
         claims: Vec::new(),
+        gpu: None,
+        displaced: Vec::new(),
         now: UNIX_EPOCH,
         disk_read_bps: None,
         disk_write_bps: None,
@@ -2645,6 +2647,8 @@ fn health(state: WatchState) -> Vec<HealthSeg> {
         name: name.to_string(),
         status,
         note: note.to_string(),
+        word_cells: 0,
+        note_cells: 0,
     };
     match state {
         WatchState::Generating => vec![
@@ -6640,6 +6644,7 @@ fn hold_claim() -> HeaderClaim {
         hold_until: Some(claim_now() + Duration::from_secs(2 * 3600 + 43 * 60)),
         hold_tz_offset_s: 0,
         hold_reason: "overnight eval, do not unload".to_owned(),
+        conditional: false,
     }
 }
 
@@ -6708,11 +6713,19 @@ fn header_claim_four_forms_at_192() {
         h_short.contains("claim chat-ui") && h_short.contains("0:41 left"),
         "{h_short}"
     );
+    // #167: `on <model>` takes room, so at 192 the reason is cut first.
     assert!(
         h_hold.contains("hold operator")
             && h_hold.contains("until 21:30")
-            && h_hold.contains("overnight eval, do not unload"),
+            && h_hold.contains("overnight"),
         "{h_hold}"
+    );
+    let h_wide = header_line(&hold, 286);
+    assert!(
+        h_wide.contains(
+            "hold operator on qwen3.6-35b-a3b · until 21:30 · overnight eval, do not unload"
+        ),
+        "{h_wide}"
     );
     let grid = draw(&in_use, 192, 60);
     let text = row_string(&grid, 0);
@@ -6738,7 +6751,8 @@ fn header_claim_four_forms_at_192() {
     let hold_at = char_at(&text, "hold");
     assert_eq!(grid.get(hold_at as u16, 0).unwrap().fg, C16::Yellow);
     let until = char_at(&text, "until 21:30");
-    assert_eq!(grid.get(until as u16, 0).unwrap().fg, C16::BrightWhite);
+    // #167: a hold's end is the mock-ups' bright yellow.
+    assert_eq!(grid.get(until as u16, 0).unwrap().fg, C16::BrightYellow);
     let reason = char_at(&text, "overnight");
     assert_eq!(grid.get(reason as u16, 0).unwrap().fg, C16::White);
 }
@@ -6747,6 +6761,12 @@ fn header_claim_four_forms_at_192() {
 fn header_claim_hour_form_and_zero_at_expiry() {
     let now = claim_now();
     let hour = header_claim_model(HeaderClaim {
+        model: "qwen3.6-35b-a3b".to_owned(),
+        holder: "eval-runner".to_owned(),
+        expires_at: Some(now + Duration::from_secs(3600 + 45 * 60)),
+        ..HeaderClaim::default()
+    });
+    let minutes = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
         expires_at: Some(now + Duration::from_secs(3600 + 5 * 60)),
@@ -6758,13 +6778,19 @@ fn header_claim_hour_form_and_zero_at_expiry() {
         expires_at: Some(now - Duration::from_secs(1)),
         ..HeaderClaim::default()
     });
+    // #167: `M:SS` up to 99:59, the hour form from 100 minutes.
     assert!(
-        header_line(&hour, 192).contains("1 h 05 min left"),
+        header_line(&hour, 192).contains("1 h 45 min left"),
         "{}",
         header_line(&hour, 192)
     );
     assert!(
-        header_line(&past, 192).contains("0:00 left"),
+        header_line(&minutes, 192).contains("65:00 left"),
+        "{}",
+        header_line(&minutes, 192)
+    );
+    assert!(
+        header_line(&past, 192).contains(" 0:00 left"),
         "{}",
         header_line(&past, 192)
     );
@@ -6790,16 +6816,20 @@ fn header_claim_covers_160_192_213() {
     }
 }
 
+/// #167: a claim on another model draws too, with `on <model>`. Before
+/// #167 only the header model's claim was drawn.
 #[test]
-fn header_claim_for_another_model_draws_nothing() {
+fn header_claim_for_another_model_draws_with_its_model() {
     let mut model = header_claim_model(hold_claim());
     model.model_id = "other".to_owned();
-    let with = header_line(&model, 192);
-    let mut blank = model.clone();
-    blank.claims.clear();
-    let without = header_line(&blank, 192);
-    assert_eq!(with, without);
-    assert!(!with.contains("operator"), "{with}");
+    let with = header_line(&model, 213);
+    assert!(
+        with.contains("hold operator on qwen3.6-35b-a3b \u{00B7} until 21:30"),
+        "{with}"
+    );
+    // With nothing loaded too.
+    model.model_id = String::new();
+    assert!(header_line(&model, 213).contains("hold operator on qwen3.6-35b-a3b"));
 }
 
 #[test]
@@ -6841,6 +6871,9 @@ fn header_claim_does_not_overlap_the_clock() {
     }
 }
 
+/// Nothing claimed or reserved draws nothing (#128, #167): no claims, no
+/// reservation (or one without a holder), and only displaced notes older
+/// than ten minutes.
 #[test]
 fn no_claims_is_byte_identical_to_today() {
     let today = sample(WatchState::Generating);
@@ -6848,8 +6881,15 @@ fn no_claims_is_byte_identical_to_today() {
     empty.claims.clear();
     empty.model_id = "qwen3.6-35b-a3b".to_owned();
     let mut other = empty.clone();
-    other.claims = vec![hold_claim()];
-    other.model_id = "other".to_owned();
+    other.now = claim_now();
+    other.gpu = Some(HeaderGpu::default());
+    other.displaced = vec![HeaderDisplaced {
+        model: "tiel-coder".to_owned(),
+        to: "qwen-27b".to_owned(),
+        by: "bakeoff".to_owned(),
+        at: claim_now() - Duration::from_secs(10 * 60),
+        tz_offset_s: 0,
+    }];
     for cols in [160u16, 192, 213] {
         let a = draw(&today, cols, 60);
         let b = draw(&empty, cols, 60);
@@ -6858,7 +6898,7 @@ fn no_claims_is_byte_identical_to_today() {
         assert_eq!(
             console_bytes(&a),
             console_bytes(&c),
-            "{cols} other-model claim"
+            "{cols} empty reservation, old note"
         );
         let ga = layout_exact(&today, cols, 60);
         let gb = layout_exact(&empty, cols, 60);
@@ -7100,8 +7140,9 @@ fn header_claim_is_not_drawn_when_swap_does_not_fit() {
     );
 }
 
+/// #167: every claim draws, in order; before, only the first did.
 #[test]
-fn two_claims_on_the_same_model_draw_the_first() {
+fn two_claims_on_the_same_model_both_draw_in_order() {
     let mut model = header_claim_model(HeaderClaim {
         model: "qwen3.6-35b-a3b".to_owned(),
         holder: "eval-runner".to_owned(),
@@ -7114,11 +7155,14 @@ fn two_claims_on_the_same_model_draw_the_first() {
         in_use: false,
         ..HeaderClaim::default()
     });
-    let header = header_line(&model, 192);
-    assert!(header.contains("eval-runner"), "{header}");
-    assert!(!header.contains("chat-ui"), "{header}");
+    let header = header_line(&model, 213);
+    let first = header.find("claim eval-runner").expect("first");
+    let second = header.find("claim chat-ui").expect("second");
+    assert!(first < second, "{header}");
 }
 
+/// The header model's claim comes first and matches on the full id (#128,
+/// #167).
 #[test]
 fn header_matches_the_full_llama_swap_id() {
     let q4 = "unsloth-Qwen3.6-35B-A3B-Instruct-UD-Q4_K_XL";
@@ -7136,13 +7180,15 @@ fn header_matches_the_full_llama_swap_id() {
         in_use: true,
         ..HeaderClaim::default()
     });
-    let header = header_line(&model, 192);
-    assert!(header.contains("eval-runner"), "{header}");
-    assert!(!header.contains("chat-ui"), "{header}");
+    let before = |header: &str, a: &str, b: &str| {
+        let first = header.find(a).unwrap_or_else(|| panic!("{a}: {header}"));
+        header.find(b).is_none_or(|second| first < second)
+    };
+    let header = header_line(&model, 213);
+    assert!(before(&header, "eval-runner", "chat-ui"), "{header}");
     model.model_id = q6.to_owned();
-    let header = header_line(&model, 192);
-    assert!(header.contains("chat-ui"), "{header}");
-    assert!(!header.contains("eval-runner"), "{header}");
+    let header = header_line(&model, 213);
+    assert!(before(&header, "chat-ui", "eval-runner"), "{header}");
 }
 
 const CLAIMS_GOLDENS: [(&str, u16, u16); 1] = [("claims-192.json", 192, 60)];
@@ -8075,6 +8121,8 @@ fn health_line_shows_disk_net_and_psi() {
             name: name.to_owned(),
             status,
             note: String::new(),
+            word_cells: 0,
+            note_cells: 0,
         });
     }
     let row = row_string(&draw(&model, 240, 67), 65);
@@ -8115,7 +8163,8 @@ fn long_tail(model: &mut TtyModel) -> String {
     model.snapshot_age = "12.3s".to_string();
     model.errors = 12_345;
     model.uptime = "123d04h12m".to_string();
-    "snapshot #123456789 12.3s   errors 12345   up 123d04h12m".to_string()
+    // #167: the age keeps six cells; longer numbers take what they need.
+    "snapshot #123456789  12.3s   errors 12345   up 123d04h12m".to_string()
 }
 
 fn all_down() -> Vec<HealthSeg> {
@@ -8141,6 +8190,8 @@ fn all_down() -> Vec<HealthSeg> {
         } else {
             String::new()
         },
+        word_cells: 0,
+        note_cells: 0,
     })
     .collect()
 }
@@ -8152,6 +8203,8 @@ fn with_host_health(disk: HealthStatus, net: HealthStatus, psi: HealthStatus) ->
             name: name.to_owned(),
             status,
             note: String::new(),
+            word_cells: 0,
+            note_cells: 0,
         });
     }
     model
@@ -8510,20 +8563,30 @@ fn a_claim_still_draws_with_the_gauge_grid() {
         let at = format!("{cols}x{rows}");
         let hold = draw(&gauge_model(), cols, rows);
         let header = row_string(&hold, 0);
+        // #167: `on <model>` while there is room, and the countdown's
+        // five cells.
+        let drawn = |header: &str, head: &str, status: &str| {
+            [
+                format!("{head} on qwen3.6-35b-a3b · {status}"),
+                format!("{head} · {status}"),
+            ]
+            .iter()
+            .any(|form| header.contains(form.as_str()))
+        };
         assert!(
-            header.contains("hold operator · until 21:30"),
+            drawn(&header, "hold operator", "until 21:30"),
             "{at}: {header}"
         );
         let in_use = draw(&claimed(true), cols, rows);
         let header = row_string(&in_use, 0);
         assert!(
-            header.contains("claim eval-runner · in use"),
+            drawn(&header, "claim eval-runner", "in use"),
             "{at}: {header}"
         );
         let idle = draw(&claimed(false), cols, rows);
         let header = row_string(&idle, 0);
         assert!(
-            header.contains("claim eval-runner · 4:05 left"),
+            drawn(&header, "claim eval-runner", " 4:05 left"),
             "{at}: {header}"
         );
         for grid in [&hold, &in_use, &idle] {
@@ -8883,4 +8946,515 @@ fn a_tty_blocked_sensor_never_reaches_the_screen() {
             "{cols}x{rows}\n{open}"
         );
     }
+}
+
+// ---- #167: the GPU reservation and every claim in the header ------------
+
+/// A health line as the watcher builds it since #167: latencies in five
+/// cells, `/slots` keeping the room of `idle`. `ms` is every latency.
+fn fixed_health(ms: &str, slots: HealthStatus) -> Vec<HealthSeg> {
+    let seg = |name: &str, status: HealthStatus, note: &str, word: usize, cells: usize| HealthSeg {
+        name: name.to_owned(),
+        status,
+        note: note.to_owned(),
+        word_cells: word,
+        note_cells: cells,
+    };
+    vec![
+        seg("llama-swap", HealthStatus::Ok, ms, 0, 5),
+        seg("/running", HealthStatus::Ok, "", 0, 0),
+        seg("/slots", slots, ms, 4, 5),
+        seg("metrics", HealthStatus::Ok, ms, 0, 5),
+        seg("activity", HealthStatus::Ok, ms, 0, 5),
+        seg("nvml", HealthStatus::Ok, "", 0, 0),
+        seg("hwmon", HealthStatus::Ok, "", 0, 0),
+        seg("proc", HealthStatus::Ok, "", 0, 0),
+        seg("disk", HealthStatus::Ok, "", 0, 0),
+        seg("net", HealthStatus::Ok, "", 0, 0),
+        seg("psi", HealthStatus::Ok, "", 0, 0),
+    ]
+}
+
+fn at(text: &str) -> std::time::SystemTime {
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(parse_rfc3339(text).expect("rfc3339")).unwrap())
+}
+
+/// The header of the mock-ups: no model, idle slots, `swap none`, with the
+/// #167 health line. Invented names throughout.
+fn reservation_base(state: WatchState) -> TtyModel {
+    let mut model = sample(state);
+    model.now = claim_now();
+    model.tz_offset_s = 0;
+    model.model_name = "--".to_owned();
+    model.model_detail = String::new();
+    model.model_id = String::new();
+    model.slots_line = "0/0 idle".to_owned();
+    model.swap_line = "none".to_owned();
+    model.setup = None;
+    model.health = fixed_health("  9ms", HealthStatus::Idle);
+    model.snapshot = Some(33_711);
+    model.snapshot_age = "0.0s".to_owned();
+    model.errors = 0;
+    model.uptime = "9m59s".to_owned();
+    model
+}
+
+fn serving(state: WatchState, name: &str, id: &str) -> TtyModel {
+    let mut model = reservation_base(state);
+    model.model_name = name.to_owned();
+    model.model_id = id.to_owned();
+    model.slots_line = if state == WatchState::Generating {
+        "1/1 busy".to_owned()
+    } else {
+        "0/1 idle".to_owned()
+    };
+    model.health = fixed_health(" 14ms", HealthStatus::Ok);
+    model
+}
+
+fn idle_claim_on(model: &str, holder: &str, secs: u64) -> HeaderClaim {
+    HeaderClaim {
+        model: model.to_owned(),
+        holder: holder.to_owned(),
+        expires_at: Some(claim_now() + Duration::from_secs(secs)),
+        ..HeaderClaim::default()
+    }
+}
+
+/// 1: the GPU held for a queue, with a reason, nothing loaded.
+fn state_gpu_held() -> TtyModel {
+    let mut model = reservation_base(WatchState::Ready);
+    model.gpu = Some(HeaderGpu {
+        holder: "bakeoff".to_owned(),
+        hold_until: Some(at("2026-10-13T21:01:00Z")),
+        hold_reason: "nightly model evals, do not unload".to_owned(),
+        ..HeaderGpu::default()
+    });
+    model
+}
+
+/// 2: a claim on the model being served, `secs` left.
+fn state_served_claim(secs: u64) -> TtyModel {
+    let mut model = serving(WatchState::Ready, "Tiel Coder 35B-A3B", "tiel-coder");
+    model.claims = vec![idle_claim_on("tiel-coder", "opencode", secs)];
+    model
+}
+
+/// 3: the GPU reserved and in use, a guest claim under it on the served
+/// model, a hold on a model that is not loaded.
+fn state_in_use_guest_other() -> TtyModel {
+    let mut model = serving(WatchState::Generating, "Qwen 27B", "qwen-27b");
+    model.gpu = Some(HeaderGpu {
+        holder: "bakeoff".to_owned(),
+        in_use: true,
+        ..HeaderGpu::default()
+    });
+    model.claims = vec![
+        HeaderClaim {
+            model: "tiel-coder".to_owned(),
+            holder: "eval-runner".to_owned(),
+            hold_until: Some(at("2026-10-12T23:30:00Z")),
+            hold_reason: "nightly evals".to_owned(),
+            ..HeaderClaim::default()
+        },
+        HeaderClaim {
+            conditional: true,
+            ..idle_claim_on("qwen-27b", "opencode", 4 * 60 + 12)
+        },
+    ];
+    model
+}
+
+/// 4: the GPU handed to work outside llama-swap, models still stopping.
+fn state_external_draining() -> TtyModel {
+    let mut model = reservation_base(WatchState::Ready);
+    model.gpu_busy = true;
+    model.slots_line = "--".to_owned();
+    model.swap_line = "--".to_owned();
+    model.gpu = Some(HeaderGpu {
+        holder: "bakeoff".to_owned(),
+        external: true,
+        draining: true,
+        expires_at: Some(claim_now() + Duration::from_secs(42)),
+        ..HeaderGpu::default()
+    });
+    model
+}
+
+/// 5: a claim displaced three minutes ago by the reservation's holder.
+fn state_displaced() -> TtyModel {
+    let mut model = serving(WatchState::Generating, "Qwen 27B", "qwen-27b");
+    model.gpu = Some(HeaderGpu {
+        holder: "bakeoff".to_owned(),
+        expires_at: Some(claim_now() + Duration::from_secs(23 * 60 + 58)),
+        ..HeaderGpu::default()
+    });
+    model.displaced = vec![HeaderDisplaced {
+        model: "tiel-coder".to_owned(),
+        to: "qwen-27b".to_owned(),
+        by: "bakeoff".to_owned(),
+        at: claim_now() - Duration::from_secs(3 * 60),
+        tz_offset_s: 0,
+    }];
+    model
+}
+
+/// 6: nothing claimed or reserved.
+fn state_nothing() -> TtyModel {
+    serving(WatchState::Ready, "Tiel Coder 35B-A3B", "tiel-coder")
+}
+
+type StateFn = fn() -> TtyModel;
+
+const GPU_STATES: [(&str, StateFn); 6] = [
+    ("held", state_gpu_held),
+    ("served-claim", || state_served_claim(9 * 60 + 59)),
+    ("in-use-guest-other", state_in_use_guest_other),
+    ("external-draining", state_external_draining),
+    ("displaced", state_displaced),
+    ("nothing", state_nothing),
+];
+
+const GPU_SIZES: [(u16, u16); 3] = [(213, 60), (192, 60), (160, 26)];
+
+fn gpu_golden_name(state: &str, cols: u16, rows: u16) -> String {
+    if rows == 60 {
+        format!("gpu-{state}-{cols}.json")
+    } else {
+        format!("gpu-{state}-{cols}x{rows}.json")
+    }
+}
+
+/// #167: every state at 213x60, 192x60 and 160x26, character and colour.
+#[test]
+fn gpu_claims_goldens_match_character_and_colour() {
+    for (state, model) in GPU_STATES {
+        for (cols, rows) in GPU_SIZES {
+            let name = gpu_golden_name(state, cols, rows);
+            let fix = load(&name);
+            assert_eq!((fix.w, fix.h), (cols, rows), "{name}");
+            assert_frame(&name, &fix, &model());
+        }
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #167 GPU and claims goldens"]
+fn dump_gpu_claims_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (state, model) in GPU_STATES {
+        for (cols, rows) in GPU_SIZES {
+            let grid = draw(&model(), cols, rows);
+            let name = gpu_golden_name(state, cols, rows);
+            std::fs::write(dir.join(name), dump_grid(&grid)).expect("write #167 golden");
+        }
+    }
+}
+
+#[test]
+#[ignore = "dev tool: print the #167 header and health rows as text"]
+fn print_gpu_claims_rows() {
+    for (state, model) in GPU_STATES {
+        for (cols, rows) in GPU_SIZES {
+            let grid = draw(&model(), cols, rows);
+            println!("== {state} {cols}x{rows}");
+            println!("{}", row_string(&grid, 0).trim_end());
+            println!("{}", row_string(&grid, rows - 2).trim_end());
+        }
+    }
+}
+
+/// The claims area of row 0: from after `swap <value>` to the clock block.
+fn claims_text(model: &TtyModel, cols: u16) -> String {
+    let header = header_line(model, cols);
+    let from = header
+        .find(&format!("swap {}", model.swap_line))
+        .map(|at| at + "swap ".len() + model.swap_line.len())
+        .expect("swap");
+    let clock = if cols >= 200 { "COOL" } else { "2026-09-23" };
+    let to = header.find(clock).expect("clock");
+    header[from..to].trim().to_owned()
+}
+
+/// #167: the order, words and forms of the mock-ups, in full at 286
+/// columns, and as the shedding order leaves them at 213.
+#[test]
+fn gpu_claims_text_at_286_and_213() {
+    for (state, full, at_213) in [
+        (
+            state_gpu_held(),
+            "gpu bakeoff · hold until 10-13 21:01 · nightly model evals, do not unload",
+            "gpu bakeoff · hold until 10-13 21:01 · nightly model evals, do not unload",
+        ),
+        (
+            state_served_claim(599),
+            "claim opencode on tiel-coder ·  9:59 left",
+            "claim opencode on tiel-coder ·  9:59 left",
+        ),
+        (
+            state_in_use_guest_other(),
+            "gpu bakeoff · in use   guest opencode on qwen-27b ·  4:12 left   \
+             hold eval-runner on tiel-coder · until 23:30 · nightly evals",
+            "gpu bakeoff · in use   guest opencode on qwen-27b ·  4:12 left   +1 more",
+        ),
+        (
+            state_external_draining(),
+            "gpu bakeoff · external · draining ·  0:42 left",
+            "gpu bakeoff · external · draining ·  0:42 left",
+        ),
+        (
+            state_displaced(),
+            "gpu bakeoff · 23:58 left   displaced tiel-coder -> qwen-27b by bakeoff 18:44",
+            "bakeoff · 23:58 left   tiel-coder -> qwen-27b by bakeoff 18:44",
+        ),
+        (state_nothing(), "", ""),
+    ] {
+        assert_eq!(claims_text(&state, 286), full);
+        assert_eq!(claims_text(&state, 213), at_213);
+    }
+}
+
+/// #167 colours, as the mock-ups: holders bright cyan, `hold` yellow, a
+/// hold's end bright yellow, in use bright green, `draining` in slot 6
+/// (the palette's orange), labels and `on` grey, models and reasons white.
+#[test]
+fn gpu_claims_colours_follow_the_mock_ups() {
+    let fg = |model: &TtyModel, needle: &str| {
+        let grid = draw(model, 286, 60);
+        let text = row_string(&grid, 0);
+        grid.get(char_at(&text, needle) as u16, 0).unwrap().fg
+    };
+    let held = state_gpu_held();
+    assert_eq!(fg(&held, "gpu bakeoff"), C16::BrightBlack);
+    assert_eq!(fg(&held, "bakeoff"), C16::BrightCyan);
+    assert_eq!(fg(&held, "hold until"), C16::BrightYellow);
+    assert_eq!(fg(&held, "approved"), C16::White);
+    let busy = state_in_use_guest_other();
+    assert_eq!(fg(&busy, "in use"), C16::BrightGreen);
+    assert_eq!(fg(&busy, "guest"), C16::BrightBlack);
+    assert_eq!(fg(&busy, "opencode"), C16::BrightCyan);
+    assert_eq!(fg(&busy, " on qwen-27b"), C16::BrightBlack);
+    assert_eq!(fg(&busy, "qwen-27b ·"), C16::White);
+    assert_eq!(fg(&busy, "4:12 left"), C16::BrightWhite);
+    assert_eq!(fg(&busy, "hold eval"), C16::Yellow);
+    assert_eq!(fg(&busy, "eval-runner"), C16::BrightCyan);
+    assert_eq!(fg(&busy, "until 23:30"), C16::BrightYellow);
+    assert_eq!(fg(&busy, "nightly"), C16::White);
+    let out = state_external_draining();
+    assert_eq!(fg(&out, "external"), C16::White);
+    assert_eq!(fg(&out, "draining"), C16::Cyan);
+    assert_eq!(fg(&out, "0:42 left"), C16::Yellow, "under a minute");
+    let gone = state_displaced();
+    assert_eq!(fg(&gone, "displaced"), C16::BrightBlack);
+    assert_eq!(fg(&gone, "tiel-coder"), C16::White);
+    assert_eq!(fg(&gone, " -> "), C16::BrightBlack);
+    assert_eq!(fg(&gone, "by bakeoff"), C16::BrightBlack);
+    assert_eq!(fg(&gone, "18:44"), C16::White);
+}
+
+/// #167 at every size: the area stops two cells before the clock block, no
+/// holder is cut, and the claims area is the only change to the row.
+#[test]
+fn gpu_claims_fit_every_size_without_cutting_a_holder() {
+    for (state, model) in GPU_STATES {
+        let model = model();
+        let mut blank = model.clone();
+        blank.claims.clear();
+        blank.gpu = None;
+        blank.displaced.clear();
+        for cols in 160u16..=240 {
+            let header: Vec<char> = header_line(&model, cols).chars().collect();
+            let plain: Vec<char> = header_line(&blank, cols).chars().collect();
+            let clock = if cols >= 200 { "COOL" } else { "2026-09-23" };
+            let end = find_cells(&header, clock).expect("clock");
+            let text: String = header.iter().collect();
+            assert_eq!(&header[end..], &plain[end..], "{state} {cols}");
+            let left: String = header[..end]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            assert!(left.chars().count() + 2 <= end, "{state} {cols}: {text}");
+            let base: String = plain[..end]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            assert!(left.starts_with(&base), "{state} {cols}: {text}");
+            let area = &left[base.len()..];
+            for holder in ["bakeoff", "opencode", "eval-runner"] {
+                let head = &holder[..holder.len() - 1];
+                assert!(
+                    area.contains(holder) || !area.contains(head),
+                    "{state} {cols}: {holder} cut: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// Columns of each word of `text` that follows `after`, numbers left out.
+fn words_after(text: &str, after: usize) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut col = after;
+    while col < chars.len() {
+        if chars[col] != ' ' && (col == 0 || chars[col - 1] == ' ') {
+            let word: String = chars[col..].iter().take_while(|c| **c != ' ').collect();
+            if !word.starts_with(|c: char| c.is_ascii_digit()) {
+                out.push((col, word));
+            }
+        }
+        col += 1;
+    }
+    out
+}
+
+/// #167: nothing right of a number moves when it grows a digit: 9 to 10
+/// ms and 99 to 100 ms on the health line, `9:59` to `10:00` in the header
+/// (a claim's and the reservation's), and the health tail's numbers.
+#[test]
+fn nothing_right_of_a_number_moves() {
+    let row = |model: &TtyModel, cols: u16, rows: u16, row: u16| {
+        row_string(&draw(model, cols, rows), row)
+    };
+    for (cols, rows) in GPU_SIZES {
+        let health = |ms: &str| {
+            let mut model = state_nothing();
+            model.health = fixed_health(ms, HealthStatus::Ok);
+            row(&model, cols, rows, rows - 2)
+        };
+        for (a, b) in [("  9ms", " 10ms"), (" 99ms", "100ms")] {
+            let (ra, rb) = (health(a), health(b));
+            let at = ra.find(a).expect("number");
+            assert_eq!(
+                words_after(&ra, at + a.len()),
+                words_after(&rb, at + b.len()),
+                "{cols}x{rows} {a} -> {b}\n{ra}\n{rb}"
+            );
+        }
+        // `/slots` keeps the room of `idle`.
+        let mut ok = state_nothing();
+        ok.health = fixed_health("  9ms", HealthStatus::Ok);
+        let mut idle = ok.clone();
+        idle.health = fixed_health("  9ms", HealthStatus::Idle);
+        let (ro, ri) = (
+            row(&ok, cols, rows, rows - 2),
+            row(&idle, cols, rows, rows - 2),
+        );
+        let at = ro.find("/slots").expect("/slots") + "/slots idle".len();
+        assert_eq!(
+            words_after(&ro, at),
+            words_after(&ri, at),
+            "{cols}x{rows}\n{ro}\n{ri}"
+        );
+
+        // The tail: snapshot, age, errors, uptime.
+        let tail = |seq: u64, age: &str, errors: u64, up: &str| {
+            let mut model = state_nothing();
+            model.snapshot = Some(seq);
+            model.snapshot_age = age.to_owned();
+            model.errors = errors;
+            model.uptime = up.to_owned();
+            row(&model, cols, rows, rows - 2)
+        };
+        let small = tail(9, "0.1s", 9, "9m59s");
+        let big = tail(9_999_999, "1h10m", 10, "1h10m00s");
+        let words = |text: &str| -> Vec<usize> {
+            ["errors", "up"]
+                .iter()
+                .map(|w| text.rfind(&format!("{w} ")).expect("word"))
+                .collect()
+        };
+        assert_eq!(words(&small), words(&big), "{cols}x{rows}\n{small}\n{big}");
+        assert_eq!(small.find("snapshot"), big.find("snapshot"));
+        assert_eq!(small.len(), big.len());
+
+        // The header countdowns, a claim's and the reservation's.
+        for (a, b) in [
+            (state_served_claim(9 * 60 + 59), state_served_claim(10 * 60)),
+            (
+                {
+                    let mut m = state_displaced();
+                    m.gpu.as_mut().unwrap().expires_at =
+                        Some(claim_now() + Duration::from_secs(599));
+                    m
+                },
+                {
+                    let mut m = state_displaced();
+                    m.gpu.as_mut().unwrap().expires_at =
+                        Some(claim_now() + Duration::from_secs(600));
+                    m
+                },
+            ),
+        ] {
+            let (ha, hb) = (row(&a, cols, rows, 0), row(&b, cols, rows, 0));
+            let at = ha.find("9:59 left").expect("9:59") + "9:59".len();
+            assert_eq!(
+                hb.find("10:00 left").map(|x| x + "10:00".len()),
+                Some(at),
+                "{hb}"
+            );
+            assert_eq!(
+                words_after(&ha, at),
+                words_after(&hb, at),
+                "{cols}x{rows}\n{ha}\n{hb}"
+            );
+        }
+    }
+}
+
+/// A displaced note shows for ten minutes after it happened; in the future
+/// (a clock step) it shows too.
+#[test]
+fn a_displaced_note_shows_for_ten_minutes() {
+    let mut model = state_displaced();
+    model.gpu = None;
+    for (ago, shown) in [(0i64, true), (599, true), (600, false), (-60, true)] {
+        let at = if ago >= 0 {
+            claim_now() - Duration::from_secs(ago.unsigned_abs())
+        } else {
+            claim_now() + Duration::from_secs(ago.unsigned_abs())
+        };
+        model.displaced[0].at = at;
+        assert_eq!(
+            claims_text(&model, 213).contains("displaced tiel-coder"),
+            shown,
+            "{ago}"
+        );
+    }
+}
+
+/// #167: with text off, the `text off` tag keeps its room: the claims area
+/// stops short of it, even when a reason could fill the row.
+#[test]
+fn text_off_keeps_its_tag_beside_the_claims() {
+    for (cols, _) in GPU_SIZES {
+        let mut model = state_gpu_held();
+        model.show_text = false;
+        let header = header_line(&model, cols);
+        let tag = header
+            .find("text off")
+            .unwrap_or_else(|| panic!("{cols}: {header}"));
+        let holder = header.find("gpu bakeoff").expect("holder");
+        assert!(holder < tag, "{cols}: {header}");
+        let clock = if cols >= 200 { "COOL" } else { "2026-09-23" };
+        let end = header.find(clock).expect("clock");
+        assert!(tag + "text off".len() + 2 <= end, "{cols}: {header}");
+        assert!(
+            header[holder..tag].contains("hold until"),
+            "{cols}: {header}"
+        );
+    }
+    // At 160x26 the reason is cut to make room for the tag.
+    let mut model = state_gpu_held();
+    model.show_text = false;
+    let header = header_line(&model, 160);
+    assert!(header.contains('\u{2026}'), "{header}");
+    // Text on, nothing is held back: the row is as before.
+    let header = header_line(&state_gpu_held(), 160);
+    assert!(
+        header.contains("nightly model evals, do n\u{2026}"),
+        "{header}"
+    );
 }

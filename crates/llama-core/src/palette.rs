@@ -25,7 +25,7 @@
 //! | 3    | yellow         | `#FFB030` | blackbody 120 | warnings: `AI DOWN`, stuck model, `ERR` badge, alarm bands (background), error count, capacity 40–70 % (lower) |
 //! | 4    | blue           | `#1428D8` | L1 (0)        | spectrum step 1, capacity under 15 % (lower) |
 //! | 5    | magenta        | `#7A1FE8` | L3 (40)       | spectrum step 3 |
-//! | 6    | cyan           | `#FF8A1E` | blackbody 114 | spare heat colour (the layout draws nothing in slot 6 today) |
+//! | 6    | cyan           | `#FF8A1E` | blackbody 114 | orange: `draining` beside a GPU reservation in the header (#167) |
 //! | 7    | white          | `#C8C8C8` | grey          | text and labels (default foreground), capacity 70–100 % (lower) |
 //! | 8    | bright black   | `#686868` | grey          | dim text, rules, axis labels, empty bar track |
 //! | 9    | bright red     | `#F21E5A` | L5 (80)       | spectrum step 5, live: `GENERATING`, `gen`, `>`, output cursor; reset mark `v`; capacity over 100 % (upper) |

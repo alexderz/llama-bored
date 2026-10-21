@@ -298,6 +298,16 @@ fn reply(world: &mut World, path: &str) -> Action {
             location: None,
         };
     }
+    // #167: the events thread's one read before each stream; a build
+    // without reservations.
+    if path == "/api/gpu" {
+        return Action::Respond {
+            status: 404,
+            reason: "Not Found",
+            body: Vec::new(),
+            location: None,
+        };
+    }
     if let Some(id) = path.strip_prefix("/api/captures/") {
         return match world.captures.get(id) {
             Some(body) => Action::Respond {
@@ -966,6 +976,8 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 requests: Vec::new(),
                 jobs: Vec::new(),
                 claims: Vec::new(),
+                gpu: None,
+                displaced: Vec::new(),
             },
         ));
     }
@@ -1604,7 +1616,7 @@ fn a_llamacpp_image_gets_its_flags_once_its_metrics_say_llamacpp() {
     let hits: Vec<String> = server
         .hits()
         .into_iter()
-        .filter(|path| path != "/api/events")
+        .filter(|path| path != "/api/events" && path != "/api/gpu")
         .collect();
     assert_eq!(
         hits[..8],
@@ -2319,10 +2331,12 @@ fn allowed_path(path: &str) -> bool {
     let capture = path
         .strip_prefix("/api/captures/")
         .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-    // #80, #128: llama-swap's event stream, while a model is ready.
+    // #80, #128: llama-swap's event stream; #167: its `GET /api/gpu`, both
+    // while llama-swap answers.
     path == "/running"
         || path == "/api/metrics/activity"
         || path == "/api/events"
+        || path == "/api/gpu"
         || upstream
         || capture
 }
@@ -3494,10 +3508,10 @@ fn engine_numbers(view: &LlamaView) -> bool {
 /// followed by one: the fresh gate and its self-check (#70).
 fn assert_gated(hits: &[String]) {
     // #80: `/api/events` is another thread's connection, not an upstream
-    // read; it may land anywhere in the order.
+    // read; it may land anywhere in the order. So is `/api/gpu` (#167).
     let hits: Vec<String> = hits
         .iter()
-        .filter(|path| *path != "/api/events")
+        .filter(|path| *path != "/api/events" && *path != "/api/gpu")
         .cloned()
         .collect();
     let hits = hits.as_slice();
