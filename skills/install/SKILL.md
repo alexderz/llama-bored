@@ -473,7 +473,7 @@ config: `targets: ["<this-host>:19477"]`, job name `llamabored`.
    must print `0`.
 5. **tty11 content.** Ask the human to check tty11 (Ctrl+Alt+F11): the ACTIVITY row names
    its source (`gpu`, `cpu`, or `util` when no power sensor is readable); if
-   `[fans]` is on, the FANS panel shows the chosen channels; with
+   `[fans]` is on, the fan gauges show the chosen channels; with
    `show_text = false` the header says "text off". Confirm the fan panel did
    not change anything: `pwmN_enable` of that chip is as before.
 6. **llama-view:** `usermod -aG llama-view "$BUILD_USER"`, then (in a new
