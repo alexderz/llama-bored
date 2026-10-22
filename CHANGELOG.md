@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.7.1 — 2026-10-22
+
+A small tty11 follow-up to 0.7.0. The model's SETUP block (engine, quant, context, KV, experts, speculative decoding, thinking and sampling) moves beside the GEN and PROMPT digits from 192 columns, in place of a text block that repeated the gauges; each temperature gauge shows the sensor nearest its own limit; and the big 7 is straight again. Nothing in an existing config needs to change.
+
 ### Changed
 
 - tty11's glance beside the GEN and PROMPT digits (GPU, VRAM, the two HOT rows, DISK, NET, CPU, ACT, LOAD and the state word) is replaced. It is gone at every width, with its HOT rows and their #173 ordering; the gauges on the right show the same. From 192 columns SETUP takes its place: from column 64 on the headline's top row, over the headline's rows, up to one column short of the left half's end, with its title, labels and values at the offsets they have under SLOTS, and it is no longer drawn under SLOTS as well. A row whose items do not fit wraps whole items onto continuation lines in the value column while rows remain, breaking at a ` · ` so a pair joined by a rule's own separator (`kv q8_0 / q8_0`) wraps together unless the pair alone is wider than the room; an item wider than the room has a line of its own and is cut with `…`, and #114's `text` rules hold. Rows that do not fit drop. The title's `+N` counts them, the rows cut short (trailing items left out on their last line; a row whose one item left is cut with `…` is drawn and not counted) and the other loaded models. Under 192 columns the spot beside the digits stays empty and SETUP stays under SLOTS as before, one line a row, where `+N` now also counts the rows cut short (#177).
