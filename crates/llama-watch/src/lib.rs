@@ -24,4 +24,5 @@ pub mod sglang_rows;
 pub mod slots;
 pub mod sources;
 pub mod speeds;
+pub mod tqllm;
 pub mod tty;

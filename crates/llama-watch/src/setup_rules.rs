@@ -29,13 +29,15 @@
 //!   spec, a JSON file the poller already loaded. A missing path, null,
 //!   object or array leaves the field blank. The file itself is not opened
 //!   here.
-//! - `kind = "text"` (#114) is valid only with a `spec:` source. It shows
-//!   a JSON string: whitespace runs collapse to one space, controls are
-//!   dropped, and the value is cut to `max_chars` (default
+//! - `kind = "text"` (#114) is valid only with a `spec:` source, or an
+//!   `engine:` key of [`TEXT_ENGINE_KEYS`] (#180: tqLLM's `/health` `fit`).
+//!   It shows a JSON string: whitespace runs collapse to one space,
+//!   controls are dropped, and the value is cut to `max_chars` (default
 //!   [`DEFAULT_TEXT_CHARS`], at most [`MAX_TEXT_VALUE_CHARS`]). A number,
 //!   boolean, null, object or array shows nothing. The launch command, the
-//!   environment and the engine stay limited to numbers and short tokens,
-//!   so a path or a secret on a command line still cannot reach the screen.
+//!   environment and every other engine key stay limited to numbers and
+//!   short tokens, so a path or a secret on a command line still cannot
+//!   reach the screen.
 //!
 //! [`Rules::rows`] turns the extracted values plus the live engine numbers
 //! into the rows the layout draws.
@@ -46,7 +48,7 @@ use llama_core::backend::{Backend, BackendInfo};
 use llama_core::detail::{ModelDetail, is_token};
 
 use crate::config::{Setup, SetupField};
-use crate::metrics::{ENGINE_KEYS, EngineValues};
+use crate::metrics::{ENGINE_KEYS, EngineValues, TEXT_ENGINE_KEYS};
 use crate::sources::cmdline;
 use crate::tty::layout::{SetupItem, SetupRow};
 
@@ -448,8 +450,16 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
     let source = parse_source(field.source.as_deref())?;
     // Before the source-specific kind errors, so every non-spec source
     // names this rule the same way.
-    if field.kind.as_deref() == Some("text") && !matches!(source, Source::Spec(_)) {
-        return Err(format!("rule {row:?}: kind text needs a spec: source"));
+    let text_source = match &source {
+        Source::Spec(_) => true,
+        Source::Engine(key) => TEXT_ENGINE_KEYS.contains(key),
+        _ => false,
+    };
+    if field.kind.as_deref() == Some("text") && !text_source {
+        return Err(format!(
+            "rule {row:?}: kind text needs a spec: source or engine:{}",
+            TEXT_ENGINE_KEYS.join("/engine:")
+        ));
     }
     let kind = match (&source, field.kind.as_deref()) {
         (Source::Fixed | Source::Live(_) | Source::Engine(_), None) => Kind::Token,
@@ -479,7 +489,7 @@ fn compile_field(field: &SetupField) -> Result<Rule, String> {
         return Err("kind present needs a flag source".to_owned());
     }
     if matches!(source, Source::Engine(_)) && matches!(kind, Kind::Quant | Kind::Present) {
-        return Err("an engine source takes kind number, token or mib".to_owned());
+        return Err("an engine source takes kind number, token, mib or text".to_owned());
     }
     if field.max_chars.is_some() && kind != Kind::Text {
         return Err(format!(
@@ -988,11 +998,12 @@ fn text_skipped(ch: char) -> bool {
 }
 
 /// An engine-reported value for a rule of `kind`: a number for `number`
-/// and `mib`, else a number or a short token.
+/// and `mib`, the sanitised text for `text` (compiled only for a
+/// [`TEXT_ENGINE_KEYS`] key, #180), else a number or a short token.
 fn engine_value(kind: Kind, value: &str) -> Option<String> {
     let ok = match kind {
         Kind::Number | Kind::Mib => is_number(value),
-        Kind::Text => false,
+        Kind::Text => return clean_text(value),
         _ => is_number(value) || is_token(value),
     };
     ok.then(|| value.to_owned())

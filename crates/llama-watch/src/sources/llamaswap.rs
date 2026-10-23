@@ -40,6 +40,8 @@ pub struct RunningModel {
     pub max_running: Option<u16>,
     /// llama.cpp's KV layout from its launch command (#79).
     pub kv: Option<super::cmdline::KvLayout>,
+    /// What a tqLLM launch command said about its KV (#180).
+    pub tq_kv: Option<super::cmdline::TqKv>,
     /// What the `[setup]` rules took from the launch command (#52): numbers
     /// and short tokens only.
     pub setup: Vec<Found>,
@@ -257,6 +259,7 @@ pub(crate) fn parse_body(
                 backend: parsed.backend,
                 max_running: parsed.max_running,
                 kv: parsed.kv,
+                tq_kv: parsed.tq_kv,
                 // The `name` rules (#54) read llama-swap's own `name`.
                 // `spec:` rules read the document while the command is
                 // still here, so `match` still applies (#92).

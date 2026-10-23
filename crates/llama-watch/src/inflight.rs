@@ -27,6 +27,12 @@
 //!   `live.prompt_tokens` gets them, and with them the target track
 //!   ([`Flight::progress`]); any other slot in prefill shows its prompt
 //!   with no target.
+//! - **tqLLM** (#180): one row per active request of its monitor snapshot
+//!   (queued, prefill or decode), told by its `instance_id` and request
+//!   id. `pp` shows `prefill_processed_tokens` against `prompt_tokens`,
+//!   the cached part from `prefill_cached_tokens`, and the live prefill
+//!   tok/s; `gen` the exact output tokens and the live decode tok/s. DUR
+//!   is its `elapsed_ms`: the row starts that long before the poll.
 //! - **vLLM and SGLang** (#80): llama-swap's `/api/events` lists each
 //!   request in flight ([`crate::poller::LiveRequest`]); it is `pp` until
 //!   llama-swap has streamed a byte of its answer and `gen` after, DUR runs
@@ -60,6 +66,7 @@ use std::time::{Duration, Instant, SystemTime};
 use llama_core::backend::Backend;
 
 use crate::activity::ActivityRow;
+use crate::metrics::TqPhase;
 use crate::poller::{LiveRequest, ModelEngineLive};
 use crate::resets::ResetReason;
 use crate::slots::SlotView;
@@ -68,6 +75,9 @@ use crate::slots::SlotView;
 pub const HANDOVER: Duration = Duration::from_secs(3);
 /// Most flights tracked at once.
 pub const MAX_FLIGHTS: usize = 16;
+/// Most queued tqLLM requests shown per model (#180), the next to run
+/// first. Running ones come before them and never make way for them.
+pub const MAX_TQ_QUEUED: usize = 4;
 
 /// One Strata slot's request as last seen (#81), to tell a new one.
 #[derive(Clone, Copy, Debug, Default)]
@@ -146,6 +156,8 @@ pub struct Flight {
     ended: Option<Instant>,
     /// The slot's reset total before the request.
     start_resets: u64,
+    /// A queued tqLLM request (#180): the first to make way for another.
+    queued: bool,
 }
 
 impl Flight {
@@ -188,6 +200,12 @@ enum FlightId {
     Request {
         model: String,
         id: String,
+    },
+    /// A tqLLM request (#180): its id within one engine instance.
+    Snapshot {
+        model: String,
+        instance: String,
+        id: u64,
     },
 }
 
@@ -280,6 +298,10 @@ impl Tracker {
         }
         for engine in poll.engine_live {
             let live = &engine.live;
+            if live.instance.is_some() {
+                self.poll_tqllm(engine, mono, wall, head_seq, &mut seen);
+                continue;
+            }
             if !live.slots().is_empty() {
                 self.poll_strata_slots(engine, mono, wall, head_seq, &mut seen);
                 continue;
@@ -353,7 +375,12 @@ impl Tracker {
                         row.seq > flight.head_seq && row.model == key && !taken.contains(&row.seq)
                     })
                 };
-                let seq = if exact {
+                // #180: tqLLM says when its request ended, so one still
+                // running takes no row, not even one with its prompt.
+                let running_tq = flight.engine == Some(Backend::Tqllm) && flight.ended.is_none();
+                let seq = if exact && running_tq {
+                    None
+                } else if exact {
                     // The row's whole prompt, read per engine (#82); a
                     // prompt still only a lower bound matches no row (#78).
                     flight
@@ -460,6 +487,106 @@ impl Tracker {
         flight.bump_beats(old_processed, old_decoded);
         flight.ended = None;
         seen.push(id);
+    }
+
+    /// One row per active tqLLM request (#180): the running ones first
+    /// (at most [`MAX_FLIGHTS`], oldest id first), then at most
+    /// [`MAX_TQ_QUEUED`] queued ones, the next to run first. A queued one
+    /// never takes a running one's place, and a request still active but
+    /// not shown has no flight, so none ends and takes a row.
+    fn poll_tqllm(
+        &mut self,
+        engine: &ModelEngineLive,
+        mono: Instant,
+        wall: SystemTime,
+        head_seq: u64,
+        seen: &mut Vec<FlightId>,
+    ) {
+        let live = &engine.live;
+        let instance = live.instance.clone().unwrap_or_default();
+        let flight_id = |id: u64| FlightId::Snapshot {
+            model: engine.model.clone(),
+            instance: instance.clone(),
+            id,
+        };
+        let mut running: Vec<&crate::metrics::TqRequest> = live
+            .requests
+            .iter()
+            .map(|entry| &entry.request)
+            .filter(|req| req.phase.is_some_and(TqPhase::running))
+            .collect();
+        let mut queued: Vec<&crate::metrics::TqRequest> = live
+            .requests
+            .iter()
+            .map(|entry| &entry.request)
+            .filter(|req| req.phase == Some(TqPhase::Queued))
+            .collect();
+        running.sort_by_key(|req| req.id);
+        queued.sort_by_key(|req| req.id);
+        running.truncate(MAX_FLIGHTS);
+        queued.truncate(MAX_TQ_QUEUED.min(MAX_FLIGHTS - running.len()));
+        let shown: Vec<FlightId> = running
+            .iter()
+            .chain(&queued)
+            .map(|req| flight_id(req.id))
+            .collect();
+        let hidden: Vec<FlightId> = live
+            .requests
+            .iter()
+            .map(|entry| flight_id(entry.request.id))
+            .filter(|id| !shown.contains(id))
+            .collect();
+        self.flights.retain(|flight| !hidden.contains(&flight.id));
+        for req in running.into_iter().chain(queued) {
+            let id = flight_id(req.id);
+            let waiting = req.phase == Some(TqPhase::Queued);
+            if waiting
+                && self.flights.len() >= MAX_FLIGHTS
+                && !self.flights.iter().any(|flight| flight.id == id)
+            {
+                continue;
+            }
+            // The engine's own clock: the request started this long ago.
+            let elapsed = req.elapsed_ms / 1000.0;
+            let ago = Duration::try_from_secs_f64(elapsed.min(86_400.0)).unwrap_or_default();
+            let started = mono.checked_sub(ago).unwrap_or(mono);
+            let started_wall = wall.checked_sub(ago).unwrap_or(wall);
+            let Some(flight) = self.flight(&id, &engine.model, started, started_wall, head_seq, 0)
+            else {
+                continue;
+            };
+            let decoding = req.phase == Some(TqPhase::Decode);
+            let prompt = req.prompt_tokens.unwrap_or(0);
+            let read = req.prompt_read();
+            let cached = req.cached_read();
+            let (old_processed, old_decoded) = (flight.processed, flight.decoded);
+            // DUR is the engine's `elapsed_ms`, as of this poll.
+            flight.started_mono = started;
+            flight.started_wall = started_wall;
+            flight.polled = mono;
+            flight.prompt = prompt;
+            flight.prompt_known = req.prompt_tokens.is_some();
+            flight.progress = req.prompt_tokens.is_some();
+            flight.cached = cached.min(prompt);
+            flight.cached_unknown = false;
+            flight.processed = if decoding {
+                prompt.saturating_sub(flight.cached)
+            } else {
+                read.saturating_sub(cached)
+                    .min(prompt.saturating_sub(flight.cached))
+            };
+            flight.decoded = req.output_tokens.unwrap_or(0);
+            flight.decoding = decoding;
+            flight.prompt_tps = req.prefill_tps;
+            flight.gen_tps = req.decode_tps;
+            flight.n_ctx = live.slot_ctx.filter(|n| *n > 0);
+            flight.engine = Some(Backend::Tqllm);
+            flight.queued = waiting;
+            flight.prompt_unknown = req.prompt_tokens.is_none();
+            flight.bump_beats(old_processed, old_decoded);
+            flight.ended = None;
+            seen.push(id);
+        }
     }
 
     /// One row per busy Strata batch slot (#81).
@@ -591,7 +718,7 @@ impl Tracker {
                 .flights
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, f)| f.started_mono)
+                .min_by_key(|(_, f)| (!f.queued, f.started_mono))
                 .map(|(i, _)| i)
         {
             self.flights.remove(oldest);
@@ -624,6 +751,7 @@ impl Tracker {
             head_seq,
             ended: None,
             start_resets,
+            queued: false,
         });
         let last = self.flights.len() - 1;
         Some(&mut self.flights[last])

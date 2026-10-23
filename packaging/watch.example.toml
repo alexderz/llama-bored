@@ -26,7 +26,8 @@ output_tail_chars = 24576           # 256..=32768
 # Each model's server is read from its llama-swap cmd: llama-server (any path
 # or fork) is "llamacpp"; sglang.launch_server / sglang serve is "sglang";
 # vllm serve / vllm.entrypoints is "vllm"; serve/server.py --engine strata (or
-# a strata* image running python serve/server.py) is "strata"; anything else is
+# a strata* image running python serve/server.py) is "strata"; tqserve (or
+# --entrypoint tqserve, or a tqllm* image) is "tqllm"; anything else is
 # "openai" (TabbyAPI, ExLlamaV3 or another OpenAI-compatible server). Only
 # llama.cpp has /slots (SLOTS, IN/OUT text). SGLang (start it with
 # --enable-metrics) and vLLM give tok/s, running/queued requests and KV fill

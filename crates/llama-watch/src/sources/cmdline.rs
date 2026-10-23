@@ -8,10 +8,10 @@
 //!
 //! The server is told by its entry point (T72): a `llama-server` binary under
 //! any path, `sglang.launch_server` / `sglang serve`, `vllm serve` /
-//! `vllm.entrypoints`, Strata's `serve/server.py` (see [`strata_at`]), else
-//! any OpenAI-compatible server. A server's flags are read only after its
-//! entry point, so a `podman run ...` wrapper in front cannot lend its own
-//! flags.
+//! `vllm.entrypoints`, Strata's `serve/server.py` (see [`strata_at`]),
+//! tqLLM's `tqserve` (#180, see [`tqllm_container`]), else any
+//! OpenAI-compatible server. A server's flags are read only after its entry
+//! point, so a `podman run ...` wrapper in front cannot lend its own flags.
 //!
 //! A container started by image (`podman run … <image> --flags`) names no
 //! entry point. Once its server is known from elsewhere (`[llama.backends]`
@@ -24,6 +24,8 @@ use llama_core::detail::{MAX_TOKEN_CHARS, ModelDetail, NCMOE_ALL, is_token};
 
 /// KV type shown for SGLang and vLLM when no `--kv-cache-dtype` is given.
 const KV_AUTO: &str = "auto";
+/// tqLLM's KV format when neither `--kv` nor `-ctk` / `-ctv` is given (#180).
+pub const KV_TQLLM: &str = "bf16";
 
 /// What one launch command says about its server.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -33,11 +35,27 @@ pub struct Launch {
     /// Tuning detail. `None` for a server whose flags are not read.
     pub detail: Option<ModelDetail>,
     /// `--max-running-requests` (SGLang) or `--max-num-seqs` (vLLM); 1 for
-    /// Strata, which serves one request at a time.
+    /// Strata, which serves one request at a time; tqLLM's `--np` (1 when
+    /// absent, its default).
     pub max_running: Option<u16>,
     /// llama.cpp's KV layout (#79). `None` for other servers, and for a
     /// command whose flags are not read as llama.cpp's.
     pub kv: Option<KvLayout>,
+    /// What a tqLLM command said about its KV (#180). `None` for other
+    /// servers, and for a command whose flags are not read as tqLLM's.
+    pub tq_kv: Option<TqKv>,
+}
+
+/// What a tqLLM launch command said about its KV cache (#180).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TqKv {
+    /// No `--kv`, `-ctk` or `-ctv`: tqLLM's default, [`KV_TQLLM`], unless
+    /// its memory fit picks a smaller one.
+    Default,
+    /// Named, and every value given is a token: [`Launch::detail`] has it.
+    Named,
+    /// Named, but a value given is not a token: the KV is unknown.
+    Unreadable,
 }
 
 /// How a llama-server lays out its KV cache (#79), from its flags; later
@@ -83,6 +101,7 @@ pub fn parse_launch_as(cmd: &str, known: Option<Backend>) -> Launch {
         detail,
         max_running,
         kv: (reader == Backend::LlamaCpp).then(|| kv_layout(&args[start..])),
+        tq_kv: (reader == Backend::Tqllm).then(|| TqFlags::read(&args[start..]).kv()),
     }
 }
 
@@ -100,6 +119,7 @@ fn read_flags(reader: Backend, args: &[&str]) -> (Option<ModelDetail>, Option<u1
             }),
             Some(1),
         ),
+        Backend::Tqllm => tqllm_flags(args),
         Backend::OpenAi => (None, None),
         Backend::SgLang | Backend::Vllm => server_flags(reader, args),
     }
@@ -206,9 +226,17 @@ fn takes_value(arg: &str) -> bool {
 
 /// The server kind and the index of the first argument after its entry point.
 fn detect(args: &[&str]) -> (Backend, usize) {
+    let image = container_flags(args);
     for (index, arg) in args.iter().enumerate() {
         let base = arg.rsplit('/').next().unwrap_or(arg);
         let next = args.get(index + 1).copied();
+        // #180: `tqserve` as the entry point. A `tqserve` among a
+        // container's own options (`--name tqserve`, `--entrypoint
+        // tqserve`) is not one; the second is told by
+        // [`tqllm_container`] below.
+        if base == "tqserve" && image.is_none_or(|after| index + 1 >= after) {
+            return (Backend::Tqllm, index + 1);
+        }
         if base.starts_with("llama-server") {
             return (Backend::LlamaCpp, index + 1);
         }
@@ -228,7 +256,114 @@ fn detect(args: &[&str]) -> (Backend, usize) {
             return (Backend::Strata, index + 1);
         }
     }
+    if let Some(after) = image.filter(|after| tqllm_container(args, *after)) {
+        return (Backend::Tqllm, after);
+    }
     (Backend::OpenAi, args.len())
+}
+
+/// A word whose base name is `tqserve`, bare or under a directory (#180).
+fn is_tqserve(word: &str) -> bool {
+    word.rsplit('/').next() == Some("tqserve")
+}
+
+/// A container that runs tqLLM (#180), given `after`, the index right
+/// after its image ([`container_flags`]):
+/// - started with `--entrypoint tqserve` (or `--entrypoint=tqserve`, any
+///   path whose base name is `tqserve`) before the image, or
+/// - the image's last path segment starts with `tqllm`
+///   (`ytan2000/tqllm:1.2.3`, `ghcr.io/turbo-tan/tqllm@sha256:…`).
+///
+/// Its flags are read after the image. `tqllm` in a volume, a model path,
+/// or a registry or team segment of another image is not enough.
+fn tqllm_container(args: &[&str], after: usize) -> bool {
+    let Some(at) = after.checked_sub(1) else {
+        return false;
+    };
+    let options = &args[..at];
+    let entry = options.iter().enumerate().any(|(index, arg)| {
+        arg.strip_prefix("--entrypoint=").is_some_and(is_tqserve)
+            || (*arg == "--entrypoint" && options.get(index + 1).is_some_and(|v| is_tqserve(v)))
+    });
+    let image = args[at].rsplit('/').next().unwrap_or_default();
+    entry || image.starts_with("tqllm")
+}
+
+/// tqLLM's flags as given (#180): `None` where a flag is absent, and
+/// `Some(None)` for a KV side given a value that is not a token. Later
+/// flags win; a `--context` or `--np` value that does not parse is ignored.
+#[derive(Default)]
+struct TqFlags {
+    context: Option<u32>,
+    np: Option<u16>,
+    kv_k: Option<Option<String>>,
+    kv_v: Option<Option<String>>,
+}
+
+impl TqFlags {
+    fn read(args: &[&str]) -> Self {
+        let mut flags = Self::default();
+        let mut args = args.iter().copied();
+        while let Some(arg) = args.next() {
+            let (flag, inline) = match arg.split_once('=') {
+                Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+                _ => (arg, None),
+            };
+            if !matches!(flag, "--context" | "--np" | "--kv" | "-ctk" | "-ctv") {
+                continue;
+            }
+            let Some(value) = inline.or_else(|| args.next()) else {
+                break;
+            };
+            match flag {
+                "--context" => {
+                    let parsed = value.parse::<u32>().ok().filter(|n| *n > 0);
+                    flags.context = parsed.or(flags.context);
+                }
+                "--np" => {
+                    let parsed = value.parse::<u16>().ok().filter(|n| *n > 0);
+                    flags.np = parsed.or(flags.np);
+                }
+                "--kv" => {
+                    let (k, v) = value.split_once('/').unwrap_or((value, value));
+                    flags.kv_k = Some(kv_token(k));
+                    flags.kv_v = Some(kv_token(v));
+                }
+                "-ctk" => flags.kv_k = Some(kv_token(value)),
+                _ => flags.kv_v = Some(kv_token(value)),
+            }
+        }
+        flags
+    }
+
+    fn kv(&self) -> TqKv {
+        match (&self.kv_k, &self.kv_v) {
+            (None, None) => TqKv::Default,
+            (Some(None), _) | (_, Some(None)) => TqKv::Unreadable,
+            _ => TqKv::Named,
+        }
+    }
+}
+
+/// tqLLM's flags (#180): `--context N` split evenly across `--np N` (the
+/// request cap, 1 by default), and the KV format from `--kv F` (`q4/tcq2`
+/// is K `q4`, V `tcq2`; one word is both) or `-ctk K` / `-ctv V`. With
+/// none of them the KV is left unknown here ([`TqKv::Default`]: the memory
+/// fit may pick a smaller one than [`KV_TQLLM`]). With one side given the
+/// other is [`KV_TQLLM`]; a given value that is not a token is unknown.
+/// The snapshot's own `engine.context_per_slot` and `engine.slots`
+/// replace these once read.
+fn tqllm_flags(args: &[&str]) -> (Option<ModelDetail>, Option<u16>) {
+    let flags = TqFlags::read(args);
+    let np = flags.np.unwrap_or(1);
+    let other = (flags.kv() != TqKv::Default).then(|| KV_TQLLM.to_owned());
+    let detail = ModelDetail {
+        ctx: flags.context.map(|n| n / u32::from(np)).filter(|n| *n > 0),
+        kv_k: flags.kv_k.clone().unwrap_or_else(|| other.clone()),
+        kv_v: flags.kv_v.clone().unwrap_or(other),
+        ..ModelDetail::default()
+    };
+    (Some(detail), Some(np))
 }
 
 /// Strata's server script: `serve/server.py`, bare or under a directory.
@@ -716,6 +851,147 @@ mod tests {
         ] {
             assert_eq!(kind(cmd), Backend::OpenAi, "{cmd}");
         }
+    }
+
+    /// #180: the sample llama-swap entry of the README, values invented.
+    const TQLLM_PODMAN: &str = "podman run --rm --name tq-invented --device nvidia.com/gpu=all -p 127.0.0.1:${PORT}:8086 -v /srv/invented/models:/models:ro --entrypoint tqserve ghcr.io/turbo-tan/tqllm:1.2.3 --model /models/Invented-9B-TQ4.gguf --host 0.0.0.0 --port 8086 --context 65536 --np 2 --kv q4/tcq2 --mtp --draft-max 4 --reasoning on --reasoning-budget 2048 --temperature 0.6 --top-p 0.95 --top-k 20";
+
+    #[test]
+    fn tqllm_is_told_by_tqserve_its_entrypoint_or_its_image() {
+        let kind = |cmd: &str| parse_launch(cmd).backend;
+        for cmd in [
+            // `tqserve` as the entry point, bare or under a path.
+            "tqserve --model /m/x.gguf --port 8086",
+            "/opt/tqllm/build/tqserve --model /m/x.gguf",
+            "env CUDA_VISIBLE_DEVICES=0 ./build/tqserve --context 4096",
+            // A container whose command is tqserve.
+            "podman run --rm invented/base:1 tqserve --context 4096",
+            // `--entrypoint tqserve` before the image.
+            TQLLM_PODMAN,
+            "podman run --rm --entrypoint=tqserve invented/any:1 --context 4096",
+            "docker run --entrypoint /usr/local/bin/tqserve invented/any:1 --np 2",
+            // The image's last path segment starts with tqllm.
+            "podman run --rm ytan2000/tqllm:1.2.3 --context 4096",
+            "podman run ghcr.io/turbo-tan/tqllm@sha256:0123456789abcdef --np 2",
+            "docker run -v /a:/b localhost/tqllm-cuda12:dev --kv tq3",
+        ] {
+            assert_eq!(kind(cmd), Backend::Tqllm, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tqllm_elsewhere_is_not_tqllm() {
+        let kind = |cmd: &str| parse_launch(cmd).backend;
+        for (cmd, want) in [
+            // `tqserve` inside another word.
+            ("tqserve-old --context 4096", Backend::OpenAi),
+            ("/opt/bin/mytqserve --np 2", Backend::OpenAi),
+            ("./tqserve.sh --np 2", Backend::OpenAi),
+            (
+                "podman run --entrypoint tqserve2 invented/any:1 --np 2",
+                Backend::OpenAi,
+            ),
+            // A container named tqserve is not its entry point.
+            (
+                "podman run --name tqserve invented/any:1 --np 2",
+                Backend::OpenAi,
+            ),
+            // `tqllm` in a volume, a model path, or another segment.
+            (
+                "podman run -v /models/tqllm:/m invented/any:1 --np 2",
+                Backend::OpenAi,
+            ),
+            (
+                "podman run tqllm-org/llama.cpp:server --np 2",
+                Backend::OpenAi,
+            ),
+            ("podman run ghcr.io/tqllm/runner:1 --np 2", Backend::OpenAi),
+            ("python /srv/tqllm/serve.py --np 2", Backend::OpenAi),
+            ("tqllm", Backend::OpenAi),
+            // Another server under a tqllm path stays itself.
+            (
+                "/opt/tqllm/llama-server -m /models/tqllm/x-Q4_K_M.gguf",
+                Backend::LlamaCpp,
+            ),
+        ] {
+            assert_eq!(kind(cmd), want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tqllm_flags_after_its_entry_point_or_image() {
+        let launch = parse_launch(TQLLM_PODMAN);
+        assert_eq!(launch.backend, Backend::Tqllm);
+        assert_eq!(launch.max_running, Some(2));
+        assert_eq!(launch.kv, None);
+        let detail = launch.detail.expect("tqllm detail");
+        assert_eq!(
+            detail,
+            ModelDetail {
+                ctx: Some(32_768),
+                kv_k: Some("q4".to_owned()),
+                kv_v: Some("tcq2".to_owned()),
+                ..ModelDetail::default()
+            }
+        );
+        let debug = format!("{detail:?}");
+        for leak in ["/models", "/srv", "8086", "Invented", "tq-invented", "gguf"] {
+            assert!(!debug.contains(leak), "{leak}: {debug}");
+        }
+        // Defaults: one slot, no context until the snapshot says, and no
+        // KV: the memory fit may pick one smaller than bf16.
+        let bare = parse_launch("tqserve --model /m/x.gguf");
+        assert_eq!(bare.max_running, Some(1));
+        assert_eq!(bare.tq_kv, Some(TqKv::Default));
+        let detail = bare.detail.expect("detail");
+        assert_eq!(detail.ctx, None);
+        assert_eq!((detail.kv_k, detail.kv_v), (None, None));
+        // One side named: the other is tqLLM's default.
+        let named = parse_launch("tqserve -ctk q8");
+        assert_eq!(named.tq_kv, Some(TqKv::Named));
+        let detail = named.detail.expect("detail");
+        assert_eq!(
+            (detail.kv_k.as_deref(), detail.kv_v.as_deref()),
+            (Some("q8"), Some(KV_TQLLM))
+        );
+        // A later value that does not parse keeps the one before.
+        let launch = parse_launch("tqserve --context 8192 --np 4 --np x --context y");
+        assert_eq!(launch.max_running, Some(4));
+        assert_eq!(launch.detail.expect("detail").ctx, Some(2048));
+        // `=` forms, one-word KV, later flags win, -ctk / -ctv.
+        let detail = parse_launch("tqserve --context=8192 --np=4 --kv tq3 -ctv q8")
+            .detail
+            .expect("detail");
+        assert_eq!(detail.ctx, Some(2048));
+        assert_eq!(detail.kv_k.as_deref(), Some("tq3"));
+        assert_eq!(detail.kv_v.as_deref(), Some("q8"));
+        let detail = parse_launch("tqserve -ctk q8 -ctv q4 --context 1000 --np 3")
+            .detail
+            .expect("detail");
+        assert_eq!(detail.ctx, Some(333), "split evenly, rounded down");
+        assert_eq!(
+            (detail.kv_k.as_deref(), detail.kv_v.as_deref()),
+            (Some("q8"), Some("q4"))
+        );
+        // The wrapper's own flags lend nothing; hostile values stay out.
+        let launch = parse_launch(
+            "podman run --context 7 --np 9 ytan2000/tqllm:1 --kv q4;rm/../x --context -5 --np 0",
+        );
+        assert_eq!(launch.max_running, Some(1));
+        assert_eq!(launch.tq_kv, Some(TqKv::Unreadable), "named, not a token");
+        let detail = launch.detail.expect("detail");
+        assert_eq!(detail.ctx, None);
+        assert_eq!((detail.kv_k, detail.kv_v), (None, None));
+        // Other servers' commands carry no tqLLM KV.
+        assert_eq!(parse_launch("llama-server -ctk q8").tq_kv, None);
+        // Known from `[llama.backends]` or the probe: after the image.
+        let known = parse_launch_as(
+            "podman run --name t invented/any:1 --context 4096 --np 2",
+            Some(Backend::Tqllm),
+        );
+        assert_eq!(known.backend, Backend::OpenAi, "the command names none");
+        assert_eq!(known.max_running, Some(2));
+        assert_eq!(known.detail.expect("detail").ctx, Some(2048));
     }
 
     #[test]

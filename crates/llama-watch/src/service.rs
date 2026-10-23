@@ -613,6 +613,7 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         .collect();
     let mut held = state.detail.slots.clone();
     held.extend(strata_views(&state.detail.engine_live));
+    held.extend(tqllm_views(&state.detail.engine_live));
     state.ctx_history.record(mono, &running, &held);
     let zone = input.clock.zone(mono);
     let model = tty_model(&sample, state, mono, wall, zone, ctx);
@@ -1109,6 +1110,7 @@ fn tty_model(
                 &tick.llama.models,
                 &tick.ctx_history,
             ));
+            slots.extend(tqllm_slot_rows(&tick.detail.engine_live, &tick.ctx_history));
             slots
         },
         backend_lines: engine_lines(sample, &tick.detail.engine_live, watch),
@@ -2008,6 +2010,119 @@ fn strata_slot_rows(
                 ctx_prompt: Some(held - decoded.min(held)),
                 n_ctx,
                 ctx_history: history.points(&entry.model, i64::from(slot.slot)),
+            });
+        }
+    }
+    rows
+}
+
+/// One tqLLM SLOTS line (#180): the request llama-watch put on it, if any.
+struct TqLine<'a> {
+    slot: u32,
+    request: Option<&'a crate::metrics::TqRequest>,
+}
+
+/// tqLLM's lines (#180): `engine.slots` of them, each with the running
+/// request that holds it.
+fn tqllm_lines(live: &EngineLive) -> Vec<TqLine<'_>> {
+    let count = live
+        .request_slots
+        .unwrap_or(1)
+        .min(crate::tqllm::MAX_TQ_SLOTS);
+    (0..count)
+        .map(|slot| TqLine {
+            slot,
+            request: live
+                .requests
+                .iter()
+                .find(|entry| entry.slot == Some(slot))
+                .map(|entry| &entry.request),
+        })
+        .collect()
+}
+
+/// A tqLLM request's context (#180): `(prompt part, generated)` of its
+/// `context_tokens`, else of the prompt read so far.
+fn tqllm_context(req: &crate::metrics::TqRequest) -> (u64, u64) {
+    let output = req.output_tokens.unwrap_or(0);
+    let context = req
+        .context_tokens
+        .unwrap_or_else(|| req.prompt_read().saturating_add(output));
+    let decoded = output.min(context);
+    (context - decoded, decoded)
+}
+
+/// tqLLM's SLOTS lines (#180) as numbers-only slot views for the ctx
+/// sparklines: a busy line's `context_tokens`, an idle one's 0.
+fn tqllm_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
+    live.iter()
+        .filter(|entry| entry.live.instance.is_some())
+        .flat_map(|entry| {
+            tqllm_lines(&entry.live).into_iter().map(|line| {
+                let (prompt, decoded) = line.request.map_or((0, 0), tqllm_context);
+                SlotView {
+                    model: entry.model.clone(),
+                    id: i64::from(line.slot),
+                    id_task: -1,
+                    is_processing: line.request.is_some(),
+                    n_prompt_tokens: prompt + decoded,
+                    n_prompt_tokens_processed: 0,
+                    n_decoded: decoded,
+                    n_ctx: entry.live.slot_ctx,
+                    ctx_prompt: Some(prompt),
+                    prompt_cached: None,
+                    input: Vec::new(),
+                    output: Vec::new(),
+                    ctx_used: Some(prompt + decoded),
+                    resets: Default::default(),
+                    last_reset: None,
+                }
+            })
+        })
+        .collect()
+}
+
+/// One SLOTS row per tqLLM line (#180), up to `engine.slots`: a busy one
+/// shows its request's progress (`prefill_processed_tokens` over
+/// `prompt_tokens`, the cached part apart) and its `context_tokens` against
+/// `engine.context_per_slot` on the ctx meter; the rest are idle.
+fn tqllm_slot_rows(live: &[ModelEngineLive], history: &CtxBook) -> Vec<Slot> {
+    let mut rows = Vec::new();
+    for entry in live.iter().filter(|entry| entry.live.instance.is_some()) {
+        for line in tqllm_lines(&entry.live) {
+            let ctx_history = history.points(&entry.model, i64::from(line.slot));
+            let Some(req) = line.request else {
+                rows.push(Slot {
+                    id: line.slot,
+                    generating: false,
+                    done: 0,
+                    cached: 0,
+                    total: 0,
+                    open: false,
+                    done_known: true,
+                    decoded: 0,
+                    ctx_prompt: Some(0),
+                    n_ctx: entry.live.slot_ctx,
+                    ctx_history,
+                });
+                continue;
+            };
+            let total = req.prompt_tokens.unwrap_or(0);
+            let cached = req.cached_read().min(total);
+            let done = req.prompt_read().min(total).saturating_sub(cached);
+            let (prompt, decoded) = tqllm_context(req);
+            rows.push(Slot {
+                id: line.slot,
+                generating: true,
+                done,
+                cached,
+                total,
+                open: false,
+                done_known: req.prompt_tokens.is_some(),
+                decoded,
+                ctx_prompt: Some(prompt),
+                n_ctx: entry.live.slot_ctx,
+                ctx_history,
             });
         }
     }
@@ -4080,6 +4195,102 @@ mod tests {
             engine: Default::default(),
             kv: None,
         }
+    }
+
+    /// #180: tqLLM's engine line has no KV item. Its SLOTS lines are
+    /// `engine.slots` long: each running request on the line the book gave
+    /// it, its progress against its prompt with the cached part apart, its
+    /// context against `context_per_slot`; a free line is idle.
+    #[test]
+    fn tqllm_engine_line_and_slot_lines() {
+        let info = BackendInfo {
+            kind: Backend::Tqllm,
+            max_running: Some(2),
+            running: Some(2),
+            queued: Some(1),
+            kv_permille: None,
+            hit_permille: None,
+            engine: llama_core::backend::EngineStats {
+                spec_permille: Some(660),
+                prefill_tps_tenths: Some(3099),
+                decode_tps_tenths: Some(842),
+                ..Default::default()
+            },
+            kv: None,
+        };
+        let sample = backend_sample(vec![served("tq", "ready", Some(info))]);
+        assert_eq!(
+            backend_lines(&sample, WatchState::Generating),
+            vec!["tqllm  running 2/2 · queued 1 · spec 66 % · prefill 310/s · decode 84.2/s"]
+        );
+        let body = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/llama/tqllm-snapshot.json"
+        ))
+        .expect("tqllm fixture");
+        let mut snap = crate::metrics::parse_tqllm(&body).expect("snapshot");
+        snap.slots = Some(3);
+        let now = SystemTime::now();
+        let mut book = crate::tqllm::TqllmBook::default();
+        let observed = book.observe("tq", &snap, Instant::now(), now, now);
+        let entry = ModelEngineLive {
+            model: "tq".to_owned(),
+            live: observed.facts.live.expect("live"),
+        };
+        let rows = tqllm_slot_rows(std::slice::from_ref(&entry), &CtxBook::new(6));
+        let got: Vec<_> = rows
+            .iter()
+            .map(|slot| {
+                (
+                    slot.id,
+                    slot.generating,
+                    (slot.done, slot.cached, slot.total, slot.decoded),
+                    (slot.ctx_prompt, slot.n_ctx),
+                    (slot.done_known, slot.open),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                // Request 4 decoding: 288 read beyond 512 cached of 800.
+                (
+                    0,
+                    true,
+                    (288, 512, 800, 150),
+                    (Some(800), Some(32_768)),
+                    (true, false)
+                ),
+                // Request 5 reading: 2,048 of 6,000 read, 1,024 of them cached.
+                (
+                    1,
+                    true,
+                    (1_024, 1_024, 6_000, 0),
+                    (Some(6_000), Some(32_768)),
+                    (true, false)
+                ),
+                (
+                    2,
+                    false,
+                    (0, 0, 0, 0),
+                    (Some(0), Some(32_768)),
+                    (true, false)
+                ),
+            ]
+        );
+        // The sparkline views: each line's context, 0 when idle.
+        let used: Vec<_> = tqllm_views(std::slice::from_ref(&entry))
+            .iter()
+            .map(|view| (view.id, view.is_processing, view.ctx_used))
+            .collect();
+        assert_eq!(
+            used,
+            [
+                (0, true, Some(950)),
+                (1, true, Some(6_000)),
+                (2, false, Some(0))
+            ]
+        );
     }
 
     fn frame_ctx(mem_total_bytes: Option<u64>, llama_enabled: bool) -> FrameCtx {

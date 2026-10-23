@@ -19,6 +19,10 @@
 //! gauges (they lag the scheduler by up to 40 decode steps), vLLM's
 //! `cache_config_info` capacity times its usage ratio, and Strata's batch
 //! slots. llama.cpp's comes from `/slots` ([`crate::kv`]).
+//!
+//! #180 adds tqLLM, which has no `/metrics`: its monitor snapshot is one
+//! JSON document of per-request numbers ([`parse_tqllm`]). The counters
+//! across reads are [`crate::tqllm::TqllmBook`]'s.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -409,7 +413,9 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             let (sample, facts) = parse_strata(body);
             return (sample, Some(facts));
         }
-        Backend::OpenAi => return (MetricsSample::default(), None),
+        // tqLLM's snapshot needs the reads before it (#180): the poller
+        // reads it through [`crate::tqllm::TqllmBook`], never here.
+        Backend::Tqllm | Backend::OpenAi => return (MetricsSample::default(), None),
     };
     let mut decode = Acc::default();
     let mut running = Acc::default();
@@ -817,8 +823,16 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
 /// Engine-reported settings and counters for SETUP's `engine:<key>`
 /// source (#54), keyed by a name from [`ENGINE_KEYS`]. Each value is a
 /// plain number (`-?digits(.digits)?`, at most [`MAX_ENGINE_VALUE`]
-/// characters), a short token ([`is_token`]) or `on` / `off`.
+/// characters), a short token ([`is_token`]) or `on` / `off`; a key of
+/// [`TEXT_ENGINE_KEYS`] holds sanitised text instead (#180).
 pub type EngineValues = BTreeMap<&'static str, String>;
+
+/// The [`ENGINE_KEYS`] whose value is text, for a SETUP rule of `kind =
+/// "text"` (#114, #180): tqLLM's `/health` `fit`, controls and zero-width
+/// characters dropped, at most [`crate::setup_rules::MAX_SPEC_VALUE_CHARS`];
+/// and the KV its command asked for, `q4/tcq2` (two checked tokens) or
+/// `--` when it is not known.
+pub const TEXT_ENGINE_KEYS: [&str; 2] = ["fit", "kv_asked"];
 
 /// Longest value kept in [`EngineValues`].
 pub const MAX_ENGINE_VALUE: usize = 16;
@@ -826,7 +840,7 @@ pub const MAX_ENGINE_VALUE: usize = 16;
 /// Every key the engine parsers fill (Strata's, #54). `[setup]`'s
 /// `engine:<key>` must name one of these; nothing else of the JSON is
 /// reachable.
-pub const ENGINE_KEYS: [&str; 33] = [
+pub const ENGINE_KEYS: [&str; 37] = [
     // `engine` object: the server's own settings.
     "engine",
     "version",
@@ -868,6 +882,14 @@ pub const ENGINE_KEYS: [&str; 33] = [
     "kv_tokens",
     "kv_blocks",
     "kv_max_concurrency",
+    // tqLLM (#180): the snapshot's `engine.slots` and
+    // `engine.context_per_slot`, and `/health`'s `fit` (text). Its
+    // `engine.build` is `version`. `kv_asked` (text) is the KV its launch
+    // command asked for, absent when it named none, `--` when unknown.
+    "slots",
+    "context_per_slot",
+    "fit",
+    "kv_asked",
 ];
 
 /// Longest `live.phase` kept, characters (#54).
@@ -889,8 +911,12 @@ pub struct EngineFacts {
     pub prefix_cache: Option<bool>,
     /// Settings and counters for SETUP's `engine:<key>` (#54).
     pub values: EngineValues,
-    /// What the engine is doing now (Strata's `live`, #54).
+    /// What the engine is doing now (Strata's `live`, #54; tqLLM's active
+    /// requests, #180).
     pub live: Option<EngineLive>,
+    /// [`Self::ctx`] replaces the launch command's (tqLLM, #180: the memory
+    /// fit may lower `--context`). Otherwise it only fills a missing one.
+    pub ctx_exact: bool,
 }
 
 /// The request in flight, as Strata's `live` object reports it (#54).
@@ -935,7 +961,185 @@ pub struct EngineLive {
     /// [`Self::held_tokens`]. In parallel mode the top-level request fields
     /// above are the newest request's only. Built only by the parser.
     pub slots: Vec<LiveSlot>,
+    /// tqLLM's active requests (#180), by id: queued, in prefill or
+    /// decoding. Empty for every other engine.
+    pub requests: Vec<EngineRequest>,
+    /// tqLLM's `engine.slots`: the request cap and SLOTS' lines (#180).
+    pub request_slots: Option<u32>,
+    /// tqLLM's `engine.context_per_slot` (#180).
+    pub slot_ctx: Option<u64>,
+    /// tqLLM's `instance_id` (#180): request ids restart with the engine,
+    /// so a flight is told by both. Kept in memory only, never shown.
+    pub instance: Option<String>,
 }
+
+/// The sum of `rate` over the requests in `phase` (#180): 0 with none,
+/// `None` while none of them has a rate.
+fn rate_sum(
+    requests: &[EngineRequest],
+    phase: TqPhase,
+    rate: impl Fn(&TqRequest) -> Option<f64>,
+) -> Option<f64> {
+    let mut any = false;
+    let mut known: Option<f64> = None;
+    for req in requests
+        .iter()
+        .filter(|req| req.request.phase == Some(phase))
+    {
+        any = true;
+        if let Some(tps) = rate(&req.request) {
+            known = Some(known.unwrap_or(0.0) + tps);
+        }
+    }
+    if any { known } else { Some(0.0) }
+}
+
+/// A tqLLM request's phase (#180), as the monitor contract names it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TqPhase {
+    /// Accepted, waiting for a slot.
+    Queued,
+    /// Reading its prompt.
+    Prefill,
+    /// Generating.
+    Decode,
+    /// Finished with an answer.
+    Complete,
+    /// Ended with an error.
+    Failed,
+    /// Ended by its client.
+    Cancelled,
+}
+
+impl TqPhase {
+    fn from_word(word: &str) -> Option<Self> {
+        Some(match word {
+            "queued" => Self::Queued,
+            "prefill" => Self::Prefill,
+            "decode" => Self::Decode,
+            "complete" => Self::Complete,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
+    /// Queued, in prefill or decoding.
+    #[must_use]
+    pub fn active(self) -> bool {
+        matches!(self, Self::Queued | Self::Prefill | Self::Decode)
+    }
+
+    /// In a slot: prefill or decode.
+    #[must_use]
+    pub fn running(self) -> bool {
+        matches!(self, Self::Prefill | Self::Decode)
+    }
+}
+
+/// One request of a tqLLM snapshot (#180): numbers only. Every count is
+/// `None` where the snapshot has `null` (before the engine knows it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TqRequest {
+    /// Its id, unique within one `instance_id`.
+    pub id: u64,
+    /// Its phase. `None` only for a [`Default`] value; the parser skips a
+    /// request whose phase it does not know.
+    pub phase: Option<TqPhase>,
+    /// Its lifetime so far, queue time included, frozen at its end.
+    pub elapsed_ms: f64,
+    /// Prompt tokens of the current pass.
+    pub prompt_tokens: Option<u64>,
+    /// Generated tokens, across continuation passes.
+    pub output_tokens: Option<u64>,
+    /// Prompt plus generated tokens of the current pass.
+    pub context_tokens: Option<u64>,
+    /// Prompt positions done so far, the cached ones included.
+    pub prefill_processed: Option<u64>,
+    /// Of those, reused from a cached prefix.
+    pub prefill_cached: Option<u64>,
+    /// Mean uncached prefill tok/s.
+    pub prefill_tps: Option<f64>,
+    /// Mean decode tok/s.
+    pub decode_tps: Option<f64>,
+    /// Prefill time once a pass completed.
+    pub prefill_ms: Option<f64>,
+    /// Decode time once a pass completed.
+    pub decode_ms: Option<f64>,
+    /// Draft tokens proposed.
+    pub drafted: Option<u64>,
+    /// Of those, accepted.
+    pub accepted: Option<u64>,
+}
+
+impl TqRequest {
+    /// Tokens of the prompt read so far: the whole prompt once it decodes
+    /// or finished, `prefill_processed_tokens` while in prefill, 0 queued.
+    #[must_use]
+    pub fn prompt_read(&self) -> u64 {
+        match self.phase {
+            Some(TqPhase::Prefill) => self.prefill_processed.unwrap_or(0),
+            Some(TqPhase::Decode | TqPhase::Complete) => {
+                self.prompt_tokens.or(self.prefill_processed).unwrap_or(0)
+            }
+            Some(TqPhase::Failed | TqPhase::Cancelled) => self.prefill_processed.unwrap_or(0),
+            Some(TqPhase::Queued) | None => 0,
+        }
+    }
+
+    /// Of [`Self::prompt_read`], the cached part, never above it.
+    #[must_use]
+    pub fn cached_read(&self) -> u64 {
+        self.prefill_cached.unwrap_or(0).min(self.prompt_read())
+    }
+}
+
+/// A tqLLM active request as tty11 needs it (#180), with the SLOTS line
+/// llama-watch gave it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineRequest {
+    /// The snapshot's numbers.
+    pub request: TqRequest,
+    /// Its SLOTS line, 0-based; `None` while queued (or past the slots).
+    pub slot: Option<u32>,
+}
+
+/// A tqLLM monitor snapshot (#180): the parts llama-watch reads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TqSnapshot {
+    /// `instance_id`: a new one is an engine restart.
+    pub instance: String,
+    /// `engine.context_per_slot`, when positive.
+    pub context_per_slot: Option<u64>,
+    /// `engine.slots`, when positive.
+    pub slots: Option<u64>,
+    /// `engine.build`, when a short token.
+    pub build: Option<String>,
+    /// `requests[]` whose phase is known, in the snapshot's order.
+    pub requests: Vec<TqRequest>,
+}
+
+/// Why a tqLLM body was not read (#180).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TqError {
+    /// Nested deeper than [`MAX_TQLLM_DEPTH`].
+    Depth,
+    /// A `schema_version` other than 1 (`None`: not a whole number).
+    Schema(Option<u64>),
+    /// Not the snapshot's shape, or a field it uses has the wrong type.
+    Malformed,
+}
+
+/// The only tqLLM monitor schema this reads (#180).
+pub const TQLLM_SCHEMA: u64 = 1;
+/// Deepest JSON nesting read from tqLLM (#180). The snapshot is three
+/// deep (`requests[]` objects); `/health` is one.
+pub const MAX_TQLLM_DEPTH: usize = 8;
+/// Longest `instance_id` read (#180).
+pub const MAX_INSTANCE_CHARS: usize = 64;
+/// Most `requests[]` entries read from one snapshot (#180): 32 finished
+/// ones plus the active ones. The 256 KiB body cap holds about 500.
+pub const MAX_TQLLM_REQUESTS: usize = 1024;
 
 /// One of Strata's batch slots (#81), from `live.slots[]`: idle with the
 /// tokens it keeps for a next turn, or busy with a request.
@@ -1018,6 +1222,21 @@ impl EngineLive {
         });
         let first = reading.next()?;
         reading.next().is_none().then_some(first.slot)
+    }
+
+    /// GEN for tqLLM (#180): the sum of `decode_tokens_per_second` over its
+    /// requests in decode. 0 with none in decode; `None` while every one
+    /// in decode still has no rate. Nothing is extrapolated.
+    #[must_use]
+    pub fn decode_tps_sum(&self) -> Option<f64> {
+        rate_sum(&self.requests, TqPhase::Decode, |req| req.decode_tps)
+    }
+
+    /// PROMPT for tqLLM (#180): the sum of `prefill_tokens_per_second`
+    /// over its requests in prefill, on the same terms.
+    #[must_use]
+    pub fn prefill_tps_sum(&self) -> Option<f64> {
+        rate_sum(&self.requests, TqPhase::Prefill, |req| req.prefill_tps)
     }
 
     /// Tokens the busy slots generated so far; `None` in serial mode.
@@ -1309,6 +1528,248 @@ fn newest_request<'de, D: Deserializer<'de>>(
         }
     }
     Ok(newest)
+}
+
+/// `body` nests no deeper than `max` (#180): brackets inside strings do not
+/// count. Unbalanced text is left to the JSON parser.
+#[must_use]
+pub fn depth_ok(body: &str, max: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in body.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    return false;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
+}
+
+/// tqLLM's snapshot shape (#180, the `/metrics` probe of a server the
+/// launch command did not name): `schema_version` 1, an `engine` object
+/// and a `requests` array. Their contents are not looked at.
+#[must_use]
+pub fn is_tqllm_json(body: &str) -> bool {
+    type Object = serde_json::Map<String, serde_json::Value>;
+    #[derive(Deserialize)]
+    struct Shape {
+        schema_version: serde_json::Value,
+        #[allow(dead_code)]
+        engine: Object,
+        #[allow(dead_code)]
+        requests: Vec<serde_json::Value>,
+    }
+    body.trim_start().starts_with('{')
+        && depth_ok(body, MAX_TQLLM_DEPTH)
+        && serde_json::from_str::<Shape>(body)
+            .is_ok_and(|shape| shape.schema_version.as_u64() == Some(TQLLM_SCHEMA))
+}
+
+/// The fields of tqLLM's snapshot llama-watch uses (#180). Each must have
+/// its contract type; anything else in the document (`hardware`, `host`,
+/// `capabilities`, the model alias, the device id) is skipped unread.
+#[derive(Deserialize)]
+struct TqDoc {
+    instance_id: String,
+    engine: TqEngine,
+    requests: Vec<TqRequestJson>,
+}
+
+#[derive(Deserialize)]
+struct TqEngine {
+    context_per_slot: u64,
+    slots: u64,
+    #[serde(default, deserialize_with = "word")]
+    build: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TqRequestJson {
+    id: u64,
+    phase: String,
+    #[serde(deserialize_with = "tq_rate_required")]
+    elapsed_ms: f64,
+    #[serde(default, deserialize_with = "tq_count")]
+    prompt_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    output_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    context_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    prefill_processed_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    prefill_cached_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "tq_rate")]
+    prefill_tokens_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "tq_rate")]
+    decode_tokens_per_second: Option<f64>,
+    #[serde(default, deserialize_with = "tq_rate")]
+    prefill_ms: Option<f64>,
+    #[serde(default, deserialize_with = "tq_rate")]
+    decode_ms: Option<f64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    drafted: Option<u64>,
+    #[serde(default, deserialize_with = "tq_count")]
+    accepted: Option<u64>,
+}
+
+/// Largest count read from tqLLM: every integer up to it is exact in an f64.
+const MAX_TQ_COUNT: f64 = 9_007_199_254_740_991.0;
+
+/// `null`, or a whole non-negative number (tqLLM may print `15.000000`).
+/// Any other value fails the snapshot.
+fn tq_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => match number.as_u64() {
+            Some(n) if n as f64 <= MAX_TQ_COUNT => Ok(Some(n)),
+            Some(_) => Err(serde::de::Error::custom("not a token count")),
+            None => match number.as_f64() {
+                Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= MAX_TQ_COUNT => {
+                    Ok(Some(n as u64))
+                }
+                _ => Err(serde::de::Error::custom("not a token count")),
+            },
+        },
+        _ => Err(serde::de::Error::custom("not a token count")),
+    }
+}
+
+/// `null`, or a finite non-negative number of at most [`MAX_TQ_COUNT`]
+/// (a time in ms or a rate), so no sum of them is ever infinite. Any other
+/// value fails.
+fn tq_rate<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= MAX_TQ_COUNT)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("not a time or rate")),
+        _ => Err(serde::de::Error::custom("not a time or rate")),
+    }
+}
+
+/// A finite non-negative number that must be there.
+fn tq_rate_required<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    tq_rate(deserializer)?.ok_or_else(|| serde::de::Error::custom("missing time"))
+}
+
+/// tqLLM's `GET /api/monitor/v1/snapshot` (#180).
+///
+/// - Nested deeper than [`MAX_TQLLM_DEPTH`]: [`TqError::Depth`], unparsed.
+/// - `schema_version` other than [`TQLLM_SCHEMA`]: [`TqError::Schema`].
+/// - Strict on what is used: `instance_id` (1..=[`MAX_INSTANCE_CHARS`]
+///   printable ASCII), `engine.context_per_slot` and `engine.slots`, and
+///   each request's `id`, `phase` and `elapsed_ms` must be there with
+///   their contract types; its token counts must be `null` or whole
+///   non-negative numbers, its times and rates `null` or finite
+///   non-negative numbers. Anything else: [`TqError::Malformed`].
+/// - Unknown members are skipped, `hardware` and `host` included:
+///   llama-watch reads NVML itself.
+/// - A request whose `phase` is not one this reader knows is left out.
+/// - More than [`MAX_TQLLM_REQUESTS`] requests: [`TqError::Malformed`].
+pub fn parse_tqllm(body: &str) -> Result<TqSnapshot, TqError> {
+    if !depth_ok(body, MAX_TQLLM_DEPTH) {
+        return Err(TqError::Depth);
+    }
+    #[derive(Deserialize)]
+    struct Version {
+        schema_version: serde_json::Value,
+    }
+    let version = serde_json::from_str::<Version>(body).map_err(|_| TqError::Malformed)?;
+    match version.schema_version.as_u64() {
+        Some(TQLLM_SCHEMA) => {}
+        other => return Err(TqError::Schema(other)),
+    }
+    let doc = serde_json::from_str::<TqDoc>(body).map_err(|_| TqError::Malformed)?;
+    let instance_ok = !doc.instance_id.is_empty()
+        && doc.instance_id.len() <= MAX_INSTANCE_CHARS
+        && doc.instance_id.bytes().all(|b| b.is_ascii_graphic());
+    if !instance_ok || doc.requests.len() > MAX_TQLLM_REQUESTS {
+        return Err(TqError::Malformed);
+    }
+    let requests = doc
+        .requests
+        .into_iter()
+        .filter_map(|req| {
+            let phase = TqPhase::from_word(&req.phase)?;
+            Some(TqRequest {
+                id: req.id,
+                phase: Some(phase),
+                elapsed_ms: req.elapsed_ms,
+                prompt_tokens: req.prompt_tokens,
+                output_tokens: req.output_tokens,
+                context_tokens: req.context_tokens,
+                prefill_processed: req.prefill_processed_tokens,
+                prefill_cached: req.prefill_cached_tokens,
+                prefill_tps: req
+                    .prefill_tokens_per_second
+                    .filter(|tps| *tps <= backend::MAX_ENGINE_TPS),
+                decode_tps: req
+                    .decode_tokens_per_second
+                    .filter(|tps| *tps <= backend::MAX_ENGINE_TPS),
+                prefill_ms: req.prefill_ms,
+                decode_ms: req.decode_ms,
+                drafted: req.drafted,
+                accepted: req.accepted,
+            })
+        })
+        .collect();
+    Ok(TqSnapshot {
+        instance: doc.instance_id,
+        context_per_slot: Some(doc.engine.context_per_slot).filter(|n| *n > 0),
+        slots: Some(doc.engine.slots).filter(|n| *n > 0),
+        build: doc.engine.build.filter(|text| is_token(text)),
+        requests,
+    })
+}
+
+/// tqLLM's `GET /health` `fit` (#180): free text of what the memory fit
+/// chose, empty when it kept what was asked. `Ok(None)` for an empty or
+/// absent `fit`; the text has controls and zero-width characters dropped
+/// and blanks collapsed, at most
+/// [`crate::setup_rules::MAX_SPEC_VALUE_CHARS`] characters (a longer one
+/// is cut). tqLLM writes control characters raw inside the string, which
+/// JSON forbids, so every byte below 0x20 in the (capped) body is read as
+/// a space first. A body that is not a JSON object, nests too deep, or has
+/// a `fit` that is not a string is an error.
+pub fn parse_tqllm_health(body: &str) -> Result<Option<String>, TqError> {
+    if !depth_ok(body, MAX_TQLLM_DEPTH) {
+        return Err(TqError::Depth);
+    }
+    // One ASCII byte for another: still UTF-8.
+    let body: String = body
+        .chars()
+        .map(|ch| if ch < ' ' { ' ' } else { ch })
+        .collect();
+    let body = body.as_str();
+    #[derive(Deserialize)]
+    struct Health {
+        #[serde(default)]
+        fit: Option<String>,
+    }
+    let health = serde_json::from_str::<Health>(body).map_err(|_| TqError::Malformed)?;
+    Ok(health.fit.and_then(|fit| {
+        crate::setup_rules::text_held(&fit, crate::setup_rules::MAX_SPEC_VALUE_CHARS)
+    }))
 }
 
 /// Strata's `live.phase` for tty11: control and bidi-override scalars
@@ -1669,6 +2130,10 @@ fn strata_live(live: &StrataLive) -> EngineLive {
         tok_s: rate(live.tok_s),
         tok_s_mean: rate(live.tok_s_mean),
         prefill_tok_s_mean: rate(live.prefill_tok_s_mean),
+        requests: Vec::new(),
+        request_slots: None,
+        slot_ctx: None,
+        instance: None,
         parallel: small(live.parallel),
         running: small(live.running),
         waiting: small(live.waiting),

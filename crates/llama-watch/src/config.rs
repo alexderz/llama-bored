@@ -425,7 +425,8 @@ pub struct Llama {
     #[serde(default = "defaults::output_tail_chars")]
     pub output_tail_chars: u32,
     /// `[llama.backends]`: model id to `llamacpp`, `sglang`, `vllm`,
-    /// `strata` or `openai`, over what the launch command says (T72).
+    /// `strata`, `tqllm` or `openai`, over what the launch command says
+    /// (T72).
     /// Unknown words fail the parse; ids that are not loaded are fine.
     #[serde(default = "defaults::backends")]
     pub backends: BTreeMap<String, Backend>,

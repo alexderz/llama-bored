@@ -724,7 +724,7 @@ fn backend_gauges_are_additive_on_schema_v1() {
     );
     assert_eq!(parse_validated(&bytes).expect("strata round trip"), strata);
 
-    for word in ["vllm", "openai", "llamacpp", "sglang", "strata"] {
+    for word in ["vllm", "openai", "llamacpp", "sglang", "strata", "tqllm"] {
         let json = insert_after(
             &base_json(),
             r#""state":"ready""#,
@@ -745,6 +745,39 @@ fn backend_gauges_are_additive_on_schema_v1() {
     assert_eq!(parse_validated(&json), Err(WireError::Parse));
     let json = insert_after(&base_json(), r#""state":"ready""#, r#","running":-1"#);
     assert_eq!(parse_validated(&json), Err(WireError::Parse));
+}
+
+/// #180: a tqLLM model is one more backend word on schema 1. A reader that
+/// predates the word (0.7.1 and older) maps it to `openai` through
+/// `deserialize_lenient`, as it maps any word it does not know, so the
+/// snapshot still validates there; this reader keeps `tqllm`.
+#[test]
+fn a_tqllm_model_stays_on_schema_v1() {
+    assert_eq!(wire::SCHEMA, 1);
+    let mut snap = valid();
+    snap.ai.models[0].backend = Some(wire::Backend::Tqllm);
+    snap.ai.models[0].running = Some(1);
+    snap.ai.models[0].queued = Some(0);
+    let bytes = to_json(&snap).expect("encode");
+    let text = std::str::from_utf8(&bytes).expect("utf-8");
+    assert!(text.contains(r#""schema":1"#), "{text}");
+    assert!(
+        text.contains(r#""backend":"tqllm","running":1,"queued":0"#),
+        "{text}"
+    );
+    assert!(!text.contains("kv_fill"), "no KV gauge: {text}");
+    assert_eq!(parse_validated(&bytes).expect("tqllm round trip"), snap);
+    // What an older reader does with the word: any word it does not know
+    // reads as openai, and the snapshot is kept.
+    for word in ["tqllm2", "tqLLM", "turbo"] {
+        let json = insert_after(
+            &base_json(),
+            r#""state":"ready""#,
+            &format!(r#","backend":"{word}""#),
+        );
+        let snap = parse_validated(&json).expect(word);
+        assert_eq!(snap.ai.models[0].backend, Some(wire::Backend::OpenAi));
+    }
 }
 
 #[test]

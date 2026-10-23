@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use llama_core::backend::{Backend, BackendInfo, EngineStats};
 use llama_core::detail::ModelDetail;
 use llama_watch::config::{Config, Setup};
-use llama_watch::metrics::{EngineFacts, parse_strata};
+use llama_watch::metrics::{EngineFacts, EngineValues, parse_strata, parse_tqllm};
 use llama_watch::setup_rules::{Found, LiveCtx, Rules};
 use llama_watch::sources::cmdline::{parse_launch, parse_launch_as};
+use llama_watch::tqllm::{TqllmBook, kv_asked};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -104,8 +105,13 @@ fn rows_of(
         info,
         engine: None,
     };
+    rows_live(rules, found, &live)
+}
+
+/// [`rows_of`] with the engine's values too.
+fn rows_live(rules: &Rules, found: &[Found], live: &LiveCtx<'_>) -> Vec<String> {
     rules
-        .rows(found, &live)
+        .rows(found, live)
         .into_iter()
         .map(|row| {
             let mut text = format!("{}:", row.label);
@@ -611,4 +617,157 @@ fn bad_rules_fail_validation_with_the_field_index() {
     // An unknown key or engine word is a parse error, as everywhere else.
     assert!(Config::from_toml("[setup]\nextend = true\n").is_err());
     assert!(Config::from_toml("[[setup.field]]\nrow = \"x\"\nengines = [\"tabby\"]\n").is_err());
+}
+
+/// #180: tqLLM's SETUP rows come from its flags (after `tqserve`, its
+/// entry point) and from what it reports: the build, the per-slot context
+/// and the slot count from the snapshot, and `fit` from `/health`.
+#[test]
+fn tqllm_shows_its_flags_and_what_it_reports() {
+    use std::time::{Instant, SystemTime};
+    let cmd = "podman run --rm --name tq --device nvidia.com/gpu=all -v /models/invented:/models:ro --entrypoint tqserve ghcr.io/example/moe-server:1 --model /models/Invented-Q4_K_M.gguf --context 65536 --np 2 --kv q8/q4 -md /models/drafter.gguf --draft-max 4 --reasoning on --reasoning-budget 2048 --temperature 0.6 --top-p 0.95 --top-k 20 --moe-host-mb 20480 --moe-cache-mb 4096 --port 8000";
+    let launch = parse_launch(cmd);
+    assert_eq!(launch.backend, Backend::Tqllm);
+    assert_eq!(launch.max_running, Some(2));
+    let detail = launch.detail.expect("detail");
+    assert_eq!(detail.ctx, Some(32_768), "--context over --np");
+    let rules = with_example();
+    let found = rules.extract(cmd);
+    // The command alone: the KV it asked for comes as `engine:kv_asked`,
+    // as the poller adds it.
+    let mut asked = EngineValues::new();
+    asked.insert("kv_asked", kv_asked(Some(&detail)).expect("asked"));
+    let alone = LiveCtx {
+        backend: Backend::Tqllm,
+        detail: Some(&detail),
+        info: None,
+        engine: Some(&asked),
+    };
+    assert_eq!(
+        rows_live(&rules, &found, &alone),
+        [
+            "engine: tqLLM",
+            "ctx: 32,768 · kv q8/q4",
+            "experts: host 20.0 GiB · cache 4.0 GiB",
+            "spec: DFlash2 · n-max 4",
+            "think: budget 2,048 · on",
+            "serve: 2 slots",
+            "sample: temp 0.6 · top-p 0.95 · top-k 20",
+        ]
+    );
+    for value in &found {
+        assert!(!value.value.contains('/'), "no paths: {value:?}");
+    }
+    // What it reports: the snapshot's per-slot context and slots, its build
+    // as the version, and `/health`'s fit as text.
+    let body = std::fs::read_to_string(root().join("fixtures/llama/tqllm-snapshot.json"))
+        .expect("tqllm fixture");
+    let snap = parse_tqllm(&body).expect("snapshot");
+    // `/health` is read after the first snapshot of an instance.
+    let mut book = TqllmBook::default();
+    let now = SystemTime::now();
+    book.observe("tq", &snap, Instant::now(), now, now);
+    book.set_fit("tq", Some("2 slots x 32k fit in 22.5 GiB".to_owned()));
+    let facts = book.observe("tq", &snap, Instant::now(), now, now).facts;
+    let mut values = facts.values;
+    values.insert("kv_asked", "q8/q4".to_owned());
+    let reported = ModelDetail {
+        ctx: facts.ctx,
+        ..detail
+    };
+    let live = LiveCtx {
+        backend: Backend::Tqllm,
+        detail: Some(&reported),
+        info: None,
+        engine: Some(&values),
+    };
+    let text: Vec<String> = rules
+        .rows(&found, &live)
+        .into_iter()
+        .map(|row| {
+            let items: Vec<String> = row
+                .items
+                .iter()
+                .map(|item| format!("{}{}", item.sep, item.text))
+                .collect();
+            format!("{}:{}", row.label, items.concat())
+        })
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "engine: · tqLLM 0a1b2c3",
+            "ctx: · 32,768 · kv q8/q4",
+            "fit: · 2 slots x 32k fit in 22.5 GiB",
+            "experts: · host 20.0 GiB · cache 4.0 GiB",
+            "spec: · DFlash2 · n-max 4",
+            "think: · budget 2,048 · on",
+            "serve: · 2 slots",
+            "sample: · temp 0.6 · top-p 0.95 · top-k 20",
+        ]
+    );
+    // `--mtp` (one slot only) is named before a `-md` draft.
+    let cmd = "tqserve --model /m/x.gguf --mtp -md /m/draft.gguf --np 1 --draft-max 8";
+    let found = rules.extract(cmd);
+    let spec: Vec<String> = rows_of(&rules, &found, Backend::Tqllm, None, None)
+        .into_iter()
+        .filter(|row| row.starts_with("spec:"))
+        .collect();
+    assert_eq!(spec, ["spec: MTP · n-max 8"]);
+}
+
+/// #180: `kind = "text"` takes `engine:fit` as well as a `spec:` source;
+/// any other engine key is refused.
+#[test]
+fn text_takes_engine_fit_and_no_other_engine_key() {
+    let ok = "[[setup.field]]\nrow = \"fit\"\nsource = \"engine:fit\"\nkind = \"text\"\n";
+    let config = Config::from_toml(ok).expect("parses");
+    assert!(config.validate(8).is_ok(), "engine:fit as text");
+    let bad = "[[setup.field]]\nrow = \"x\"\nsource = \"engine:version\"\nkind = \"text\"\n";
+    let config = Config::from_toml(bad).expect("parses");
+    let err = config.validate(8).expect_err("engine:version as text");
+    assert!(
+        err.to_string().contains("kind text needs a spec: source"),
+        "{err}"
+    );
+}
+
+/// #180: a command that names no KV leaves it to tqLLM's default, which
+/// the memory fit may change, so SETUP draws `kv bf16` dim; one named side
+/// makes the KV what was asked.
+#[test]
+fn tqllm_without_a_kv_flag_draws_the_default_dim() {
+    let cmd = "tqserve --model /m/x.gguf --context 8192";
+    let detail = parse_launch(cmd).detail.expect("detail");
+    assert_eq!(kv_asked(Some(&detail)), None);
+    let rules = Rules::builtin();
+    let ctx = |rows: Vec<String>| -> Vec<String> {
+        rows.into_iter()
+            .filter(|row| row.starts_with("ctx:"))
+            .collect()
+    };
+    assert_eq!(
+        ctx(rows_of(
+            &rules,
+            &rules.extract(cmd),
+            Backend::Tqllm,
+            Some(&detail),
+            None
+        )),
+        ["ctx: 8,192 · kv bf16*"]
+    );
+    let cmd = "tqserve --model /m/x.gguf -ctk q8";
+    let detail = parse_launch(cmd).detail.expect("detail");
+    let mut asked = EngineValues::new();
+    asked.insert("kv_asked", kv_asked(Some(&detail)).expect("asked"));
+    let live = LiveCtx {
+        backend: Backend::Tqllm,
+        detail: Some(&detail),
+        info: None,
+        engine: Some(&asked),
+    };
+    assert_eq!(
+        ctx(rows_live(&rules, &rules.extract(cmd), &live)),
+        ["ctx: kv q8/bf16"]
+    );
 }
