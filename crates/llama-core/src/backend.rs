@@ -5,6 +5,8 @@
 //! other OpenAI-compatible server (TabbyAPI, ExLlamaV3) has neither, and
 //! the watcher falls back to llama-swap's activity log for it. Strata serves
 //! one request at a time and answers `/metrics` with JSON, not Prometheus.
+//! tqLLM (`tqserve`) has no `/metrics` at all: its telemetry is one
+//! versioned JSON snapshot, `/api/monitor/v1/snapshot` (#180).
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,9 @@ pub enum Backend {
     /// Strata (`serve/server.py --engine strata`): JSON `/metrics`, one
     /// request at a time, no usable `/slots`.
     Strata,
+    /// tqLLM (`tqserve`, #180): a JSON monitor snapshot of every request,
+    /// no Prometheus `/metrics`, no `/slots`, no KV bytes.
+    Tqllm,
     /// Any other OpenAI-compatible server.
     OpenAi,
 }
@@ -38,12 +43,13 @@ impl Backend {
             Self::SgLang => "sglang",
             Self::Vllm => "vllm",
             Self::Strata => "strata",
+            Self::Tqllm => "tqllm",
             Self::OpenAi => "openai",
         }
     }
 
     /// Display name (#33): `llama.cpp`, `SGLang`, `vLLM`, `Strata`,
-    /// `OpenAI-compatible`. A llama.cpp fork stays `llama.cpp`.
+    /// `tqLLM`, `OpenAI-compatible`. A llama.cpp fork stays `llama.cpp`.
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
@@ -51,12 +57,13 @@ impl Backend {
             Self::SgLang => "SGLang",
             Self::Vllm => "vLLM",
             Self::Strata => "Strata",
+            Self::Tqllm => "tqLLM",
             Self::OpenAi => "OpenAI-compatible",
         }
     }
 
     /// Short display name for tight spots (#33): `llama.cpp`, `sglang`,
-    /// `vllm`, `strata`, `openai`.
+    /// `vllm`, `strata`, `tqllm`, `openai`.
     #[must_use]
     pub fn short_name(self) -> &'static str {
         match self {
@@ -74,11 +81,12 @@ impl Backend {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::LlamaCpp,
         Self::SgLang,
         Self::Vllm,
         Self::Strata,
+        Self::Tqllm,
         Self::OpenAi,
     ];
 
@@ -101,10 +109,11 @@ impl Backend {
     }
 
     /// Whether the server reports a KV cache fill ratio of its own. Strata
-    /// has none; its KV comes as tokens (#79).
+    /// has none; its KV comes as tokens (#79). tqLLM exports no KV at all
+    /// (#180).
     #[must_use]
     pub fn has_kv_gauge(self) -> bool {
-        self != Self::Strata
+        !matches!(self, Self::Strata | Self::Tqllm)
     }
 
     /// Only llama.cpp answers `/slots`.
@@ -113,7 +122,8 @@ impl Backend {
         self == Self::LlamaCpp
     }
 
-    /// Whether `/upstream/<id>/metrics` is worth a GET.
+    /// Whether the server has telemetry worth a GET: `/upstream/<id>/metrics`,
+    /// or tqLLM's monitor snapshot in its place (#180).
     #[must_use]
     pub fn has_metrics(self) -> bool {
         self != Self::OpenAi
@@ -318,6 +328,7 @@ mod tests {
             Backend::SgLang,
             Backend::Vllm,
             Backend::Strata,
+            Backend::Tqllm,
             Backend::OpenAi,
         ] {
             let json = serde_json::to_string(&kind).expect("encode");
@@ -331,6 +342,8 @@ mod tests {
         assert!(serde_json::from_str::<Backend>("\"SGLang\"").is_err());
         assert_eq!(Backend::from_word("strata"), Some(Backend::Strata));
         assert_eq!(Backend::from_word("Strata"), None);
+        assert_eq!(Backend::from_word("tqllm"), Some(Backend::Tqllm));
+        assert_eq!(Backend::from_word("tqLLM"), None);
     }
 
     /// #33: one long and one short display name per engine.
@@ -347,6 +360,7 @@ mod tests {
                 ("SGLang", "sglang"),
                 ("vLLM", "vllm"),
                 ("Strata", "strata"),
+                ("tqLLM", "tqllm"),
                 ("OpenAI-compatible", "openai"),
             ]
         );
@@ -383,6 +397,10 @@ mod tests {
             read(r#"{"backend":"strata\u0031"}"#).ok(),
             Some(Some(Backend::OpenAi))
         );
+        assert_eq!(
+            read(r#"{"backend":"tqllm"}"#).ok(),
+            Some(Some(Backend::Tqllm))
+        );
         assert_eq!(read(r#"{"backend":null}"#).ok(), Some(None));
         assert_eq!(read("{}").ok(), Some(None));
         assert!(read(r#"{"backend":7}"#).is_err());
@@ -396,6 +414,10 @@ mod tests {
         assert!(!Backend::Strata.has_slots());
         assert!(Backend::Strata.has_metrics());
         assert!(!Backend::Strata.has_kv_gauge());
+        // #180: a snapshot, no `/slots`, no KV gauge.
+        assert!(!Backend::Tqllm.has_slots());
+        assert!(Backend::Tqllm.has_metrics());
+        assert!(!Backend::Tqllm.has_kv_gauge());
         assert!(Backend::SgLang.has_kv_gauge());
         assert!(Backend::SgLang.has_metrics());
         assert!(!Backend::OpenAi.has_metrics());

@@ -1,5 +1,6 @@
 # Built-in SETUP rules (#52): upstream llama.cpp, vLLM and SGLang flags,
-# and the settings Strata reports in its /metrics (#54, `engine:<key>`).
+# the settings Strata reports in its /metrics (#54, `engine:<key>`), and
+# tqLLM's flags with what its snapshot and /health report (#180).
 #
 # The same format as `[[setup.field]]` in watch.toml (README "SETUP rules").
 # watch.toml rules extend these; `[setup] defaults = false` drops them.
@@ -42,6 +43,14 @@ engines = ["strata"]
 source = "name"
 kind = "quant"
 order = 11
+
+# tqLLM: its build, from the snapshot's `engine.build`.
+[[field]]
+row = "engine"
+engines = ["tqllm"]
+source = "engine:version"
+sep = " "
+order = 10
 
 [[field]]
 row = "engine"
@@ -108,6 +117,19 @@ source = "live:kv_dtype"
 label = "kv"
 order = 22
 
+# tqLLM: the KV its command asked for with --kv or -ctk / -ctv (`--` when
+# a value is not a token); with none of them its default, dim, since the
+# memory fit may pick a smaller one (#180).
+[[field]]
+row = "ctx"
+engines = ["tqllm"]
+source = "engine:kv_asked"
+kind = "text"
+max_chars = 33
+label = "kv"
+default = "kv bf16"
+order = 22
+
 # Strata: KV tokens kept resident on the GPU.
 [[field]]
 row = "ctx"
@@ -131,6 +153,16 @@ source = "live:prefix_cache"
 map = { on = "prefix on", off = "prefix off" }
 group = "prefix"
 order = 25
+
+# tqLLM: what its memory fit chose, from /health (empty when it kept what
+# was asked, and then the row is not drawn).
+[[field]]
+row = "fit"
+engines = ["tqllm"]
+source = "engine:fit"
+kind = "text"
+max_chars = 96
+order = 26
 
 # ---- experts: MoE layers kept in system RAM ------------------------------
 
@@ -168,6 +200,23 @@ engines = ["strata"]
 source = "engine:expert_slots"
 kind = "number"
 suffix = " slots"
+order = 31
+
+# tqLLM: the MoE expert memory in system RAM and its cache.
+[[field]]
+row = "experts"
+engines = ["tqllm"]
+source = "flag:--moe-host-mb"
+kind = "mib"
+label = "host"
+order = 30
+
+[[field]]
+row = "experts"
+engines = ["tqllm"]
+source = "flag:--moe-cache-mb"
+kind = "mib"
+label = "cache"
 order = 31
 
 # The newest request's expert cache hit rate and PCIe share (any engine
@@ -274,6 +323,35 @@ kind = "number"
 label = "min-p"
 order = 43
 
+# tqLLM: the model's own MTP head, or a DFlash2 drafter (-md), and the
+# drafted tokens per step.
+[[field]]
+row = "spec"
+engines = ["tqllm"]
+source = "flag:--mtp"
+kind = "present"
+map = { on = "MTP" }
+group = "kind"
+order = 40
+
+[[field]]
+row = "spec"
+engines = ["tqllm"]
+source = "flag:-md"
+kind = "present"
+map = { on = "DFlash2" }
+group = "kind"
+fallback = true
+order = 41
+
+[[field]]
+row = "spec"
+engines = ["tqllm"]
+source = "flag:--draft-max"
+kind = "number"
+label = "n-max"
+order = 42
+
 [[field]]
 row = "spec"
 source = "live:spec_len"
@@ -287,7 +365,7 @@ order = 45
 
 [[field]]
 row = "spec"
-engines = ["llamacpp", "vllm", "sglang"]
+engines = ["llamacpp", "vllm", "sglang", "tqllm"]
 default = "none"
 fallback = true
 order = 49
@@ -318,6 +396,24 @@ source = "flag:--reasoning-parser"
 kind = "token"
 label = "parser"
 order = 52
+
+# tqLLM: --reasoning on|off and its token budget.
+[[field]]
+row = "think"
+engines = ["tqllm"]
+source = "flag:--reasoning-budget,--thinking-budget"
+kind = "number"
+label = "budget"
+map = { "-1" = "unlimited", "0" = "off" }
+order = 50
+
+[[field]]
+row = "think"
+engines = ["tqllm"]
+source = "flag:--reasoning"
+kind = "token"
+map = { on = "on", off = "off" }
+order = 51
 
 # ---- serve: memory share and batch limits --------------------------------
 
@@ -405,6 +501,27 @@ group = "conv"
 fallback = true
 order = 64
 
+# tqLLM: the requests it serves at once, the snapshot's `engine.slots`
+# (the memory fit may lower --np), else --np.
+[[field]]
+row = "serve"
+engines = ["tqllm"]
+source = "engine:slots"
+kind = "number"
+suffix = " slots"
+group = "np"
+order = 61
+
+[[field]]
+row = "serve"
+engines = ["tqllm"]
+source = "flag:--np"
+kind = "number"
+suffix = " slots"
+group = "np"
+fallback = true
+order = 62
+
 # ---- sample: sampling overrides ------------------------------------------
 
 [[field]]
@@ -446,3 +563,28 @@ source = "flag:--presence-penalty"
 kind = "number"
 label = "pres"
 order = 74
+
+# tqLLM: the defaults for requests that set none (greedy otherwise).
+[[field]]
+row = "sample"
+engines = ["tqllm"]
+source = "flag:--temperature"
+kind = "number"
+label = "temp"
+order = 70
+
+[[field]]
+row = "sample"
+engines = ["tqllm"]
+source = "flag:--top-p"
+kind = "number"
+label = "top-p"
+order = 71
+
+[[field]]
+row = "sample"
+engines = ["tqllm"]
+source = "flag:--top-k"
+kind = "number"
+label = "top-k"
+order = 72

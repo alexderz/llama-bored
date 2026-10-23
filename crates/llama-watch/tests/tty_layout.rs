@@ -9778,3 +9778,173 @@ fn a_temperature_gauge_picks_the_reading_nearest_its_limit() {
     ]);
     assert_eq!(tie, "probe         50 C");
 }
+
+// ---- #180: tqLLM, one request reading and one generating ----------------------
+
+/// An invented tqLLM launch: podman, `tqserve` its entry point.
+const TQLLM_CMD: &str = "podman run --rm --name tq --device nvidia.com/gpu=all -p 127.0.0.1:8000:8000 -v /models/invented:/models:ro --entrypoint tqserve ghcr.io/example/moe-server:1 --model /models/Invented-Q4_K_M.gguf --context 65536 --np 2 -md /models/drafter.gguf --draft-max 4 --reasoning on --reasoning-budget 2048 --temperature 0.6 --top-p 0.95 --moe-host-mb 20480 --port 8000";
+
+/// #180: tqLLM generating, from `fixtures/llama/tqllm-snapshot.json`
+/// (request 4 decoding, request 5 reading, request 6 queued). SETUP comes
+/// from its flags and its report, with `/health`'s fit; the engine line
+/// has no KV item; the SLOTS lines, the engine numbers and the line are
+/// the ones `service.rs` and `tests/poller.rs` pin for that snapshot; GEN
+/// and PROMPT are the running requests' own rates; RECENT has both
+/// requests in flight above the finished rows, whose cached count tqLLM
+/// does not report.
+fn tqllm_model() -> TtyModel {
+    let mut model = sglang_model();
+    model.chart_glyphs = ChartGlyphs::Eighths;
+    model.model_name = "moe-tq".to_string();
+    model.model_detail = "tqLLM".to_string();
+    let body = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/llama/tqllm-snapshot.json"),
+    )
+    .expect("tqllm fixture");
+    let snap = llama_watch::metrics::parse_tqllm(&body).expect("snapshot");
+    let mut book = llama_watch::tqllm::TqllmBook::default();
+    let now = std::time::SystemTime::now();
+    book.observe("moe-tq", &snap, Instant::now(), now, now);
+    book.set_fit("moe-tq", Some("2 slots x 32k fit in 22.5 GiB".to_owned()));
+    let facts = book
+        .observe("moe-tq", &snap, Instant::now(), now, now)
+        .facts;
+    let launch = llama_watch::sources::cmdline::parse_launch(TQLLM_CMD);
+    assert_eq!(launch.backend, Backend::Tqllm);
+    let detail = ModelDetail {
+        ctx: facts.ctx,
+        ..launch.detail.expect("detail")
+    };
+    let info = BackendInfo {
+        kind: Backend::Tqllm,
+        engine: EngineStats {
+            spec_permille: Some(660),
+            prefill_tps_tenths: Some(3099),
+            decode_tps_tenths: Some(842),
+            ..EngineStats::default()
+        },
+        ..BackendInfo::default()
+    };
+    let rules = Rules::builtin();
+    let live = LiveCtx {
+        backend: Backend::Tqllm,
+        detail: Some(&detail),
+        info: Some(&info),
+        engine: Some(&facts.values),
+    };
+    model.setup = Some(SetupView {
+        id: "moe-tq".to_owned(),
+        name: "MoE TQ".to_owned(),
+        more: 0,
+        rows: rules.rows(&rules.extract(TQLLM_CMD), &live),
+    });
+    model.slots_line = "--".to_string();
+    model.backend_lines = vec![
+        "tqllm  running 2/2 · queued 1 · spec 66 % · prefill 310/s · decode 84.2/s".to_string(),
+    ];
+    let line = |id, done, cached, total, decoded, ctx_prompt| Slot {
+        id,
+        generating: true,
+        done,
+        cached,
+        total,
+        open: false,
+        done_known: true,
+        decoded,
+        ctx_prompt: Some(ctx_prompt),
+        n_ctx: Some(32_768),
+        ctx_history: Vec::new(),
+    };
+    model.slots = vec![
+        line(0, 288, 512, 800, 150, 800),
+        line(1, 1_024, 1_024, 6_000, 0, 6_000),
+    ];
+    model.gen_tps = Some(83.5);
+    model.prompt_tps = Some(1_137.777_778);
+    let flight = |time: &str, prompt, cached, decoded, processed, dur: &str| Activity {
+        time: time.to_string(),
+        model: "moe-tq".to_string(),
+        input_tok: prompt,
+        cached_tok: cached,
+        output_tok: decoded,
+        dur: dur.to_string(),
+        n_ctx: Some(32_768),
+        inflight: Some(llama_watch::tty::layout::InFlight {
+            decoding: decoded > 0,
+            processed,
+            target: true,
+            ..llama_watch::tty::layout::InFlight::default()
+        }),
+        ..Activity::default()
+    };
+    let mut reading = flight("18:47:20", 6_000, 1_024, 0, 1_024, "0.9s");
+    reading.prompt_tps = Some(1_137.777_778);
+    reading.prompt_measured = true;
+    let mut generating = flight("18:47:18", 800, 512, 150, 288, "2.5s");
+    (generating.prompt_tps, generating.gen_tps) = (Some(443.076_923), Some(83.5));
+    (generating.prompt_measured, generating.gen_measured) = (true, true);
+    let mut rows = vec![reading, generating];
+    // Finished rows: llama-swap's rates from tqLLM's timings; the cached
+    // count only where one completed request matched the row.
+    rows.extend(
+        model
+            .requests
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.live = false;
+                r.model = "moe-tq".to_string();
+                r.prompt_tps = Some(400.0);
+                r.gen_tps = Some(85.4);
+                if i > 0 {
+                    r.cached_tok = 0;
+                    r.cached_unknown = true;
+                }
+                r
+            }),
+    );
+    model.requests = rows;
+    model
+}
+
+const TQLLM_GOLDENS: [(&str, u16, u16); 2] = [
+    ("tqllm-213x60.json", 213, 60),
+    ("tqllm-160x48.json", 160, 48),
+];
+
+#[test]
+fn tqllm_goldens_match_character_and_colour() {
+    for (name, _, _) in TQLLM_GOLDENS {
+        assert_frame(name, &load(name), &tqllm_model());
+    }
+}
+
+#[test]
+#[ignore = "run with --ignored to write the #180 tqLLM goldens"]
+fn dump_tqllm_goldens() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tty");
+    for (name, cols, rows) in TQLLM_GOLDENS {
+        let grid = draw(&tqllm_model(), cols, rows);
+        std::fs::write(dir.join(name), dump_grid(&grid)).expect("write tqllm golden");
+    }
+}
+
+/// #180: the frame's tqLLM parts at both sizes: the engine line without
+/// KV, both SLOTS lines, the fit row and both in-flight rows.
+#[test]
+fn tqllm_frame_shows_its_lines_and_rows() {
+    for (cols, rows) in [(213, 60), (160, 48)] {
+        let grid = draw(&tqllm_model(), cols, rows);
+        let all = whole(&grid);
+        assert!(all.contains("tqllm  running 2/2 · queued 1"), "{all}");
+        assert!(!all.contains("KV"), "no KV item: {all}");
+        assert!(all.contains("tqLLM"), "{all}");
+        let recent = row_with(&grid, "RECENT");
+        let flights: Vec<String> = (recent + 1..recent + 3)
+            .map(|row| row_string(&grid, row))
+            .collect();
+        assert!(flights[0].contains("pp"), "{flights:?}");
+        assert!(flights[1].contains("gen"), "{flights:?}");
+    }
+}

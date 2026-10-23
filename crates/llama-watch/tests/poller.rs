@@ -118,6 +118,12 @@ struct World {
     upstream_at: Vec<(String, Instant)>,
     /// Becomes `running_after` once an upstream request is served (#70).
     after_upstream: Option<Vec<u8>>,
+    /// tqLLM's `/upstream/<id>/api/monitor/v1/snapshot` bodies (#180).
+    snapshots: HashMap<String, Vec<u8>>,
+    /// tqLLM's `/upstream/<id>/health` bodies (#180).
+    health: HashMap<String, Vec<u8>>,
+    /// `METHOD path` of every request, in order (#180).
+    requests: Vec<String>,
 }
 
 impl World {
@@ -140,6 +146,9 @@ impl World {
             upstream_delay: HashMap::new(),
             upstream_at: Vec::new(),
             after_upstream: None,
+            snapshots: HashMap::new(),
+            health: HashMap::new(),
+            requests: Vec::new(),
         }
     }
 }
@@ -176,6 +185,14 @@ impl Server {
         self.hits
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.world
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .requests
             .clone()
     }
 
@@ -221,6 +238,8 @@ fn serve(
             .push(path.clone());
         let (action, delay) = {
             let mut world = world.lock().unwrap_or_else(|err| err.into_inner());
+            let method = head.split_whitespace().next().unwrap_or("").to_owned();
+            world.requests.push(format!("{method} {path}"));
             (
                 reply(&mut world, &path),
                 world.upstream_delay.get(&path).copied(),
@@ -337,6 +356,28 @@ fn reply(world: &mut World, path: &str) -> Action {
                 location: location.clone(),
             };
         }
+    }
+    // #180: tqLLM's two leaves; a model without a body answers 404.
+    let tqllm = path
+        .strip_prefix("/upstream/")
+        .and_then(|rest| rest.strip_suffix("/api/monitor/v1/snapshot"))
+        .map(|model| world.snapshots.get(model))
+        .or_else(|| upstream_model(path, "health").map(|model| world.health.get(model)));
+    if let Some(body) = tqllm {
+        return match body {
+            Some(body) => Action::Respond {
+                status: 200,
+                reason: "OK",
+                body: body.clone(),
+                location: None,
+            },
+            None => Action::Respond {
+                status: 404,
+                reason: "Not Found",
+                body: Vec::new(),
+                location: None,
+            },
+        };
     }
     if let Some(model) = upstream_model(path, "metrics") {
         let body = world
@@ -1401,14 +1442,22 @@ fn openai_server_gets_no_metrics_or_slots_and_counts_activity() {
     wait_msg(&rx, Duration::from_secs(2), |view, _| {
         view.decoded_total == Some(40)
     });
-    // #31: one /metrics probe for this load (no known names: stays
-    // openai), logged once; never /slots.
+    // #31: one /metrics probe for this load (no known names), then one
+    // tqLLM snapshot probe (#180; none: stays openai), logged once; never
+    // /slots.
     let hits = server.hits();
     let upstream: Vec<&String> = hits
         .iter()
         .filter(|path| path.contains("/upstream/"))
         .collect();
-    assert_eq!(upstream, ["/upstream/tabby/metrics"], "{hits:?}");
+    assert_eq!(
+        upstream,
+        [
+            "/upstream/tabby/metrics",
+            "/upstream/tabby/api/monitor/v1/snapshot"
+        ],
+        "{hits:?}"
+    );
     let lines = log.lines();
     let notes: Vec<&String> = lines
         .iter()
@@ -1417,7 +1466,7 @@ fn openai_server_gets_no_metrics_or_slots_and_counts_activity() {
     assert_eq!(notes.len(), 1, "{lines:?}");
     assert!(
         notes[0].contains(
-            "tabby: launch command names no server; no known metric names; staying openai"
+            "tabby: launch command names no server; no known metric names; no tqLLM snapshot (http status); staying openai"
         ),
         "{lines:?}"
     );
@@ -2318,7 +2367,8 @@ fn a_slot_drop_is_classified_from_activity_with_text_off() {
 
 // ---- #5: IN/OUT from llama-swap captures ------------------------------------
 
-/// Every path the watcher may GET from llama-swap (the S17 fence, #5).
+/// Every path the watcher may GET from llama-swap (the S17 fence, #5;
+/// tqLLM's snapshot and health, #180).
 fn allowed_path(path: &str) -> bool {
     let upstream = path
         .strip_prefix("/upstream/")
@@ -2326,7 +2376,14 @@ fn allowed_path(path: &str) -> bool {
         .is_some_and(|(model, leaf)| {
             !model.is_empty()
                 && !model.contains("..")
-                && matches!(leaf, "metrics" | "slots" | "v1/loads?include=core")
+                && matches!(
+                    leaf,
+                    "metrics"
+                        | "slots"
+                        | "v1/loads?include=core"
+                        | "api/monitor/v1/snapshot"
+                        | "health"
+                )
         });
     let capture = path
         .strip_prefix("/api/captures/")
@@ -4303,4 +4360,497 @@ fn jobs_dir_with_llama_off_is_read() {
     assert_eq!(detail.jobs[0].name, "example-trainer");
     assert_eq!(detail.jobs[0].kind.as_deref(), Some("training"));
     assert_eq!(detail.jobs[0].state, llama_watch::jobs::JobState::Running);
+}
+
+// ---- #180: tqLLM's monitor snapshot ---------------------------------------------
+
+/// tqLLM in podman, told by its entry point. Invented paths and image.
+const TQLLM_CMD: &str = "podman run --rm --name tq --device nvidia.com/gpu=all -p 127.0.0.1:${PORT}:8000 -v /models/invented:/models:ro --entrypoint tqserve ghcr.io/example/moe-server:1 --model /models/invented.gguf --context 65536 --np 2 --port 8000";
+
+/// `fixtures/llama/tqllm-snapshot.json` under another `instance_id`, its
+/// requests edited.
+fn tq_snapshot(instance: &str, edit: impl FnOnce(&mut Vec<serde_json::Value>)) -> Vec<u8> {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fixture("tqllm-snapshot.json")).expect("tqllm fixture");
+    doc["instance_id"] = serde_json::json!(instance);
+    edit(doc["requests"].as_array_mut().expect("requests"));
+    serde_json::to_vec(&doc).expect("json")
+}
+
+/// Request `id`'s member `key` set to `value`.
+fn tq_set(requests: &mut [serde_json::Value], id: u64, key: &str, value: serde_json::Value) {
+    let req = requests
+        .iter_mut()
+        .find(|req| req["id"] == id)
+        .expect("request");
+    req[key] = value;
+}
+
+const TQ_HEALTH: &[u8] =
+    br#"{"status":"ok","engine":"0a1b2c3","fit":"2 slots x 32k fit in 22.5 GiB"}"#;
+
+fn tq_hits(server: &Server, leaf: &str) -> usize {
+    server
+        .hits()
+        .iter()
+        .filter(|path| path.as_str() == format!("/upstream/tq/{leaf}"))
+        .count()
+}
+
+/// Every request the watcher made is a GET on an allowed path; nothing
+/// went to tqLLM's slot admin or its chat bridge (#180).
+fn assert_get_only(server: &Server) {
+    let requests = server.requests();
+    assert!(!requests.is_empty());
+    for request in &requests {
+        let (method, path) = request.split_once(' ').expect("method and path");
+        assert_eq!(method, "GET", "{requests:?}");
+        assert!(allowed_path(path), "{requests:?}");
+        for never in ["admin", "chat", "completions", "/slots"] {
+            assert!(!path.contains(never), "{never}: {requests:?}");
+        }
+    }
+}
+
+/// #180: a server the command does not name and whose `/metrics` says
+/// nothing is tqLLM when its snapshot answers, once per load and logged
+/// once; from then on the snapshot is read in place of `/metrics`.
+#[test]
+fn a_container_tqllm_is_found_by_its_snapshot() {
+    let mut world = World::running(running_cmd("tq", CONTAINER_CMD));
+    world
+        .snapshots
+        .insert("tq".to_owned(), tq_snapshot("4242000000000000007", |_| ()));
+    world.health.insert("tq".to_owned(), TQ_HEALTH.to_vec());
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, _) = wait_msg(&rx, Duration::from_secs(3), |view, _| {
+        view.models
+            .first()
+            .and_then(|model| model.backend)
+            .is_some_and(|info| {
+                info.kind == llama_core::backend::Backend::Tqllm && info.running.is_some()
+            })
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kv_permille, None, "no KV gauge");
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(tq_hits(&server, "metrics"), 1, "{:?}", server.hits());
+    assert!(tq_hits(&server, "api/monitor/v1/snapshot") >= 3);
+    assert_eq!(tq_hits(&server, "health"), 1);
+    assert_get_only(&server);
+    let lines = log.lines();
+    let notes: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("names no server"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{lines:?}");
+    assert!(
+        notes[0].contains(
+            "tq: launch command names no server; no known metric names; /api/monitor/v1/snapshot says tqllm"
+        ),
+        "{lines:?}"
+    );
+}
+
+/// #180: tqLLM's counters come from its requests, counted once per
+/// `instance_id`: a running request's output as it grows, a request that
+/// appears and finishes between two reads in full. Its gauges are the
+/// running, queued and slot counts; `/health`'s `fit` is read once per
+/// instance; a restart starts the counters again. Never `/metrics`.
+#[test]
+fn tqllm_counts_its_snapshot_and_reads_health_once_per_instance() {
+    let mut world = World::running(running_cmd("tq", TQLLM_CMD));
+    world
+        .snapshots
+        .insert("tq".to_owned(), tq_snapshot("4242000000000000007", |_| ()));
+    world.health.insert("tq".to_owned(), TQ_HEALTH.to_vec());
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(3), |view, detail| {
+        view.decoded_total == Some(0)
+            && view.models[0]
+                .backend
+                .is_some_and(|info| info.running.is_some())
+            && detail
+                .setup
+                .first()
+                .is_some_and(|setup| setup.engine.contains_key("fit"))
+    });
+    let info = view.models[0].backend.expect("backend");
+    assert_eq!(info.kind, llama_core::backend::Backend::Tqllm);
+    assert_eq!((info.running, info.queued), (Some(2), Some(1)));
+    assert_eq!(info.max_running, Some(2), "engine.slots");
+    assert_eq!(info.kv_permille, None);
+    // Engine numbers from the finished requests: 248 of 376 drafted
+    // tokens accepted; 220 uncached prompt tokens in 0.71 s; 310 output
+    // tokens in 3.68 s (each request's first comes from its prefill).
+    assert_eq!(info.engine.spec_permille, Some(660));
+    assert_eq!(info.engine.prefill_tps_tenths, Some(3099));
+    assert_eq!(info.engine.decode_tps_tenths, Some(842));
+    // GEN and PROMPT: the sums of the running requests' own rates.
+    assert_eq!(detail.gen_tps, Some(83.5));
+    assert!(
+        detail
+            .prompt_tps
+            .is_some_and(|tps| (tps - 1_137.777_778).abs() < 1e-6),
+        "{:?}",
+        detail.prompt_tps
+    );
+    let setup = &detail.setup[0];
+    assert_eq!(
+        setup.engine.get("fit").map(String::as_str),
+        Some("2 slots x 32k fit in 22.5 GiB")
+    );
+    assert_eq!(
+        setup.engine.get("version").map(String::as_str),
+        Some("0a1b2c3")
+    );
+    // The snapshot's per-slot context beats the flag's 65,536 / 2.
+    let tuning = view.models[0].detail.as_ref().expect("detail");
+    assert_eq!(tuning.ctx, Some(32_768));
+    let live = &detail.engine_live[0].live;
+    assert_eq!(live.instance.as_deref(), Some("4242000000000000007"));
+    assert_eq!(live.requests.len(), 3, "decode, prefill, queued");
+
+    // Request 4 decodes 40 more; request 7 came and finished in between.
+    server.update(|world| {
+        world.snapshots.insert(
+            "tq".to_owned(),
+            tq_snapshot("4242000000000000007", |requests| {
+                tq_set(requests, 4, "output_tokens", serde_json::json!(190));
+                let mut seven = requests[0].clone();
+                seven["id"] = serde_json::json!(7);
+                seven["output_tokens"] = serde_json::json!(25);
+                requests.push(seven);
+            }),
+        );
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(65)
+    });
+    thread::sleep(Duration::from_millis(500));
+    let (view, _) = wait_msg(&rx, Duration::from_secs(2), |_, _| true);
+    assert_eq!(view.decoded_total, Some(65), "each id counted once");
+    assert_eq!(tq_hits(&server, "health"), 1);
+
+    // A new instance: its requests count from zero, and `/health` is read
+    // again.
+    server.update(|world| {
+        world.snapshots.insert(
+            "tq".to_owned(),
+            tq_snapshot("4242000000000000099", |requests| {
+                requests.retain(|req| req["id"] == 1);
+            }),
+        );
+    });
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(77)
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(tq_hits(&server, "health"), 2);
+    assert_eq!(tq_hits(&server, "metrics"), 0);
+    assert_get_only(&server);
+    let lines = log.lines();
+    assert_eq!(
+        lines_count(&log, "tq: tqLLM restarted (new instance_id)"),
+        1,
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("no /metrics")),
+        "{lines:?}"
+    );
+}
+
+/// #180: a snapshot of another `schema_version` is no metrics: the model
+/// is counted from activity rows, logged once for the load.
+#[test]
+fn tqllm_another_schema_is_no_metrics_and_logged_once() {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&tq_snapshot("4242000000000000007", |_| ())).expect("json");
+    body["schema_version"] = serde_json::json!(2);
+    let mut world = World::running(running_cmd("tq", TQLLM_CMD));
+    world
+        .snapshots
+        .insert("tq".to_owned(), serde_json::to_vec(&body).expect("json"));
+    world.activity = activity_page(&[(1, "tq", 30)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    server.update(|world| world.activity = activity_page(&[(2, "tq", 12), (1, "tq", 30)]));
+    wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(12)
+    });
+    thread::sleep(Duration::from_millis(600));
+    assert!(tq_hits(&server, "api/monitor/v1/snapshot") >= 3);
+    assert_eq!(tq_hits(&server, "health"), 0, "no snapshot, no health");
+    let lines = log.lines();
+    assert_eq!(
+        lines_count(
+            &log,
+            "tq: tqLLM snapshot schema_version 2 is not 1; using llama-swap activity"
+        ),
+        1,
+        "{lines:?}"
+    );
+    assert_get_only(&server);
+}
+
+/// #180: a snapshot over the 256 KiB cap is not parsed; the model is
+/// counted from activity rows, logged once.
+#[test]
+fn tqllm_snapshot_over_the_cap_falls_back() {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&tq_snapshot("4242000000000000007", |_| ())).expect("json");
+    body["a_future_member"] = serde_json::json!("x".repeat(poller::TQLLM_CAP));
+    let mut world = World::running(running_cmd("tq", TQLLM_CMD));
+    world
+        .snapshots
+        .insert("tq".to_owned(), serde_json::to_vec(&body).expect("json"));
+    world.activity = activity_page(&[(1, "tq", 30)]);
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(2), |view, _| {
+        view.decoded_total == Some(0)
+    });
+    assert_eq!(
+        view.models[0].backend.and_then(|info| info.running),
+        None,
+        "no gauges"
+    );
+    assert!(detail.engine_live.is_empty());
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        lines_count(&log, "tq: no /metrics from tqllm (oversized body)"),
+        1,
+        "{:?}",
+        log.lines()
+    );
+    assert_get_only(&server);
+}
+
+/// One tqLLM activity row, as llama-swap writes it.
+fn tq_activity(
+    id: i64,
+    stamp: &str,
+    input: i64,
+    output: i64,
+    prompt: f64,
+    gen_rate: f64,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "data": [{
+        "id": id,
+        "timestamp": stamp,
+        "model": "tq",
+        "tokens": {
+            "input_tokens": input,
+            "output_tokens": output,
+            "cache_tokens": -1,
+            "prompt_per_second": prompt,
+            "tokens_per_second": gen_rate
+        },
+        "duration_ms": 3_500,
+        "resp_status_code": 200
+    }]}))
+    .expect("json")
+}
+
+/// #180: a tqLLM row matched to its one finished request shows that
+/// request's own prompt rate, without the cache, in place of llama-swap's,
+/// which counts the cache (6,000 tokens, 5,000 of them cached, read in
+/// 1 s: llama-swap says 6,000/s, the request 1,000/s). CACHED comes from
+/// the request; llama-swap's IN and GEN stay.
+#[test]
+fn a_tqllm_row_takes_its_requests_own_prompt_rate() {
+    let only_four = |requests: &mut Vec<serde_json::Value>| requests.retain(|req| req["id"] == 4);
+    let mut world = World::running(running_cmd("tq", TQLLM_CMD));
+    world.snapshots.insert(
+        "tq".to_owned(),
+        tq_snapshot("4242000000000000007", only_four),
+    );
+    world.health.insert("tq".to_owned(), TQ_HEALTH.to_vec());
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(3), |view, _| {
+        view.models[0]
+            .backend
+            .is_some_and(|info| info.running == Some(1))
+    });
+    thread::sleep(Duration::from_millis(500));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
+    let stamp = sglang_stamp_at(now.as_secs() as i64);
+    server.update(|world| {
+        world.snapshots.insert(
+            "tq".to_owned(),
+            tq_snapshot("4242000000000000007", |requests| {
+                only_four(requests);
+                for (key, value) in [
+                    ("phase", serde_json::json!("complete")),
+                    ("elapsed_ms", serde_json::json!(3_500.0)),
+                    ("prompt_tokens", serde_json::json!(6_000)),
+                    ("prefill_processed_tokens", serde_json::json!(6_000)),
+                    ("prefill_cached_tokens", serde_json::json!(5_000)),
+                    ("prefill_ms", serde_json::json!(1_000.0)),
+                    ("prefill_tokens_per_second", serde_json::json!(1_000.0)),
+                    ("output_tokens", serde_json::json!(40)),
+                    ("decode_ms", serde_json::json!(1_000.0)),
+                    ("decode_tokens_per_second", serde_json::json!(39.0)),
+                ] {
+                    tq_set(requests, 4, key, value);
+                }
+            }),
+        );
+        world.activity = tq_activity(1, &stamp, 6_000, 40, 6_000.0, 40.0);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(10), |_, detail| {
+        detail
+            .activity
+            .iter()
+            .any(|row| row.id == 1 && row.cached_tokens.is_some())
+    });
+    let row = detail.activity.iter().find(|row| row.id == 1).expect("row");
+    assert_eq!(row.cached_tokens, Some(5_000));
+    assert_eq!(row.prompt_tps, Some(1_000.0), "the request's own rate");
+    assert_eq!(row.gen_tps, Some(40.0), "llama-swap's");
+    assert_eq!(row.input_tokens, Some(6_000), "llama-swap's");
+    assert_get_only(&server);
+}
+
+/// #180: a `/health` that fails (404 here) loses only the `fit`, logged
+/// once: the gauges stay through it, and the fit of the old instance goes.
+#[test]
+fn a_failed_tqllm_health_drops_only_the_fit() {
+    let mut world = World::running(running_cmd("tq", TQLLM_CMD));
+    world
+        .snapshots
+        .insert("tq".to_owned(), tq_snapshot("4242000000000000007", |_| ()));
+    world.health.insert("tq".to_owned(), TQ_HEALTH.to_vec());
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(3), |view, detail| {
+        view.models[0]
+            .backend
+            .is_some_and(|info| info.running.is_some())
+            && detail
+                .setup
+                .first()
+                .is_some_and(|setup| setup.engine.contains_key("fit"))
+    });
+    // A new instance, and `/health` now fails.
+    server.update(|world| {
+        world.health.clear();
+        world
+            .snapshots
+            .insert("tq".to_owned(), tq_snapshot("4242000000000000099", |_| ()));
+    });
+    let start = Instant::now();
+    let mut fit_gone = false;
+    while start.elapsed() < Duration::from_millis(1_500) {
+        match rx.try_recv() {
+            Ok((view, detail)) => {
+                let info = view.models[0].backend.expect("backend");
+                assert_eq!(info.running, Some(2), "the gauges stay");
+                assert_eq!(
+                    detail.setup[0].engine.get("version").map(String::as_str),
+                    Some("0a1b2c3"),
+                    "the other engine values stay"
+                );
+                fit_gone = !detail.setup[0].engine.contains_key("fit");
+            }
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert!(fit_gone, "the old fit went");
+    assert_eq!(tq_hits(&server, "health"), 2, "once per instance");
+    assert_eq!(
+        lines_count(&log, "tq: no tqLLM /health (http status); no fit shown"),
+        1,
+        "{:?}",
+        log.lines()
+    );
+    assert_get_only(&server);
+}
+
+/// #180: what a tqLLM command says about its KV. No `--kv`, `-ctk` or
+/// `-ctv`: bf16 on the wire, and SETUP's default (dim, no `kv_asked`). A
+/// value that is not a token: unknown, and `kv_asked` is `--`. A valid one:
+/// that value.
+#[test]
+fn a_tqllm_kv_is_its_default_unknown_or_what_was_asked() {
+    let cmds = [
+        ("tq-default", "tqserve --model /m/a.gguf --port 8086"),
+        ("tq-bad", "tqserve --model /m/b.gguf --kv q8;x --port 8086"),
+        (
+            "tq-named",
+            "tqserve --model /m/c.gguf --kv q8/tcq2 --port 8086",
+        ),
+    ];
+    let running: Vec<serde_json::Value> = cmds
+        .iter()
+        .map(|(id, cmd)| serde_json::json!({"model": id, "name": id, "state": "ready", "cmd": cmd}))
+        .collect();
+    let mut world = World::running(
+        serde_json::to_vec(&serde_json::json!({ "running": running })).expect("json"),
+    );
+    for (id, _) in cmds {
+        world
+            .snapshots
+            .insert(id.to_owned(), tq_snapshot("4242000000000000007", |_| ()));
+    }
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let (view, detail) = wait_msg(&rx, Duration::from_secs(3), |view, detail| {
+        view.models.len() == 3
+            && view
+                .models
+                .iter()
+                .all(|model| model.backend.is_some_and(|info| info.running.is_some()))
+            && detail.setup.len() == 3
+    });
+    let kv = |name: &str| {
+        let model = view
+            .models
+            .iter()
+            .find(|model| model.name == name)
+            .expect("model");
+        let detail = model.detail.as_ref().expect("detail");
+        (detail.kv_k.clone(), detail.kv_v.clone())
+    };
+    let asked = |id: &str| {
+        detail
+            .setup
+            .iter()
+            .find(|setup| setup.id == id)
+            .expect("setup")
+            .engine
+            .get("kv_asked")
+            .cloned()
+    };
+    let bf16 = Some("bf16".to_owned());
+    assert_eq!(kv("tq-default"), (bf16.clone(), bf16));
+    assert_eq!(asked("tq-default"), None, "SETUP draws its default dim");
+    assert_eq!(kv("tq-bad"), (None, None), "unknown");
+    assert_eq!(asked("tq-bad").as_deref(), Some("--"));
+    assert_eq!(
+        kv("tq-named"),
+        (Some("q8".to_owned()), Some("tcq2".to_owned()))
+    );
+    assert_eq!(asked("tq-named").as_deref(), Some("q8/tcq2"));
 }

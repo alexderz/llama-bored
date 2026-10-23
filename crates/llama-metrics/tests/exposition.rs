@@ -1540,6 +1540,36 @@ fn kv_ratio_is_used_over_capacity_else_the_engines_own() {
     );
 }
 
+/// #180: a tqLLM model's series carry `engine="tqllm"`; it has no KV
+/// gauge, so no KV series.
+#[test]
+fn a_tqllm_model_is_labelled_tqllm() {
+    let mut snap = load("snapshot-loaded.json");
+    let model = snap
+        .ai
+        .models
+        .iter_mut()
+        .find(|m| m.id.as_deref() == Some("tabby-exl3"))
+        .expect("openai model");
+    model.backend = Some(wire::Backend::Tqllm);
+    let all = samples(&render(&Ok(snap), T0));
+    let info = find(&all, "llamabored_model_info", "tabby-exl3").expect("info");
+    assert_eq!(info.1[1], ("engine".to_owned(), "tqllm".to_owned()));
+    let series: Vec<&Sample> = all
+        .iter()
+        .filter(|(_, labels, _)| labels.first().is_some_and(|(_, v)| v == "tabby-exl3"))
+        .collect();
+    assert!(series.len() > 3, "{series:?}");
+    for (name, labels, _) in series {
+        assert_eq!(
+            labels[1],
+            ("engine".to_owned(), "tqllm".to_owned()),
+            "{name}"
+        );
+        assert!(!name.contains("_kv_"), "{name}");
+    }
+}
+
 fn set_host_gauge(metric: &str, want: &str, set: impl FnOnce(&mut llama_core::wire::Host)) {
     let mut snap = load("snapshot-loaded.json");
     set(&mut snap.host);

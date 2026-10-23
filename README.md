@@ -50,7 +50,7 @@ before #84); after an upgrade, restart every unit so no older reader meets a
 larger snapshot.
 
 **Engine.** tty11's header always names the inference engine serving the
-shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `OpenAI-compatible`
+shown model: `llama.cpp`, `SGLang`, `vLLM`, `Strata`, `tqLLM`, `OpenAI-compatible`
 (a llama.cpp fork is `llama.cpp`); with no model loaded it says
 `engine --`. Its settings are in the SETUP block (below). While the shown
 model is llama-swap `starting` or `stopping`, the word is `LOADING` or
@@ -83,10 +83,10 @@ the last items fold into `+N more`. A holder is never cut. The countdown
 keeps five cells up to `99:59`. Nothing claimed or reserved, or a
 llama-swap that never says, leaves the header as it is. The LCD
 starts the line under the model name with the short name (`llama.cpp`,
-`sglang`, `vllm`, `strata`, `openai`) and drops the quant first when space
+`sglang`, `vllm`, `strata`, `tqllm`, `openai`) and drops the quant first when space
 is short.
 The exporter carries the wire word (`llamacpp`, `sglang`, `vllm`, `strata`,
-`openai`) as the `engine` label on every per-model series (see
+`tqllm`, `openai`) as the `engine` label on every per-model series (see
 **llama-metrics** under Features).
 
 **Speeds.** RECENT's PROMPT and GEN tok/s come from llama-swap, which has
@@ -128,7 +128,8 @@ finish, is not used. The prompt rate is shown only while the engine's
 queue count and request count agree at an idle point, so on an engine
 whose queue count runs ahead of its request count it stays `--`.
 The cached count and the generation rate stay. A value llama-swap
-already reported is never replaced.
+already reported is never replaced (tqLLM's prompt rate is the one
+exception, #180: see **tqLLM** under Features).
 A missing cached count is still filled, and so is a rate the row did
 not report. Two requests, a second request running, a counter that
 went backwards, a missed scrape, or a row that does not match fill
@@ -502,8 +503,8 @@ falls back to utilisation.
   llama-swap's `/upstream/<id>/…`, which can load a model (#70).
 - Since 0.5 (#71) every engine's numbers that mean the same thing are one
   series, told apart by labels: `model` (the llama-swap model id, exact;
-  the join key), `engine` (`llamacpp`, `vllm`, `sglang`, `strata` or
-  `openai`), and `slot`, `state`, `status` and `reason` where they apply.
+  the join key), `engine` (`llamacpp`, `vllm`, `sglang`, `strata`,
+  `tqllm` or `openai`), and `slot`, `state`, `status` and `reason` where they apply.
 - Names carry their unit, ratios are 0 to 1, only counters end in
   `_total`, and descriptive strings live on `llamabored_model_info` only.
   Counters count since llama-watch started: an engine restart or a model
@@ -516,26 +517,26 @@ Per model (labels `model`, `engine`):
 
 | Series | Type | Filled by |
 |---|---|---|
-| `llamabored_model_info{display_name, quant, kv_type, version}` | gauge, 1 | every engine (`version`: Strata; empty when unknown) |
+| `llamabored_model_info{display_name, quant, kv_type, version}` | gauge, 1 | every engine (`version`: Strata, tqLLM's `engine.build`; empty when unknown) |
 | `llamabored_model_state{state}` | gauge | every engine (`ready`, `starting`, `stopping`, `other`) |
-| `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context` |
-| `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata |
+| `llamabored_model_context_size_tokens` | gauge | `-c`, `--max-model-len`, `--context-length`, Strata `context`, tqLLM `engine.context_per_slot` (else `--context` / `--np`) |
+| `llamabored_model_requests_running`, `…_requests_waiting` | gauge | llama.cpp (`requests_processing`, `requests_deferred`), vLLM, SGLang, Strata, tqLLM (its requests by phase) |
 | `llamabored_model_inflight_requests` | gauge | every engine, from llama-swap's `/api/events` while a vLLM or SGLang model is loaded (#80); one aggregate per model, never a series per request |
-| `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1, or its `batch_slots` in parallel mode (#81) |
-| `llamabored_model_kv_cache_usage_ratio` | gauge | KV in use / capacity (#79), else the engine's own ratio: every engine but OpenAI-compatible |
+| `llamabored_model_slots` | gauge | llama.cpp slots; vLLM `--max-num-seqs`, SGLang `--max-running-requests`, Strata 1, or its `batch_slots` in parallel mode (#81), tqLLM `engine.slots` (else `--np`) |
+| `llamabored_model_kv_cache_usage_ratio` | gauge | KV in use / capacity (#79), else the engine's own ratio: every engine but tqLLM and OpenAI-compatible |
 | `llamabored_model_kv_used_tokens`, `…_kv_capacity_tokens` | gauge | KV across all sessions (#79): llama.cpp (`/slots`), vLLM (ratio × `kv_cache_size_tokens`, block-rounded), SGLang, Strata |
 | `llamabored_model_kv_cached_tokens` | gauge | SGLang's reusable radix cache, not part of used (#79) |
 | `llamabored_model_kv_sessions` | gauge | slots holding tokens (llama.cpp, Strata), else running requests (#79) |
 | `llamabored_model_kv_unified` | gauge | llama.cpp: 1 when every slot shares one pool (#79) |
 | `llamabored_model_prompt_tokens_total` | counter | every engine (llama.cpp and OpenAI-compatible from llama-swap's activity rows) |
-| `llamabored_model_prompt_cached_tokens_total` | counter | llama.cpp (`cache_tokens`), vLLM, SGLang, Strata (`reused`) |
+| `llamabored_model_prompt_cached_tokens_total` | counter | llama.cpp (`cache_tokens`), vLLM, SGLang, Strata (`reused`), tqLLM (`prefill_cached_tokens`) |
 | `llamabored_model_generation_tokens_total` | counter | every engine (llama.cpp `tokens_predicted_total`; OpenAI-compatible from activity rows) |
-| `llamabored_model_prefill_seconds_total`, `…_decode_seconds_total` | counter | llama.cpp (`prompt_seconds_total`, `tokens_predicted_seconds_total`), vLLM (per-request time sums), Strata (`prompt_ms`, `decode_ms`) |
+| `llamabored_model_prefill_seconds_total`, `…_decode_seconds_total` | counter | llama.cpp (`prompt_seconds_total`, `tokens_predicted_seconds_total`), vLLM (per-request time sums), Strata (`prompt_ms`, `decode_ms`), tqLLM (completed requests' `prefill_ms`, `decode_ms`) |
 | `llamabored_model_requests_total{status}` | counter | every engine, from llama-swap's activity rows (`ok` is 2xx, else `error`) |
 | `llamabored_model_time_to_first_token_seconds` | summary (`_sum`, `_count`) | vLLM, SGLang |
 | `llamabored_model_inter_token_latency_seconds` | summary | vLLM, SGLang |
 | `llamabored_model_request_duration_seconds` | summary | vLLM, SGLang (e2e histograms); others from activity row durations |
-| `llamabored_model_spec_draft_tokens_total`, `…_spec_accepted_tokens_total` | counter | vLLM, Strata, llama.cpp (activity draft fields) |
+| `llamabored_model_spec_draft_tokens_total`, `…_spec_accepted_tokens_total` | counter | vLLM, Strata, tqLLM (`drafted`, `accepted`), llama.cpp (activity draft fields) |
 | `llamabored_model_spec_drafts_total` | counter | vLLM (the others count no draft rounds) |
 | `llamabored_model_preemptions_total`, `llamabored_model_sleeping` | counter, gauge | vLLM |
 | `llamabored_model_kv_block_size_tokens`, `llamabored_model_prefix_caching` | gauge | vLLM `cache_config_info` |
@@ -545,8 +546,8 @@ Per model (labels `model`, `engine`):
 
 The latencies are `summary` families with no quantiles: one `# TYPE …
 summary` and a `_sum` and `_count` sample per model, both counters to
-`rate()`. Not reported, so absent: TTFT and ITL for llama.cpp, Strata and
-OpenAI-compatible servers; prefill and decode seconds for SGLang and
+`rate()`. Not reported, so absent: TTFT and ITL for llama.cpp, Strata,
+tqLLM and OpenAI-compatible servers; prefill and decode seconds for SGLang and
 OpenAI-compatible servers; speculative counters for SGLang (it reports
 only gauges) and OpenAI-compatible servers. SGLang's request counter
 (the `is_streaming="false"` series as well as the sum), prompt,
@@ -620,13 +621,15 @@ by its launch command (or `[llama.backends]` in `watch.toml`):
 | SGLang | tok/s, running and queued requests, KV fill and cache hit rate from `sglang:*` metrics (start it with `--enable-metrics`); tuning line from its flags; IN/OUT from llama-swap captures |
 | vLLM | The same from `vllm:*` metrics, plus speculative-decoding acceptance (`spec 78 %`, also on the LCD), mean TTFT, inter-token and request latency, preemptions, and the KV dtype, block size and prefix caching from `cache_config_info`; IN/OUT from llama-swap captures |
 | Strata (`serve/server.py --engine strata`, or recognised by its JSON `/metrics`) | From its JSON `/metrics`: tok/s, running and queued requests (one at a time), its settings in SETUP (context, KV, expert cache, spec depth, serving knobs), speculative acceptance, window prefill and decode tok/s, expert cache hit rate and PCIe share, and its live phase (`writing a tool call: write`, tty11 only, never exported); numbers and short tokens only, at most 1 MiB, `history` never read; no KV fill or cache hit rate; IN/OUT from llama-swap captures. Started with `--api-key`, it falls back to llama-swap's request log (llama-bored keeps no keys) |
+| tqLLM (`tqserve`, `--entrypoint tqserve`, a `tqllm…` image, or recognised by its monitor snapshot, #180) | From `/api/monitor/v1/snapshot`: tok/s as the running requests' own rates, running and queued requests and the slot count, prompt, cached, output and speculative counters per request, window prefill and decode tok/s, an in-flight RECENT row per request, SLOTS lines with each request's context; `fit` from `/health` in SETUP; no KV gauge and no `/slots`; IN/OUT from llama-swap captures. See **tqLLM** below |
 | Any other OpenAI-compatible server (TabbyAPI, ...) | Token counts from llama-swap's request log; GPU, CPU and activity as always |
 
 When the launch command does not name the server (a container whose image
 starts it, or a wrapper script), llama-watch reads that model's `/metrics`
 once while it is loaded and recognises the server by its metric names
 (`vllm:`, `sglang:`, `llamacpp:`), or Strata by the shape of its JSON (an
-object whose `engine` and `live` members are objects). It only ever reads models llama-swap
+object whose `engine` and `live` members are objects); when `/metrics` says
+nothing, one tqLLM monitor snapshot read tells tqLLM (#180, below). It only ever reads models llama-swap
 reports as `ready`, so it never makes llama-swap load one (see
 **Never swaps models** below).
 `[llama.backends]` overrides the detection. Once the server is known either
@@ -643,12 +646,129 @@ OUT show the last finished exchange from llama-swap's request captures and
 the log says so once per model; SLOTS, ctx and resets still come from
 `/slots`, and a server restarted with the variable gets live text again.
 
+**tqLLM** (#180). A launch command that names no server, and whose
+`/metrics` gives no known names, gets one more probe that load: `GET
+/upstream/<id>/api/monitor/v1/snapshot`. A snapshot makes it tqLLM; the
+log says so once (`<id>: launch command names no server; no known metric
+names; /api/monitor/v1/snapshot says tqllm`), and once if not (`…; no
+tqLLM snapshot (http status); staying openai`). A tqLLM model's snapshot
+is read at the metrics cadence in place of `/metrics`, through the same
+fresh gate: at most 256 KiB, nested at most 8 deep, no redirects, its
+`schema_version` exactly 1 and the fields llama-watch uses checked
+strictly (unknown members are ignored). Another schema is no metrics: the
+model is counted from llama-swap's activity rows, and the log says once
+per load `<id>: tqLLM snapshot schema_version 2 is not 1; using llama-swap
+activity`. Its `hardware` block, `engine.host`, `engine.device_id` and
+`engine.model` are never read. `/health` is read once per load and once
+per `instance_id`, for its `fit`; a non-2xx answer there loses only the
+`fit` (logged once, `<id>: no tqLLM /health (http status); no fit
+shown`), and the model's gauges stay. tqLLM writes control characters raw
+inside `fit`, which JSON forbids, so each is read as a space. Token
+counts, times and rates above 2^53 − 1 make the snapshot malformed. The
+slot admin (`POST /admin/slots`)
+and the chat bridge are never called; llama-watch sends tqLLM only GETs.
+
+- **Counters** come from the requests the snapshot lists: each request's
+  prompt, cached and output tokens and its drafted and accepted tokens
+  count once per `instance_id`, as they grow and when it completes. A
+  failed or cancelled request adds nothing more. A new `instance_id` is a
+  restart: its counters start again (logged once). tqLLM keeps its last
+  32 finished requests; a request id that left that list before
+  llama-watch saw it finish is a gap, logged once, its unseen tokens not
+  counted.
+- **Gauges**: running is the requests in `prefill` or `decode`, queued
+  those `queued`, the request cap `engine.slots`. tqLLM has no KV gauge
+  and no `/slots`. GEN and PROMPT are the sums of the running requests'
+  own `decode_tokens_per_second` and `prefill_tokens_per_second` (0 with
+  none in that phase, `--` while none has a rate yet). The backend line
+  ends with the spec acceptance and the engine speeds of the window, from
+  the completed requests' `prefill_ms` and `decode_ms` (the prefill
+  tokens beyond the cache; every output token after the first).
+- **In flight**: each queued, prefill or decode request is a RECENT row.
+  `pp` fills toward the prompt from `prefill_processed_tokens`, with
+  `prefill_cached_tokens` as the cached part; `gen` counts its output; DUR
+  is tqLLM's `elapsed_ms`; PROMPT and GEN are that request's own rates.
+  A queued request shows `--` until its prompt is known. The running
+  requests come first; at most four queued ones follow, the next to run
+  first, and a queued one never pushes a running one out of the 16 rows
+  RECENT tracks. llama-swap's finished rows take the flights over one
+  each, oldest first, an exact prompt match first; a request tqLLM still
+  lists as running takes no row, even one with its prompt.
+- **Finished rows**: tqLLM sends llama.cpp-style `timings` without a
+  cached count, so llama-swap's `input_tokens` is the whole prompt and
+  CACHED is `--`. When exactly one completed request in the snapshot has
+  the row's prompt and output counts and ended within 2 s of the row,
+  CACHED takes that request's `prefill_cached_tokens`, a generation rate
+  llama-swap left out takes that request's own, and PROMPT is that
+  request's `prefill_tokens_per_second`. That is the one exception to "a
+  value llama-swap reported is never replaced": llama-swap's prompt rate
+  for tqLLM is the whole prompt, cached part included, over the prefill
+  time (6,000 tokens with 5,000 cached, read in 1 s, give 6,000/s), while
+  the in-flight row showed the uncached 1,000/s. Two candidates, or none,
+  fill nothing, and the row keeps llama-swap's numbers. A request seen
+  only as finished on the first read is counted but fills no row: when it
+  ended is not known, and it may predate llama-watch. When llama-swap's
+  row ids start again (#44), the fills go.
+- **SLOTS** gets `engine.slots` lines (at most 64): each running request
+  keeps the line it took (the lowest free one when it started), its
+  prompt progress (`1,024/6,000` beyond the cache while it reads) and
+  what it generated, and its `context_tokens` on the ctx meter against
+  `engine.context_per_slot`; a free line is idle.
+
+```text
+  SLOTS  prompt processed                        decoded                                  ctx · 6h
+  s0 gen ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄             288/800   150 tok      ctx ▄···········   950/32k
+  s1 gen ▄▄▄▄▄▄···········         1,024/6,000   0 tok        ctx ▄▄··········    6k/32k
+  tqllm  running 2/2 · queued 1 · spec 66 % · prefill 310/s · decode 84.2/s
+
+  RECENT TIME      MODEL       IN   CACHED   OUT  PROMPT     GEN    DUR
+>        18:47:20  moe-tq   6,000    1,024     0  ~1,138      --   0.9s ▇▄▄▇▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ pp
+>        18:47:18  moe-tq     800      512   150    ~443   ~83.5   2.5s ▆▂▇▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ gen
+```
+
+A llama-swap entry for tqLLM in podman (invented paths and image).
+tqserve listens on its default port 8086 inside the container, on all of
+the container's interfaces, and podman publishes it on the host's
+127.0.0.1 only, at llama-swap's `${PORT}`. The weights are mounted
+read-only. The first start of a model can take many minutes while tqLLM
+prepares it and its memory fit measures, so `healthCheckTimeout` (in
+seconds, llama-swap's default is 120) must allow for that, or llama-swap
+gives up on the start:
+
+```yaml
+healthCheckTimeout: 1800
+models:
+  moe-tq:
+    name: "MoE TQ"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: >
+      podman run --rm --name moe-tq --device nvidia.com/gpu=all
+      -p 127.0.0.1:${PORT}:8086
+      -v /models/moe-tq:/models:ro
+      --entrypoint tqserve ghcr.io/example/tqllm:latest
+      --model /models/moe-tq.gguf -md /models/moe-tq-drafter.gguf
+      --context 65536 --np 2 --kv bf16 --draft-max 4
+      --host 0.0.0.0 --port 8086
+    cmdStop: podman stop moe-tq
+```
+
+Its flags fill SETUP (#180): `--context` (split across `--np` slots),
+`--np`, `--kv`/`-ctk`/`-ctv` (`bf16` when none is given, drawn grey;
+one side named makes the other `bf16`; a value that is not a token leaves
+the KV unknown), `--mtp` or `-md`
+(DFlash2), `--draft-max`, `--reasoning`, `--reasoning-budget`,
+`--temperature`, `--top-p`, `--top-k`, `--moe-host-mb` and
+`--moe-cache-mb`; no path is kept, and a later value that does not parse
+is ignored. Once read, the snapshot's `engine.context_per_slot` and
+`engine.slots` replace the flags' values.
+
 **Never swaps models (#70).** llama-swap starts, or swaps in, any model
 an `/upstream/<model>/…` request names that is not loaded, so llama-watch
 makes sure its own polling never does:
 
 - **Fresh gate.** Every upstream read (`/metrics`, `/slots`, the one-time
-  engine probe, SGLang's `/v1/loads?include=core` for an in-flight row)
+  engine probe, SGLang's `/v1/loads?include=core` for an in-flight row,
+  tqLLM's `/api/monitor/v1/snapshot` and `/health`, #180)
   is sent right after a `/running` read of its own, and only
   for a model that read lists as `ready`. A model that was ready a moment
   ago but is not in that read is skipped, not retried.
@@ -689,6 +809,7 @@ upstream:
   ignorePaths:
     - '.*\.(js|json|css|png|gif|jpg|jpeg|ico|txt)$'
     - '^/(metrics|slots|props|health)$'
+    - '^/api/monitor/v1/snapshot$'
 ```
 
 **Works without AI:** llama-swap, NVIDIA, the power sensors and the Aura
@@ -832,7 +953,7 @@ required. Check a file without starting anything:
 | Key | Meaning |
 |---|---|
 | `[llama] enabled`, `url` | Poll llama-swap at a **loopback** URL (default `http://127.0.0.1:8080`). Point it at llama-swap itself, not a proxy in front of it |
-| `[llama.backends]` | `"model-id" = "llamacpp"`, `"sglang"`, `"vllm"`, `"strata"` or `"openai"`: overrides the backend detected from the launch command |
+| `[llama.backends]` | `"model-id" = "llamacpp"`, `"sglang"`, `"vllm"`, `"strata"`, `"tqllm"` or `"openai"`: overrides the backend detected from the launch command |
 | `[models.aliases]` | `"long-model-id" = "Short Name"` |
 | `[load] cpu_limit_w`, `nominal_frac` | CPU full-load socket watts; `nominal_frac` (0.8) of each limit reads 100 |
 | `[load] idle`, `gpu_idle_w`, `cpu_idle_w` | `"auto"` learns idle floors; `"fixed"` uses the watts as given |
@@ -1074,7 +1195,7 @@ defaults = true
 
 [[setup.field]]
 row = "spec"              # the row it is drawn on, 1..=8 of A-Z a-z 0-9 _ - .
-engines = ["vllm"]        # llamacpp, sglang, vllm, strata, openai; absent: any
+engines = ["vllm"]        # llamacpp, sglang, vllm, strata, tqllm, openai; absent: any
 match = "hyperqwen"       # only commands containing this (case ignored)
 source = "env:SPEC"       # where the value comes from, below
 kind = "token"            # how it is read, below
@@ -1108,11 +1229,11 @@ separators), `token` (at most 16 characters of `A-Z a-z 0-9 _ . + -`; a
 path-like value gives only its file stem), `quant` (the GGUF quant tag of
 a model file name, `UD-Q4_K_M`), `present` (the flag is there: `on`),
 `mib` (a number of MiB drawn as `16.4 GiB`, or `512 MiB` below 1 GiB),
-`text` (#114, a `spec:` source only: a JSON string, whitespace runs
-collapsed to one space, controls dropped, cut to `max_chars`).
-`max_chars` defaults to 64 and is at most 96; it is an error on any other
-kind, and outside 1..=96. `text` on a source other than `spec:` is an
-error. An `engine:` source takes `number`, `token` or `mib` (default: as
+`text` (#114, a `spec:` source, `engine:fit` or `engine:kv_asked` only: a JSON string,
+whitespace runs collapsed to one space, controls dropped, cut to
+`max_chars`). `max_chars` defaults to 64 and is at most 96; it is an
+error on any other kind, and outside 1..=96. `text` on any other source
+is an error. An `engine:` source takes `number`, `token` or `mib` (default: as
 reported). `present` needs a flag source.
 
 `spec:<dotted.path>` reads `<specs_dir>/<model-id>.json`, the entry spec
@@ -1172,7 +1293,31 @@ reachable. Strata (#54) fills, from `engine`: `engine`, `version`,
 `max_tokens` (the request in flight); and of the newest finished request
 `last_hit_rate`, `last_pcie_share`, `last_decode_tok_s`,
 `last_drafts_offered`, `last_drafts_accepted`. The built-in rules show
-Strata's rows above. Whatever a rule says, only numbers and short
+Strata's rows above. tqLLM (#180) fills `version` (`engine.build`),
+`slots` and `context_per_slot` from its snapshot, and `fit` (kind `text`,
+at most 96 characters) from `/health`, read once per load and per
+`instance_id`; the built-in rules draw `fit` on a row of its own after
+`ctx`:
+
+```text
+    engine   tqLLM 0a1b2c3
+    ctx      32,768 · kv bf16
+    fit      2 slots x 32k fit in 22.5 GiB
+    experts  host 20.0 GiB
+    spec     DFlash2 · n-max 4 · 66 %
+    think    budget 2,048 · on
+    serve    2 slots
+    sample   temp 0.6 · top-p 0.95
+```
+
+With no `--kv`, `-ctk` or `-ctv`, `kv bf16` is grey: tqLLM's memory fit
+may pick a smaller KV and says so only in `fit`. `engine:kv_asked` (kind
+`text`) is the KV the command asked for (`q8`, or `q4/tcq2` when K and V
+differ), absent when it named none, and `--` when a value given is not a
+token or the flags were not read as tqLLM's; the KV is then unknown, not
+`bf16`.
+
+Whatever a rule says, only numbers and short
 tokens leave the launch command, never a path or a raw argument, and the
 command itself is not kept. A bad rule (unknown kind or source, text too
 long) fails `watch.toml` validation with its index:

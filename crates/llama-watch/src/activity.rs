@@ -77,7 +77,10 @@ impl PromptSplit {
 /// engine (#82). llama-swap takes it from llama-server's `timings.prompt_n`
 /// when the reply has `timings` (llama.cpp, and Strata, which sends them),
 /// and from OpenAI `usage.prompt_tokens`, which counts them, otherwise
-/// (vLLM, SGLang, any OpenAI-compatible server).
+/// (vLLM, SGLang, any OpenAI-compatible server). tqLLM (#180) sends
+/// `timings` too, but its `prompt_n` is the whole prompt (the same number
+/// as `usage.prompt_tokens`) and it sends no `cache_n`, so its
+/// `input_tokens` counts the cache and its `cache_tokens` is unknown.
 #[must_use]
 pub fn input_excludes_cache(engine: Backend) -> bool {
     matches!(engine, Backend::LlamaCpp | Backend::Strata)
@@ -374,7 +377,12 @@ mod tests {
                 Some(500)
             );
         }
-        for engine in [Backend::Vllm, Backend::SgLang, Backend::OpenAi] {
+        for engine in [
+            Backend::Vllm,
+            Backend::SgLang,
+            Backend::Tqllm,
+            Backend::OpenAi,
+        ] {
             let got = split(9_000, Some(8_192), Some(engine)).expect("split");
             assert_eq!(
                 (got.whole, got.cached, got.new_tokens()),
@@ -384,6 +392,14 @@ mod tests {
             let odd = split(10, Some(50), Some(engine)).expect("split");
             assert_eq!((odd.whole, odd.cached), (10, 10));
         }
+        // #180: tqLLM's row has no cached count; its input is the prompt.
+        assert_eq!(
+            split(4_096, None, Some(Backend::Tqllm)),
+            Some(PromptSplit {
+                whole: 4_096,
+                cached: 0
+            })
+        );
         // No cached count: the split's cached number is 0. RECENT prints `--`.
         assert_eq!(
             split(64, None, Some(Backend::LlamaCpp)),

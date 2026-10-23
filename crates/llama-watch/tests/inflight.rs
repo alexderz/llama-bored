@@ -674,3 +674,236 @@ fn vllm_flights_hand_over_one_row_each() {
             .is_empty()
     );
 }
+
+// ---- #180: tqLLM ---------------------------------------------------------------
+
+/// The tqLLM requests of one snapshot, read as the poller reads them
+/// (through the book, which gives each running request its line).
+fn tqllm_live(
+    book: &mut llama_watch::tqllm::TqllmBook,
+    requests: Vec<llama_watch::metrics::TqRequest>,
+) -> ModelEngineLive {
+    let snap = llama_watch::metrics::TqSnapshot {
+        instance: "4242000000000000007".to_owned(),
+        context_per_slot: Some(32_768),
+        slots: Some(2),
+        build: None,
+        requests,
+    };
+    let now = SystemTime::now();
+    let observed = book.observe("tq", &snap, Instant::now(), now, now);
+    ModelEngineLive {
+        model: "tq".to_owned(),
+        live: observed.facts.live.expect("live"),
+    }
+}
+
+fn tq_request(
+    id: u64,
+    phase: llama_watch::metrics::TqPhase,
+    elapsed_ms: f64,
+) -> llama_watch::metrics::TqRequest {
+    llama_watch::metrics::TqRequest {
+        id,
+        phase: Some(phase),
+        elapsed_ms,
+        ..llama_watch::metrics::TqRequest::default()
+    }
+}
+
+fn tq_prefill(id: u64, read: u64) -> llama_watch::metrics::TqRequest {
+    llama_watch::metrics::TqRequest {
+        prompt_tokens: Some(6_000),
+        prefill_processed: Some(read),
+        prefill_cached: Some(1_024),
+        prefill_tps: Some(1_137.5),
+        context_tokens: Some(6_000),
+        ..tq_request(id, llama_watch::metrics::TqPhase::Prefill, 900.0)
+    }
+}
+
+fn tq_decode(id: u64, output: u64, elapsed_ms: f64) -> llama_watch::metrics::TqRequest {
+    llama_watch::metrics::TqRequest {
+        prompt_tokens: Some(800),
+        prefill_processed: Some(800),
+        prefill_cached: Some(512),
+        prefill_tps: Some(443.0),
+        output_tokens: Some(output),
+        context_tokens: Some(800 + output),
+        decode_tps: Some(83.5),
+        ..tq_request(id, llama_watch::metrics::TqPhase::Decode, elapsed_ms)
+    }
+}
+
+/// #180: one row per active tqLLM request. `pp` is `prefill_processed`
+/// against the prompt with the cached part apart, `gen` the exact output,
+/// each with its own live rate; DUR is the request's `elapsed_ms`; a
+/// queued request is a row too, its prompt unknown.
+#[test]
+fn tqllm_requests_are_one_flight_each() {
+    use llama_watch::metrics::TqPhase;
+    let mut book = llama_watch::tqllm::TqllmBook::default();
+    let mut feed = Feed::new();
+    let live = tqllm_live(
+        &mut book,
+        vec![tq_decode(1, 150, 2_500.0), tq_prefill(2, 2_048)],
+    );
+    let got = feed.poll_with(0, &[], &[live], &[]);
+    assert_eq!(got.len(), 2);
+    let (reading, decoding) = (&got[0], &got[1]);
+    assert_eq!(
+        (
+            reading.prompt,
+            reading.cached,
+            reading.processed,
+            reading.decoded
+        ),
+        (6_000, 1_024, 1_024, 0),
+        "newest first: the prefill"
+    );
+    assert!(reading.prompt_known && reading.progress && !reading.decoding);
+    assert!(!reading.cached_unknown && !reading.prompt_unknown);
+    assert_eq!(reading.prompt_tps, Some(1_137.5));
+    assert_eq!(reading.n_ctx, Some(32_768));
+    assert_eq!(reading.engine, Some(Backend::Tqllm));
+    assert_eq!(
+        (
+            decoding.prompt,
+            decoding.cached,
+            decoding.processed,
+            decoding.decoded
+        ),
+        (800, 512, 288, 150)
+    );
+    assert!(decoding.decoding);
+    assert_eq!(decoding.gen_tps, Some(83.5));
+    let dur = |flight: &Flight| flight.polled.saturating_duration_since(flight.started_mono);
+    assert_eq!(dur(reading), Duration::from_millis(900));
+    assert_eq!(dur(decoding), Duration::from_millis(2_500));
+
+    // pp → gen: the prefill finishes reading and decodes; DUR follows the
+    // engine's clock. A queued request joins with its prompt unknown.
+    let mut handover = tq_decode(2, 5, 1_400.0);
+    handover.prompt_tokens = Some(6_000);
+    handover.prefill_processed = Some(6_000);
+    handover.prefill_cached = Some(1_024);
+    let live = tqllm_live(
+        &mut book,
+        vec![
+            tq_decode(1, 190, 3_000.0),
+            handover,
+            tq_request(3, TqPhase::Queued, 100.0),
+        ],
+    );
+    let got = feed.poll_with(500, &[], &[live], &[]);
+    assert_eq!(got.len(), 3);
+    let queued = &got[0];
+    assert!(queued.prompt_unknown && !queued.decoding);
+    let two = got.iter().find(|f| f.prompt == 6_000).expect("request 2");
+    assert!(two.decoding);
+    assert_eq!((two.processed, two.cached, two.decoded), (4_976, 1_024, 5));
+    assert_eq!(dur(two), Duration::from_millis(1_400));
+    assert!(two.beats >= 1, "its count rose");
+}
+
+/// #180: handover to llama-swap's finished row is one flight per row,
+/// oldest first; a row whose prompt matches a flight takes that one.
+#[test]
+fn tqllm_flights_hand_over_one_per_finished_row() {
+    use llama_watch::metrics::TqPhase;
+    let mut book = llama_watch::tqllm::TqllmBook::default();
+    let mut feed = Feed::new();
+    let live = tqllm_live(
+        &mut book,
+        vec![tq_decode(1, 150, 2_500.0), tq_prefill(2, 2_048)],
+    );
+    feed.poll_with(0, &[], &[live], &[]);
+    // Both finish. Their rows: one has request 2's prompt (6,000, the
+    // whole prompt: tqLLM's input_tokens counts the cache), one another.
+    let mut one = tq_decode(1, 200, 3_000.0);
+    one.phase = Some(TqPhase::Complete);
+    let mut two = tq_decode(2, 10, 2_000.0);
+    two.phase = Some(TqPhase::Complete);
+    two.prompt_tokens = Some(6_000);
+    let live = tqllm_live(&mut book, vec![one.clone(), two.clone()]);
+    let got = feed.poll_with(500, &[], std::slice::from_ref(&live), &[]);
+    assert_eq!(got.len(), 2, "ended, waiting for their rows");
+    let rows = [row(2, "tq", 6_000)];
+    let got = feed.poll_with(1_000, &[], std::slice::from_ref(&live), &rows);
+    assert_eq!(got.len(), 1, "the matching row took request 2: {got:?}");
+    assert_eq!(got[0].prompt, 800);
+    // The next row matches nothing exactly: the oldest ended flight goes.
+    let rows = [row(3, "tq", 801), row(2, "tq", 6_000)];
+    let got = feed.poll_with(1_500, &[], std::slice::from_ref(&live), &rows);
+    assert!(got.is_empty(), "{got:?}");
+    // Never back: a later snapshot still listing them adds no flight.
+    let got = feed.poll_with(2_000, &[], &[live], &rows);
+    assert!(got.is_empty());
+    // A restarted engine's request 1 is a new request.
+    let mut fresh = llama_watch::tqllm::TqllmBook::default();
+    let mut live = tqllm_live(&mut fresh, vec![tq_decode(1, 3, 100.0)]);
+    live.live.instance = Some("4242000000000000099".to_owned());
+    let got = feed.poll_with(2_500, &[], &[live], &rows);
+    assert_eq!(got.len(), 1);
+}
+
+/// #180: a tqLLM request still running takes no finished row, not even one
+/// with its own prompt: the row goes to the request that ended.
+#[test]
+fn a_running_tqllm_flight_never_takes_another_requests_row() {
+    use llama_watch::metrics::TqPhase;
+    let mut book = llama_watch::tqllm::TqllmBook::default();
+    let mut feed = Feed::new();
+    // A (1) is older; B (2) has the same 800-token prompt.
+    let live = tqllm_live(
+        &mut book,
+        vec![tq_decode(1, 150, 3_000.0), tq_decode(2, 100, 1_000.0)],
+    );
+    feed.poll_with(0, &[], &[live], &[]);
+    // B finishes first, A decodes on; the row is B's.
+    let mut b_done = tq_decode(2, 120, 1_400.0);
+    b_done.phase = Some(TqPhase::Complete);
+    let live = tqllm_live(&mut book, vec![tq_decode(1, 180, 3_500.0), b_done]);
+    let rows = [row(1, "tq", 800)];
+    let got = feed.poll_with(500, &[], std::slice::from_ref(&live), &rows);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].decoding);
+    assert_eq!(got[0].decoded, 180, "A is still a row: {got:?}");
+}
+
+/// #180: 20 requests on 2 slots: the 2 running ones are rows, then the
+/// next queued ones up to the cap; poll after poll the same ones, and no
+/// queued request pushes a running one out.
+#[test]
+fn many_queued_tqllm_requests_never_push_out_the_running_ones() {
+    use llama_watch::inflight::MAX_TQ_QUEUED;
+    use llama_watch::metrics::TqPhase;
+    let mut book = llama_watch::tqllm::TqllmBook::default();
+    let mut feed = Feed::new();
+    let dur = |flight: &Flight| flight.polled.saturating_duration_since(flight.started_mono);
+    for poll in 0..6_u64 {
+        let mut requests = vec![
+            tq_decode(1, 100 + poll, 2_000.0),
+            tq_prefill(2, 1_024 + poll),
+        ];
+        // Queued 3..=20, each waiting 50 ms × its id.
+        requests.extend((3..=20).map(|id| tq_request(id, TqPhase::Queued, 50.0 * id as f64)));
+        let live = tqllm_live(&mut book, requests);
+        let got = feed.poll_with(poll * 500, &[], &[live], &[]);
+        assert_eq!(got.len(), 2 + MAX_TQ_QUEUED, "{poll}: {got:?}");
+        assert!(
+            got.iter().any(|f| f.decoding && f.decoded == 100 + poll),
+            "{poll}: the decoding one"
+        );
+        assert!(
+            got.iter().any(|f| f.prompt == 6_000 && !f.decoding),
+            "{poll}: the reading one"
+        );
+        let mut waits: Vec<Duration> = got.iter().filter(|f| f.prompt_unknown).map(dur).collect();
+        waits.sort();
+        let next: Vec<Duration> = (3..3 + MAX_TQ_QUEUED as u64)
+            .map(|id| Duration::from_millis(50 * id))
+            .collect();
+        assert_eq!(waits, next, "{poll}: the next to run");
+    }
+}

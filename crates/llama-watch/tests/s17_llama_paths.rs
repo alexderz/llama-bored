@@ -20,6 +20,13 @@
 //! (like `/api/events`, it names no model path and cannot load one), read
 //! once before each stream session on the same thread and agent. Never a
 //! POST: the reservation's write calls are not this watcher's.
+//!
+//! #180 adds two upstream leaves on purpose, both through the same fresh
+//! gate: tqLLM's `api/monitor/v1/snapshot` (its live requests, read in place
+//! of `/metrics`, and the probe that tells tqLLM) and `health` (its `fit`,
+//! once per load and instance). tqLLM's slot admin (`POST /admin/slots`)
+//! and its chat bridge are never called: no POST anywhere, and neither
+//! path is named in the code.
 
 use std::path::PathBuf;
 
@@ -105,6 +112,8 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
     assert_eq!(
         leaves,
         vec![
+            "api/monitor/v1/snapshot".to_owned(),
+            "health".to_owned(),
             "metrics".to_owned(),
             "slots".to_owned(),
             "v1/loads?include=core".to_owned()
@@ -112,6 +121,7 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
     );
     // The gate's own name for that leaf is the same text (#80).
     assert!(poller.contains(r#"const LOADS_LEAF: &str = "v1/loads?include=core";"#));
+    assert!(poller.contains(r#"const HEALTH_LEAF: &str = "health";"#));
 
     // #80: the event stream is one fixed path, one GET site, on an agent
     // from `new_agent`; #167: `/api/gpu` the same.
@@ -144,6 +154,8 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
         "src/sources/llamaswap.rs",
         "src/sources/events.rs",
         "src/service.rs",
+        "src/tqllm.rs",
+        "src/metrics.rs",
     ] {
         let code = source(rel);
         // (`SampleRx::put` is the one-deep sample slot, not HTTP.)
@@ -151,6 +163,10 @@ fn the_poller_gets_only_the_allowed_llama_swap_paths() {
             ".post(", ".put(url", ".put(&", ".delete(", ".patch(", ".head(", "unload",
         ] {
             assert!(!code.contains(verb), "{rel} uses {verb}");
+        }
+        // #180: tqLLM's slot admin and chat bridge are not named.
+        for never in ["admin/", "chat/completions", "v1/chat"] {
+            assert!(!code.contains(never), "{rel} names {never}");
         }
     }
 }
@@ -272,7 +288,15 @@ fn every_upstream_get_goes_through_the_fresh_gate() {
     assert!(check < suspect);
     assert!(gate.contains("SUSPECT_SLOW"));
     // Every upstream reader goes through the gate and makes no GET itself.
-    for name in ["probe_backends", "poll_metrics", "poll_slots", "poll_loads"] {
+    for name in [
+        "probe_backends",
+        "probe_tqllm",
+        "poll_metrics",
+        "poll_tqllm",
+        "poll_health",
+        "poll_slots",
+        "poll_loads",
+    ] {
         let text = body(&poller, name);
         assert!(text.contains("self.upstream_read("), "{name}");
         assert!(!text.contains("get_"), "{name} GETs itself");

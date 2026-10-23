@@ -2,7 +2,7 @@
 //!
 //! Every metric is named `llamabored_*`. The only strings exported are
 //! llama-swap model ids, model display names and their allowlisted tuning
-//! and version tokens, the five engine words, fan labels (short printable
+//! and version tokens, the six engine words, fan labels (short printable
 //! ASCII from `[fans]`), hwmon chip and sensor names (#74: the chip's
 //! `name` and `tempN_label`, short printable ASCII) and fixed source names,
 //! as label values. The
@@ -17,7 +17,7 @@
 //!
 //! Every per-model series has the labels `model` (the llama-swap id, the
 //! join key) and `engine` (`llamacpp`, `vllm`, `sglang`, `strata`,
-//! `openai`), and the same name for every engine that has the quantity;
+//! `tqllm`, `openai`), and the same name for every engine that has the quantity;
 //! an engine that cannot report one leaves its series absent. Descriptive
 //! strings live on `llamabored_model_info` only. Names carry their unit,
 //! ratios are 0 to 1, and only counters end in `_total`. A model that is

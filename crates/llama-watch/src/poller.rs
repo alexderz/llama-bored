@@ -47,14 +47,29 @@
 //! [`LlamaDetail::engine_live`] while its gauges are fresh (#54). A 401 or 403 (Strata started with an API key; llama-bored
 //! keeps no secrets) falls back like any missing `/metrics`.
 //!
+//! tqLLM (#180) has no `/metrics`: at the metrics cadence it gets
+//! `GET /upstream/<id>/api/monitor/v1/snapshot` instead, capped at
+//! [`TQLLM_CAP`], its JSON depth capped, and read strictly
+//! ([`crate::metrics::parse_tqllm`]); [`crate::tqllm::TqllmBook`] turns
+//! its per-request numbers into the counters every engine has. A
+//! `schema_version` other than 1 is "no metrics", logged once per load.
+//! `GET /upstream/<id>/health` is read once per load and once per
+//! `instance_id`, for its `fit` (SETUP's `engine:fit`). Nothing else is
+//! sent to tqLLM: never `POST /admin/slots` (it changes the live slot
+//! count) or the monitor's chat bridge.
+//!
 //! A model whose launch command names no server (`openai`: a container
 //! whose image runs `vllm serve`, a wrapper script around llama-server) and
 //! that `[llama.backends]` does not name gets one `/upstream/<id>/metrics`
 //! GET per load, with the usual cap and timeout (#31). A JSON object with
 //! `engine` and `live` objects is Strata (#54, a container started by image
 //! digest); else the first sample's metric prefix decides: `vllm:`,
-//! `sglang:` or `llamacpp:` (which then also gets `/slots`); anything else,
-//! or no `/metrics`, stays `openai`. Each outcome is logged once. A probe
+//! `sglang:` or `llamacpp:` (which then also gets `/slots`). When
+//! `/metrics` gives none of these (#180), one
+//! `GET /upstream/<id>/api/monitor/v1/snapshot` follows, in the same round
+//! or the next: a body with `schema_version` 1, an `engine` object and a
+//! `requests` array is tqLLM. Anything else stays `openai`. Each outcome
+//! is logged once. A probe
 //! that names a server re-reads `/running` at once, and that read and each
 //! one after it pass the server to the launch command parser, which reads
 //! a container's flags after its image (#67).
@@ -136,7 +151,8 @@ use crate::jobs::{self, Job, Jobs};
 use crate::live::{LOADS_CAP, LiveBook, LiveTokens, parse_loads};
 use crate::metrics::{
     DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, KvTokens,
-    MetricsSample, PromptCache, detect_backend, parse_metrics_full,
+    MetricsSample, PromptCache, TqError, detect_backend, is_tqllm_json, parse_metrics_full,
+    parse_tqllm, parse_tqllm_health,
 };
 use crate::recent::{Merged, Recent};
 use crate::series::{ModelSeries, SeriesBook};
@@ -144,12 +160,13 @@ use crate::setup_rules::{Found, Rules};
 use crate::setup_specs::Specs;
 use crate::sglang_rows::{Claim, SglangBook, Totals};
 use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
-use crate::sources::cmdline::KvLayout;
+use crate::sources::cmdline::{KvLayout, TqKv};
 use crate::sources::events::{
     DisplacedNote, Events, EventsView, GpuReservation, ModelClaim, claim_model,
 };
 use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
+use crate::tqllm::{RowClaim, TqllmBook};
 use crate::tty::grid::Cell;
 
 const RUNNING_CAP: usize = 64 * 1024;
@@ -159,6 +176,9 @@ const LLAMACPP_METRICS_CAP: usize = 64 * 1024;
 /// about 70 KiB with one model loaded and grows with its labels.
 const SERVER_METRICS_CAP: usize = 1024 * 1024;
 const ACTIVITY_CAP: usize = 256 * 1024;
+/// tqLLM's monitor snapshot and its `/health` (#180): 32 finished requests
+/// and the active ones are a few KiB each.
+pub const TQLLM_CAP: usize = 256 * 1024;
 /// A capture read may take longer than the activity page: it can be MiBs.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 const MODEL_PLACEHOLDER: &str = "model";
@@ -177,6 +197,8 @@ const MAX_ROW_ENGINES: usize = 64;
 /// flight: the leaf [`State::poll_loads`] names at its gate call (S17
 /// reads it there). A non-2xx answer to it says nothing of the model.
 const LOADS_LEAF: &str = "v1/loads?include=core";
+/// tqLLM's `/health` leaf (#180): a non-2xx there only loses the `fit`.
+const HEALTH_LEAF: &str = "health";
 /// The shortest connect and head timeout for `/api/events` (#80).
 const EVENTS_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -569,6 +591,8 @@ struct State<L> {
     /// llama.cpp KV layout of each entry of `models`, from its launch
     /// command (#79), in the same order.
     model_kv: Vec<Option<KvLayout>>,
+    /// What each listed tqLLM command said about its KV (#180).
+    model_tq_kv: Vec<Option<TqKv>>,
     /// SETUP values of each entry of `models`, in the same order (#52).
     model_setup: Vec<ModelSetup>,
     /// Per-model spec files, read with `/running` (#92).
@@ -609,6 +633,16 @@ struct State<L> {
     detected: HashMap<String, Backend>,
     /// `id:kind` probe outcomes already logged this run.
     detect_logged: HashSet<String>,
+    /// Ready models whose `/metrics` probe found no known server this load
+    /// (#180): why, for the log. Their probe goes on to the tqLLM snapshot.
+    probe_snapshot: HashMap<String, String>,
+    /// tqLLM counters, slots and row fills (#180).
+    tqllm: TqllmBook,
+    /// Ready tqLLM models whose snapshot `schema_version` was logged this
+    /// load (#180).
+    schema_logged: HashSet<String>,
+    /// tqLLM models whose `/health` failed this load, logged (#180).
+    health_logged: HashSet<String>,
     /// A probe found a server: read `/running` again at once, so the
     /// launch command's flags are read as that server's (#67).
     running_due: bool,
@@ -710,6 +744,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         models: Vec::new(),
         model_ids: Vec::new(),
         model_kv: Vec::new(),
+        model_tq_kv: Vec::new(),
         model_setup: Vec::new(),
         specs,
         jobs,
@@ -729,6 +764,10 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         series: SeriesBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
+        probe_snapshot: HashMap::new(),
+        tqllm: TqllmBook::default(),
+        schema_logged: HashSet::new(),
+        health_logged: HashSet::new(),
         running_due: false,
         running_up: false,
         unmetered: false,
@@ -911,6 +950,7 @@ impl<L: Sink> State<L> {
             .collect();
         self.model_ids = models.iter().map(|info| info.id.clone()).collect();
         self.model_kv = models.iter().map(|info| info.kv).collect();
+        self.model_tq_kv = models.iter().map(|info| info.tq_kv).collect();
         self.model_setup = models
             .iter()
             .map(|info| ModelSetup {
@@ -967,6 +1007,9 @@ impl<L: Sink> State<L> {
             // its prompt counters go back to activity rows until `/metrics`
             // takes over again (#46).
             self.detected.retain(|id, _| ready.contains(id));
+            self.probe_snapshot.retain(|id, _| ready.contains(id));
+            self.schema_logged.retain(|id| ready.contains(id));
+            self.health_logged.retain(|id| ready.contains(id));
             let gone: Vec<String> = was_ready
                 .iter()
                 .filter(|(id, backend)| {
@@ -1058,6 +1101,7 @@ impl<L: Sink> State<L> {
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
         self.series.forget_process(id);
+        self.tqllm.forget(id);
     }
 
     /// `[llama.backends]` first, then the launch command, then what this
@@ -1093,6 +1137,11 @@ impl<L: Sink> State<L> {
             .map(|model| model.id.clone())
             .collect();
         for id in todo {
+            // #180: `/metrics` already said nothing this load.
+            if self.probe_snapshot.contains_key(&id) {
+                self.probe_tqllm(&id);
+                continue;
+            }
             let read = match self.upstream_read(&id, "metrics", self.limits.metrics_timeout, |_| {
                 SERVER_METRICS_CAP
             }) {
@@ -1102,17 +1151,60 @@ impl<L: Sink> State<L> {
             let read = exact(read)
                 .map_err(TapError::label)
                 .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
-            let (kind, note) = match read.as_deref().map(detect_backend) {
-                Ok(Some(kind)) => (kind, format!("/metrics says {}", kind.as_str())),
-                Ok(None) => (
-                    Backend::OpenAi,
-                    "no known metric names; staying openai".to_owned(),
-                ),
-                Err(label) => (
-                    Backend::OpenAi,
-                    format!("no /metrics ({label}); staying openai"),
-                ),
+            let why = match read.as_deref().map(detect_backend) {
+                Ok(Some(kind)) => {
+                    self.settle_probe(&id, kind, &format!("/metrics says {}", kind.as_str()));
+                    continue;
+                }
+                Ok(None) => "no known metric names".to_owned(),
+                Err(label) => format!("no /metrics ({label})"),
             };
+            // A non-2xx answer skips the model for the rest of this round:
+            // the snapshot then waits for the next one.
+            self.probe_snapshot.insert(id.clone(), why);
+            self.probe_tqllm(&id);
+        }
+    }
+
+    /// #180: the `/metrics` probe found no known server, so one
+    /// `GET /upstream/<id>/api/monitor/v1/snapshot` through the fresh gate
+    /// tells tqLLM. A model the gate skips keeps this for a later round.
+    fn probe_tqllm(&mut self, id: &str) {
+        let read = match self.upstream_read(
+            id,
+            "api/monitor/v1/snapshot",
+            self.limits.metrics_timeout,
+            |_| TQLLM_CAP,
+        ) {
+            Gate::Read(model, read) if model.probe && !self.detected.contains_key(id) => read,
+            Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => return,
+        };
+        let why = self.probe_snapshot.remove(id).unwrap_or_default();
+        let read = exact(read)
+            .map_err(TapError::label)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
+        let (kind, note) = match read.as_deref() {
+            Ok(body) if is_tqllm_json(body) => (
+                Backend::Tqllm,
+                format!("{why}; /api/monitor/v1/snapshot says tqllm"),
+            ),
+            Ok(_) => (
+                Backend::OpenAi,
+                format!("{why}; no tqLLM snapshot; staying openai"),
+            ),
+            Err(label) => (
+                Backend::OpenAi,
+                format!("{why}; no tqLLM snapshot ({label}); staying openai"),
+            ),
+        };
+        self.settle_probe(id, kind, &note);
+    }
+
+    /// This load's probe found `kind` for `id` (#31, #180): remember it,
+    /// log it once, and read `/running` again for its container flags.
+    fn settle_probe(&mut self, id: &str, kind: Backend, note: &str) {
+        let id = id.to_owned();
+        {
             self.detected.insert(id.clone(), kind);
             // The detail and SETUP values were read before the server was
             // known: read `/running` again now, so its container flags are
@@ -1166,6 +1258,11 @@ impl<L: Sink> State<L> {
         let started = Instant::now();
         let mut failure: Option<&'static str> = None;
         for listed in &ready {
+            // #180: tqLLM's snapshot in place of `/metrics`.
+            if listed.backend == Backend::Tqllm {
+                self.poll_tqllm(&listed.id);
+                continue;
+            }
             // The engine reads its counters during the request. The stamp
             // below is after the parse, so a finish in between can be absent
             // from this scrape and still have a stamp later than it.
@@ -1270,6 +1367,145 @@ impl<L: Sink> State<L> {
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
         self.poll_loads();
         self.latencies.metrics = Some(started.elapsed());
+    }
+
+    /// One tqLLM snapshot read (#180), through the fresh gate, in place of
+    /// `/metrics`: the counters, gauges, engine facts and active requests,
+    /// then `/health` when this load or instance has not had it.
+    fn poll_tqllm(&mut self, id: &str) {
+        let before = SystemTime::now();
+        let (model, read) = match self.upstream_read(
+            id,
+            "api/monitor/v1/snapshot",
+            self.limits.metrics_timeout,
+            |_| TQLLM_CAP,
+        ) {
+            Gate::Read(model, read) if model.backend == Backend::Tqllm => (model, read),
+            Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => return,
+        };
+        let text = exact(read)
+            .map_err(TapError::label)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| "malformed"));
+        let snap = match text.map(|text| parse_tqllm(&text)) {
+            Ok(Ok(snap)) => snap,
+            Ok(Err(TqError::Schema(version))) => {
+                // Not a schema this reader knows: no metrics, as if absent.
+                self.fallback.insert(model.id.clone());
+                if self.schema_logged.insert(model.id.clone()) {
+                    let version = version.map_or_else(|| "?".to_owned(), |v| v.to_string());
+                    log::emit(
+                        &mut self.log,
+                        Priority::Info,
+                        &format!(
+                            "{}: tqLLM snapshot schema_version {version} is not 1; using llama-swap activity",
+                            model.id
+                        ),
+                    );
+                }
+                return;
+            }
+            Ok(Err(TqError::Depth)) => {
+                return self.use_activity(&model, "snapshot nested too deep");
+            }
+            Ok(Err(TqError::Malformed)) => return self.use_activity(&model, "malformed snapshot"),
+            Err(label) => return self.use_activity(&model, label),
+        };
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        if self.tqllm.is_restart(&model.id, &snap) {
+            self.tqllm_restarted(&model.id);
+        }
+        let observed = self.tqllm.observe(&model.id, &snap, now, before, wall);
+        if observed.log_gap {
+            log::emit(
+                &mut self.log,
+                Priority::Info,
+                &format!(
+                    "{}: {} tqLLM request(s) left its history before they were seen finished; their unseen tokens are not counted",
+                    model.id, observed.gap
+                ),
+            );
+        }
+        let mut facts = observed.facts;
+        let live = facts.live.take();
+        self.engine_facts.insert(model.id.clone(), facts);
+        let sample = observed.sample;
+        self.series
+            .observe_metrics(&model.id, model.backend, &sample, now);
+        self.prompt_cache
+            .observe_metrics(&model.id, sample.prompt_total, sample.cached_total);
+        let engine = self.engines.observe(&model.id, &sample);
+        self.gauges
+            .insert(model.id.clone(), Gauges::of(&sample, engine, live, now));
+        if let Some(prompt) = sample.prompt_total {
+            self.prompt_counter.observe(&model.id, prompt, None, now);
+        }
+        if let Some(value) = sample.n_decode_total {
+            self.fallback.remove(&model.id);
+            self.counter
+                .observe(&model.id, value, sample.requests_processing, now);
+        }
+        if let Some(prompt) = sample.prompt_total {
+            self.prompt_box.observe(&model.id, prompt, None, now);
+        }
+        if self.tqllm.health_due(&model.id) {
+            self.poll_health(&model.id);
+        }
+    }
+
+    /// A new tqLLM `instance_id` for `id` (#180): its counters, engine
+    /// numbers and book start again, logged.
+    fn tqllm_restarted(&mut self, id: &str) {
+        log::emit(
+            &mut self.log,
+            Priority::Info,
+            &format!("{id}: tqLLM restarted (new instance_id); its counters start again"),
+        );
+        self.forget_engine(id);
+        self.forget_process(id);
+    }
+
+    /// tqLLM's `GET /upstream/<id>/health` (#180), once per load and once
+    /// per `instance_id`: its `fit` becomes SETUP's `engine:fit`. A failed
+    /// read counts as read; the next instance asks again.
+    fn poll_health(&mut self, id: &str) {
+        let read =
+            match self.upstream_read(id, "health", self.limits.metrics_timeout, |_| TQLLM_CAP) {
+                Gate::Read(model, read) if model.backend == Backend::Tqllm => read,
+                Gate::Read(..) | Gate::Skipped | Gate::NotLoaded => return,
+            };
+        let fit = match exact(read).map_err(TapError::label) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .ok()
+                .and_then(|text| parse_tqllm_health(&text).ok())
+                .flatten(),
+            Err(label) => {
+                if self.health_logged.insert(id.to_owned()) {
+                    log::emit(
+                        &mut self.log,
+                        Priority::Info,
+                        &format!("{id}: no tqLLM /health ({label}); no fit shown"),
+                    );
+                }
+                None
+            }
+        };
+        self.note_fit(id, fit);
+    }
+
+    /// Keep `/health`'s `fit` for `id` and show it now (#180).
+    fn note_fit(&mut self, id: &str, fit: Option<String>) {
+        self.tqllm.set_fit(id, fit.clone());
+        if let Some(facts) = self.engine_facts.get_mut(id) {
+            match fit {
+                Some(fit) => {
+                    facts.values.insert("fit", fit);
+                }
+                None => {
+                    facts.values.remove("fit");
+                }
+            }
+        }
     }
 
     /// Start llama-swap's `/api/events` stream while llama-swap answers (or
@@ -1476,6 +1712,9 @@ impl<L: Sink> State<L> {
             // An SGLang without `/v1/loads` answers 404: that says nothing
             // of the model, whose gauges stay (#80).
             Err(TapError::Status) if leaf == LOADS_LEAF => {}
+            // #180: a tqLLM without `/health`, or one that refuses it,
+            // loses only its `fit`; its gauges stay.
+            Err(TapError::Status | TapError::Unauthorized) if leaf == HEALTH_LEAF => {}
             Err(TapError::Status | TapError::Unauthorized) => self.not_available(id),
             Ok(_) => {
                 self.not_loaded.remove(id);
@@ -1679,6 +1918,8 @@ impl<L: Sink> State<L> {
                             Priority::Info,
                             "activity: llama-swap restarted; its row ids start again",
                         );
+                        // #180: no tqLLM fill carries over to the new ids.
+                        self.tqllm.forget_rows();
                     }
                     self.count_activity(&merged);
                     self.slots.note_activity(&merged.page, Instant::now());
@@ -1730,7 +1971,12 @@ impl<L: Sink> State<L> {
         // #35: new rows of a model without `/slots` that llama-swap gave
         // no speeds wait for the engine's.
         let mut measure: Vec<(u64, String)> = Vec::new();
-        for model in self.ready.iter().filter(|model| !model.backend.has_slots()) {
+        // #180: a tqLLM row takes only its own request's numbers, below.
+        for model in self
+            .ready
+            .iter()
+            .filter(|model| !model.backend.has_slots() && model.backend != Backend::Tqllm)
+        {
             let key = activity::model_key(&model.id);
             measure.extend(
                 rows.iter()
@@ -1764,6 +2010,30 @@ impl<L: Sink> State<L> {
             }
         }
         self.sglang.activity(now, &claims);
+        // #180: tqLLM rows wait for the one finished request that matches.
+        let mut tq_rows = Vec::new();
+        for model in self
+            .ready
+            .iter()
+            .filter(|model| model.backend == Backend::Tqllm)
+        {
+            let key = activity::model_key(&model.id);
+            for row in rows.iter().filter(|row| row.model == key) {
+                let (Some(prompt), Some(output)) =
+                    (row.prompt_for(Some(Backend::Tqllm)), row.output_tokens)
+                else {
+                    continue;
+                };
+                tq_rows.push(RowClaim {
+                    seq: row.seq,
+                    model: model.id.clone(),
+                    input: prompt.whole,
+                    output,
+                    timestamp: Some(row.time.clone()),
+                });
+            }
+        }
+        self.tqllm.activity(now, &tq_rows);
         for model in &self.ready {
             let key = activity::model_key(&model.id);
             for row in rows.iter().filter(|row| row.model == key) {
@@ -1922,6 +2192,12 @@ impl<L: Sink> State<L> {
         } else {
             self.slots.prompt_tps().or(prompt_rate)
         };
+        // #180: with only tqLLM loaded, GEN and PROMPT are its requests'
+        // own rates, `--` until it has them.
+        let (gen_tps, prompt_tps) = match self.tqllm_rates(now) {
+            Some(rates) if self.running_up => rates,
+            _ => (gen_tps, prompt_tps),
+        };
         let view = LlamaView {
             ai: self.ai,
             models: self.models_with_gauges(now),
@@ -1973,12 +2249,65 @@ impl<L: Sink> State<L> {
         Ok(())
     }
 
-    /// [`Self::model_setup`] with each model's engine-reported values (#54).
+    /// GEN and PROMPT from tqLLM's requests (#180) when every ready model
+    /// with telemetry is tqLLM and each has a fresh snapshot: the sum of
+    /// `decode_tokens_per_second` over the requests in decode, and of
+    /// `prefill_tokens_per_second` over those in prefill. Each is 0 with
+    /// no such request and `None` while they have no rate yet. `None` for
+    /// any other mix of models: the counters' rates stay.
+    fn tqllm_rates(&self, now: Instant) -> Option<(Option<f64>, Option<f64>)> {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        let mut metered = self
+            .ready
+            .iter()
+            .filter(|model| model.backend.has_metrics())
+            .peekable();
+        metered.peek()?;
+        let mut decode = Some(0.0);
+        let mut prompt = Some(0.0);
+        for model in metered {
+            if model.backend != Backend::Tqllm {
+                return None;
+            }
+            let live = self
+                .gauges
+                .get(&model.id)
+                .filter(|gauges| now.saturating_duration_since(gauges.at) <= fresh)?
+                .live
+                .as_ref()?;
+            decode = decode.zip(live.decode_tps_sum()).map(|(a, b)| a + b);
+            prompt = prompt.zip(live.prefill_tps_sum()).map(|(a, b)| a + b);
+        }
+        Some((decode, prompt))
+    }
+
+    /// [`Self::model_setup`] with each model's engine-reported values (#54),
+    /// and for tqLLM the KV its command asked for (#180).
     fn setup_with_engine(&self) -> Vec<ModelSetup> {
         let mut setup = self.model_setup.clone();
-        for (entry, id) in setup.iter_mut().zip(&self.model_ids) {
+        for (((entry, id), model), tq_kv) in setup
+            .iter_mut()
+            .zip(&self.model_ids)
+            .zip(&self.models)
+            .zip(&self.model_tq_kv)
+        {
             if let Some(facts) = self.engine_facts.get(id) {
                 entry.engine = facts.values.clone();
+            }
+            if !model
+                .backend
+                .is_some_and(|info| info.kind == Backend::Tqllm)
+            {
+                continue;
+            }
+            // No KV flag: no value, and SETUP draws the default dim.
+            let asked = match tq_kv {
+                Some(TqKv::Default) => None,
+                Some(TqKv::Named) => crate::tqllm::kv_asked(model.detail.as_ref()),
+                Some(TqKv::Unreadable) | None => Some(crate::tqllm::KV_UNKNOWN.to_owned()),
+            };
+            if let Some(kv) = asked {
+                entry.engine.insert("kv_asked", kv);
             }
         }
         setup
@@ -2039,7 +2368,10 @@ impl<L: Sink> State<L> {
     /// applied on this copy: the prompt counters and the snapshot never
     /// see it. A value llama-swap reported is left as it was. A missing
     /// cached count is filled even when a rate was reported, and a missing
-    /// rate is filled the same way.
+    /// rate is filled the same way. The one exception is tqLLM's prompt
+    /// rate (#180): llama-swap's is the whole prompt, cached part
+    /// included, over the prefill time, so the matched request's own
+    /// uncached rate replaces it.
     fn measured_activity(&self) -> Vec<ActivityRow> {
         let mut rows = self.recent.rows(self.activity_rows());
         for row in &mut rows {
@@ -2049,6 +2381,19 @@ impl<L: Sink> State<L> {
                 }
                 if row.gen_tps.is_none() {
                     row.engine_gen_tps = speeds.decode;
+                }
+            }
+            // #180: a tqLLM row's one matching finished request. Its own
+            // prompt rate replaces llama-swap's, which counts the cache.
+            if let Some(fill) = self.tqllm.fill(row.seq) {
+                if row.cached_tokens.is_none() {
+                    row.cached_tokens = Some(fill.cached);
+                }
+                if fill.prompt_tps.is_some() {
+                    row.prompt_tps = fill.prompt_tps;
+                }
+                if row.gen_tps.is_none() && row.engine_gen_tps.is_none() {
+                    row.engine_gen_tps = fill.gen_tps;
                 }
             }
             let Some(fill) = self.sglang.fill(row.seq) else {
@@ -2074,9 +2419,28 @@ impl<L: Sink> State<L> {
         let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
         let mut models = self.models.clone();
         let slots = self.slots.slots();
-        for ((model, id), layout) in models.iter_mut().zip(&self.model_ids).zip(&self.model_kv) {
+        for (((model, id), layout), tq_kv) in models
+            .iter_mut()
+            .zip(&self.model_ids)
+            .zip(&self.model_kv)
+            .zip(&self.model_tq_kv)
+        {
             if let Some(facts) = self.engine_facts.get(id) {
                 with_facts(&mut model.detail, facts);
+            }
+            // #180: a tqLLM command that named no KV flag at all runs
+            // tqLLM's default unless the fit picked another; the snapshot
+            // does not say. An unreadable one, or flags not read as
+            // tqLLM's, stay unknown.
+            if model
+                .backend
+                .is_some_and(|info| info.kind == Backend::Tqllm)
+                && *tq_kv == Some(TqKv::Default)
+                && let Some(detail) = model.detail.as_mut()
+            {
+                for side in [&mut detail.kv_k, &mut detail.kv_v] {
+                    side.get_or_insert_with(|| crate::sources::cmdline::KV_TQLLM.to_owned());
+                }
             }
             let ctx = model.detail.as_ref().and_then(|detail| detail.ctx);
             let Some(info) = model.backend.as_mut() else {
@@ -2109,6 +2473,10 @@ impl<L: Sink> State<L> {
                 .filter(|n| *n >= 2)
             {
                 info.max_running = backend::reqs(f64::from(parallel));
+            }
+            // #180: tqLLM's `engine.slots` replaces `--np`.
+            if let Some(slots) = gauges.live.as_ref().and_then(|live| live.request_slots) {
+                info.max_running = backend::reqs(f64::from(slots));
             }
             info.kv = crate::kv::from_metrics(gauges.kv, gauges.running);
         }
@@ -2191,15 +2559,16 @@ impl TapError {
     }
 }
 
-/// Fill `detail`'s ctx when the launch command gave none, its KV when it
-/// is unknown or `auto`, and the KV block size and prefix caching (#31),
-/// from the server's own report.
+/// Fill `detail`'s ctx when the launch command gave none (or replace it
+/// with tqLLM's per-slot context, #180), its KV when it is unknown or
+/// `auto`, and the KV block size and prefix caching (#31), from the
+/// server's own report.
 fn with_facts(detail: &mut Option<llama_core::detail::ModelDetail>, facts: &EngineFacts) {
     if *facts == EngineFacts::default() {
         return;
     }
     let detail = detail.get_or_insert_with(Default::default);
-    if detail.ctx.is_none() {
+    if detail.ctx.is_none() || (facts.ctx_exact && facts.ctx.is_some()) {
         detail.ctx = facts.ctx;
     }
     if detail.kv_block.is_none() {
