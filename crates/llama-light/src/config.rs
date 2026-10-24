@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use llama_core::color::Rgb;
 use serde::Deserialize;
 
+use crate::aura::proto::MAX_LEDS;
 use crate::heat::MIN_CONDUCTION_S;
 use crate::keyboard::keymap::{KEYS, key_index, suggest};
 use crate::metric::Metric;
@@ -17,8 +18,10 @@ use crate::palette::{MAX_PCT, Palette, Scale, dim, parse_hex};
 
 /// Largest config file read.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-/// Most fans on a daisy chain.
-pub const MAX_CHAIN: usize = 8;
+/// Most fans on a daisy chain: one LED each fills the header. A chain is
+/// also held to [`MAX_LEDS`] LEDs in all, so a small `leds_per_fan` can
+/// describe strips of any length in steps of that size.
+pub const MAX_CHAIN: usize = MAX_LEDS;
 /// Most LEDs per fan.
 pub const MAX_LEDS_PER_FAN: usize = 20;
 /// Most `[[light]]` entries.
@@ -494,6 +497,14 @@ fn validate(raw: RawFile) -> Result<LightConfig, ConfigError> {
         brightness_max,
         fps,
     };
+    if let Layout::Chain(fans) = aura.layout
+        && aura.frame_len() > MAX_LEDS
+    {
+        return err(format!(
+            "aura.chain_len = {fans} with aura.leds_per_fan = {leds_per_fan} is {} LEDs; the header takes at most {MAX_LEDS}",
+            aura.frame_len()
+        ));
+    }
     let keyboard = KeyboardCfg {
         enabled: raw.keyboard.enabled.unwrap_or(false),
         brightness_max: int_in(
