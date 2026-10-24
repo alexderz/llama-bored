@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- llama-light: a chain can now fill the Aura header's 120 LEDs. `chain_len` (or an `aura.chain` list) takes up to 120 fans, so a small `leds_per_fan` describes strips of any length (`leds_per_fan = 4`, `chain_len = 30` is 120 LEDs with a 28-LED strip still on `aura.chain[0..7]`); before, a chain stopped at 8 fans. `check` now rejects a chain longer than 120 LEDs, which it used to accept and which then failed every frame (#182).
+
 ### Added
 
 - llama-watch reads tqLLM (#180), shown as `tqLLM` in tty11's header, `tqllm` on the LCD and `engine="tqllm"` on every llama-metrics series. It is told by `tqserve` in the launch command, `--entrypoint tqserve` (or `=tqserve`) before a container image, an image whose last path segment starts with `tqllm`, `"tqllm"` in `[llama.backends]`, or, for a command that names no server and whose `/metrics` gives no known names, one `GET /upstream/<id>/api/monitor/v1/snapshot` probe per load, logged once either way. A tqLLM model's monitor snapshot is read at the metrics cadence in place of `/metrics` (at most 256 KiB, nested at most 8 deep, no redirects, `schema_version` 1 only; another schema means no metrics, the model is counted from llama-swap's activity rows, and the log says so once per load), and `/health` once per load and per `instance_id` for its `fit`. Its hardware block, host, device id and model name are never read, and its slot admin and chat bridge are never called: only GETs, on two new upstream leaves.

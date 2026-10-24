@@ -50,8 +50,12 @@ fn bounds_are_enforced_with_the_key_and_the_allowed_range() {
         ("[aura]\nleds_per_fan = 0\n", "aura.leds_per_fan = 0"),
         ("[aura]\nleds_per_fan = 21\n", "aura.leds_per_fan = 21"),
         (
-            "[aura]\nfans = \"chain\"\nchain_len = 9\n",
-            "aura.chain_len = 9",
+            "[aura]\nfans = \"chain\"\nchain_len = 0\n",
+            "aura.chain_len = 0",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 121\nleds_per_fan = 1\n",
+            "aura.chain_len = 121",
         ),
         ("[[light]]\nbrightness = 101\n", "light[0].brightness = 101"),
         ("[[light]]\nsmooth_s = 61.0\n", "light[0].smooth_s = 61"),
@@ -761,4 +765,92 @@ fn heat_rejects_keys_that_do_not_apply_and_a_foot_the_span_cannot_hold() {
             "{text}\nwanted: {needle}\ngot:    {err}"
         );
     }
+}
+
+#[test]
+fn a_chain_fills_the_header_and_no_more() {
+    // Two 28-LED strips and more after them, in steps of 4: the first strip
+    // is still exactly chain[0..7].
+    let config = parse(
+        "[aura]\nfans = \"chain\"\nchain_len = 30\nleds_per_fan = 4\n\
+         [[light]]\ntarget = \"aura.chain[0..7]\"\nmetric = \"activity\"\n\
+         [[light]]\ntarget = \"aura.chain[7..30]\"\nmetric = \"activity\"\n",
+    )
+    .expect("120 LEDs");
+    assert_eq!(config.aura.layout, Layout::Chain(30));
+    assert_eq!(config.aura.frame_len(), 120);
+    assert_eq!(
+        config.layers[0].target,
+        Target::AuraChain {
+            start: 0,
+            end: 7,
+            reversed: false
+        }
+    );
+    assert_eq!(
+        config.layers[1].target,
+        Target::AuraChain {
+            start: 7,
+            end: 30,
+            reversed: false
+        }
+    );
+    let one_each = parse("[aura]\nfans = \"chain\"\nchain_len = 120\nleds_per_fan = 1\n")
+        .expect("120 fans of 1");
+    assert_eq!(one_each.aura.frame_len(), 120);
+
+    for (text, total) in [
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 8\nleds_per_fan = 20\n",
+            "160",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 9\nleds_per_fan = 14\n",
+            "126",
+        ),
+        (
+            "[aura]\nfans = \"chain\"\nchain_len = 61\nleds_per_fan = 2\n",
+            "122",
+        ),
+    ] {
+        let err = error(text);
+        assert!(err.contains("aura.chain_len = "), "{err}");
+        assert!(err.contains(&format!("{total} LEDs")), "{err}");
+        assert!(err.contains("at most 120"), "{err}");
+    }
+    // A mirrored layout is one fan's LEDs, however large leds_per_fan is.
+    parse("[aura]\nleds_per_fan = 20\n").expect("mirrored");
+}
+
+#[test]
+fn a_chain_list_is_held_to_the_same_limits() {
+    let items = |n: usize| vec!["{ metric = \"gpu\" }"; n].join(", ");
+    let config = parse(&format!(
+        "[aura]\nleds_per_fan = 1\nchain = [ {} ]\n",
+        items(120)
+    ))
+    .expect("120 entries");
+    assert_eq!(config.aura.frame_len(), 120);
+    assert_eq!(config.layers.len(), 120);
+    assert_eq!(
+        config.layers[119].target,
+        Target::AuraChain {
+            start: 119,
+            end: 120,
+            reversed: false
+        }
+    );
+    let err = error(&format!(
+        "[aura]\nleds_per_fan = 1\nchain = [ {} ]\n",
+        items(121)
+    ));
+    assert!(
+        err.contains("aura.chain lists 121 fans; at most 120"),
+        "{err}"
+    );
+    let err = error(&format!(
+        "[aura]\nleds_per_fan = 6\nchain = [ {} ]\n",
+        items(21)
+    ));
+    assert!(err.contains("126 LEDs"), "{err}");
 }

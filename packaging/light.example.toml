@@ -18,7 +18,9 @@
 enabled = true            # ASUS Aura USB controller (0b05:18f3), addressable header 1
 leds_per_fan = 6          # 1..=20. many 120 mm ARGB fans have 6; LED 0 is lower-left, clockwise
 fans = "mirrored"         # "mirrored" (splitter: every fan shows the same LEDs) | "chain"
-# chain_len = 4           # fans = "chain" only: fans on the daisy chain, 1..=8
+# chain_len = 4           # fans = "chain" only: fans on the daisy chain, 1..=120;
+                          # chain_len x leds_per_fan is at most 120 (the header's limit).
+                          # Strips of other lengths: a small leds_per_fan, e.g. 4.
 metric = "activity"       # default entry's metric when there are no [[light]] entries
 style = "solid"           # default entry's style: solid | ring | bar | pulse
 brightness_max = 80       # 0..=100 %. A cap on every LED (limits header current)

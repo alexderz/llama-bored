@@ -981,7 +981,7 @@ required. Check a file without starting anything:
 enabled = true
 leds_per_fan = 6          # 1..=20
 fans = "mirrored"         # "mirrored" (splitter) or "chain" (daisy chain)
-# chain_len = 4           # fans = "chain" only, 1..=8
+# chain_len = 4           # fans = "chain" only, 1..=120; at most 120 LEDs in all
 brightness_max = 80       # cap on every LED, 0..=100 %
 fps = 10
 
@@ -1007,6 +1007,11 @@ With no `[[light]]` entries every fan shows activity on the LCD's colour ramp.
 such as `"Number Pad +"`, and `led:N`. `aura.chain[4..2]` is fans 2 and 3 from
 the far end, the last LED of fan 3 back to the first LED of fan 2, so two
 strips mounted end to end grow toward the point where they meet.
+A chain (`fans = "chain"`) takes up to 120 fans and at most 120 LEDs in
+all, `chain_len` × `leds_per_fan`, which is as far as the header reaches;
+`check` rejects a longer one. Strips whose lengths share no fan size can
+use a small `leds_per_fan`: with 4, two 28-LED strips are
+`aura.chain[0..7]` and `aura.chain[7..14]`.
 
 `style = "heat"` treats an Aura span as a metal bar. The first LED is a
 cold sink at the bottom and the last is the heater; the metric drives the
