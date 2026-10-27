@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::termios::{
-    LocalModes, OptionalActions, SpecialCodeIndex, Termios, isatty, tcgetattr, tcsetattr,
+    InputModes, LocalModes, OptionalActions, SpecialCodeIndex, Termios, isatty, tcgetattr,
+    tcsetattr,
 };
 
 /// What [`wait_input`] saw.
@@ -50,7 +51,8 @@ pub fn wait_input(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<Wait> {
 /// The terminal settings to put back on exit: the ones found at start, with
 /// canonical input, echo, signals and extended input forced on. Forcing them
 /// heals a terminal that an earlier llama-view left raw when it was killed
-/// (SIGTERM cannot be caught without `unsafe`).
+/// (SIGTERM cannot be caught without `unsafe`). XON/XOFF flow control is a
+/// user's choice (`stty -ixon`) and is left as found (#186).
 pub fn restored(mut found: Termios) -> Termios {
     found.local_modes |=
         LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG | LocalModes::IEXTEN;
@@ -58,11 +60,14 @@ pub fn restored(mut found: Termios) -> Termios {
 }
 
 /// Non-canonical, no echo, no signal keys (Ctrl-C arrives as a byte and
-/// quits cleanly), reads return as soon as one byte is there.
+/// quits cleanly), reads return as soon as one byte is there. No XON/XOFF
+/// flow control either (#186): with `IXON` a Ctrl+S stops all output and the
+/// next frame write blocks until a Ctrl+Q, which froze kiosk screens.
 pub fn raw(mut found: Termios) -> Termios {
     found
         .local_modes
         .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG | LocalModes::IEXTEN);
+    found.input_modes.remove(InputModes::IXON);
     found.special_codes[SpecialCodeIndex::VMIN] = 1;
     found.special_codes[SpecialCodeIndex::VTIME] = 0;
     found
@@ -118,6 +123,7 @@ impl<Fd: AsFd> Drop for RawInput<Fd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
 
     fn some_termios() -> Option<Termios> {
         // Any tty will do for the flag arithmetic; skip when there is none.
@@ -131,16 +137,73 @@ mod tests {
             eprintln!("no controlling tty; skipped");
             return;
         };
-        let r = raw(found.clone());
+        let mut flowing = found.clone();
+        flowing.input_modes |= InputModes::IXON;
+        let r = raw(flowing);
         assert!(!r.local_modes.intersects(
             LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG | LocalModes::IEXTEN
         ));
+        assert!(
+            !r.input_modes.contains(InputModes::IXON),
+            "Ctrl+S must not stop output"
+        );
         assert_eq!(r.special_codes[SpecialCodeIndex::VMIN], 1);
         assert_eq!(r.special_codes[SpecialCodeIndex::VTIME], 0);
         let back = restored(r);
         assert!(back.local_modes.contains(
             LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG | LocalModes::IEXTEN
         ));
+    }
+
+    /// A pseudo-terminal's two ends, or `None` where there is no `/dev/ptmx`
+    /// (a minimal container).
+    fn some_pty() -> Option<(OwnedFd, OwnedFd)> {
+        use rustix::fs::{Mode, OFlags, open};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).ok()?;
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let name = ptsname(&master, Vec::new()).expect("ptsname");
+        let pty = open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .expect("open pts");
+        Some((master, pty))
+    }
+
+    /// #186: Ctrl+S must not be able to stop output while llama-view runs,
+    /// and the terminal's own flow control setting comes back on exit,
+    /// whichever it was. A pty, so this runs without a controlling tty.
+    #[test]
+    fn raw_input_turns_flow_control_off_and_puts_it_back() {
+        for ixon in [true, false] {
+            let Some((_master, pty)) = some_pty() else {
+                eprintln!("no pty; skipped");
+                return;
+            };
+            let mut start = tcgetattr(&pty).expect("tcgetattr");
+            start.input_modes.set(InputModes::IXON, ixon);
+            tcsetattr(&pty, OptionalActions::Now, &start).expect("tcsetattr");
+            let mut input = RawInput::enter(&pty)
+                .expect("enter")
+                .expect("a pty is a tty");
+            let inside = tcgetattr(&pty).expect("tcgetattr");
+            assert!(
+                !inside.input_modes.contains(InputModes::IXON),
+                "Ctrl+S must not stop output"
+            );
+            assert!(!inside.local_modes.contains(LocalModes::ICANON));
+            input.restore().expect("restore");
+            let after = tcgetattr(&pty).expect("tcgetattr");
+            assert_eq!(after.input_modes.contains(InputModes::IXON), ixon);
+            assert!(
+                after
+                    .local_modes
+                    .contains(LocalModes::ICANON | LocalModes::ECHO)
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- llama-view: Ctrl+S no longer freezes the screen. Raw mode now turns off XON/XOFF flow control (`IXON`), which used to let one Ctrl+S stop all output until a Ctrl+Q; a kiosk console stayed frozen. The terminal's own settings come back on exit (#186).
+
 ### Changed
 
 - llama-light: a chain can now fill the Aura header's 120 LEDs. `chain_len` (or an `aura.chain` list) takes up to 120 fans, so a small `leds_per_fan` describes strips of any length (`leds_per_fan = 4`, `chain_len = 30` is 120 LEDs with a 28-LED strip still on `aura.chain[0..7]`); before, a chain stopped at 8 fans. `check` now rejects a chain longer than 120 LEDs, which it used to accept and which then failed every frame (#182).
