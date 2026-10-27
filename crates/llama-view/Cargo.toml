@@ -12,3 +12,6 @@ rustix = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }
