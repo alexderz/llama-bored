@@ -512,7 +512,11 @@ mod tests {
         let next_prompt = chars("next prompt");
         let rows = [turn(1, 10.0, 10.0), turn(2, 20.0, 20.0)];
         let next = motion.update(&sample(2, &next_prompt, &answer, &rows, None, None), later);
-        assert_eq!(next.out, Some(held), "the leftover reply is not started over");
+        assert_eq!(
+            next.out,
+            Some(held),
+            "the leftover reply is not started over"
+        );
         let fresh = chars("brand new answer");
         let started = motion.update(&sample(2, &next_prompt, &fresh, &rows, None, None), later);
         assert_eq!(started.out, Some(0), "the new reply starts at the top");
