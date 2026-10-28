@@ -203,6 +203,12 @@ impl Panel {
             self.mode = Mode::Tail;
             return;
         }
+        // A new request often still holds the previous reply until its own
+        // output arrives. That leftover is not this turn's OUT (#188).
+        if request != self.request && self.text.as_slice() == text && !text.is_empty() {
+            self.request = request;
+            return;
+        }
         let tps = choose(pace.live, pace.history, pace.own);
         let cps = chars_per_sec(text.len(), pace.tokens, tps);
         if self.request == request && self.text.as_slice() == text {
@@ -486,6 +492,30 @@ mod tests {
         );
         assert_eq!(view.in_cps, Some(7.0), "live prefill, not the average");
         assert_eq!(view.out_cps, Some(9.0), "live generation, not the average");
+    }
+
+    /// The previous reply is still in the slot when the next prompt arrives.
+    /// It is not scrolled again as this turn's OUT.
+    #[test]
+    fn a_new_turn_does_not_replay_the_previous_reply() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let prompt = chars("prompt");
+        let answer = chars("previous answer that is long enough");
+        let rows = [turn(1, 10.0, 10.0)];
+        let first = motion.update(&sample(1, &prompt, &answer, &rows, None, None), now);
+        assert_eq!(first.out, Some(0));
+        let later = now + std::time::Duration::from_millis(500);
+        let mid = motion.update(&sample(1, &prompt, &answer, &rows, None, None), later);
+        let held = mid.out.expect("still scrolling the first reply");
+        assert!(held > 0, "half a second in: {held}");
+        let next_prompt = chars("next prompt");
+        let rows = [turn(1, 10.0, 10.0), turn(2, 20.0, 20.0)];
+        let next = motion.update(&sample(2, &next_prompt, &answer, &rows, None, None), later);
+        assert_eq!(next.out, Some(held), "the leftover reply is not started over");
+        let fresh = chars("brand new answer");
+        let started = motion.update(&sample(2, &next_prompt, &fresh, &rows, None, None), later);
+        assert_eq!(started.out, Some(0), "the new reply starts at the top");
     }
 
     #[test]
