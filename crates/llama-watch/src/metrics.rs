@@ -2448,6 +2448,14 @@ impl EngineBook {
         track.observe(sample)
     }
 
+    /// Held prefill tok/s of `model` (#188): the last window that finished
+    /// a prefill, kept until the next one does. `None` when this model has
+    /// no prefill histograms.
+    #[must_use]
+    pub fn prefill_tps(&self, model: &str) -> Option<f64> {
+        self.models.get(model).and_then(|track| track.tps[0])
+    }
+
     /// `model` is no longer loaded: drop its window values and baselines,
     /// keep its counters. The next read starts afresh.
     pub fn forget(&mut self, model: &str) {

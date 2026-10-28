@@ -2182,16 +2182,22 @@ impl<L: Sink> State<L> {
                 .requests_processing(&model.id, now)
                 .is_some_and(|value| value > 0.0)
         });
-        // Prompt tok/s from SGLang/vLLM's prompt counter, for when no
-        // `/slots` gave one.
+        // Prompt tok/s from the counter, for a streaming engine with no
+        // `/slots` rate. A burst engine does not use it (#188).
         let prompt_rate = self.prompt_rate.observe(now, self.prompt_counter.total());
-        let prompt_tps = if !self.running_up {
-            None
-        } else if !busy {
-            Some(0.0)
-        } else {
-            self.slots.prompt_tps().or(prompt_rate)
-        };
+        // An idle llama.cpp slot stores 0. That is not a live prefill, so
+        // it must not hide a vLLM or SGLang rate or bring the wall-clock
+        // spike back. A slot that is actually in flight still reports its
+        // rate, including 0 while it is decoding (#188).
+        let slots_rate = self.slots_prompt_rate(now);
+        let prompt_tps = crate::prompt_head::headline(
+            self.running_up,
+            busy,
+            slots_rate,
+            prompt_rate,
+            self.burst_prompt_engine(now),
+            self.held_burst_prompt(now),
+        );
         // #180: with only tqLLM loaded, GEN and PROMPT are its requests'
         // own rates, `--` until it has them.
         let (gen_tps, prompt_tps) = match self.tqllm_rates(now) {
@@ -2279,6 +2285,79 @@ impl<L: Sink> State<L> {
             prompt = prompt.zip(live.prefill_tps_sum()).map(|(a, b)| a + b);
         }
         Some((decode, prompt))
+    }
+
+    /// `/slots` prefill while a llama.cpp model is actually in flight.
+    /// `idle()` stores 0 when nothing with `/slots` is processing, and that
+    /// stored 0 must not hide a burst engine (#188). Decoding really is 0,
+    /// so an in-flight slot still reports it, including 0.
+    fn slots_prompt_rate(&self, now: Instant) -> Option<f64> {
+        let in_flight = self.ready.iter().any(|model| {
+            model.backend.has_slots()
+                && self
+                    .counter
+                    .requests_processing(&model.id, now)
+                    .is_some_and(|value| value > 0.0)
+        });
+        if !in_flight {
+            return None;
+        }
+        self.slots
+            .prompt_tps()
+            .filter(|rate| rate.is_finite() && *rate >= 0.0)
+    }
+
+    /// The models busy right now are all vLLM or SGLang (#188). An idle
+    /// llama.cpp or Strata sitting loaded does not count, so its stored 0
+    /// cannot bring the wall-clock spike back onto a burst prefill. A busy
+    /// streaming engine does. tqLLM is left out: its own rates replace the
+    /// headline just after this choice.
+    fn burst_prompt_engine(&self, now: Instant) -> bool {
+        let mut saw = false;
+        for model in &self.ready {
+            if !model.backend.has_metrics() || model.backend == Backend::Tqllm {
+                continue;
+            }
+            let busy = self
+                .counter
+                .requests_processing(&model.id, now)
+                .is_some_and(|value| value > 0.0);
+            if !busy {
+                continue;
+            }
+            if !matches!(model.backend, Backend::Vllm | Backend::SgLang) {
+                return false;
+            }
+            saw = true;
+        }
+        saw
+    }
+
+    /// Honest prefill tok/s of the burst engines that are busy now (#188).
+    /// vLLM's is the held histogram window. SGLang's is the last rate from
+    /// one finished request that was alone. Several busy models add.
+    fn held_burst_prompt(&self, now: Instant) -> Option<f64> {
+        let mut sum = 0.0;
+        let mut n = 0u32;
+        for model in &self.ready {
+            let processing = self
+                .counter
+                .requests_processing(&model.id, now)
+                .unwrap_or(0.0);
+            if processing <= 0.0 {
+                continue;
+            }
+            let rate = match model.backend {
+                Backend::Vllm => self.engines.prefill_tps(&model.id),
+                Backend::SgLang => self.sglang.prompt_rate(&model.id),
+                _ => None,
+            };
+            if let Some(rate) = rate.filter(|rate| rate.is_finite() && *rate >= 0.0) {
+                sum += rate;
+                n += 1;
+            }
+        }
+        (n > 0).then_some(sum)
     }
 
     /// [`Self::model_setup`] with each model's engine-reported values (#54),
@@ -2769,5 +2848,238 @@ mod tests {
         assert_eq!(snapshot_name("", 12), "model");
         assert_eq!(snapshot_name("", 4), format!("mod{}", '\u{2026}'));
         assert_eq!(snapshot_name("", 2), format!("m{}", '\u{2026}'));
+    }
+
+    /// One finished SGLang request, alone, holds its prefill on the big
+    /// number while llama.cpp sits idle beside it (#188). Replacing the
+    /// SGLang arm of [`State::held_burst_prompt`] with `None` loses the 200.
+    #[test]
+    fn one_finished_sglang_request_holds_its_rate_beside_an_idle_slot() {
+        let mut state = blank_state();
+        lone_sglang_finish(&mut state.sglang);
+        assert_eq!(
+            state.sglang.prompt_rate("flash"),
+            Some(200.0),
+            "one lone finish is (1000 - 600) / 2"
+        );
+        state.slots.idle();
+        assert_eq!(
+            state.slots.prompt_tps(),
+            Some(0.0),
+            "an idle llama.cpp slot stored 0"
+        );
+        state.ready = vec![
+            ReadyModel {
+                id: "cpp".to_owned(),
+                name: "llama".to_owned(),
+                backend: Backend::LlamaCpp,
+                probe: false,
+            },
+            ReadyModel {
+                id: "flash".to_owned(),
+                name: "flash".to_owned(),
+                backend: Backend::SgLang,
+                probe: false,
+            },
+        ];
+        state.running_up = true;
+        let now = Instant::now();
+        let _ = state.prompt_rate.observe(now - Duration::from_secs(1), 0);
+        state
+            .prompt_counter
+            .observe("flash", 0, None, now - Duration::from_secs(1));
+        state
+            .prompt_counter
+            .observe("flash", 20_000, Some(1.0), now);
+        assert_eq!(state.prompt_counter.total(), 20_000, "the wall-clock spike");
+        state.counter.observe("flash", 1, Some(1.0), now);
+
+        let rx = state.tx.share_with_thread();
+        state.publish().expect("publish");
+        let (_view, detail) = rx.take().expect("sample");
+        assert_eq!(
+            detail.prompt_tps,
+            Some(200.0),
+            "the big number is the lone SGLang prefill, not the idle 0 or the spike"
+        );
+    }
+
+    fn blank_state() -> State<llama_core::log::Stderr> {
+        State {
+            limits: Limits {
+                url: "http://127.0.0.1:9".to_owned(),
+                running_interval: Duration::from_secs(1),
+                running_timeout: Duration::from_secs(1),
+                metrics_interval: Duration::from_secs(1),
+                metrics_timeout: Duration::from_secs(1),
+                slots_interval: Duration::from_secs(1),
+                slots_timeout: Duration::from_secs(1),
+                slots_cap: 1024,
+                activity_interval: Duration::from_secs(1),
+                activity_timeout: Duration::from_secs(1),
+                input_tail: 0,
+                output_tail: 0,
+                show_text: false,
+                prompt_view: PromptView::default(),
+                max_name_chars: 48,
+                aliases: HashMap::new(),
+                backends: HashMap::new(),
+                setup: Rules::default(),
+                specs_dir: None,
+                jobs_dir: None,
+                llama_enabled: true,
+            },
+            agent: llamaswap::new_agent(),
+            log: llama_core::log::Stderr,
+            tx: SampleRx::new(),
+            counter: DecodedCounter::default(),
+            gen_rate: GenRate::default(),
+            slots: SlotBook::default(),
+            recent: Recent::default(),
+            ai: AiState::Loaded,
+            models: Vec::new(),
+            model_ids: Vec::new(),
+            model_kv: Vec::new(),
+            model_tq_kv: Vec::new(),
+            model_setup: Vec::new(),
+            specs: Specs::new(None),
+            jobs: Jobs::new(None),
+            ready: Vec::new(),
+            down_ready: Vec::new(),
+            gauges: HashMap::new(),
+            engine_facts: HashMap::new(),
+            fallback: HashSet::new(),
+            no_metrics_logged: HashSet::new(),
+            prompt_counter: DecodedCounter::default(),
+            prompt_rate: GenRate::default(),
+            prompt_box: DecodedCounter::default(),
+            prompt_cache: PromptCache::default(),
+            engines: EngineBook::default(),
+            speeds: SpeedBook::default(),
+            sglang: SglangBook::default(),
+            series: SeriesBook::default(),
+            detected: HashMap::new(),
+            detect_logged: HashSet::new(),
+            probe_snapshot: HashMap::new(),
+            tqllm: TqllmBook::default(),
+            schema_logged: HashSet::new(),
+            health_logged: HashSet::new(),
+            running_due: false,
+            running_up: false,
+            unmetered: false,
+            latencies: PollLatencies::default(),
+            reach: Reach::Unknown,
+            slots_oversize: false,
+            metrics_failed: false,
+            slots_failed: false,
+            activity_failed: false,
+            capture_seen: None,
+            capture: None,
+            slots_textless: HashSet::new(),
+            textless_logged: HashSet::new(),
+            capture_failed: false,
+            capture_oversize: false,
+            round_skip: HashSet::new(),
+            not_loaded: HashSet::new(),
+            swapping: false,
+            round_blocked: false,
+            backoff: HashMap::new(),
+            suspected: Vec::new(),
+            row_engines: HashMap::new(),
+            events: None,
+            events_view: EventsView::default(),
+            events_failed: false,
+            claims_failed: false,
+            gpu_failed: false,
+            inflight_engines: false,
+            live: LiveBook::default(),
+            loads_missing: HashSet::new(),
+            loads_failed: false,
+        }
+    }
+
+    /// The SGLang book's one-request window: 1,000 prompt tokens, 600
+    /// cached, two seconds to the first token. The honest rate is 200.
+    fn lone_sglang_finish(book: &mut SglangBook) {
+        let origin = Instant::now();
+        let at = |ms: u64| origin + Duration::from_millis(ms);
+        let wall = |ms: u64| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+        let see = |book: &mut SglangBook, ms: u64, totals: Totals| {
+            book.observe("flash", at(ms), wall(ms), Some(totals));
+        };
+        let zeros = Totals {
+            requests: 0,
+            batch: 0,
+            prompt: 0,
+            cached: 0,
+            generated: 0,
+            e2e_sum: 0.0,
+            e2e_count: 0.0,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            queue_sum: 0.0,
+            queue_count: 0.0,
+            running: 0.0,
+        };
+        let mut ms = 0;
+        loop {
+            see(book, ms, zeros);
+            if ms >= 8_000 {
+                break;
+            }
+            let next = ms.saturating_add(2_000);
+            ms = if next > 8_000 { 8_000 } else { next };
+        }
+        book.activity(at(100), &[]);
+        see(
+            book,
+            10_000,
+            Totals {
+                ttft_sum: 2.0,
+                ttft_count: 1.0,
+                running: 1.0,
+                ..zeros
+            },
+        );
+        let after = Totals {
+            requests: 1,
+            batch: 0,
+            prompt: 1_000,
+            cached: 600,
+            generated: 401,
+            e2e_sum: 10.0,
+            e2e_count: 1.0,
+            ttft_sum: 2.0,
+            ttft_count: 1.0,
+            queue_sum: 0.0,
+            queue_count: 0.0,
+            running: 0.0,
+        };
+        see(book, 12_000, after);
+        let stamp = format!(
+            "{}Z",
+            crate::localtime::format_local(12, crate::localtime::Zone::utc())
+        );
+        book.activity(
+            at(12_500),
+            &[Claim {
+                seq: 1,
+                model: "flash".to_owned(),
+                input: 1_000,
+                output: Some(401),
+                duration_ms: Some(10_000),
+                prompt_known: false,
+                gen_known: false,
+                timestamp: Some(stamp),
+            }],
+        );
+        ms = 14_000;
+        loop {
+            see(book, ms, after);
+            if ms > 18_000 {
+                break;
+            }
+            ms = ms.saturating_add(2_000);
+        }
     }
 }

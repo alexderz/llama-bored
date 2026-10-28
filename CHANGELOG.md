@@ -6,8 +6,14 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+## 0.7.2 — 2026-10-27
+
+tqLLM on the dashboard, LED chains up to the header's 120 LEDs, a console that Ctrl+S can no longer freeze, and an honest prefill speed with IN and OUT that scroll from the top. Nothing in an existing config needs to change.
+
 ### Fixed
 
+- tty11's big PROMPT number on a burst engine is the prefill speed, not the one-second counter spike. vLLM holds the histogram rate (new uncached prompt tokens over prefill seconds) until the next prefill finishes, so 20,000 tokens in 10 s read as 2,000 and stay 2,000 a second later. SGLang uses a rate only when one finished request was alone and its own prompt time is known, and then holds that rate; it does not invent a wall-clock spike. llama.cpp's live `/slots` rate and tqLLM's own rates are unchanged. Idle is still 0 and a missing rate is still `--`. An idle llama.cpp model beside a busy vLLM or SGLang does not replace that held rate with the idle slot's stored 0 or the wall-clock spike; a live non-zero `/slots` prefill still wins (#188).
+- IN and OUT start at the top when a whole prompt or reply arrives in one update, and scroll by elapsed time. The speed is the live tok/s when one is known (a streaming engine, `/slots`, or tqLLM); otherwise the average of the last five completed turns of that model, this turn's own measured speed on the first turn, or the whole text in two seconds when that is missing too. A streaming update keeps growing in place and does not jump back to the top. A live rate that appears after the burst has started takes over without a jump, and when it disappears the speed falls back along that same list, again without a jump. Text shorter than the panel sits at the top. No replay label (#188).
 - llama-view: Ctrl+S no longer freezes the screen. Raw mode now turns off XON/XOFF flow control (`IXON`), which used to let one Ctrl+S stop all output until a Ctrl+Q; a kiosk console stayed frozen. The terminal's own settings come back on exit (#186).
 
 ### Changed

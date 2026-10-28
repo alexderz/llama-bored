@@ -2747,6 +2747,102 @@ fn speed_page(rows: &[(i64, &str, f64, f64)]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "data": data })).expect("json")
 }
 
+fn with_prompt_total(body: Vec<u8>, total: u64) -> Vec<u8> {
+    let mut text = String::from_utf8(body).expect("utf8");
+    let old = text
+        .lines()
+        .find(|line| line.starts_with("vllm:prompt_tokens_total{"))
+        .expect("prompt counter")
+        .to_owned();
+    text = text.replace(
+        &old,
+        &format!("vllm:prompt_tokens_total{{engine=\"0\",model_name=\"qwen3.8-27b\"}} {total}.0"),
+    );
+    text.into_bytes()
+}
+
+/// #188: 20,000 prompt tokens in 10 s of prefill is 2,000 on the big
+/// number, and it is still 2,000 a second later. The wall-clock counter
+/// would read about 20,000 on the sample that lands the tokens and 0 once
+/// that second has passed.
+#[test]
+fn vllm_prefill_speed_holds_the_big_prompt_number() {
+    let mut world = World::running(running_cmd("qwen3.8-27b-vllm", CONTAINER_CMD));
+    world.metrics.insert(
+        "qwen3.8-27b-vllm".to_owned(),
+        with_prompt_total(vllm_finished(0, 0.0, 0, 0.0, 0), 500_000),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    let near = |got: Option<f64>, want: f64| got.is_some_and(|got| (got - want).abs() < 1.0);
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        near(detail.prompt_tps, 2_500.0)
+    });
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.8-27b-vllm".to_owned(),
+            with_prompt_total(vllm_finished(1, 10.0, 20_000, 0.0, 0), 520_000),
+        );
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        near(detail.prompt_tps, 2_000.0)
+    });
+    assert!(
+        near(detail.prompt_tps, 2_000.0),
+        "not the 20,000 wall-clock spike: {:?}",
+        detail.prompt_tps
+    );
+    thread::sleep(Duration::from_millis(1_200));
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, _| true);
+    assert!(
+        near(detail.prompt_tps, 2_000.0),
+        "a second later, not 0 and not 20,000: {:?}",
+        detail.prompt_tps
+    );
+}
+
+/// #188: llama.cpp's live slot rate stays the big number even when the
+/// prompt counter jumps by far more in the same second.
+#[test]
+fn llamacpp_live_slot_rate_stays_the_big_prompt_number() {
+    let mut world = World::running(running_model("qwen3.6-35b-a3b", "Qwen", "ready"));
+    world.metrics.insert(
+        "qwen3.6-35b-a3b".to_owned(),
+        b"llamacpp:prompt_tokens_total 100\nllamacpp:n_decode_total 20\nllamacpp:requests_processing 1\n".to_vec(),
+    );
+    world.slots.insert(
+        "qwen3.6-35b-a3b".to_owned(),
+        slot_body(7, "prompt", "", 100, 0),
+    );
+    let server = Server::start(world);
+    let log = MemLog::new();
+    let config = watch(server.port, 12, 4_194_304, 0.15);
+    let (_poller, rx) = spawn(&config, &log);
+    wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        !detail.slots.is_empty()
+    });
+    server.update(|world| {
+        world.metrics.insert(
+            "qwen3.6-35b-a3b".to_owned(),
+            b"llamacpp:prompt_tokens_total 100100\nllamacpp:n_decode_total 20\nllamacpp:requests_processing 1\n".to_vec(),
+        );
+        world.slots.insert(
+            "qwen3.6-35b-a3b".to_owned(),
+            slot_body(7, "prompt", "", 2_100, 0),
+        );
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.prompt_tps.is_some_and(|rate| rate > 0.0)
+    });
+    let rate = detail.prompt_tps.expect("slot rate");
+    assert!(
+        rate < 20_000.0,
+        "the live slot rate, not the 100,000-token wall-clock spike: {rate}"
+    );
+}
+
 #[test]
 fn vllm_rows_get_the_engine_speeds_of_the_window_they_finished_in() {
     let running = serde_json::to_vec(&serde_json::json!({

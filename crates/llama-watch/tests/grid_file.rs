@@ -977,6 +977,8 @@ fn busy_frame() -> TtyModel {
         out_lines: vec![prose("OUT")],
         out_shown: 0,
         replay_frame: None,
+        in_scroll: None,
+        out_scroll: None,
         show_text: true,
         down_since: String::new(),
         health: vec![

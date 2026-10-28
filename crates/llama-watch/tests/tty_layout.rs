@@ -1028,6 +1028,50 @@ fn replay_frame_zero_keeps_the_previous_poll() {
     );
 }
 
+/// #188: a burst's first frame is the start of the text, not the tail a
+/// streaming panel keeps. Short burst text sits at the top.
+#[test]
+fn a_burst_starts_at_the_top_and_a_stream_keeps_the_end() {
+    let body = format!("START{}END", "x".repeat(20_000));
+    let mut burst = sample(WatchState::Ready);
+    burst.out_lines = vec![body.clone()];
+    burst.out_scroll = Some(0);
+    // Frame 0 of a streaming replay would hide this reply. The burst must
+    // still show its start, so ignoring `out_scroll` fails.
+    burst.replay_frame = Some(0);
+    burst.out_shown = 0;
+    let top = draw(&burst, 160, 40);
+    let shown = whole(&top);
+    assert!(shown.contains("START"), "{shown}");
+    assert!(
+        !shown.contains("END"),
+        "the first frame must not be the tail"
+    );
+
+    let mut stream = burst.clone();
+    stream.out_scroll = None;
+    stream.replay_frame = None;
+    let tail = whole(&draw(&stream, 160, 40));
+    assert!(tail.contains("END"), "a streaming panel keeps the end");
+    assert!(
+        !tail.contains("START"),
+        "a stream does not jump back to the top"
+    );
+
+    let mut high = sample(WatchState::Ready);
+    high.out_lines = vec!["SHORT".to_owned()];
+    high.out_scroll = Some(0);
+    let mut low = high.clone();
+    low.out_scroll = None;
+    low.replay_frame = None;
+    let high_row = row_with(&draw(&high, 240, 67), "SHORT");
+    let low_row = row_with(&draw(&low, 240, 67), "SHORT");
+    assert!(
+        high_row < low_row,
+        "short burst text sits at the top ({high_row}) not the tail ({low_row})"
+    );
+}
+
 #[test]
 fn huge_model_name_does_not_panic_or_spill() {
     let mut model = sample(WatchState::Generating);
@@ -2241,6 +2285,8 @@ fn sample(state: WatchState) -> TtyModel {
         out_lines: Vec::new(),
         out_shown: 0,
         replay_frame: None,
+        in_scroll: None,
+        out_scroll: None,
         show_text: true,
         down_since: down_since.to_string(),
         health: health(state),

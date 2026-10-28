@@ -265,8 +265,14 @@ pub struct TtyModel {
     /// the whole tail.
     pub out_shown: usize,
     /// Which frame of the 10-frame replay is on screen. `None` shows the tail
-    /// in full.
+    /// in full. Ignored while [`Self::out_scroll`] is set.
     pub replay_frame: Option<u32>,
+    /// Burst scroll for IN (#188): characters skipped from the start.
+    /// `None` keeps the tail view. `Some(0)` is the first frame, the start
+    /// of the text. Short text is drawn from the top either way.
+    pub in_scroll: Option<usize>,
+    /// Burst scroll for OUT. `None` keeps the streaming replay and the tail.
+    pub out_scroll: Option<usize>,
     /// `tty.show_text`. False draws no IN/OUT panels, gives their rows to the
     /// chart and RECENT, and tags the header `text off`.
     pub show_text: bool,
@@ -4555,6 +4561,7 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
         false,
         2,
         width,
+        model.in_scroll,
     );
     place_lines(
         grid,
@@ -4565,6 +4572,7 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
         true,
         2,
         width,
+        model.out_scroll,
     );
     if !model.text_note.is_empty() && model.in_lines.is_empty() && model.out_lines.is_empty() {
         for (start, rows) in [(in_start, in_rows), (out_start, out_rows)] {
@@ -5102,6 +5110,11 @@ fn draw_fan_row(
 type Glyph = (char, char);
 
 fn revealed_lines(model: &TtyModel) -> Vec<Vec<Glyph>> {
+    // A burst shows the whole reply and scrolls the window (#188). The
+    // streaming replay would hide it and then land on the tail.
+    if model.out_scroll.is_some() {
+        return logical_lines(&model.out_lines);
+    }
     let stream = tail_stream(&model.out_lines);
     let total = stream.len();
     let keep = match model.replay_frame {
@@ -5169,11 +5182,22 @@ fn place_lines(
     out: bool,
     origin: u16,
     width: usize,
+    scroll: Option<usize>,
 ) {
     let width = width.max(1);
-    let view = visual_tail(lines, width, usize::from(rows));
     let rows_n = usize::from(rows);
-    let pad = rows_n.saturating_sub(view.len());
+    // `None` is the streaming tail, bottom-aligned when it is short.
+    // `Some` is a burst: the window starts at that character and short
+    // text sits at the top (#188).
+    let (view, from_top) = match scroll {
+        Some(skip) => (visual_window(lines, width, rows_n, skip), true),
+        None => (visual_tail(lines, width, rows_n), false),
+    };
+    let pad = if from_top {
+        0
+    } else {
+        rows_n.saturating_sub(view.len())
+    };
     let total = view
         .iter()
         .filter(|line| line.iter().any(|g| g.0 != ' '))
@@ -5219,6 +5243,104 @@ fn cursor_col(text: &[Glyph], origin: u16) -> u16 {
         Some(last) => col_u16(usize::from(origin).saturating_add(last).saturating_add(1)),
         None => origin,
     }
+}
+
+/// First visual rows from character `skip`. Short text is the whole
+/// text, from the top, whatever `skip` says. A skip past the last page
+/// stays on the last page so the end does not scroll away into blank rows.
+fn visual_window(lines: &[Vec<Glyph>], width: usize, limit: usize, skip: usize) -> Vec<Vec<Glyph>> {
+    if limit == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let flat = flatten_lines(lines);
+    let rows = wrap_indexed(&flat, width);
+    if rows.len() <= limit {
+        return rows.into_iter().map(|(_, row)| row).collect();
+    }
+    // The row that contains `skip`: the last row starting at or before it.
+    let mut at = rows.partition_point(|(start, _)| *start <= skip);
+    at = at.saturating_sub(1).min(rows.len().saturating_sub(1));
+    if at + limit > rows.len() {
+        at = rows.len() - limit;
+    }
+    rows.into_iter()
+        .skip(at)
+        .take(limit)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+fn flatten_lines(lines: &[Vec<Glyph>]) -> Vec<Glyph> {
+    let mut flat = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            flat.push(('\n', '\n'));
+        }
+        flat.extend(line.iter().copied());
+    }
+    flat
+}
+
+/// Visual rows of `chars`, each with the index in `chars` where it starts.
+/// A `\n` ends a logical line. A line that wraps uses the same breaks as
+/// [`word_wrap`].
+fn wrap_indexed(chars: &[Glyph], width: usize) -> Vec<(usize, Vec<Glyph>)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start <= chars.len() {
+        if start == chars.len() {
+            break;
+        }
+        if chars[start].0 == '\n' {
+            out.push((start, Vec::new()));
+            start += 1;
+            continue;
+        }
+        let logical_end = chars[start..]
+            .iter()
+            .position(|glyph| glyph.0 == '\n')
+            .map(|at| start + at)
+            .unwrap_or(chars.len());
+        let mut i = start;
+        if i == logical_end {
+            out.push((i, Vec::new()));
+        }
+        while i < logical_end {
+            let remain = logical_end - i;
+            if remain <= width {
+                out.push((i, chars[i..logical_end].to_vec()));
+                break;
+            }
+            if chars.get(i + width).is_some_and(|glyph| glyph.0 == ' ') {
+                out.push((i, chars[i..i + width].to_vec()));
+                i += width + 1;
+                continue;
+            }
+            let window = &chars[i..i + width];
+            if let Some(at) = window
+                .iter()
+                .rposition(|glyph| glyph.0 == ' ')
+                .filter(|at| *at > 0)
+            {
+                out.push((i, chars[i..i + at].to_vec()));
+                i += at + 1;
+            } else {
+                out.push((i, chars[i..i + width].to_vec()));
+                i += width;
+            }
+        }
+        start = if logical_end < chars.len() {
+            logical_end + 1
+        } else {
+            logical_end
+        };
+    }
+    if out.is_empty() {
+        out.push((0, Vec::new()));
+    }
+    out
 }
 
 /// Last `limit` visual rows. Wrapping walks back from the end and stops
@@ -7618,6 +7740,7 @@ fn draw_panes(grid: &mut Grid, model: &TtyModel, g: &Geom, title: u16, text_rows
         false,
         left_x,
         left_w,
+        model.in_scroll,
     );
     place_lines(
         grid,
@@ -7628,6 +7751,7 @@ fn draw_panes(grid: &mut Grid, model: &TtyModel, g: &Geom, title: u16, text_rows
         true,
         right_x,
         right_w,
+        model.out_scroll,
     );
     if !model.text_note.is_empty() && model.in_lines.is_empty() && model.out_lines.is_empty() {
         let mid_row = title + 1 + text_rows.saturating_sub(1) / 2;
