@@ -506,6 +506,7 @@ impl TickState {
                 activity: Vec::new(),
                 gen_tps: None,
                 prompt_tps: None,
+                chart_prompt_tps: None,
                 latencies: PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,
@@ -607,7 +608,9 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         (Some(at), Some(count)) => Some((at, count)),
         _ => None,
     };
-    state.chart.ingest(mono, decoded, state.detail.prompt_tps);
+    state
+        .chart
+        .ingest(mono, decoded, state.detail.chart_prompt_tps);
     let running: Vec<String> = state
         .llama
         .models
@@ -4079,6 +4082,7 @@ mod tests {
                     activity: Vec::new(),
                     gen_tps: Some(40.0),
                     prompt_tps: Some(0.0),
+                    chart_prompt_tps: Some(0.0),
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
@@ -4233,6 +4237,7 @@ mod tests {
                     activity: Vec::new(),
                     gen_tps: None,
                     prompt_tps: None,
+                    chart_prompt_tps: None,
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,

@@ -228,6 +228,10 @@ pub struct LlamaDetail {
     pub gen_tps: Option<f64>,
     /// Prompt tok/s from `/slots`, or zero when nothing is in flight.
     pub prompt_tps: Option<f64>,
+    /// Chart input: phase-gated historical estimate for active llama.cpp prefill,
+    /// true zero for confirmed decode, and unknown for missing phase. Other
+    /// engines retain their existing rate semantics; this is not a measurement.
+    pub chart_prompt_tps: Option<f64>,
     /// Last poll durations.
     pub latencies: PollLatencies,
     /// Prompt and cached-prompt counters of each ready model (#10).
@@ -2197,6 +2201,7 @@ impl<L: Sink> State<L> {
                     .requests_processing(&model.id, now)
                     .is_some_and(|n| n > 0.0)
         });
+        let mut chart_prompt_tps = None;
         let prompt_tps = if !self.running_up {
             None
         } else if llama_busy {
@@ -2206,6 +2211,8 @@ impl<L: Sink> State<L> {
             let rows = self.measured_activity_limit(crate::recent::RING);
             let mut rates = Vec::new();
             let mut missing = false;
+            let mut chart_sum = 0.0;
+            let mut chart_known = true;
             for model in &self.ready {
                 if !self
                     .counter
@@ -2236,11 +2243,37 @@ impl<L: Sink> State<L> {
                         .and_then(|live| live.prefill_tps_sum()),
                     _ => None,
                 };
+                let chart_rate = if model.backend == Backend::LlamaCpp {
+                    let active = self
+                        .counter
+                        .requests_processing(&model.id, now)
+                        .unwrap_or(0.0);
+                    match self.slots.chart_phase(
+                        &model.id,
+                        active,
+                        now,
+                        self.limits.slots_interval * 2,
+                    ) {
+                        Some(crate::slots::ChartPhase::Decode) => Some(0.0),
+                        Some(crate::slots::ChartPhase::Prefill) => rate,
+                        None => None,
+                    }
+                } else {
+                    rate
+                };
+                if let Some(value) = chart_rate {
+                    chart_sum += value;
+                } else {
+                    chart_known = false;
+                }
                 if let Some(rate) = rate {
                     rates.push(rate);
                 } else {
                     missing = true;
                 }
+            }
+            if chart_known {
+                chart_prompt_tps = Some(chart_sum);
             }
             if missing || rates.is_empty() {
                 None
@@ -2263,6 +2296,9 @@ impl<L: Sink> State<L> {
             Some(rates) if self.running_up => rates,
             _ => (gen_tps, prompt_tps),
         };
+        if !llama_busy {
+            chart_prompt_tps = prompt_tps;
+        }
         let view = LlamaView {
             ai: self.ai,
             models: self.models_with_gauges(now),
@@ -2274,6 +2310,7 @@ impl<L: Sink> State<L> {
             activity: self.measured_activity(),
             gen_tps,
             prompt_tps,
+            chart_prompt_tps,
             latencies: self.latencies,
             prompt_cache: self
                 .ready
@@ -2955,6 +2992,164 @@ mod tests {
         assert_eq!(detail.prompt_tps, Some(600.0));
     }
 
+    #[test]
+    fn chart_feed_separates_prefill_estimate_from_decode_and_headline() {
+        use crate::tty::chart::TokenChart;
+        let mut state = blank_state();
+        state.running_up = true;
+        state.ready = vec![ReadyModel {
+            id: "cpp".into(),
+            name: "cpp".into(),
+            backend: Backend::LlamaCpp,
+            probe: false,
+        }];
+        let now = Instant::now();
+        state.counter.observe("cpp", 1, Some(1.0), now);
+        state.recent.merge(activity::parse_activity(br#"{"data":[{"id":1,"timestamp":"2026-10-29T01:00:01Z","model":"cpp","tokens":{"input_tokens":100,"cache_tokens":900,"prompt_per_second":600}}]}"#).unwrap());
+        let rx = state.tx.share_with_thread();
+        let mut chart = TokenChart::new(2);
+        let apply = |state: &mut State<llama_core::log::Stderr>,
+                     task: i64,
+                     decoded: Option<u64>| {
+            let next = decoded.map_or(String::new(), |n| {
+                format!(r#", "next_token":[{{"n_decoded":{n}}}]"#)
+            });
+            let body = format!(
+                r#"[{{"id":0,"id_task":{task},"is_processing":true,"n_prompt_tokens_processed":100{next}}}]"#
+            );
+            state.slots.begin_round();
+            assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
+            state.slots.finish_round(Instant::now());
+        };
+        apply(&mut state, 1, Some(0));
+        state.publish().unwrap();
+        let (_, prefill) = rx.take().unwrap();
+        assert_eq!(prefill.prompt_tps, Some(600.0));
+        assert_eq!(prefill.chart_prompt_tps, Some(600.0));
+        chart.ingest(now, None, prefill.chart_prompt_tps);
+        apply(&mut state, 1, Some(1));
+        state.publish().unwrap();
+        let (_, decode) = rx.take().unwrap();
+        assert_eq!(decode.prompt_tps, Some(600.0));
+        assert_eq!(decode.chart_prompt_tps, Some(0.0));
+        chart.ingest(now + Duration::from_secs(2), None, decode.chart_prompt_tps);
+        chart.ingest(now + Duration::from_secs(4), None, decode.chart_prompt_tps);
+        let buckets = chart.buckets();
+        assert_eq!(buckets[buckets.len() - 2].prompt_tps, Some(0.0));
+        assert_eq!(buckets[buckets.len() - 1].prompt_tps, Some(0.0));
+        apply(&mut state, 2, Some(8)); // possibly stale previous-task output
+        state.publish().unwrap();
+        assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
+        apply(&mut state, 2, None); // missing next_token, not a zero
+        state.publish().unwrap();
+        assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
+        apply(&mut state, 2, Some(0));
+        state.publish().unwrap();
+        assert_eq!(rx.take().unwrap().1.chart_prompt_tps, Some(600.0));
+        state.counter.observe("cpp", 1, Some(0.0), Instant::now());
+        state.publish().unwrap();
+        assert_eq!(rx.take().unwrap().1.chart_prompt_tps, Some(0.0));
+    }
+
+    #[test]
+    fn chart_phase_mixed_slots_and_models_requires_every_active_phase() {
+        let mut book = SlotBook::default();
+        let now = Instant::now();
+        book.begin_round();
+        assert!(book.apply("a", "a", br#"[{"id":0,"id_task":1,"is_processing":true,"next_token":[{"n_decoded":0}]},{"id":1,"id_task":2,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#, 0, 0));
+        assert!(book.apply(
+            "b",
+            "b",
+            br#"[{"id":0,"id_task":3,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#,
+            0,
+            0
+        ));
+        book.finish_round(now);
+        book.begin_round();
+        assert!(book.apply("a", "a", br#"[{"id":0,"id_task":1,"is_processing":true,"next_token":[{"n_decoded":5}]},{"id":1,"id_task":2,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#, 0, 0));
+        assert!(book.apply(
+            "b",
+            "b",
+            br#"[{"id":0,"id_task":3,"is_processing":true,"next_token":[{"n_decoded":9}]}]"#,
+            0,
+            0
+        ));
+        book.finish_round(now);
+        assert_eq!(
+            book.chart_phase("a", 2.0, now, Duration::from_secs(2)),
+            Some(crate::slots::ChartPhase::Prefill)
+        );
+        assert_eq!(
+            book.chart_phase("b", 1.0, now, Duration::from_secs(2)),
+            Some(crate::slots::ChartPhase::Decode)
+        );
+        assert_eq!(
+            book.chart_phase("a", 3.0, now, Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            book.chart_phase(
+                "a",
+                2.0,
+                now + Duration::from_secs(3),
+                Duration::from_secs(2)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn chart_feed_mixed_models_does_not_hide_another_prefill() {
+        let mut state = blank_state();
+        state.running_up = true;
+        for id in ["a", "b"] {
+            state.ready.push(ReadyModel {
+                id: id.into(),
+                name: id.into(),
+                backend: Backend::LlamaCpp,
+                probe: false,
+            });
+            state.counter.observe(
+                id,
+                1,
+                Some(if id == "a" { 2.0 } else { 1.0 }),
+                Instant::now(),
+            );
+        }
+        state.recent.merge(activity::parse_activity(br#"{"data":[
+          {"id":2,"timestamp":"2026-10-29T01:00:02Z","model":"a","tokens":{"input_tokens":100,"prompt_per_second":400}},
+          {"id":1,"timestamp":"2026-10-29T01:00:01Z","model":"b","tokens":{"input_tokens":100,"prompt_per_second":1000}}]}"#).unwrap());
+        let rx = state.tx.share_with_thread();
+        for decode in [0, 1] {
+            state.slots.begin_round();
+            let a = format!(
+                r#"[{{"id":0,"id_task":1,"is_processing":true,"next_token":[{{"n_decoded":{decode}}}]}},{{"id":1,"id_task":2,"is_processing":true,"next_token":[{{"n_decoded":0}}]}}]"#
+            );
+            let b = format!(
+                r#"[{{"id":0,"id_task":3,"is_processing":true,"next_token":[{{"n_decoded":{decode}}}]}}]"#
+            );
+            assert!(state.slots.apply("a", "a", a.as_bytes(), 0, 0));
+            assert!(state.slots.apply("b", "b", b.as_bytes(), 0, 0));
+            state.slots.finish_round(Instant::now());
+        }
+        state.publish().unwrap();
+        let (_, detail) = rx.take().unwrap();
+        assert_eq!(detail.prompt_tps, Some(1400.0));
+        assert_eq!(detail.chart_prompt_tps, Some(400.0));
+        state.slots.begin_round();
+        assert!(state.slots.apply("a", "a", br#"[{"id":0,"id_task":1,"is_processing":true},{"id":1,"id_task":2,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#, 0, 0));
+        assert!(state.slots.apply(
+            "b",
+            "b",
+            br#"[{"id":0,"id_task":3,"is_processing":true,"next_token":[{"n_decoded":2}]}]"#,
+            0,
+            0
+        ));
+        state.slots.finish_round(Instant::now());
+        state.publish().unwrap();
+        assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
+    }
+
     /// One finished SGLang request, alone, holds its prefill on the big
     /// number while llama.cpp sits idle beside it (#188). Replacing the
     /// SGLang arm of [`State::held_burst_prompt`] with `None` loses the 200.
@@ -3007,6 +3202,7 @@ mod tests {
             Some(200.0),
             "the big number is the lone SGLang prefill, not the idle 0 or the spike"
         );
+        assert_eq!(detail.chart_prompt_tps, Some(200.0));
     }
 
     fn blank_state() -> State<llama_core::log::Stderr> {

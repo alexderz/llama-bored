@@ -1007,6 +1007,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 activity: Vec::new(),
                 gen_tps: None,
                 prompt_tps: None,
+                chart_prompt_tps: None,
                 latencies: poller::PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,

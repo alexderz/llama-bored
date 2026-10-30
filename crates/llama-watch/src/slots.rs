@@ -126,6 +126,8 @@ pub fn whole_prompt(
 
 #[derive(Debug, Default)]
 struct Tracked {
+    chart_phase: Option<ChartPhase>,
+    phase_decoded: Option<u64>,
     model_id: String,
     model: String,
     id: i64,
@@ -263,6 +265,13 @@ fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
         .is_some_and(|split| split.whole.abs_diff(prompt) <= (prompt / 200).max(8))
 }
 
+/// Phase observed for a current task, not a rate measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartPhase {
+    Prefill,
+    Decode,
+}
+
 /// Slot numbers and tails across polls.
 ///
 /// [`Self::without_text`] builds a book that never keeps llama text: the
@@ -270,6 +279,8 @@ fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
 /// strings are not even allocated (RR-LV1, `tty.show_text = false`).
 #[derive(Debug, Default)]
 pub struct SlotBook {
+    phase_at: HashMap<String, Instant>,
+    phase_round: HashSet<String>,
     text_off: bool,
     prompt_view: PromptView,
     slots: Vec<Tracked>,
@@ -305,6 +316,8 @@ pub struct SlotBook {
 impl SlotBook {
     /// Start a slots phase. Deltas from [`Self::apply`] land in [`Self::finish_round`].
     pub fn begin_round(&mut self) {
+        self.phase_at.clear();
+        self.phase_round.clear();
         self.round_delta = 0;
         self.round_seen = false;
         self.round_prefilling = false;
@@ -325,6 +338,7 @@ impl SlotBook {
     /// and that reset's delta lands in the fresh baseline round, never
     /// applied to the rate.
     pub fn idle(&mut self) {
+        self.phase_at.clear();
         self.prompt_tps = Some(0.0);
         self.last_at = None;
         self.last_progress_at = None;
@@ -511,12 +525,14 @@ impl SlotBook {
                 return false;
             };
             self.round_seen = true;
+            self.phase_round.insert(model_id.to_owned());
             let next = parsed
                 .iter()
                 .map(|slot| {
                     self.note_processed(model_id, slot);
                     self.note_ctx(model_id, slot);
-                    tracked(model_id, display, slot, Vec::new(), Vec::new(), None)
+                    let phase = self.phase_for(model_id, slot);
+                    tracked(model_id, display, slot, Vec::new(), Vec::new(), None, phase)
                 })
                 .collect::<Vec<_>>();
             self.slots.retain(|row| row.model_id != model_id);
@@ -546,6 +562,7 @@ impl SlotBook {
             vec![String::new(); parsed.len()]
         };
         self.round_seen = true;
+        self.phase_round.insert(model_id.to_owned());
         let mut next = Vec::with_capacity(parsed.len());
         for (slot, prompt) in parsed.iter().zip(prompts) {
             self.note_processed(model_id, slot);
@@ -570,11 +587,66 @@ impl SlotBook {
                 input,
                 output,
                 captured_task,
+                self.phase_for(model_id, slot),
             ));
         }
         self.slots.retain(|row| row.model_id != model_id);
         self.slots.extend(next);
         true
+    }
+
+    fn phase_for(&self, model_id: &str, slot: &LightSlot) -> Option<ChartPhase> {
+        if !slot.is_processing || slot.id_task < 0 {
+            return None;
+        }
+        let decoded = slot.phase_decoded?;
+        if decoded == 0 {
+            return Some(ChartPhase::Prefill);
+        }
+        let prev = self.slots.iter().find(|row| {
+            row.model_id == model_id
+                && row.id == slot.id
+                && row.id_task == slot.id_task
+                && row.is_processing
+        })?;
+        // A positive value on a new task can be left over from its predecessor.
+        // Require either a same-task prefill transition or an advancing decode.
+        if prev.chart_phase == Some(ChartPhase::Decode)
+            || prev.chart_phase == Some(ChartPhase::Prefill)
+            || prev.phase_decoded.is_some_and(|n| decoded > n)
+        {
+            Some(ChartPhase::Decode)
+        } else {
+            None
+        }
+    }
+
+    /// Fresh, complete per-model phase; unknown is never coerced to zero.
+    pub fn chart_phase(
+        &self,
+        model_id: &str,
+        active: f64,
+        now: Instant,
+        fresh: std::time::Duration,
+    ) -> Option<ChartPhase> {
+        if now.saturating_duration_since(*self.phase_at.get(model_id)?) > fresh {
+            return None;
+        }
+        let active_slots: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing)
+            .collect();
+        if active_slots.len() as f64 != active {
+            return None;
+        }
+        let mut phase = ChartPhase::Decode;
+        for slot in active_slots {
+            if slot.chart_phase? == ChartPhase::Prefill {
+                phase = ChartPhase::Prefill;
+            }
+        }
+        Some(phase)
     }
 
     fn note_processed(&mut self, model_id: &str, slot: &LightSlot) {
@@ -614,6 +686,9 @@ impl SlotBook {
     pub fn finish_round(&mut self, now: Instant) {
         if !self.round_seen {
             return;
+        }
+        for model in self.phase_round.drain() {
+            self.phase_at.insert(model, now);
         }
         let prefilling = self.round_prefilling;
         if self.last_at.is_none() {
@@ -700,8 +775,11 @@ fn tracked(
     input: Vec<Cell>,
     output: Vec<Cell>,
     captured_task: Option<i64>,
+    chart_phase: Option<ChartPhase>,
 ) -> Tracked {
     Tracked {
+        chart_phase,
+        phase_decoded: slot.phase_decoded,
         model_id: model_id.to_owned(),
         model: display.to_owned(),
         id: slot.id,
@@ -720,6 +798,7 @@ fn tracked(
 }
 
 struct LightSlot {
+    phase_decoded: Option<u64>,
     id: i64,
     id_task: i64,
     is_processing: bool,
@@ -810,11 +889,16 @@ impl LightSlot {
         held: Option<u64>,
         cached: Option<u64>,
         processed: u64,
-        next_token: &[NextTokenJson],
+        next_token: &Option<Vec<NextTokenJson>>,
         n_ctx: Option<u64>,
     ) -> Self {
-        let n_decoded = next_token.first().map_or(0, |token| token.n_decoded);
+        let phase_decoded = next_token
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .and_then(|token| token.n_decoded);
+        let n_decoded = phase_decoded.unwrap_or(0);
         Self {
+            phase_decoded,
             id,
             id_task,
             is_processing,
@@ -886,7 +970,7 @@ struct SlotJsonLight {
     #[serde(default)]
     n_prompt_tokens_processed: u64,
     #[serde(default)]
-    next_token: Vec<NextTokenJson>,
+    next_token: Option<Vec<NextTokenJson>>,
     /// Present only with `LLAMA_SERVER_SLOTS_DEBUG=1` on current
     /// llama-server (#66); skipped, never allocated, here.
     #[serde(default)]
@@ -914,7 +998,7 @@ struct SlotJsonNumbers {
     #[serde(default)]
     n_prompt_tokens_processed: u64,
     #[serde(default)]
-    next_token: Vec<NextTokenJson>,
+    next_token: Option<Vec<NextTokenJson>>,
     // No `prompt` or `generated` field: serde skips undeclared keys without
     // building their strings.
 }
@@ -932,7 +1016,7 @@ fn missing_task() -> i64 {
 #[derive(Debug, Deserialize)]
 struct NextTokenJson {
     #[serde(default)]
-    n_decoded: u64,
+    n_decoded: Option<u64>,
 }
 
 #[cfg(test)]
