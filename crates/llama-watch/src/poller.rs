@@ -2926,11 +2926,17 @@ mod tests {
         let now = Instant::now();
         state.counter.observe("cpp", 1, Some(1.0), now);
         let rows = activity::parse_activity(br#"{"data":[
+            {"id":8,"timestamp":"2026-10-29T01:00:08Z","model":"other","tokens":{"input_tokens":1000,"prompt_per_second":34000}},
+            {"id":7,"timestamp":"2026-10-29T01:00:07Z","model":"cpp","tokens":{"input_tokens":100}},
+            {"id":6,"timestamp":"2026-10-29T01:00:06Z","model":"cpp","tokens":{"input_tokens":100}},
+            {"id":5,"timestamp":"2026-10-29T01:00:05Z","model":"cpp","tokens":{"input_tokens":100}},
+            {"id":4,"timestamp":"2026-10-29T01:00:04Z","model":"cpp","tokens":{"input_tokens":100}},
+            {"id":3,"timestamp":"2026-10-29T01:00:03Z","model":"cpp","tokens":{"input_tokens":100}},
             {"id":2,"timestamp":"2026-10-29T01:00:02Z","model":"cpp","tokens":{"input_tokens":1000,"cache_tokens":9000,"prompt_per_second":900}},
             {"id":1,"timestamp":"2026-10-29T01:00:01Z","model":"cpp","tokens":{"input_tokens":100,"cache_tokens":9900,"prompt_per_second":300}}
         ]}"#).unwrap();
         assert_eq!(
-            rows[0].prompt_for(Some(Backend::LlamaCpp)).unwrap().whole,
+            rows[6].prompt_for(Some(Backend::LlamaCpp)).unwrap().whole,
             10000
         );
         state.recent.merge(rows);

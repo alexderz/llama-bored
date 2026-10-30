@@ -42,9 +42,9 @@ pub fn headline(
 /// A missing measurement is not a zero, and models must be filtered first.
 pub fn last_five(rates: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let rates: Vec<f64> = rates
-        .take(5)
         .flatten()
         .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .take(5)
         .collect();
     (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
 }
@@ -72,9 +72,38 @@ mod tests {
                 ]
                 .into_iter()
             ),
-            Some(600.0)
+            Some(620.0)
         );
         assert_eq!(last_five([None, Some(0.0)].into_iter()), None);
+    }
+
+    #[test]
+    fn missing_and_invalid_readings_do_not_count_toward_five() {
+        assert_eq!(
+            last_five([None, None, None, None, None, Some(600.0)].into_iter()),
+            Some(600.0)
+        );
+        assert_eq!(
+            last_five(
+                [
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    Some(0.0),
+                    Some(-1.0),
+                    Some(100.0),
+                    None,
+                    Some(200.0),
+                    Some(300.0),
+                    Some(400.0),
+                    Some(500.0),
+                    Some(9000.0)
+                ]
+                .into_iter()
+            ),
+            Some(300.0)
+        );
+        assert_eq!(last_five([Some(f64::NAN), Some(-1.0)].into_iter()), None);
     }
 
     /// 20,000 tokens in 10 s is 2,000. The wall-clock spike is 20,000 on
