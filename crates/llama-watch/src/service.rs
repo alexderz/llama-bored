@@ -1361,9 +1361,9 @@ fn text_chars(lines: &[String]) -> Vec<char> {
 }
 
 /// Live tok/s for scroll (#188). A burst engine's held prefill speed and its
-/// wall-clock generation spike are not live. `/slots` prefill and tqLLM's
-/// request rates are, and so is generation while a streaming engine is the
-/// one on screen.
+/// wall-clock generation spike are not live. The llama.cpp headline is
+/// a completed-turn average, not a live slot measurement. tqLLM's own
+/// request rate is live when it is the only engine on screen.
 fn live_token_rates(detail: &LlamaDetail, models: &[ModelInfo]) -> (Option<f64>, Option<f64>) {
     let kinds: Vec<Backend> = models
         .iter()
@@ -1373,12 +1373,7 @@ fn live_token_rates(detail: &LlamaDetail, models: &[ModelInfo]) -> (Option<f64>,
         && kinds
             .iter()
             .all(|kind| matches!(kind, Backend::Vllm | Backend::SgLang));
-    let prompt_live = if kinds.contains(&Backend::Tqllm)
-        || detail
-            .slots
-            .iter()
-            .any(|slot| slot.is_processing && slot.n_decoded == 0)
-    {
+    let prompt_live = if !kinds.is_empty() && kinds.iter().all(|kind| *kind == Backend::Tqllm) {
         detail
             .prompt_tps
             .filter(|rate| rate.is_finite() && *rate > 0.0)
@@ -2358,7 +2353,9 @@ fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
         requests: &state.detail.requests,
         activity: &state.detail.activity,
         ids: &ids,
-        prompt_tps: state.detail.prompt_tps,
+        // The llama.cpp headline is a completed-turn average, not this
+        // in-flight slot's own measurement.
+        prompt_tps: None,
         gen_tps: state.detail.gen_tps,
     };
     state.flights.poll(&poll, mono, wall);
@@ -2918,11 +2915,10 @@ mod tests {
         );
     }
 
-    /// #188: a second turn with a live `/slots` prefill starts at the top
-    /// and moves at that rate. Replacing `live_token_rates` with
-    /// `(None, None)`, or skipping `apply_scroll`, fails this.
+    /// #188: a llama.cpp headline average is not a live slot rate; scroll
+    /// starts at the top and uses this model's completed-turn history.
     #[test]
-    fn a_live_slots_rate_scrolls_the_new_turn_from_the_top() {
+    fn llama_headline_average_does_not_masquerade_as_live_scroll_rate() {
         let llama = BackendInfo {
             kind: Backend::LlamaCpp,
             ..BackendInfo::default()
@@ -2973,8 +2969,8 @@ mod tests {
         );
         let at = moved.in_scroll.expect("the burst is still scrolling");
         assert!(
-            (at as f64 - 400.0).abs() < 2.0,
-            "live /slots prefill is 400 tok/s, not the 5 tok/s average: {at}"
+            (at as f64 - 5.0).abs() < 2.0,
+            "the per-model completed-turn history is 5 tok/s, not headline 400: {at}"
         );
 
         let grown = format!("{prompt}CCCC");
@@ -5466,8 +5462,8 @@ mod tests {
         assert!(held.contains("~41.5") && held.contains("1.2s"), "{held}");
         assert_eq!(
             held.matches("--").count(),
-            4,
-            "IN, CACHED, OUT and PROMPT: {held}"
+            5,
+            "PROMPT, CACHED, NEW, OUTPUT and READ: {held}"
         );
         let shared = shown[2];
         assert!(

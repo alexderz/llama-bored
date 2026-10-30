@@ -189,18 +189,18 @@ lower — a whole one is `▄`, a partial one `▂`/`▃` — so cached, new and
 read as three distinct steps rather than one continuous colour run. The
 RECENT header row carries the key (#96) in the same place a rainbow strip
 used to: `▇cached ▇new ▇out`, each mark in its run's colour and its label
-dim (`▇cach` below 17 columns of bar). The colours are a function of the
+dim (`▇cach` below 17 columns of bar, `▇c ▇n ▇o` when narrower). The colours are a function of the
 counts only, except for the head spinner below: a finished row's colours
 never change. Empty cells are a dim baseline. A request at 90 % of the
 context or more gets a bright yellow `!` after its bar (a step brighter
 than the out run, since out is yellow too). Without a context size the
-bar is scaled to the largest such row shown and marked `~`. With
+bar is scaled to that row’s own length and marked `~`; this does not claim a context capacity. With
 `chart_glyphs = "halves"` the heights fall back to `▄` (and the header
 key's mark with them) and the colours carry the rest. A cached count the
 engine did not report is `--`. On a finished row the prompt is one dim
 run in that same grey, not all new. On an in-flight row the done and
 pending runs and the prefill cursor stay as they were when an omitted
-count was read as zero; only the CACHED cell is `--`. A reported 0
+count was read as zero; CACHED and NEW are `--`. A reported 0
 stays 0 and the prompt is all new.
 
 **Head spinner** (#96). An in-flight row's growing run — new while it is
@@ -212,7 +212,9 @@ run is still empty (decoding has just started, or prefill has not
 computed anything new yet) the cursor is a single cell on its own. A
 finished row never spins.
 
-IN is always the whole prompt and CACHED its reused part (#82):
+PROMPT is the whole prompt, CACHED its reused part, NEW the saturating difference, and OUTPUT the generated tokens. READ t/s and WRITE t/s are the prefill and decode rates. When CACHED is unknown, NEW is `--` as well.
+
+For the whole prompt and cached part (#82):
 llama-swap's `input_tokens` leaves the cached tokens out for llama.cpp
 and Strata (it takes their `timings`) and counts them for vLLM, SGLang
 and any OpenAI `usage`, so llama-watch reads it per engine, in one place,
@@ -223,9 +225,9 @@ input, which only the other form can give. A cached count the row did
 not report prints `--` under CACHED. A reported 0 prints `0`.
 
 ```text
- RECENT TIME      SOURCE      MODEL          IN   CACHED   OUT  ...    DUR ▇cached ▇new ▇out
->       18:47:20              Qwen 35B  69,632+   61,440     0  ...  36.4s ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▄▄▇▁▁▁▁▁ pp
-   4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960   612  ...  13.2s ▇▇▇▇▇▇▇▇▇▇▇▇▄▂▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+ RECENT TIME      SOURCE      MODEL      PROMPT   CACHED    NEW OUTPUT  ...    DUR ▇cached ▇new ▇out
+>       18:47:20              Qwen 35B  69,632+   61,440  8,192      0  ...  36.4s ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▄▄▇▁▁▁▁▁ pp
+   4822 18:47:01  192.0.2.83  Qwen 35B   91,204   88,960  2,244    612  ...  13.2s ▇▇▇▇▇▇▇▇▇▇▇▇▄▂▃▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
 ```
 
 The first row is a llama.cpp request in prefill (#78): `/slots` gives
@@ -237,7 +239,7 @@ is RECENT's top row until llama-swap's finished row replaces it (never
 both): llama.cpp from `/slots` (one row per busy slot, at most half the
 rows), Strata from its `live` report. IN is the whole prompt, CACHED the
 reused part, OUT the tokens so far, DUR the time since it was first seen;
-PROMPT and GEN are the live rates, marked `~`. During prefill the new run
+READ and WRITE are live engine rates when known, marked `~`; llama.cpp does not report a live prefill time, so its in-flight READ is `--`. The headline uses its last five completed request prefill rates instead. During prefill the new run
 fills, poll by poll, toward the rest of the prompt drawn as a sky-blue low
 line. llama.cpp's `/slots` does not give the prompt's length, so its
 prefill row shows only what the slot holds so far, IN with a `+`

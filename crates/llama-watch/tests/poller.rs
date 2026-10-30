@@ -852,7 +852,7 @@ fn slots_tails_are_truncated_and_input_is_once_per_task() {
     assert!(!input.contains("SECONDPROMPT"), "{input}");
     assert!(output.contains("gen-two"), "{output}");
     assert_eq!(slot.n_prompt_tokens_processed, 9);
-    assert!(detail.prompt_tps.is_some());
+    assert_eq!(detail.prompt_tps, None, "no completed prefill measurement");
 }
 
 #[test]
@@ -2806,7 +2806,7 @@ fn vllm_prefill_speed_holds_the_big_prompt_number() {
 /// #188: llama.cpp's live slot rate stays the big number even when the
 /// prompt counter jumps by far more in the same second.
 #[test]
-fn llamacpp_live_slot_rate_stays_the_big_prompt_number() {
+fn llamacpp_headline_ignores_polled_batches_until_completed_rates_arrive() {
     let mut world = World::running(running_model("qwen3.6-35b-a3b", "Qwen", "ready"));
     world.metrics.insert(
         "qwen3.6-35b-a3b".to_owned(),
@@ -2834,12 +2834,28 @@ fn llamacpp_live_slot_rate_stays_the_big_prompt_number() {
         );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
-        detail.prompt_tps.is_some_and(|rate| rate > 0.0)
+        detail
+            .slots
+            .iter()
+            .any(|slot| slot.n_prompt_tokens_processed == 2_100)
     });
-    let rate = detail.prompt_tps.expect("slot rate");
-    assert!(
-        rate < 20_000.0,
-        "the live slot rate, not the 100,000-token wall-clock spike: {rate}"
+    assert_eq!(
+        detail.prompt_tps, None,
+        "neither the slot batch nor the wall-clock spike is a measured prefill rate"
+    );
+    server.update(|world| {
+        world.activity = speed_page(&[
+            (2, "qwen3.6-35b-a3b", 900.0, 40.0),
+            (1, "qwen3.6-35b-a3b", 300.0, 40.0),
+        ]);
+    });
+    let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
+        detail.prompt_tps == Some(600.0)
+    });
+    assert_eq!(
+        detail.prompt_tps,
+        Some(600.0),
+        "mean of the two measured completed turns"
     );
 }
 

@@ -38,6 +38,17 @@ pub fn headline(
     finite(wall)
 }
 
+/// Mean of the newest five valid completed per-request engine rates.
+/// A missing measurement is not a zero, and models must be filtered first.
+pub fn last_five(rates: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let rates: Vec<f64> = rates
+        .take(5)
+        .flatten()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .collect();
+    (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
+}
+
 fn finite(rate: Option<f64>) -> Option<f64> {
     rate.filter(|rate| rate.is_finite() && *rate >= 0.0)
 }
@@ -45,6 +56,26 @@ fn finite(rate: Option<f64>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_rates_ignore_poll_spikes_and_other_models() {
+        assert_eq!(
+            last_five(
+                [
+                    Some(300.0),
+                    Some(1000.0),
+                    None,
+                    Some(500.0),
+                    Some(600.0),
+                    Some(700.0),
+                    Some(34000.0)
+                ]
+                .into_iter()
+            ),
+            Some(600.0)
+        );
+        assert_eq!(last_five([None, Some(0.0)].into_iter()), None);
+    }
 
     /// 20,000 tokens in 10 s is 2,000. The wall-clock spike is 20,000 on
     /// the sample that lands them and 0 a second later. Neither replaces

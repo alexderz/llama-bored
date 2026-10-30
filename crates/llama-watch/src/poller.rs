@@ -2190,14 +2190,73 @@ impl<L: Sink> State<L> {
         // spike back. A slot that is actually in flight still reports its
         // rate, including 0 while it is decoding (#188).
         let slots_rate = self.slots_prompt_rate(now);
-        let prompt_tps = crate::prompt_head::headline(
-            self.running_up,
-            busy,
-            slots_rate,
-            prompt_rate,
-            self.burst_prompt_engine(now),
-            self.held_burst_prompt(now),
-        );
+        let llama_busy = self.ready.iter().any(|model| {
+            model.backend == Backend::LlamaCpp
+                && self
+                    .counter
+                    .requests_processing(&model.id, now)
+                    .is_some_and(|n| n > 0.0)
+        });
+        let prompt_tps = if !self.running_up {
+            None
+        } else if llama_busy {
+            // /slots supplies cumulative processed tokens, not elapsed prefill
+            // time. Poll-to-poll deltas can land a whole batch in a tiny gap.
+            // Prefer completed per-request engine timings for each busy model.
+            let rows = self.measured_activity_limit(crate::recent::RING);
+            let mut rates = Vec::new();
+            let mut missing = false;
+            for model in &self.ready {
+                if !self
+                    .counter
+                    .requests_processing(&model.id, now)
+                    .is_some_and(|n| n > 0.0)
+                {
+                    continue;
+                }
+                let rate = match model.backend {
+                    Backend::LlamaCpp => {
+                        let key = activity::model_key(&model.id);
+                        crate::prompt_head::last_five(
+                            rows.iter()
+                                .filter(|row| row.model == key)
+                                .map(|row| row.prompt_tps.or(row.engine_prompt_tps)),
+                        )
+                    }
+                    Backend::Vllm => self.engines.prefill_tps(&model.id),
+                    Backend::SgLang => self.sglang.prompt_rate(&model.id),
+                    Backend::Tqllm => self
+                        .gauges
+                        .get(&model.id)
+                        .filter(|gauges| {
+                            now.saturating_duration_since(gauges.at)
+                                <= FRESH_GAUGES.max(self.limits.metrics_interval * 2)
+                        })
+                        .and_then(|gauges| gauges.live.as_ref())
+                        .and_then(|live| live.prefill_tps_sum()),
+                    _ => None,
+                };
+                if let Some(rate) = rate {
+                    rates.push(rate);
+                } else {
+                    missing = true;
+                }
+            }
+            if missing || rates.is_empty() {
+                None
+            } else {
+                Some(rates.iter().sum())
+            }
+        } else {
+            crate::prompt_head::headline(
+                self.running_up,
+                busy,
+                slots_rate,
+                prompt_rate,
+                self.burst_prompt_engine(now),
+                self.held_burst_prompt(now),
+            )
+        };
         // #180: with only tqLLM loaded, GEN and PROMPT are its requests'
         // own rates, `--` until it has them.
         let (gen_tps, prompt_tps) = match self.tqllm_rates(now) {
@@ -2452,7 +2511,11 @@ impl<L: Sink> State<L> {
     /// included, over the prefill time, so the matched request's own
     /// uncached rate replaces it.
     fn measured_activity(&self) -> Vec<ActivityRow> {
-        let mut rows = self.recent.rows(self.activity_rows());
+        self.measured_activity_limit(self.activity_rows())
+    }
+
+    fn measured_activity_limit(&self, limit: usize) -> Vec<ActivityRow> {
+        let mut rows = self.recent.rows(limit);
         for row in &mut rows {
             if let Some(speeds) = self.speeds.speeds(row.seq) {
                 if row.prompt_tps.is_none() {
@@ -2848,6 +2911,42 @@ mod tests {
         assert_eq!(snapshot_name("", 12), "model");
         assert_eq!(snapshot_name("", 4), format!("mod{}", '\u{2026}'));
         assert_eq!(snapshot_name("", 2), format!("m{}", '\u{2026}'));
+    }
+
+    #[test]
+    fn llama_headline_uses_completed_engine_rates_not_batch_poll_spike() {
+        let mut state = blank_state();
+        state.ready = vec![ReadyModel {
+            id: "cpp".into(),
+            name: "cpp".into(),
+            backend: Backend::LlamaCpp,
+            probe: false,
+        }];
+        state.running_up = true;
+        let now = Instant::now();
+        state.counter.observe("cpp", 1, Some(1.0), now);
+        let rows = activity::parse_activity(br#"{"data":[
+            {"id":2,"timestamp":"2026-10-29T01:00:02Z","model":"cpp","tokens":{"input_tokens":1000,"cache_tokens":9000,"prompt_per_second":900}},
+            {"id":1,"timestamp":"2026-10-29T01:00:01Z","model":"cpp","tokens":{"input_tokens":100,"cache_tokens":9900,"prompt_per_second":300}}
+        ]}"#).unwrap();
+        assert_eq!(
+            rows[0].prompt_for(Some(Backend::LlamaCpp)).unwrap().whole,
+            10000
+        );
+        state.recent.merge(rows);
+        for (processed, at) in [(100, now - Duration::from_millis(100)), (3500, now)] {
+            let body = format!(
+                r#"[{{"id":0,"id_task":1,"is_processing":true,"n_prompt_tokens":{processed},"n_prompt_tokens_processed":{processed}}}]"#
+            );
+            state.slots.begin_round();
+            assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
+            state.slots.finish_round(at);
+        }
+        assert_eq!(state.slots.prompt_tps(), Some(34_000.0));
+        let rx = state.tx.share_with_thread();
+        state.publish().expect("publish");
+        let (_, detail) = rx.take().expect("sample");
+        assert_eq!(detail.prompt_tps, Some(600.0));
     }
 
     /// One finished SGLang request, alone, holds its prefill on the big

@@ -6,6 +6,11 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- RECENT labels prompt, cached, new and output tokens separately, with READ and WRITE in tokens per second. Unknown cached tokens leave NEW unknown. Context bars use each model’s known capacity, or the row’s own length marked `~` when capacity is unknown (#190).
+- For a busy llama.cpp model the headline uses the mean of the last five completed request prefill measurements rather than a `/slots` polling derivative, which can produce batch-timing spikes; it stays unknown until a measured rate is available (#188).
+
 ## 0.7.2 — 2026-10-27
 
 tqLLM on the dashboard, LED chains up to the header's 120 LEDs, a console that Ctrl+S can no longer freeze, and an honest prefill speed with IN and OUT that scroll from the top. Nothing in an existing config needs to change.

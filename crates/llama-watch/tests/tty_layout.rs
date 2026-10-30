@@ -572,7 +572,10 @@ fn recent_headers_use_plain_words_and_the_narrow_legend() {
     );
     assert!(header.contains("PROMPT"), "{header}");
     assert!(header.contains("CACHED"), "{header}");
-    assert!(header.contains("GEN"), "{header}");
+    assert!(
+        header.contains("NEW") && header.contains("WRITE t/s"),
+        "{header}"
+    );
     assert!(header.contains("DUR"), "{header}");
     assert!(header.contains("SL"), "SL column: {header}");
     let all = whole(&narrow);
@@ -584,11 +587,11 @@ fn recent_headers_use_plain_words_and_the_narrow_legend() {
         let grid = draw(&recent_model(), cols, rows);
         let header = full_row(&grid, row_with(&grid, "RECENT"));
         for word in [
-            "PROMPT tokens",
-            "CACHED tokens",
-            "OUTPUT tokens",
-            "PROMPT tok/s",
-            "GEN tok/s",
+            "PROMPT",
+            "CACHED",
+            "OUTPUT",
+            "READ t/s",
+            "WRITE t/s",
             "DURATION",
         ] {
             assert!(
@@ -652,20 +655,22 @@ fn recent_numbers_stay_right_aligned_under_their_headers() {
         let data = full_row(&grid, header_row + 1);
         let pairs: &[(&str, &str)] = if cols == 160 {
             &[
-                ("IN", "91,204"),
+                ("PROMPT", "91,204"),
                 ("CACHED", "88,960"),
-                ("OUT", "612"),
-                ("PROMPT", "1,212"),
-                ("GEN", "54.2"),
+                ("NEW", "2,244"),
+                ("OUTPUT", "612"),
+                ("READ t/s", "1,212"),
+                ("WRITE t/s", "54.2"),
                 ("DUR", "13.2s"),
             ]
         } else {
             &[
-                ("PROMPT tokens", "91,204"),
-                ("CACHED tokens", "88,960"),
-                ("OUTPUT tokens", "612"),
-                ("PROMPT tok/s", "1,212"),
-                ("GEN tok/s", "54.2"),
+                ("PROMPT", "91,204"),
+                ("CACHED", "88,960"),
+                ("NEW", "2,244"),
+                ("OUTPUT", "612"),
+                ("READ t/s", "1,212"),
+                ("WRITE t/s", "54.2"),
                 ("DURATION", "13.2s"),
             ]
         };
@@ -695,12 +700,12 @@ fn recent_unknown_cache_is_dim_and_a_reported_zero_is_new() {
     let grid = draw(&model, 240, 67);
     let header_row = row_with(&grid, "RECENT");
     let header = full_row(&grid, header_row);
-    let label = "CACHED tokens";
+    let label = "CACHED";
     let label_end = find_chars(&header, label).expect("cached header") + label.chars().count();
-    let prompt_label = "PROMPT tok/s";
+    let prompt_label = "READ t/s";
     let prompt_end =
         find_chars(&header, prompt_label).expect("prompt header") + prompt_label.chars().count();
-    let gen_label = "GEN tok/s";
+    let gen_label = "WRITE t/s";
     let gen_end = find_chars(&header, gen_label).expect("gen header") + gen_label.chars().count();
     // (model, cached text, unknown bar, reported zero, filled)
     let cases = [
@@ -721,6 +726,15 @@ fn recent_unknown_cache_is_dim_and_a_reported_zero_is_new() {
             .take(cached.chars().count())
             .collect();
         assert_eq!(got, cached, "{name}: CACHED cell: {text}");
+        if cached == "--" {
+            let end = find_chars(&header, "NEW").expect("new header") + 3;
+            assert_eq!(
+                text.chars().skip(end - 2).take(2).collect::<String>(),
+                "--",
+                "{name}: NEW must be unknown"
+            );
+        }
+
         assert_eq!(
             text.chars().nth(start - 1),
             Some(' '),
@@ -931,9 +945,9 @@ fn recent_duration_sits_between_the_numbers_and_the_bar() {
             let header = full_row(&grid, header_row);
             let data = full_row(&grid, header_row + 1);
             let (gen_label, dur_label) = if cols == 160 {
-                ("GEN", "DUR")
+                ("WRITE t/s", "DUR")
             } else {
-                ("GEN tok/s", "DURATION")
+                ("WRITE t/s", "DURATION")
             };
             let gen_end = find_chars(&header, gen_label).expect("gen header") + gen_label.len();
             let dur_at = find_chars(&header, dur_label).expect("dur header");
@@ -5998,7 +6012,7 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
         !warn_at(row(1_000_000, None)),
         "no context size, no warning"
     );
-    // Relative: the largest unknown row fills the bar; `~` before each.
+    // Unknown capacity: every row fills its own bar; `~` before each.
     let grid = draw(
         &bar_model(
             vec![row(40_000, None), row(10_000, None)],
@@ -6013,10 +6027,7 @@ fn ninety_percent_of_the_context_is_a_warning_and_unknown_is_relative() {
     // full-height `█` (#95).
     assert!(big.iter().all(|(ch, _)| *ch == '▄'), "{big:?}");
     let small = bar_of(&grid, header + 2);
-    assert!(
-        small.iter().any(|(_, fg)| *fg == C16::BrightBlack),
-        "{small:?}"
-    );
+    assert!(small.iter().all(|(ch, _)| *ch == '▄'), "{small:?}");
     for r in [header + 1, header + 2] {
         let line = row_string(&grid, r);
         let tilde = line.chars().position(|c| c == '~').expect("~");
@@ -6104,7 +6115,8 @@ fn legend_fits_160_columns_without_the_header_key() {
     model.requests[0].n_ctx = None;
     let grid = draw(&model, 160, 48);
     let header = row_string(&grid, row_with(&grid, "RECENT"));
-    assert!(header.contains("GEN"), "{header}");
+    assert!(header.contains("WRITE t/s"), "{header}");
+    assert!(header.contains("▇c ▇n ▇o"), "{header}");
     assert!(header.trim_end().chars().count() <= 158, "{header}");
 }
 
@@ -6646,7 +6658,7 @@ fn a_serving_model_keeps_inference_and_a_job_note() {
     model.job = None;
     model.job_note = Some("example-trainer 921/1,075 43 min left".to_owned());
     let text = painted(&model, 192, 60);
-    assert!(text.contains("GEN tok/s"), "{text}");
+    assert!(text.contains("WRITE t/s"), "{text}");
     assert!(text.contains("RECENT"), "{text}");
     assert!(text.contains("example-trainer"), "{text}");
     assert!(text.contains("43 min left"), "{text}");
@@ -6660,7 +6672,7 @@ fn done_and_failed_notes_sit_in_the_header() {
     model.job_note = Some("example-trainer done 4 h 16 min".to_owned());
     let text = painted(&model, 192, 60);
     assert!(text.contains("example-trainer done 4 h 16 min"), "{text}");
-    assert!(text.contains("GEN tok/s"), "{text}");
+    assert!(text.contains("WRITE t/s"), "{text}");
     model.job_note = Some("example-trainer failed 12 min".to_owned());
     let text = painted(&model, 192, 60);
     assert!(text.contains("example-trainer failed 12 min"), "{text}");
@@ -6672,7 +6684,7 @@ fn a_stale_job_does_not_replace_inference() {
     model.job = None;
     model.job_note = None;
     let text = painted(&model, 192, 60);
-    assert!(text.contains("GEN tok/s"), "{text}");
+    assert!(text.contains("WRITE t/s"), "{text}");
     assert!(!text.contains("PHASES"), "{text}");
     assert!(!text.contains("TRAINING"), "{text}");
 }
