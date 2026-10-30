@@ -115,7 +115,7 @@ pub struct Activity {
     pub dur: String,
     pub err: bool,
     /// The model's context size (#75): the bar's full width. `None` scales
-    /// the bar to the largest row shown and marks it `~`.
+    /// the bar to the row’s own length and marks it `~`.
     pub n_ctx: Option<u64>,
     /// A request still running (#75), from live per-request numbers.
     /// `input_tok` is then its whole prompt (or, while `open`, the prompt
@@ -265,8 +265,14 @@ pub struct TtyModel {
     /// the whole tail.
     pub out_shown: usize,
     /// Which frame of the 10-frame replay is on screen. `None` shows the tail
-    /// in full.
+    /// in full. Ignored while [`Self::out_scroll`] is set.
     pub replay_frame: Option<u32>,
+    /// Burst scroll for IN (#188): characters skipped from the start.
+    /// `None` keeps the tail view. `Some(0)` is the first frame, the start
+    /// of the text. Short text is drawn from the top either way.
+    pub in_scroll: Option<usize>,
+    /// Burst scroll for OUT. `None` keeps the streaming replay and the tail.
+    pub out_scroll: Option<usize>,
     /// `tty.show_text`. False draws no IN/OUT panels, gives their rows to the
     /// chart and RECENT, and tags the header `text off`.
     pub show_text: bool,
@@ -2987,16 +2993,22 @@ pub const SPIN: [C16; 4] = [
 /// mode, since eurlatgr lacks the eighths block.
 fn paint_segment_key(grid: &mut Grid, bar: Span, row: u16, glyphs: ChartGlyphs) {
     let mark = meter_glyph(glyphs).to_string();
-    let cached_label = if bar.w >= 17 { "cached" } else { "cach" };
+    let (cached_label, new_label, out_label) = if bar.w >= 17 {
+        ("cached", "new", "out")
+    } else if bar.w >= 15 {
+        ("cach", "new", "out")
+    } else {
+        ("c", "n", "o")
+    };
     let items: [(&str, C16); 8] = [
         (mark.as_str(), C16::Blue),
         (cached_label, C16::BrightBlack),
         (" ", C16::BrightBlack),
         (mark.as_str(), C16::BrightCyan),
-        ("new", C16::BrightBlack),
+        (new_label, C16::BrightBlack),
         (" ", C16::BrightBlack),
         (mark.as_str(), C16::Yellow),
-        ("out", C16::BrightBlack),
+        (out_label, C16::BrightBlack),
     ];
     let mut col = bar.x;
     for (text, fg) in items {
@@ -3283,7 +3295,7 @@ fn eighth_glyph(eighths: u8, glyphs: ChartGlyphs) -> char {
 
 /// RECENT's bar (#75, #96): the request's context, cached / new / output in
 /// fixed colours (the header key), against the model's context size; `~`
-/// before a bar scaled to the largest row instead; a `!` after one at 90 %
+/// before a bar scaled to its own length instead; a `!` after one at 90 %
 /// of the context. An in-flight row's growing segment carries the head
 /// spinner (#96): its cursor cell cycles [`SPIN`] a step per poll its
 /// token count rose. A finished row never spins.
@@ -3292,14 +3304,13 @@ fn draw_ctx_bar(
     req: &Activity,
     span: Span,
     row: u16,
-    relative_scale: u64,
     dim: bool,
     glyphs: ChartGlyphs,
 ) {
     let parts = ctx_parts(req);
     let total: u64 = parts.iter().map(|(_, v)| *v).sum();
     let n_ctx = req.n_ctx.filter(|n| *n > 0);
-    let scale = n_ctx.unwrap_or(relative_scale);
+    let scale = n_ctx.unwrap_or(total.max(1));
     let width = usize::from(span.w);
     let spin = req.inflight.map(|flight| Spin {
         decoding: flight.decoding,
@@ -3390,6 +3401,7 @@ struct Plan {
     model: Span,
     prompt_tok: Span,
     cached: Span,
+    new: Span,
     output: Span,
     prompt_tps: Span,
     gen_tps: Span,
@@ -3541,7 +3553,7 @@ fn long_specs() -> &'static [ColSpec] {
     &LONG_SPECS
 }
 
-const SHORT_SPECS: [ColSpec; 13] = [
+const SHORT_SPECS: [ColSpec; 14] = [
     ColSpec {
         header: "RECENT",
         floor: 6,
@@ -3573,7 +3585,7 @@ const SHORT_SPECS: [ColSpec; 13] = [
         side: Side::Left,
     },
     ColSpec {
-        header: "IN",
+        header: "PROMPT",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
@@ -3585,20 +3597,26 @@ const SHORT_SPECS: [ColSpec; 13] = [
         side: Side::Right,
     },
     ColSpec {
-        header: "OUT",
+        header: "NEW",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "PROMPT",
+        header: "OUTPUT",
+        floor: 8,
+        grow: Grow::None,
+        side: Side::Right,
+    },
+    ColSpec {
+        header: "READ t/s",
         floor: 7,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "GEN",
-        floor: 6,
+        header: "WRITE t/s",
+        floor: 7,
         grow: Grow::None,
         side: Side::Right,
     },
@@ -3622,7 +3640,7 @@ const SHORT_SPECS: [ColSpec; 13] = [
     },
 ];
 
-const LONG_SPECS: [ColSpec; 13] = [
+const LONG_SPECS: [ColSpec; 14] = [
     ColSpec {
         header: "RECENT",
         floor: 6,
@@ -3654,31 +3672,37 @@ const LONG_SPECS: [ColSpec; 13] = [
         side: Side::Left,
     },
     ColSpec {
-        header: "PROMPT tokens",
+        header: "PROMPT",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "CACHED tokens",
+        header: "CACHED",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "OUTPUT tokens",
+        header: "NEW",
         floor: 8,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "PROMPT tok/s",
+        header: "OUTPUT",
+        floor: 8,
+        grow: Grow::None,
+        side: Side::Right,
+    },
+    ColSpec {
+        header: "READ t/s",
         floor: 7,
         grow: Grow::None,
         side: Side::Right,
     },
     ColSpec {
-        header: "GEN tok/s",
+        header: "WRITE t/s",
         floor: 6,
         grow: Grow::None,
         side: Side::Right,
@@ -3759,12 +3783,13 @@ fn request_plan(cols: u16) -> Plan {
         model: spans[4],
         prompt_tok: spans[5],
         cached: spans[6],
-        output: spans[7],
-        prompt_tps: spans[8],
-        gen_tps: spans[9],
-        dur: spans[10],
-        bar: spans[11],
-        status: spans[12],
+        new: spans[7],
+        output: spans[8],
+        prompt_tps: spans[9],
+        gen_tps: spans[10],
+        dur: spans[11],
+        bar: spans[12],
+        status: spans[13],
         headers,
     }
 }
@@ -3817,13 +3842,6 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
         .chain(model.requests.iter().filter(|req| req.inflight.is_none()))
         .take(usize::from(slots))
         .collect();
-    let relative_scale = shown
-        .iter()
-        .filter(|req| req.n_ctx.is_none_or(|n| n == 0))
-        .map(|req| ctx_parts(req).iter().map(|(_, v)| *v).sum::<u64>())
-        .max()
-        .unwrap_or(0)
-        .max(1);
     for (i, req) in shown.into_iter().enumerate() {
         let Ok(offset) = u16::try_from(i) else {
             break;
@@ -3866,6 +3884,11 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
             known(flight.no_prompt, req.cached_tok)
         };
         paint_span_approx(grid, plan.cached, row, &cached, approx, plain);
+        let (new, approx) = known(
+            req.cached_unknown || flight.no_prompt,
+            req.input_tok.saturating_sub(req.cached_tok),
+        );
+        paint_span_approx(grid, plan.new, row, &new, approx, hot);
         let (output, approx) = known(flight.no_output, req.output_tok);
         paint_span_approx(grid, plan.output, row, &output, approx, hot);
         paint_rate_span(
@@ -3894,15 +3917,7 @@ fn draw_requests(grid: &mut Grid, model: &TtyModel, g: &Geom, header: u16, slots
                 paint_span_left(grid, plan.bar, row, &text, C16::BrightBlack, C16::Black);
             }
         } else {
-            draw_ctx_bar(
-                grid,
-                req,
-                plan.bar,
-                row,
-                relative_scale,
-                dim,
-                model.chart_glyphs,
-            );
+            draw_ctx_bar(grid, req, plan.bar, row, dim, model.chart_glyphs);
         }
         if req.err {
             paint_span_left(grid, plan.status, row, " ERR ", C16::Black, C16::Yellow);
@@ -3957,6 +3972,7 @@ fn paint_request_headers(grid: &mut Grid, row: u16, plan: &Plan) {
         plan.model,
         plan.prompt_tok,
         plan.cached,
+        plan.new,
         plan.output,
         plan.prompt_tps,
         plan.gen_tps,
@@ -4555,6 +4571,7 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
         false,
         2,
         width,
+        model.in_scroll,
     );
     place_lines(
         grid,
@@ -4565,6 +4582,7 @@ fn draw_text(grid: &mut Grid, model: &TtyModel, g: &Geom, req_rule: u16) {
         true,
         2,
         width,
+        model.out_scroll,
     );
     if !model.text_note.is_empty() && model.in_lines.is_empty() && model.out_lines.is_empty() {
         for (start, rows) in [(in_start, in_rows), (out_start, out_rows)] {
@@ -5102,6 +5120,11 @@ fn draw_fan_row(
 type Glyph = (char, char);
 
 fn revealed_lines(model: &TtyModel) -> Vec<Vec<Glyph>> {
+    // A burst shows the whole reply and scrolls the window (#188). The
+    // streaming replay would hide it and then land on the tail.
+    if model.out_scroll.is_some() {
+        return logical_lines(&model.out_lines);
+    }
     let stream = tail_stream(&model.out_lines);
     let total = stream.len();
     let keep = match model.replay_frame {
@@ -5169,11 +5192,22 @@ fn place_lines(
     out: bool,
     origin: u16,
     width: usize,
+    scroll: Option<usize>,
 ) {
     let width = width.max(1);
-    let view = visual_tail(lines, width, usize::from(rows));
     let rows_n = usize::from(rows);
-    let pad = rows_n.saturating_sub(view.len());
+    // `None` is the streaming tail, bottom-aligned when it is short.
+    // `Some` is a burst: the window starts at that character and short
+    // text sits at the top (#188).
+    let (view, from_top) = match scroll {
+        Some(skip) => (visual_window(lines, width, rows_n, skip), true),
+        None => (visual_tail(lines, width, rows_n), false),
+    };
+    let pad = if from_top {
+        0
+    } else {
+        rows_n.saturating_sub(view.len())
+    };
     let total = view
         .iter()
         .filter(|line| line.iter().any(|g| g.0 != ' '))
@@ -5219,6 +5253,104 @@ fn cursor_col(text: &[Glyph], origin: u16) -> u16 {
         Some(last) => col_u16(usize::from(origin).saturating_add(last).saturating_add(1)),
         None => origin,
     }
+}
+
+/// First visual rows from character `skip`. Short text is the whole
+/// text, from the top, whatever `skip` says. A skip past the last page
+/// stays on the last page so the end does not scroll away into blank rows.
+fn visual_window(lines: &[Vec<Glyph>], width: usize, limit: usize, skip: usize) -> Vec<Vec<Glyph>> {
+    if limit == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let flat = flatten_lines(lines);
+    let rows = wrap_indexed(&flat, width);
+    if rows.len() <= limit {
+        return rows.into_iter().map(|(_, row)| row).collect();
+    }
+    // The row that contains `skip`: the last row starting at or before it.
+    let mut at = rows.partition_point(|(start, _)| *start <= skip);
+    at = at.saturating_sub(1).min(rows.len().saturating_sub(1));
+    if at + limit > rows.len() {
+        at = rows.len() - limit;
+    }
+    rows.into_iter()
+        .skip(at)
+        .take(limit)
+        .map(|(_, row)| row)
+        .collect()
+}
+
+fn flatten_lines(lines: &[Vec<Glyph>]) -> Vec<Glyph> {
+    let mut flat = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            flat.push(('\n', '\n'));
+        }
+        flat.extend(line.iter().copied());
+    }
+    flat
+}
+
+/// Visual rows of `chars`, each with the index in `chars` where it starts.
+/// A `\n` ends a logical line. A line that wraps uses the same breaks as
+/// [`word_wrap`].
+fn wrap_indexed(chars: &[Glyph], width: usize) -> Vec<(usize, Vec<Glyph>)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start <= chars.len() {
+        if start == chars.len() {
+            break;
+        }
+        if chars[start].0 == '\n' {
+            out.push((start, Vec::new()));
+            start += 1;
+            continue;
+        }
+        let logical_end = chars[start..]
+            .iter()
+            .position(|glyph| glyph.0 == '\n')
+            .map(|at| start + at)
+            .unwrap_or(chars.len());
+        let mut i = start;
+        if i == logical_end {
+            out.push((i, Vec::new()));
+        }
+        while i < logical_end {
+            let remain = logical_end - i;
+            if remain <= width {
+                out.push((i, chars[i..logical_end].to_vec()));
+                break;
+            }
+            if chars.get(i + width).is_some_and(|glyph| glyph.0 == ' ') {
+                out.push((i, chars[i..i + width].to_vec()));
+                i += width + 1;
+                continue;
+            }
+            let window = &chars[i..i + width];
+            if let Some(at) = window
+                .iter()
+                .rposition(|glyph| glyph.0 == ' ')
+                .filter(|at| *at > 0)
+            {
+                out.push((i, chars[i..i + at].to_vec()));
+                i += at + 1;
+            } else {
+                out.push((i, chars[i..i + width].to_vec()));
+                i += width;
+            }
+        }
+        start = if logical_end < chars.len() {
+            logical_end + 1
+        } else {
+            logical_end
+        };
+    }
+    if out.is_empty() {
+        out.push((0, Vec::new()));
+    }
+    out
 }
 
 /// Last `limit` visual rows. Wrapping walks back from the end and stops
@@ -7618,6 +7750,7 @@ fn draw_panes(grid: &mut Grid, model: &TtyModel, g: &Geom, title: u16, text_rows
         false,
         left_x,
         left_w,
+        model.in_scroll,
     );
     place_lines(
         grid,
@@ -7628,6 +7761,7 @@ fn draw_panes(grid: &mut Grid, model: &TtyModel, g: &Geom, title: u16, text_rows
         true,
         right_x,
         right_w,
+        model.out_scroll,
     );
     if !model.text_note.is_empty() && model.in_lines.is_empty() && model.out_lines.is_empty() {
         let mid_row = title + 1 + text_rows.saturating_sub(1) / 2;

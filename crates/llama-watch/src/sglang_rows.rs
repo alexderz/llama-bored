@@ -289,6 +289,10 @@ struct Model {
     /// The time-to-first-token series had no `is_streaming` label, so a
     /// streaming finish cannot be told from a batch finish. Rates stay off.
     ttft_unlabeled: bool,
+    /// Last prompt tok/s from one finished request that was alone and
+    /// whose own prompt time was known (#188). A finish that does not
+    /// qualify leaves this where it was.
+    honest_prompt: Option<f64>,
 }
 
 /// A scrape's place on the two clocks. Coverage of an isolation window is
@@ -417,6 +421,14 @@ impl SglangBook {
     #[must_use]
     pub fn fill(&self, seq: u64) -> Option<Fill> {
         self.rows.get(&seq).copied()
+    }
+
+    /// Last honest prompt tok/s for `model` (#188). `None` when no finished
+    /// request was alone with its own prompt time, including after
+    /// [`Self::forget`].
+    #[must_use]
+    pub fn prompt_rate(&self, model: &str) -> Option<f64> {
+        self.models.get(model).and_then(|state| state.honest_prompt)
     }
 
     /// `model` was unloaded. Rows already filled keep their numbers.
@@ -685,6 +697,9 @@ impl Model {
             gen_tps = None;
         } else if hide_prompt(queue, ttft_s) {
             prompt_tps = None;
+        }
+        if let Some(rate) = prompt_tps {
+            self.honest_prompt = Some(rate);
         }
         self.finishes.push_back(Finish {
             at: snap.at,
@@ -2331,6 +2346,7 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
             Some(200.0),
             "its own queue time is 0.02 s"
         );
+        assert_eq!(book.prompt_rate("flash"), Some(200.0));
         assert_eq!(first.gen_tps, Some(50.0));
 
         // The waiter finishes at second 32, clear of [7, 18]. Nothing new
@@ -2352,6 +2368,11 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
         assert_eq!(second.cached, 100);
         assert_eq!(second.prompt_tps, None, "the 3 s wait is this request's");
         assert_eq!(second.gen_tps, Some(50.0), "(201 - 1) / (8 - 4)");
+        assert_eq!(
+            book.prompt_rate("flash"),
+            Some(200.0),
+            "a finish that is not alone does not wipe the last honest rate"
+        );
     }
 
     /// Two requests leave the queue between the same two scrapes. The sum
@@ -2369,6 +2390,11 @@ sglang:num_running_reqs{model_name=\"flash\"} 0.0
         assert_eq!(fill.cached, 600);
         assert_eq!(fill.prompt_tps, None, "two departures, one sum");
         assert_eq!(fill.gen_tps, Some(50.0));
+        assert_eq!(
+            book.prompt_rate("flash"),
+            None,
+            "no honest rate has ever been measured"
+        );
     }
 
     fn wall_at(ms: u64) -> SystemTime {

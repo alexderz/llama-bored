@@ -8,6 +8,7 @@ pub mod ctx_history;
 pub mod grid;
 pub mod layout;
 pub mod sanitize;
+pub mod scroll;
 pub mod setup;
 pub mod term;
 pub mod writer;

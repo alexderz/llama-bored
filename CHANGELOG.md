@@ -4,14 +4,20 @@ All notable changes to llama-bored. Versions follow
 [Semantic Versioning](https://semver.org/); the process is in
 [docs/RELEASING.md](docs/RELEASING.md).
 
-## Unreleased
+## 0.7.2 — 2026-10-29
+
+tqLLM on the dashboard, LED chains up to the header's 120 LEDs, a console that Ctrl+S can no longer freeze, and an honest prefill speed with IN and OUT that scroll from the top. Nothing in an existing config needs to change.
 
 ### Fixed
 
+- tty11's big PROMPT number on a burst engine is the prefill speed, not the one-second counter spike. vLLM holds the histogram rate (new uncached prompt tokens over prefill seconds) until the next prefill finishes, so 20,000 tokens in 10 s read as 2,000 and stay 2,000 a second later. SGLang uses a rate only when one finished request was alone and its own prompt time is known, and then holds that rate; it does not invent a wall-clock spike. llama.cpp's live `/slots` rate and tqLLM's own rates are unchanged. Idle is still 0 and a missing rate is still `--`. An idle llama.cpp model beside a busy vLLM or SGLang does not replace that held rate with the idle slot's stored 0 or the wall-clock spike; a live non-zero `/slots` prefill still wins (#188).
+- IN and OUT start at the top when a whole prompt or reply arrives in one update, and scroll by elapsed time. The speed is the live tok/s when one is known (a streaming engine, `/slots`, or tqLLM); otherwise the average of the last five completed turns of that model, this turn's own measured speed on the first turn, or the whole text in two seconds when that is missing too. A streaming update keeps growing in place and does not jump back to the top. A new prompt does not replay the previous reply: OUT stays where it was until the new answer arrives, then that answer starts at the top. A live rate that appears after the burst has started takes over without a jump, and when it disappears the speed falls back along that same list, again without a jump. Text shorter than the panel sits at the top. No replay label (#188).
 - llama-view: Ctrl+S no longer freezes the screen. Raw mode now turns off XON/XOFF flow control (`IXON`), which used to let one Ctrl+S stop all output until a Ctrl+Q; a kiosk console stayed frozen. The terminal's own settings come back on exit (#186).
 
 ### Changed
 
+- RECENT labels prompt, cached, new and output tokens separately, with READ and WRITE in tokens per second. Unknown cached tokens leave NEW unknown. Context bars use each model’s known capacity, or the row’s own length marked `~` when capacity is unknown (#190).
+- For a busy llama.cpp model the headline uses the mean of the last five completed request prefill measurements rather than a `/slots` polling derivative, which can produce batch-timing spikes; it stays unknown until a measured rate is available (#188).
 - llama-light: a chain can now fill the Aura header's 120 LEDs. `chain_len` (or an `aura.chain` list) takes up to 120 fans, so a small `leds_per_fan` describes strips of any length (`leds_per_fan = 4`, `chain_len = 30` is 120 LEDs with a 28-LED strip still on `aura.chain[0..7]`); before, a chain stopped at 8 fans. `check` now rejects a chain longer than 120 LEDs, which it used to accept and which then failed every frame (#182).
 
 ### Added

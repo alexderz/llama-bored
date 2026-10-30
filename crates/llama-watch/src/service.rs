@@ -488,6 +488,8 @@ struct TickState {
     ctx_sizes: BTreeMap<String, u64>,
     /// Last non-zero decode rate for the dim GEN digits (#163).
     gen_last: Option<f64>,
+    /// IN/OUT burst scroll (#188).
+    motion: crate::tty::scroll::Motion,
 }
 
 impl TickState {
@@ -532,6 +534,7 @@ impl TickState {
             flights: crate::inflight::Tracker::default(),
             ctx_sizes: BTreeMap::new(),
             gen_last: None,
+            motion: crate::tty::scroll::Motion::default(),
         }
     }
 }
@@ -1014,7 +1017,7 @@ fn tty_model(
     });
     // With text off the poller keeps none, and nothing here reads the slot
     // tails either, so no llama text can reach the frame (RR-LV1).
-    let text = if !ctx.show_text {
+    let mut text = if !ctx.show_text {
         FrameText::default()
     } else if let Some(capture) = capture {
         capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap)
@@ -1026,6 +1029,16 @@ fn tty_model(
             ctx.output_cap,
         )
     };
+    if ctx.show_text {
+        apply_scroll(
+            &mut text,
+            &mut tick.motion,
+            &tick.detail,
+            capture,
+            &sample.snapshot.models,
+            mono,
+        );
+    }
     let mem_total = ctx.mem_total_bytes.map(gib);
     let mem_used = mem_used_bytes(sample.snapshot.mem_pct, ctx.mem_total_bytes).map(gib);
     let job_and_note = job_and_note(
@@ -1136,6 +1149,8 @@ fn tty_model(
         out_lines: text.out_lines,
         out_shown: text.out_shown,
         replay_frame: text.replay_frame,
+        in_scroll: text.in_scroll,
+        out_scroll: text.out_scroll,
         show_text: ctx.show_text,
         down_since: tick
             .down_since
@@ -1341,6 +1356,134 @@ fn paired_setup<'a>(
     Some((setup, model))
 }
 
+fn text_chars(lines: &[String]) -> Vec<char> {
+    lines.iter().flat_map(|line| line.chars()).collect()
+}
+
+/// Live tok/s for scroll (#188). A burst engine's held prefill speed and its
+/// wall-clock generation spike are not live. The llama.cpp headline is
+/// a completed-turn average, not a live slot measurement. tqLLM's own
+/// request rate is live when it is the only engine on screen.
+fn live_token_rates(detail: &LlamaDetail, models: &[ModelInfo]) -> (Option<f64>, Option<f64>) {
+    let kinds: Vec<Backend> = models
+        .iter()
+        .filter_map(|model| model.backend.map(|info| info.kind))
+        .collect();
+    let burst_only = !kinds.is_empty()
+        && kinds
+            .iter()
+            .all(|kind| matches!(kind, Backend::Vllm | Backend::SgLang));
+    let prompt_live = if !kinds.is_empty() && kinds.iter().all(|kind| *kind == Backend::Tqllm) {
+        detail
+            .prompt_tps
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+    } else {
+        None
+    };
+    let gen_live = if burst_only {
+        None
+    } else if kinds
+        .iter()
+        .any(|kind| matches!(kind, Backend::LlamaCpp | Backend::Strata | Backend::Tqllm))
+        || (kinds.is_empty() && detail.slots.iter().any(|slot| slot.is_processing))
+    {
+        detail
+            .gen_tps
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+    } else {
+        None
+    };
+    (prompt_live, gen_live)
+}
+
+fn scroll_identity(
+    detail: &LlamaDetail,
+    capture: Option<&CaptureView>,
+) -> (String, u64, Option<u64>, Option<u64>) {
+    if let Some(capture) = capture {
+        let row = detail.activity.iter().find(|row| row.id == capture.id);
+        let model = row
+            .map(|row| row.model.clone())
+            .unwrap_or_else(|| capture.model.clone());
+        let request = u64::try_from(capture.id.max(0)).unwrap_or(0);
+        return (
+            model,
+            request,
+            row.and_then(|row| row.input_tokens),
+            row.and_then(|row| row.output_tokens),
+        );
+    }
+    let Some(slot) = pick_slot(&detail.slots) else {
+        let model = detail
+            .setup
+            .first()
+            .map(|setup| setup.key.clone())
+            .unwrap_or_default();
+        return (model, 0, None, None);
+    };
+    let model = detail
+        .setup
+        .iter()
+        .find(|setup| setup.name == slot.model || setup.id == slot.model || setup.key == slot.model)
+        .map(|setup| setup.key.clone())
+        .or_else(|| (detail.setup.len() == 1).then(|| detail.setup[0].key.clone()))
+        .unwrap_or_else(|| slot.model.clone());
+    let request = if slot.id_task < 0 {
+        0
+    } else {
+        (slot.id as u64)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(slot.id_task as u64)
+            .max(1)
+    };
+    (
+        model,
+        request,
+        (slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens),
+        (slot.n_decoded > 0).then_some(slot.n_decoded),
+    )
+}
+
+fn apply_scroll(
+    text: &mut FrameText,
+    motion: &mut crate::tty::scroll::Motion,
+    detail: &LlamaDetail,
+    capture: Option<&CaptureView>,
+    models: &[ModelInfo],
+    now: Instant,
+) {
+    let (model, request, input_tokens, output_tokens) = scroll_identity(detail, capture);
+    let input = text_chars(&text.in_lines);
+    let output = text_chars(&text.out_lines);
+    let rows: Vec<crate::tty::scroll::Turn> = detail
+        .activity
+        .iter()
+        .map(|row| crate::tty::scroll::Turn {
+            seq: row.seq,
+            model: row.model.clone(),
+            prompt_tps: row.prompt_tps.or(row.engine_prompt_tps),
+            gen_tps: row.gen_tps.or(row.engine_gen_tps),
+        })
+        .collect();
+    let (live_prompt, live_gen) = live_token_rates(detail, models);
+    let view = motion.update(
+        &crate::tty::scroll::Sample {
+            model: &model,
+            request,
+            input: &input,
+            output: &output,
+            input_tokens,
+            output_tokens,
+            live_prompt,
+            live_gen,
+            rows: &rows,
+        },
+        now,
+    );
+    text.in_scroll = view.inn;
+    text.out_scroll = view.out;
+}
+
 /// IN and OUT for one frame, both from [`pick_slot`]. Advances the OUT
 /// replay cursor. IN keeps no cursor: it is rebuilt from the picked slot on
 /// every frame, so a slot switch swaps it at once. OUT's cursor goes through
@@ -1364,6 +1507,8 @@ fn frame_text(
         out_lines: chars_lines(&replay.tail),
         out_shown: replay.shown,
         replay_frame: replay.frame,
+        in_scroll: None,
+        out_scroll: None,
     }
 }
 
@@ -1386,6 +1531,8 @@ fn capture_text(
         out_lines: chars_lines(&replay.tail),
         out_shown: replay.shown,
         replay_frame: replay.frame,
+        in_scroll: None,
+        out_scroll: None,
     }
 }
 
@@ -1412,6 +1559,8 @@ struct FrameText {
     out_lines: Vec<String>,
     out_shown: usize,
     replay_frame: Option<u32>,
+    in_scroll: Option<usize>,
+    out_scroll: Option<usize>,
 }
 
 fn watch_state(
@@ -2204,7 +2353,9 @@ fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
         requests: &state.detail.requests,
         activity: &state.detail.activity,
         ids: &ids,
-        prompt_tps: state.detail.prompt_tps,
+        // The llama.cpp headline is a completed-turn average, not this
+        // in-flight slot's own measurement.
+        prompt_tps: None,
         gen_tps: state.detail.gen_tps,
     };
     state.flights.poll(&poll, mono, wall);
@@ -2762,6 +2913,103 @@ mod tests {
             "idle live job has no note: {:?}",
             model.job_note
         );
+    }
+
+    /// #188: a llama.cpp headline average is not a live slot rate; scroll
+    /// starts at the top and uses this model's completed-turn history.
+    #[test]
+    fn llama_headline_average_does_not_masquerade_as_live_scroll_rate() {
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("m", "ready", Some(llama))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.setup = vec![ModelSetup {
+            key: "m".to_owned(),
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            ..ModelSetup::default()
+        }];
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        ctx.input_cap = 4_000;
+        ctx.output_cap = 4_000;
+
+        let mut first = slot(0, 1, true, "aaaa", "");
+        first.n_prompt_tokens = 4;
+        first.n_decoded = 0;
+        tick.detail.slots = vec![first];
+        tick.detail.activity = vec![scroll_row(1, 5.0)];
+        let t0 = Instant::now();
+        let _ = tty_model(&sample, &mut tick, t0, UNIX_EPOCH, Zone::utc(), &ctx);
+
+        let prompt = "B".repeat(2_000);
+        let mut second = slot(0, 2, true, &prompt, "");
+        second.n_prompt_tokens = 2_000;
+        second.n_decoded = 0;
+        tick.detail.slots = vec![second];
+        tick.detail.activity.push(scroll_row(2, 5.0));
+        tick.detail.prompt_tps = Some(400.0);
+        let started = tty_model(&sample, &mut tick, t0, UNIX_EPOCH, Zone::utc(), &ctx);
+        assert_eq!(
+            started.in_scroll,
+            Some(0),
+            "the new burst starts at the top"
+        );
+
+        let moved = tty_model(
+            &sample,
+            &mut tick,
+            t0 + Duration::from_secs(1),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        let at = moved.in_scroll.expect("the burst is still scrolling");
+        assert!(
+            (at as f64 - 5.0).abs() < 2.0,
+            "the per-model completed-turn history is 5 tok/s, not headline 400: {at}"
+        );
+
+        let grown = format!("{prompt}CCCC");
+        tick.detail.slots[0].input = secret_cells(&grown);
+        let streamed = tty_model(
+            &sample,
+            &mut tick,
+            t0 + Duration::from_secs(1),
+            UNIX_EPOCH,
+            Zone::utc(),
+            &ctx,
+        );
+        assert_eq!(
+            streamed.in_scroll, None,
+            "a streaming growth stays on the tail"
+        );
+    }
+
+    fn scroll_row(seq: u64, speed: f64) -> crate::activity::ActivityRow {
+        crate::activity::ActivityRow {
+            id: i64::try_from(seq).unwrap_or(0),
+            seq,
+            time: String::new(),
+            source: String::new(),
+            model: "m".to_owned(),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: None,
+            prompt_tps: Some(speed),
+            gen_tps: Some(speed),
+            engine_prompt_tps: None,
+            engine_gen_tps: None,
+            duration_ms: None,
+            status: None,
+            draft_tokens: None,
+            draft_accepted: None,
+            captured: false,
+            engine: None,
+        }
     }
 
     fn claim_tick(
@@ -5214,8 +5462,8 @@ mod tests {
         assert!(held.contains("~41.5") && held.contains("1.2s"), "{held}");
         assert_eq!(
             held.matches("--").count(),
-            4,
-            "IN, CACHED, OUT and PROMPT: {held}"
+            5,
+            "PROMPT, CACHED, NEW, OUTPUT and READ: {held}"
         );
         let shared = shown[2];
         assert!(

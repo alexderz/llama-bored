@@ -13,6 +13,7 @@ mod load;
 pub mod localtime;
 pub mod metrics;
 pub mod poller;
+pub mod prompt_head;
 pub mod publish;
 pub mod recent;
 pub mod resets;
