@@ -61,6 +61,32 @@ fn golden_frames_match_character_and_colour() {
 }
 
 #[test]
+fn rate_headings_name_decode_write_and_prefill_read() {
+    for (cols, rows) in [(160, 60), (192, 60), (240, 67), (480, 135)] {
+        let grid = draw(&sample(WatchState::Generating), cols, rows);
+        let headline = (0..grid.rows())
+            .map(|row| row_string(&grid, row))
+            .find(|row| row.contains("WRITE tok/s") && row.contains("READ tok/s"))
+            .expect("rate headings");
+        assert!(
+            headline.find("WRITE") < headline.find("READ"),
+            "{cols}x{rows}: {headline}"
+        );
+        assert!(
+            !headline.contains("GENERATION") && !headline.contains("PROMPT"),
+            "{headline}"
+        );
+    }
+}
+
+#[test]
+fn timeline_labels_write_above_and_read_below() {
+    let grid = draw(&sample(WatchState::Generating), 240, 67);
+    let timeline = row_string(&grid, timeline_rule(&grid));
+    assert!(timeline.contains("write above · read below"), "{timeline}");
+}
+
+#[test]
 fn replay_spreads_new_chars_over_ten_frames() {
     assert_eq!(replay_shown(0, 5), 0);
     assert_eq!(replay_shown(10, 0), 0);
@@ -6614,7 +6640,7 @@ fn job_view_running_shows_title_progress_digits_phases() {
     assert!(text.contains("PHASES"), "{text}");
     assert!(text.contains("JOB"), "{text}");
     assert!(text.contains("running"), "{text}");
-    assert!(!text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("WRITE tok/s"), "{text}");
     assert!(!text.contains("RECENT"), "{text}");
 }
 
@@ -6642,7 +6668,7 @@ fn job_view_minimal_shows_name_and_state() {
     assert!(text.contains("only-name"), "{text}");
     assert!(text.contains("JOB"), "{text}");
     assert!(text.contains("running"), "{text}");
-    assert!(!text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("WRITE tok/s"), "{text}");
     assert!(!text.contains("STEP"), "{text}");
 }
 
@@ -7473,7 +7499,7 @@ dir = "{}"
     assert!(text.contains("TRAINING"), "{text}");
     assert!(text.contains("Example-2B"), "{text}");
     assert!(text.contains("example-trainer"), "{text}");
-    assert!(!text.contains("GENERATION"), "{text}");
+    assert!(!text.contains("WRITE tok/s"), "{text}");
 }
 
 #[test]

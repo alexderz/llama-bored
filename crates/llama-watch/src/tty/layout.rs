@@ -298,7 +298,7 @@ pub struct TtyModel {
     pub ctx_history_h: u32,
     /// SETUP block under the meters (#52). `None` collapses it.
     pub setup: Option<SetupView>,
-    /// Job view replacing GENERATION, PROMPT, the charts, SLOTS and RECENT.
+    /// Job view replacing WRITE, READ, the charts, SLOTS and RECENT.
     /// `None` keeps the inference layout.
     pub job: Option<JobView>,
     /// One-line job note in the header when the inference view is showing.
@@ -2010,8 +2010,8 @@ fn bar_glyph(cell: usize, lit: usize) -> char {
 const TRACK: char = '\u{00b7}';
 
 fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
-    paint_label_unit(grid, g.right, 3, "GENERATION");
-    paint_label_unit(grid, g.prompt_x(), 3, "PROMPT");
+    paint_label_unit(grid, g.right, 3, "WRITE");
+    paint_label_unit(grid, g.prompt_x(), 3, "READ");
     if let Some(last) = model.prompt_last {
         let text = format!("last {last}");
         right_align(
@@ -6919,7 +6919,7 @@ fn layout_skeleton(model: &TtyModel, cols: u16, rows: u16, exact: bool) -> Grid 
 fn draw_timeline_rule(grid: &mut Grid, row: u16, cols: u16, bucket_s: u64) {
     draw_rule(grid, row, cols);
     let text = format!(
-        "TIMELINE tok/s  gen above \u{00b7} prompt below  {bucket_s} s per column, now at the left"
+        "TIMELINE tok/s  write above \u{00b7} read below  {bucket_s} s per column, now at the left"
     );
     paint_raw(grid, 2, row, &text, C16::BrightBlack);
 }
@@ -6954,12 +6954,20 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16) {
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(format_rate_digits);
     let prompt_last_text = model.prompt_last.map(|n| n.to_string());
-    paint_rate_label(grid, 2, top, "GEN", gen_live, gen_last_text.as_deref(), 31);
+    paint_rate_label(
+        grid,
+        2,
+        top,
+        "WRITE",
+        gen_live,
+        gen_last_text.as_deref(),
+        31,
+    );
     paint_rate_label(
         grid,
         32,
         top,
-        "PROMPT",
+        "READ",
         prompt_live,
         prompt_last_text.as_deref(),
         63,

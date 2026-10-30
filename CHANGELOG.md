@@ -4,6 +4,12 @@ All notable changes to llama-bored. Versions follow
 [Semantic Versioning](https://semver.org/); the process is in
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## Unreleased
+
+### Fixed
+
+- Rate headlines and timeline consistently say WRITE for decode and READ for prefill, matching RECENT; token counts and generation states keep their names.
+
 ## 0.7.2 — 2026-10-29
 
 tqLLM on the dashboard, LED chains up to the header's 120 LEDs, a console that Ctrl+S can no longer freeze, and an honest prefill speed with IN and OUT that scroll from the top. Nothing in an existing config needs to change.
