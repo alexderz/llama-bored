@@ -3065,6 +3065,140 @@ mod tests {
         );
     }
 
+    /// A llama.cpp slot as `/slots` reads during a long decode (DER-451
+    /// regression report): one task, a short cached prompt, 19,000 tokens
+    /// out and growing, the reply past `output_tail_chars`. `prompt` and
+    /// `generated` are left out when `/slots` has no text.
+    fn long_decode_body(text: bool, prompt: &str, generated: &str, decoded: u64) -> Vec<u8> {
+        let mut slot = serde_json::json!({
+            "id": 0,
+            "id_task": 41_471,
+            "is_processing": true,
+            "n_ctx": 98_304,
+            "n_prompt_tokens": 42 + 59 + decoded - 1,
+            "n_prompt_tokens_processed": 59,
+            "n_prompt_tokens_cache": 42,
+            "next_token": [{"n_decoded": decoded, "has_next_token": true, "stopped_eos": false}],
+        });
+        if text {
+            slot["prompt"] = prompt.into();
+            slot["generated"] = generated.into();
+        }
+        serde_json::to_vec(&serde_json::json!([slot])).expect("json")
+    }
+
+    /// Polls a long llama.cpp decode through `SlotBook` and the frame, as
+    /// the service does, and returns each frame's IN and OUT.
+    fn long_decode_frames(text: bool, prompt_chars: usize) -> Vec<crate::tty::layout::TtyModel> {
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("m", "ready", Some(llama))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.setup = vec![ModelSetup {
+            key: "m".to_owned(),
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            ..ModelSetup::default()
+        }];
+        tick.detail.gen_tps = Some(38.0);
+        tick.detail.activity = vec![scroll_row(1, 40.0)];
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        ctx.input_cap = 8_192;
+        ctx.output_cap = 24_576;
+        if !text {
+            // What the poller keeps for a textless model: its last finished
+            // capture, a short probe.
+            tick.detail.capture = Some(CaptureView {
+                model: "m".to_owned(),
+                id: 968,
+                input: secret_cells("Yo"),
+                input_note: String::new(),
+                output: secret_cells("Ok"),
+                over_slots: true,
+                output_chars: Some(2),
+                input_new: Some(2),
+            });
+        }
+        let prompt: String = (0..)
+            .map(|word| format!("p{word} "))
+            .take_while({
+                let mut chars = 0;
+                move |word| {
+                    chars += word.len();
+                    chars <= prompt_chars
+                }
+            })
+            .collect();
+        let mut book = crate::slots::SlotBook::default();
+        let t0 = Instant::now();
+        let mut frames = Vec::new();
+        for poll in 0..40u64 {
+            let decoded = 19_000 + 12 * poll;
+            let generated: String = (0..decoded * 4)
+                .map(|word| {
+                    if word % 9 == 8 {
+                        format!("w{word}\n")
+                    } else {
+                        format!("w{word} ")
+                    }
+                })
+                .collect();
+            let body = long_decode_body(text, &prompt, &generated, decoded);
+            assert!(book.apply("m", "m", &body, ctx.input_cap, ctx.output_cap));
+            tick.detail.slots = book.slots();
+            let now = t0 + Duration::from_millis(250 * poll);
+            frames.push(tty_model(
+                &sample,
+                &mut tick,
+                now,
+                UNIX_EPOCH,
+                Zone::utc(),
+                &ctx,
+            ));
+        }
+        frames
+    }
+
+    /// DER-451 regression report: on a long llama.cpp decode IN and OUT
+    /// showed a word or two. With `/slots` text, OUT streams its tail
+    /// (`None` after the first frame, never a burst) and IN crosses its
+    /// prompt once, then rests; with none, both panels show the last
+    /// capture whole and come to rest.
+    #[test]
+    fn a_long_llama_cpp_decode_streams_out_and_keeps_in_still() {
+        for prompt_chars in [400, 30_000] {
+            let frames = long_decode_frames(true, prompt_chars);
+            for (poll, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.in_title, "IN", "live slot text, poll {poll}");
+                let input = text_of(&frame.in_lines).chars().count();
+                assert!(input + 8 >= prompt_chars.min(8_192), "poll {poll}: {input}");
+                let output = text_of(&frame.out_lines).chars().count();
+                assert!(output > 20_000, "poll {poll}: OUT is the reply tail");
+                if poll > 0 {
+                    assert_eq!(frame.out_scroll, None, "poll {poll}: OUT streams");
+                    assert!(frame.in_scroll >= frames[poll - 1].in_scroll, "poll {poll}");
+                }
+            }
+            let rest = frames.last().expect("frames").in_scroll;
+            assert_eq!(frames[30].in_scroll, rest, "IN has come to rest");
+        }
+        let frames = long_decode_frames(false, 0);
+        let rest = frames.last().expect("frames");
+        for (poll, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.in_title, CAPTURE_IN_TITLE, "poll {poll}");
+            assert_eq!(text_of(&frame.in_lines), "Yo");
+            assert_eq!(text_of(&frame.out_lines), "Ok");
+            if poll >= 30 {
+                assert_eq!(frame.in_scroll, rest.in_scroll, "poll {poll}");
+                assert_eq!(frame.out_scroll, rest.out_scroll, "poll {poll}");
+            }
+        }
+    }
+
     fn scroll_row(seq: u64, speed: f64) -> crate::activity::ActivityRow {
         crate::activity::ActivityRow {
             id: i64::try_from(seq).unwrap_or(0),
