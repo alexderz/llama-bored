@@ -1473,7 +1473,10 @@ fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> Scrol
             .prompt_total()
             .or((slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens)),
         output_tokens: (slot.n_decoded > 0).then_some(slot.n_decoded),
-        input_chars: slot.input_chars,
+        // The whole prompt's characters go only with its whole token count.
+        // While it prefills, the count is what the slot holds so far, and
+        // the pair would cross IN many times too fast: four per token then.
+        input_chars: slot.prompt_total().and(slot.input_chars),
         output_chars: slot.output_chars,
         // While it prefills, a slot's token count is only what it holds so
         // far, so the uncached part is not known until it decodes.
@@ -2961,6 +2964,31 @@ mod tests {
         );
     }
 
+    /// A prefilling slot holds only part of its prompt: the whole prompt's
+    /// characters do not go with that partial count, or IN would cross many
+    /// times too fast. Once it decodes, the whole count is known and they
+    /// pair (DER-451).
+    #[test]
+    fn a_prefilling_slot_does_not_pair_whole_chars_with_partial_tokens() {
+        let mut tick = TickState::new(2, 6);
+        let mut busy = slot(0, 7, true, &"p".repeat(40_000), "");
+        busy.n_prompt_tokens = 800;
+        busy.prompt_cached = Some(500);
+        busy.n_prompt_tokens_processed = 300;
+        tick.detail.slots = vec![busy.clone()];
+        let id = scroll_identity(&tick.detail, None);
+        assert_eq!(id.input_tokens, Some(800));
+        assert_eq!(id.input_chars, None, "partial tokens: four per token");
+        assert_eq!(id.input_cached, None);
+        busy.n_decoded = 1;
+        busy.n_prompt_tokens_processed = 9_500;
+        tick.detail.slots = vec![busy];
+        let id = scroll_identity(&tick.detail, None);
+        assert_eq!(id.input_tokens, Some(10_000));
+        assert_eq!(id.input_chars, Some(40_000));
+        assert_eq!(id.input_cached, Some(500));
+    }
+
     /// #188: a llama.cpp headline average is not a live slot rate; scroll
     /// starts at the top and uses this model's completed-turn history.
     #[test]
@@ -3014,8 +3042,10 @@ mod tests {
             &ctx,
         );
         let at = moved.in_scroll.expect("the burst is still scrolling");
+        // Still prefilling, so its whole token count is not known: four
+        // characters per token (DER-451).
         assert!(
-            (at as f64 - 5.0).abs() < 2.0,
+            (at as f64 - 20.0).abs() < 2.0,
             "the per-model completed-turn history is 5 tok/s, not headline 400: {at}"
         );
 

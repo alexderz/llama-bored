@@ -683,7 +683,7 @@ struct State<L> {
     capture: Option<(String, CaptureView)>,
     /// Message marks of the last [`REQUEST_MARKS`] captured requests per
     /// model id, for IN's new part (DER-451). Hashes and roles, no text.
-    request_marks: HashMap<String, std::collections::VecDeque<Vec<MessageMark>>>,
+    request_marks: RequestMarks,
     /// Ready llama.cpp models whose `/slots` carries no text: IN and OUT
     /// come from their captures (#66).
     slots_textless: HashSet<String>,
@@ -805,7 +805,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         activity_failed: false,
         capture_seen: None,
         capture: None,
-        request_marks: HashMap::new(),
+        request_marks: RequestMarks::default(),
         slots_textless: HashSet::new(),
         textless_logged: HashSet::new(),
         capture_failed: false,
@@ -1130,6 +1130,9 @@ impl<L: Sink> State<L> {
         self.prompt_cache.forget(id);
         self.series.forget_process(id);
         self.tqllm.forget(id);
+        // A new process starts with a cold prefix cache: its first request
+        // is all new, not a diff against the old process's last one.
+        self.request_marks.forget(id);
     }
 
     /// `[llama.backends]` first, then the launch command, then what this
@@ -2143,8 +2146,7 @@ impl<L: Sink> State<L> {
         let failure = match get_limited(&self.agent, &url, CAPTURE_TIMEOUT, CAPTURE_CAP) {
             Ok(Limited::Exact(bytes)) => match parse_capture(&bytes) {
                 Some(mut text) => {
-                    let input_new =
-                        new_capture_input(&mut self.request_marks, &model.id, &mut text);
+                    let input_new = self.request_marks.diff_and_keep(&model.id, &mut text);
                     let input =
                         prompt_cells(&text.input, self.limits.input_tail, self.limits.prompt_view);
                     let input_new = input_new.map(|new| {
@@ -2999,28 +3001,59 @@ fn stopped(stop: &Receiver<()>) -> bool {
     }
 }
 
-/// IN's new characters in `text` (DER-451), from the requests to `model`
-/// this run has captured (`kept`), which this one then joins. Its marks are
-/// moved out of `text`.
-fn new_capture_input(
-    kept: &mut HashMap<String, std::collections::VecDeque<Vec<MessageMark>>>,
-    model: &str,
-    text: &mut crate::capture::CaptureText,
-) -> Option<usize> {
-    let new = new_input_chars(
-        kept.get(model).into_iter().flatten().map(Vec::as_slice),
-        text,
-    );
-    let marks = std::mem::take(&mut text.messages);
-    if marks.is_empty() || (!kept.contains_key(model) && kept.len() >= REQUEST_MARK_MODELS) {
-        return new;
+/// Message marks of the last [`REQUEST_MARKS`] captured requests per model
+/// id, for IN's new part (DER-451). Hashes and roles, no text. At most
+/// [`REQUEST_MARK_MODELS`] models; a new one evicts the least recently used.
+#[derive(Debug, Default)]
+struct RequestMarks {
+    tick: u64,
+    models: HashMap<String, (u64, std::collections::VecDeque<Vec<MessageMark>>)>,
+}
+
+impl RequestMarks {
+    /// IN's new characters in `text` against `model`'s kept requests, which
+    /// this one then joins. Its marks are moved out of `text`.
+    fn diff_and_keep(
+        &mut self,
+        model: &str,
+        text: &mut crate::capture::CaptureText,
+    ) -> Option<usize> {
+        let new = new_input_chars(
+            self.models
+                .get(model)
+                .into_iter()
+                .flat_map(|(_, list)| list)
+                .map(Vec::as_slice),
+            text,
+        );
+        let marks = std::mem::take(&mut text.messages);
+        if marks.is_empty() {
+            return new;
+        }
+        if !self.models.contains_key(model)
+            && self.models.len() >= REQUEST_MARK_MODELS
+            && let Some(oldest) = self
+                .models
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(id, _)| id.clone())
+        {
+            self.models.remove(&oldest);
+        }
+        self.tick += 1;
+        let (used, list) = self.models.entry(model.to_owned()).or_default();
+        *used = self.tick;
+        list.push_back(marks);
+        while list.len() > REQUEST_MARKS {
+            list.pop_front();
+        }
+        new
     }
-    let list = kept.entry(model.to_owned()).or_default();
-    list.push_back(marks);
-    while list.len() > REQUEST_MARKS {
-        list.pop_front();
+
+    /// `model`'s process is gone: its next request has nothing to diff.
+    fn forget(&mut self, model: &str) {
+        self.models.remove(model);
     }
-    new
 }
 
 #[cfg(test)]
@@ -3308,6 +3341,37 @@ mod tests {
         }
     }
 
+    /// Request marks (DER-451): a reload forgets the model's, and past the
+    /// model cap the least recently used model makes room.
+    #[test]
+    fn request_marks_forget_on_reload_and_evict_the_least_recent() {
+        use crate::capture::CaptureText;
+        let text = |hash: u64| CaptureText {
+            input: "new".into(),
+            messages: vec![MessageMark {
+                hash,
+                in_role: true,
+            }],
+            input_parts: vec![(0, 0)],
+            ..CaptureText::default()
+        };
+        let mut marks = RequestMarks::default();
+        assert_eq!(marks.diff_and_keep("a", &mut text(1)), None, "no history");
+        assert_eq!(marks.diff_and_keep("a", &mut text(1)), Some(0), "a retry");
+        marks.forget("a");
+        assert_eq!(marks.diff_and_keep("a", &mut text(1)), None, "forgotten");
+        for index in 0..REQUEST_MARK_MODELS {
+            marks.diff_and_keep(&format!("m{index}"), &mut text(1));
+        }
+        // "a" is the oldest; touching it makes "m0" the oldest instead.
+        marks.diff_and_keep("a", &mut text(1));
+        marks.diff_and_keep("new", &mut text(1));
+        assert_eq!(marks.models.len(), REQUEST_MARK_MODELS);
+        assert!(marks.models.contains_key("a"));
+        assert!(marks.models.contains_key("new"), "a new model is kept");
+        assert!(!marks.models.contains_key("m0"), "the least recent went");
+    }
+
     /// vLLM's READ chart follows its requests' phase (DER-451): the held
     /// prefill speed while one is prefilling, 0 while every one decodes,
     /// unknown when the counts do not add up or the phase read is stale.
@@ -3540,7 +3604,7 @@ mod tests {
             slots_failed: false,
             activity_failed: false,
             capture_seen: None,
-            request_marks: HashMap::new(),
+            request_marks: RequestMarks::default(),
             capture: None,
             slots_textless: HashSet::new(),
             textless_logged: HashSet::new(),

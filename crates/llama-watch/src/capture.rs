@@ -39,7 +39,8 @@
 //! (a cut JSON document does not parse).
 
 use std::fmt;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::OnceLock;
 
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -56,6 +57,13 @@ const MAX_CALLS: usize = 16;
 /// Most messages of one request hashed. A longer request keeps none, and
 /// its new part is not known from the messages.
 pub const MAX_MESSAGES: usize = 4096;
+
+/// The keyed hasher of every message mark, made once per run so marks of
+/// two captures compare and a hash says nothing outside this process.
+fn message_hasher() -> &'static RandomState {
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    STATE.get_or_init(RandomState::new)
+}
 
 /// One request message as the diff sees it (DER-451): its whole JSON
 /// hashed, and whether IN can show it (a `user`, `tool` or `function`
@@ -367,10 +375,9 @@ impl<'de> Deserialize<'de> for Recent {
                 // Each message whole, for its hash, then as the fields
                 // IN reads. One message is held at a time.
                 while let Some(value) = seq.next_element::<serde_json::Value>()? {
-                    let mut hasher = DefaultHasher::new();
-                    value.to_string().hash(&mut hasher);
+                    let hash = message_hasher().hash_one(value.to_string());
                     let message = MessageJson::deserialize(value).map_err(de::Error::custom)?;
-                    recent.add(hasher.finish(), message);
+                    recent.add(hash, message);
                 }
                 Ok(Recent(recent.seen.then_some(recent)))
             }
@@ -640,7 +647,7 @@ mod tests {
     }
 
     fn call(id: &str) -> serde_json::Value {
-        serde_json::json!({"role": "assistant", "content": "",
+        serde_json::json!({"role": "assistant", "content": "ASSISTANT-CALL-TEXT",
             "tool_calls": [{"id": id, "type": "function",
                 "function": {"name": "read", "arguments": "{}"}}]})
     }
@@ -663,9 +670,33 @@ mod tests {
         next.extend([call("c2"), msg("tool", "second invented result")]);
         let second = chat(&next);
         assert_eq!(second.input, "[tool] second invented result");
+        // The diff ends at the appended assistant call (the tool calls
+        // differ only in their id), which IN does not show: the new part
+        // is the tool result alone, none of the call's text.
+        let common = first
+            .messages
+            .iter()
+            .zip(&second.messages)
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(common, base.len());
+        let appended: Vec<bool> = second.messages[common..]
+            .iter()
+            .map(|m| m.in_role)
+            .collect();
+        assert_eq!(
+            appended,
+            [false, true],
+            "an assistant call, then a tool result"
+        );
+        assert!(!second.input.contains("ASSISTANT-CALL-TEXT"));
         let kept = [first.messages.clone(), other.messages.clone()];
         let new = new_input_chars(kept.iter().map(Vec::as_slice), &second);
-        assert_eq!(new, Some(second.input.chars().count()), "the result is new");
+        assert_eq!(
+            new,
+            Some("[tool] second invented result".len()),
+            "the result alone"
+        );
         // Two results in one turn, then a third appended to the same run.
         let mut two = next.clone();
         two.extend([call("c3"), msg("tool", "a"), msg("tool", "b")]);
@@ -697,6 +728,43 @@ mod tests {
         assert_eq!(
             new_input_chars([earlier.messages.as_slice()], &prompt),
             None
+        );
+    }
+
+    /// A run well past the cap, in multi-byte text: the run is cut as it
+    /// is read (past four caps of bytes) and again at the end, and each
+    /// kept message's start still points at its own `[tool]` marker,
+    /// counted in characters, not bytes. Messages cut away start at 0.
+    #[test]
+    fn a_run_past_the_cap_keeps_its_message_starts_in_characters() {
+        const RESULTS: usize = 20;
+        let body = |index: usize| format!("m{index} {}", "\u{e9}\u{4e16}".repeat(2_000));
+        let mut messages = vec![msg("system", "s"), msg("user", "task"), call("c1")];
+        messages.extend((0..RESULTS).map(|index| msg("tool", &body(index))));
+        let read: usize = (0..RESULTS).map(|index| body(index).len() + 8).sum();
+        assert!(read > 4 * INPUT_CAP_CHARS, "the run is cut while read");
+        let text = chat(&messages);
+        assert_eq!(text.input.chars().count(), INPUT_CAP_CHARS);
+        assert!(text.input.len() > INPUT_CAP_CHARS, "multi-byte");
+        assert_eq!(text.input_parts.len(), RESULTS);
+        let chars: Vec<char> = text.input.chars().collect();
+        let kept: Vec<_> = text.input_parts.iter().filter(|(_, at)| *at > 0).collect();
+        assert!(kept.len() >= 7 && kept.len() < RESULTS, "{}", kept.len());
+        for (index, at) in &kept {
+            let head: String = chars[*at..].iter().take(12).collect();
+            let expect = format!("[tool] m{} ", index - 3);
+            assert!(
+                head.starts_with(&expect),
+                "{head:?} at {at} is not {expect:?}"
+            );
+        }
+        // The last result appended to the previous request's run: exactly
+        // its own characters are new.
+        let earlier = chat(&messages[..messages.len() - 1]);
+        let new = new_input_chars([earlier.messages.as_slice()], &text);
+        assert_eq!(
+            new,
+            Some("[tool] ".len() + body(RESULTS - 1).chars().count())
         );
     }
 

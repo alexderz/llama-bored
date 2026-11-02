@@ -175,9 +175,18 @@ fn chars_per_sec(shown: usize, whole: Option<usize>, tokens: Option<u64>, tps: O
     tps * per_token(whole, tokens)
 }
 
+/// Uncached tokens past twice the message diff's that still read as the
+/// diff (DER-451). An agent turn's uncached count also holds the re-sent
+/// tool call, template tokens and the cache's block rounding: up to about
+/// 2,000 tokens over its new messages on real turns. A cache miss is a
+/// whole prompt.
+const MISS_SLACK_TOKENS: f64 = 4_096.0;
+
 /// Characters at the end of IN's `shown` text that this request appended
 /// (DER-451): the message diff, else the uncached tokens at the text's
-/// characters per token, else all of it.
+/// characters per token, else all of it. When the uncached tokens are far
+/// more than the diff's (a cache miss: evicted, reloaded, or a rewritten
+/// history), the larger estimate wins, so a miss is not under-scrolled.
 fn new_input(
     shown: usize,
     diff: Option<usize>,
@@ -185,18 +194,30 @@ fn new_input(
     tokens: Option<u64>,
     cached: Option<u64>,
 ) -> usize {
-    if let Some(new) = diff {
-        return new.min(shown);
-    }
-    match (tokens, cached) {
-        (Some(tokens), Some(cached)) if tokens > 0 => {
-            let chars = tokens.saturating_sub(cached) as f64 * per_token(whole, Some(tokens));
-            if chars.is_finite() && chars < shown as f64 {
-                chars.ceil() as usize
+    let per = per_token(whole, tokens);
+    let uncached = match (tokens, cached) {
+        (Some(tokens), Some(cached)) if tokens > 0 => Some(tokens.saturating_sub(cached)),
+        _ => None,
+    };
+    let estimate = uncached.map(|uncached| {
+        let chars = uncached as f64 * per;
+        if chars.is_finite() && chars < shown as f64 {
+            chars.ceil() as usize
+        } else {
+            shown
+        }
+    });
+    match (diff, uncached, estimate) {
+        (Some(new), Some(uncached), Some(estimate)) => {
+            let new = new.min(shown);
+            if uncached as f64 > 2.0 * (new as f64 / per) + MISS_SLACK_TOKENS {
+                estimate.max(new)
             } else {
-                shown
+                new
             }
         }
+        (Some(new), ..) => new.min(shown),
+        (None, _, Some(estimate)) => estimate,
         _ => shown,
     }
 }
@@ -742,6 +763,39 @@ mod tests {
         sample.input_cached = None;
         let view = Motion::default().update(&sample, now);
         assert_eq!(view.inn, Some(0), "an unknown cache crosses everything");
+    }
+
+    /// A cache miss (DER-451): the diff says one small message is new, the
+    /// engine says nothing was cached. The uncached estimate wins. An agent
+    /// turn whose uncached count is the diff plus about 2,000 tokens of
+    /// re-sent call, template and block rounding keeps the diff.
+    #[test]
+    fn a_cache_miss_beats_a_small_diff_but_an_agent_turn_does_not() {
+        let now = Instant::now();
+        let text = chars(&"x".repeat(8_192));
+        let rows = [turn(1, 1_000.0, 30.0)];
+        let mut sample = sample(1, &text, &[], &rows, None, None);
+        sample.input_chars = None;
+        // A rewritten conversation: 100 new characters, nothing cached.
+        sample.input_new = Some(100);
+        sample.input_tokens = Some(26_659);
+        sample.input_cached = Some(0);
+        assert_eq!(Motion::default().update(&sample, now).inn, Some(0));
+        // An agent turn: 884 new characters, 2,226 uncached tokens.
+        sample.input_new = Some(884);
+        sample.input_tokens = Some(32_178);
+        sample.input_cached = Some(29_952);
+        assert_eq!(
+            Motion::default().update(&sample, now).inn,
+            Some(8_192 - 884)
+        );
+        // No cached count: the diff alone.
+        sample.input_new = Some(100);
+        sample.input_cached = None;
+        assert_eq!(
+            Motion::default().update(&sample, now).inn,
+            Some(8_192 - 100)
+        );
     }
 
     /// No rate at all: IN uses the fast default, not two seconds, and the
