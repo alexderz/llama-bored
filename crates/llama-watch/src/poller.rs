@@ -145,7 +145,7 @@ use llama_core::sample::{AiState, LlamaView, ModelInfo};
 use llama_core::wire::CANONICAL_NAME_CHARS;
 
 use crate::activity::{self, ActivityRow};
-use crate::capture::{CAPTURE_CAP, parse_capture};
+use crate::capture::{CAPTURE_CAP, MessageMark, new_input_chars, parse_capture, shown_new};
 use crate::config::{PromptView, ValidWatchConfig};
 use crate::jobs::{self, Job, Jobs};
 use crate::live::{LOADS_CAP, LiveBook, LiveTokens, parse_loads};
@@ -171,6 +171,12 @@ use crate::tty::grid::Cell;
 use crate::vllm_phase::VllmPhaseBook;
 
 const RUNNING_CAP: usize = 64 * 1024;
+/// Captured requests per model whose message marks are kept for the IN
+/// diff (DER-451). Several, so conversations that interleave on one model
+/// each still find their own last request.
+const REQUEST_MARKS: usize = 8;
+/// Most models with kept request marks.
+const REQUEST_MARK_MODELS: usize = 16;
 /// llama-server's `/metrics` is a few KiB.
 const LLAMACPP_METRICS_CAP: usize = 64 * 1024;
 /// SGLang and vLLM export latency histograms per label set; SGLang's is
@@ -333,6 +339,10 @@ pub struct CaptureView {
     pub input_note: String,
     /// The answer.
     pub output: Vec<Cell>,
+    /// Characters at the end of [`Self::input`] that this request appended
+    /// (DER-451, [`new_input_chars`]); `None` when its messages give no
+    /// answer and the uncached token count has to.
+    pub input_new: Option<usize>,
     /// Characters of the whole answer [`Self::output`] is the tail of
     /// (DER-451). IN has no such count: it is the newest messages, not a
     /// tail of the prompt its token count covers.
@@ -671,6 +681,9 @@ struct State<L> {
     capture_seen: Option<(u32, i64)>,
     /// The capture shown, with the raw id of its model.
     capture: Option<(String, CaptureView)>,
+    /// Message marks of the last [`REQUEST_MARKS`] captured requests per
+    /// model id, for IN's new part (DER-451). Hashes and roles, no text.
+    request_marks: HashMap<String, std::collections::VecDeque<Vec<MessageMark>>>,
     /// Ready llama.cpp models whose `/slots` carries no text: IN and OUT
     /// come from their captures (#66).
     slots_textless: HashSet<String>,
@@ -792,6 +805,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         activity_failed: false,
         capture_seen: None,
         capture: None,
+        request_marks: HashMap::new(),
         slots_textless: HashSet::new(),
         textless_logged: HashSet::new(),
         capture_failed: false,
@@ -2128,15 +2142,24 @@ impl<L: Sink> State<L> {
         let url = join_url(&self.limits.url, &format!("api/captures/{}", row.id));
         let failure = match get_limited(&self.agent, &url, CAPTURE_TIMEOUT, CAPTURE_CAP) {
             Ok(Limited::Exact(bytes)) => match parse_capture(&bytes) {
-                Some(text) => {
+                Some(mut text) => {
+                    let input_new =
+                        new_capture_input(&mut self.request_marks, &model.id, &mut text);
+                    let input =
+                        prompt_cells(&text.input, self.limits.input_tail, self.limits.prompt_view);
+                    let input_new = input_new.map(|new| {
+                        shown_new(
+                            new,
+                            text.input.chars().count(),
+                            self.limits.input_tail,
+                            input.len(),
+                        )
+                    });
                     let view = CaptureView {
                         model: model.name.clone(),
                         id: row.id,
-                        input: prompt_cells(
-                            &text.input,
-                            self.limits.input_tail,
-                            self.limits.prompt_view,
-                        ),
+                        input,
+                        input_new,
                         input_note: text.input_note,
                         output: tail_cells(&text.output, self.limits.output_tail),
                         output_chars: Some(text.output.chars().count()).filter(|chars| *chars > 0),
@@ -2976,6 +2999,30 @@ fn stopped(stop: &Receiver<()>) -> bool {
     }
 }
 
+/// IN's new characters in `text` (DER-451), from the requests to `model`
+/// this run has captured (`kept`), which this one then joins. Its marks are
+/// moved out of `text`.
+fn new_capture_input(
+    kept: &mut HashMap<String, std::collections::VecDeque<Vec<MessageMark>>>,
+    model: &str,
+    text: &mut crate::capture::CaptureText,
+) -> Option<usize> {
+    let new = new_input_chars(
+        kept.get(model).into_iter().flatten().map(Vec::as_slice),
+        text,
+    );
+    let marks = std::mem::take(&mut text.messages);
+    if marks.is_empty() || (!kept.contains_key(model) && kept.len() >= REQUEST_MARK_MODELS) {
+        return new;
+    }
+    let list = kept.entry(model.to_owned()).or_default();
+    list.push_back(marks);
+    while list.len() > REQUEST_MARKS {
+        list.pop_front();
+    }
+    new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3493,6 +3540,7 @@ mod tests {
             slots_failed: false,
             activity_failed: false,
             capture_seen: None,
+            request_marks: HashMap::new(),
             capture: None,
             slots_textless: HashSet::new(),
             textless_logged: HashSet::new(),

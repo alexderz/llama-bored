@@ -1409,6 +1409,11 @@ struct ScrollIdentity {
     output_tokens: Option<u64>,
     input_chars: Option<usize>,
     output_chars: Option<usize>,
+    /// Of `input_tokens`, those the engine reused from its cache.
+    input_cached: Option<u64>,
+    /// Characters at the end of IN that this request appended, when the
+    /// capture's messages tell.
+    input_new: Option<usize>,
 }
 
 fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> ScrollIdentity {
@@ -1418,15 +1423,21 @@ fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> Scrol
             .map(|row| row.model.clone())
             .unwrap_or_else(|| capture.model.clone());
         let request = u64::try_from(capture.id.max(0)).unwrap_or(0);
+        let prompt = row.and_then(ActivityRow::prompt);
         return ScrollIdentity {
             model,
             request,
-            input_tokens: row.and_then(|row| row.input_tokens),
+            input_tokens: prompt.map(|split| split.whole),
             output_tokens: row.and_then(|row| row.output_tokens),
             // A capture's IN is the newest messages, not a tail of the
             // prompt its tokens count: four characters per token.
             input_chars: None,
             output_chars: capture.output_chars,
+            input_cached: row
+                .filter(|row| row.cached_tokens.is_some())
+                .and(prompt)
+                .map(|split| split.cached),
+            input_new: capture.input_new,
         };
     }
     let Some(slot) = pick_slot(&detail.slots) else {
@@ -1458,10 +1469,16 @@ fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> Scrol
     ScrollIdentity {
         model,
         request,
-        input_tokens: (slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens),
+        input_tokens: slot
+            .prompt_total()
+            .or((slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens)),
         output_tokens: (slot.n_decoded > 0).then_some(slot.n_decoded),
         input_chars: slot.input_chars,
         output_chars: slot.output_chars,
+        // While it prefills, a slot's token count is only what it holds so
+        // far, so the uncached part is not known until it decodes.
+        input_cached: slot.prompt_total().and(slot.prompt_cached),
+        input_new: None,
     }
 }
 
@@ -1497,6 +1514,8 @@ fn apply_scroll(
             output_tokens: identity.output_tokens,
             input_chars: identity.input_chars,
             output_chars: identity.output_chars,
+            input_cached: identity.input_cached,
+            input_new: identity.input_new,
             live_prompt,
             live_gen,
             rows: &rows,
@@ -5616,6 +5635,7 @@ mod tests {
             output: cells("An invented answer."),
             over_slots: false,
             output_chars: None,
+            input_new: None,
         });
         let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
@@ -5672,6 +5692,7 @@ mod tests {
             output: cells("An invented answer."),
             over_slots: false,
             output_chars: None,
+            input_new: None,
         };
         // A capture not meant to stand in for slots is not used.
         tick.detail.capture = Some(capture.clone());
