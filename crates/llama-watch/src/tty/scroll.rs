@@ -9,6 +9,14 @@
 //! falls back the same way. Either change keeps the characters already
 //! shown, so the text does not jump.
 //!
+//! Characters per second are tok/s times the characters per token of the
+//! whole text the panel shows a tail of: its full length over its token
+//! count, else four. The panel's own text is capped (`input_tail_chars`),
+//! so its length over the whole prompt's tokens would crawl: a cached
+//! 32k-token prompt with an 8k-character tail moved at a quarter character
+//! per token, crossing in the time a cold prefill of the whole prompt
+//! takes instead of the time its tail takes (DER-451).
+//!
 //! A streaming update (the text grows while it is generated) keeps the tail
 //! and does not jump back to the top. Text shorter than the panel is the
 //! layout's concern: a scroll of zero starts at the top, and a window that
@@ -49,6 +57,11 @@ pub struct Sample<'a> {
     pub output: &'a [char],
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Characters of the whole prompt that [`Self::input`] is a tail of,
+    /// when known. Not the length of `input`, which is capped.
+    pub input_chars: Option<usize>,
+    /// Characters of the whole reply that [`Self::output`] is a tail of.
+    pub output_chars: Option<usize>,
     /// Live prefill tok/s (`/slots` or tqLLM). Not a held burst speed.
     pub live_prompt: Option<f64>,
     /// Live generation tok/s. Not a wall-clock spike from a burst engine.
@@ -126,12 +139,14 @@ fn positive(rate: Option<f64>) -> Option<f64> {
     rate.filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
-fn chars_per_sec(chars: usize, tokens: Option<u64>, tps: Option<f64>) -> f64 {
+/// `shown` is the panel's text, `whole` the full text it is a tail of. Its
+/// tokens are the whole text's, so only `whole` is divided by them.
+fn chars_per_sec(shown: usize, whole: Option<usize>, tokens: Option<u64>, tps: Option<f64>) -> f64 {
     let Some(tps) = tps else {
-        return chars as f64 / FALLBACK_SECS;
+        return shown as f64 / FALLBACK_SECS;
     };
-    let per_token = match tokens {
-        Some(n) if n > 0 => chars as f64 / n as f64,
+    let per_token = match (whole, tokens) {
+        (Some(chars), Some(n)) if chars > 0 && n > 0 => chars as f64 / n as f64,
         _ => DEFAULT_CHARS_PER_TOKEN,
     };
     tps * per_token
@@ -157,6 +172,8 @@ fn continues(prev: &[char], next: &[char]) -> bool {
 /// Speed inputs for one panel of one frame.
 struct Pace<'a> {
     tokens: Option<u64>,
+    /// Characters of the whole text, when known.
+    chars: Option<usize>,
     live: Option<f64>,
     own: Option<f64>,
     history: &'a VecDeque<f64>,
@@ -210,7 +227,7 @@ impl Panel {
             return;
         }
         let tps = choose(pace.live, pace.history, pace.own);
-        let cps = chars_per_sec(text.len(), pace.tokens, tps);
+        let cps = chars_per_sec(text.len(), pace.chars, pace.tokens, tps);
         if self.request == request && self.text.as_slice() == text {
             self.retarget(cps, now);
             return;
@@ -327,6 +344,7 @@ impl Motion {
             sample.input,
             Pace {
                 tokens: sample.input_tokens,
+                chars: sample.input_chars,
                 live: sample.live_prompt,
                 own: own_prompt,
                 history: &prompt_hist,
@@ -338,6 +356,7 @@ impl Motion {
             sample.output,
             Pace {
                 tokens: sample.output_tokens,
+                chars: sample.output_chars,
                 live: sample.live_gen,
                 own: own_gen,
                 history: &gen_hist,
@@ -411,6 +430,8 @@ mod tests {
             output,
             input_tokens: Some(input.len() as u64),
             output_tokens: Some(output.len() as u64),
+            input_chars: Some(input.len()),
+            output_chars: Some(output.len()),
             live_prompt,
             live_gen,
             rows,
@@ -566,6 +587,62 @@ mod tests {
         sample.output_tokens = None;
         let view = motion.update(&sample, now);
         assert!((view.out_cps.expect("cps") - 40.0).abs() < 1e-9);
+    }
+
+    /// An 8,192-character IN tail of a 32,178-token prompt, 29,952 of them
+    /// cached, read at 3,000 tok/s (DER-451). At four characters per token
+    /// the tail is about 2,048 tokens and crosses in under a second. Its
+    /// own length over the whole prompt's tokens would take 10.7 s, the
+    /// time to prefill all 32,178 tokens cold.
+    #[test]
+    fn a_capped_tail_of_a_cached_prompt_crosses_at_the_prefill_rate() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let tail = chars(&"t".repeat(8_192));
+        let rows = [turn(1, 3_000.0, 30.0)];
+        let mut sample = sample(1, &tail, &[], &rows, None, None);
+        sample.input_tokens = Some(32_178);
+        sample.input_chars = None;
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 12_000.0).abs() < 1e-9);
+        let crossed = motion.update(&sample, now + std::time::Duration::from_millis(683));
+        assert_eq!(crossed.inn, Some(8_192), "the tail is through in 0.68 s");
+
+        // The whole prompt's length is known: its own characters per token.
+        let mut motion = Motion::default();
+        sample.input_chars = Some(96_534);
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 9_000.0).abs() < 1e-9);
+    }
+
+    /// A 24,576-character OUT tail of a 10,000-token reply that was 40,000
+    /// characters in all (DER-451): four characters per token, not 2.5.
+    #[test]
+    fn a_capped_reply_tail_uses_the_whole_reply_per_token() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let tail = chars(&"r".repeat(24_576));
+        let rows = [turn(1, 3_000.0, 30.0)];
+        let mut sample = sample(1, &[], &tail, &rows, None, None);
+        sample.output_tokens = Some(10_000);
+        sample.output_chars = Some(40_000);
+        let view = motion.update(&sample, now);
+        assert!((view.out_cps.expect("cps") - 120.0).abs() < 1e-9);
+    }
+
+    /// Text that is not capped is its own whole: the speed is what it was.
+    #[test]
+    fn an_uncapped_text_keeps_its_own_characters_per_token() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let text = chars(&"u".repeat(600));
+        let rows = [turn(1, 100.0, 10.0)];
+        let mut sample = sample(1, &text, &text, &rows, None, None);
+        sample.input_tokens = Some(200);
+        sample.output_tokens = Some(300);
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 300.0).abs() < 1e-9);
+        assert!((view.out_cps.expect("cps") - 20.0).abs() < 1e-9);
     }
 
     /// Seven completed turns. The last burst averages only the previous

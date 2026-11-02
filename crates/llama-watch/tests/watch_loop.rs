@@ -1462,6 +1462,8 @@ fn detail_output(text: &str) -> LlamaDetail {
             .chars()
             .map(|ch| Cell::new(ch, C16::White, C16::Black))
             .collect(),
+        input_chars: None,
+        output_chars: None,
     });
     detail
 }
@@ -1500,6 +1502,8 @@ fn slot_text(id: i64, text: &str, busy: bool) -> SlotView {
             .chars()
             .map(|ch| Cell::new(ch, C16::White, C16::Black))
             .collect(),
+        input_chars: None,
+        output_chars: None,
     }
 }
 

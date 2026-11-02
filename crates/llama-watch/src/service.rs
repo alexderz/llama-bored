@@ -1399,22 +1399,35 @@ fn live_token_rates(detail: &LlamaDetail, models: &[ModelInfo]) -> (Option<f64>,
     (prompt_live, gen_live)
 }
 
-fn scroll_identity(
-    detail: &LlamaDetail,
-    capture: Option<&CaptureView>,
-) -> (String, u64, Option<u64>, Option<u64>) {
+/// Whose text the panels show, and the token and character counts of the
+/// whole prompt and reply that IN and OUT are tails of (DER-451).
+#[derive(Debug, Default, PartialEq)]
+struct ScrollIdentity {
+    model: String,
+    request: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    input_chars: Option<usize>,
+    output_chars: Option<usize>,
+}
+
+fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> ScrollIdentity {
     if let Some(capture) = capture {
         let row = detail.activity.iter().find(|row| row.id == capture.id);
         let model = row
             .map(|row| row.model.clone())
             .unwrap_or_else(|| capture.model.clone());
         let request = u64::try_from(capture.id.max(0)).unwrap_or(0);
-        return (
+        return ScrollIdentity {
             model,
             request,
-            row.and_then(|row| row.input_tokens),
-            row.and_then(|row| row.output_tokens),
-        );
+            input_tokens: row.and_then(|row| row.input_tokens),
+            output_tokens: row.and_then(|row| row.output_tokens),
+            // A capture's IN is the newest messages, not a tail of the
+            // prompt its tokens count: four characters per token.
+            input_chars: None,
+            output_chars: capture.output_chars,
+        };
     }
     let Some(slot) = pick_slot(&detail.slots) else {
         let model = detail
@@ -1422,7 +1435,10 @@ fn scroll_identity(
             .first()
             .map(|setup| setup.key.clone())
             .unwrap_or_default();
-        return (model, 0, None, None);
+        return ScrollIdentity {
+            model,
+            ..ScrollIdentity::default()
+        };
     };
     let model = detail
         .setup
@@ -1439,12 +1455,14 @@ fn scroll_identity(
             .wrapping_add(slot.id_task as u64)
             .max(1)
     };
-    (
+    ScrollIdentity {
         model,
         request,
-        (slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens),
-        (slot.n_decoded > 0).then_some(slot.n_decoded),
-    )
+        input_tokens: (slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens),
+        output_tokens: (slot.n_decoded > 0).then_some(slot.n_decoded),
+        input_chars: slot.input_chars,
+        output_chars: slot.output_chars,
+    }
 }
 
 fn apply_scroll(
@@ -1455,7 +1473,7 @@ fn apply_scroll(
     models: &[ModelInfo],
     now: Instant,
 ) {
-    let (model, request, input_tokens, output_tokens) = scroll_identity(detail, capture);
+    let identity = scroll_identity(detail, capture);
     let input = text_chars(&text.in_lines);
     let output = text_chars(&text.out_lines);
     let rows: Vec<crate::tty::scroll::Turn> = detail
@@ -1471,12 +1489,14 @@ fn apply_scroll(
     let (live_prompt, live_gen) = live_token_rates(detail, models);
     let view = motion.update(
         &crate::tty::scroll::Sample {
-            model: &model,
-            request,
+            model: &identity.model,
+            request: identity.request,
             input: &input,
             output: &output,
-            input_tokens,
-            output_tokens,
+            input_tokens: identity.input_tokens,
+            output_tokens: identity.output_tokens,
+            input_chars: identity.input_chars,
+            output_chars: identity.output_chars,
             live_prompt,
             live_gen,
             rows: &rows,
@@ -2111,6 +2131,8 @@ fn strata_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
                     ctx_used: Some(held),
                     resets: Default::default(),
                     last_reset: None,
+                    input_chars: None,
+                    output_chars: None,
                 }
             })
         })
@@ -2228,6 +2250,8 @@ fn tqllm_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
                     ctx_used: Some(prompt + decoded),
                     resets: Default::default(),
                     last_reset: None,
+                    input_chars: None,
+                    output_chars: None,
                 }
             })
         })
@@ -3623,6 +3647,8 @@ mod tests {
             last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
         };
         let slots = layout_slots(&[view], &CtxBook::new(6));
         assert_eq!(slots[0].ctx_prompt, Some(91_000));
@@ -3720,6 +3746,9 @@ mod tests {
             last_reset: None,
             input: secret_cells(input),
             output: secret_cells(output),
+            // Untrimmed, as SlotBook sets them for a text it read whole.
+            input_chars: Some(input.chars().count()).filter(|n| *n > 0),
+            output_chars: Some(output.chars().count()).filter(|n| *n > 0),
         }
     }
 
@@ -4078,6 +4107,8 @@ mod tests {
                         last_reset: None,
                         input: secret_cells(SECRET_IN),
                         output: secret_cells(SECRET_OUT),
+                        input_chars: None,
+                        output_chars: None,
                     }],
                     activity: Vec::new(),
                     gen_tps: Some(40.0),
@@ -4395,6 +4426,8 @@ mod tests {
             last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
         }];
         assert_eq!(
             shown(&sample, &detail).map(|v| v.0),
@@ -5582,6 +5615,7 @@ mod tests {
             input_note: String::new(),
             output: cells("An invented answer."),
             over_slots: false,
+            output_chars: None,
         });
         let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
@@ -5637,6 +5671,7 @@ mod tests {
             input_note: String::new(),
             output: cells("An invented answer."),
             over_slots: false,
+            output_chars: None,
         };
         // A capture not meant to stand in for slots is not used.
         tick.detail.capture = Some(capture.clone());

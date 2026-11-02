@@ -53,6 +53,13 @@ pub struct SlotView {
     /// Sanitised generated tail from this poll, or the previous tail when
     /// text was skipped.
     pub output: Vec<Cell>,
+    /// Characters of the whole prompt [`Self::input`] is the tail of, when
+    /// its text was read. Scroll speed uses it with the prompt's tokens
+    /// (DER-451).
+    pub input_chars: Option<usize>,
+    /// Characters of the whole generated text [`Self::output`] is the tail
+    /// of, when this poll read it.
+    pub output_chars: Option<usize>,
     /// Context the slot holds (#10): `n_prompt_tokens`, and an idle slot
     /// keeps its last value (its KV cache stays). `None` until `/slots`
     /// gave a prompt count.
@@ -141,6 +148,8 @@ struct Tracked {
     prompt_cached: Option<u64>,
     input: Vec<Cell>,
     output: Vec<Cell>,
+    input_chars: Option<usize>,
+    output_chars: Option<usize>,
     captured_task: Option<i64>,
 }
 
@@ -573,14 +582,20 @@ impl SlotBook {
                 .iter()
                 .find(|row| row.model_id == model_id && row.id == slot.id);
             let mut captured_task = prev.and_then(|row| row.captured_task);
-            let input = if captured_task == Some(slot.id_task) {
-                prev.map(|row| row.input.clone()).unwrap_or_default()
+            let (input, input_chars) = if captured_task == Some(slot.id_task) {
+                (
+                    prev.map(|row| row.input.clone()).unwrap_or_default(),
+                    prev.and_then(|row| row.input_chars),
+                )
             } else {
                 captured_task = Some(slot.id_task);
-                prompt_cells(&prompt, input_tail, self.prompt_view)
+                (
+                    prompt_cells(&prompt, input_tail, self.prompt_view),
+                    whole_chars(&prompt),
+                )
             };
             let output = tail_cells(&slot.generated, output_tail);
-            next.push(tracked(
+            let mut row = tracked(
                 model_id,
                 display,
                 slot,
@@ -588,7 +603,10 @@ impl SlotBook {
                 output,
                 captured_task,
                 self.phase_for(model_id, slot),
-            ));
+            );
+            row.input_chars = input_chars;
+            row.output_chars = whole_chars(&slot.generated);
+            next.push(row);
         }
         self.slots.retain(|row| row.model_id != model_id);
         self.slots.extend(next);
@@ -748,6 +766,8 @@ impl SlotBook {
                 prompt_cached: row.prompt_cached,
                 input: row.input.clone(),
                 output: row.output.clone(),
+                input_chars: row.input_chars,
+                output_chars: row.output_chars,
                 ctx_used: self.ctx_of(row).and_then(|track| track.held),
                 resets: self
                     .ctx_of(row)
@@ -793,8 +813,16 @@ fn tracked(
         prompt_cached: slot.n_prompt_tokens_cache,
         input,
         output,
+        input_chars: None,
+        output_chars: None,
         captured_task,
     }
+}
+
+/// Characters of a whole text before its tail is cut; `None` when empty.
+fn whole_chars(text: &str) -> Option<usize> {
+    let chars = text.chars().count();
+    (chars > 0).then_some(chars)
 }
 
 struct LightSlot {
@@ -1069,6 +1097,31 @@ mod tests {
                 .any(|ch| ch == '\u{1b}' || (ch != '\n' && ch < ' '))
         );
         assert!(!format!("{slots:?}").contains("DROP_ME_GRAMMAR"));
+    }
+
+    /// The whole prompt and reply lengths ride with their capped tails, so
+    /// scroll speed does not divide a 256-character tail by the whole
+    /// prompt's tokens (DER-451). The prompt is read once per task; its
+    /// length stays with the kept tail.
+    #[test]
+    fn slots_keep_whole_text_lengths_beside_the_tails() {
+        let mut book = SlotBook::default();
+        let prompt = "A".repeat(1_000);
+        assert!(book.apply(
+            "m",
+            "Model",
+            &body(4, &prompt, &"B".repeat(700), 3, 2),
+            256,
+            256
+        ));
+        let slots = book.slots();
+        assert_eq!(slots[0].input.len(), 256);
+        assert_eq!(slots[0].input_chars, Some(1_000));
+        assert_eq!(slots[0].output_chars, Some(700));
+        assert!(book.apply("m", "Model", &body(4, "", &"B".repeat(900), 3, 3), 256, 256));
+        let slots = book.slots();
+        assert_eq!(slots[0].input_chars, Some(1_000), "same task, same prompt");
+        assert_eq!(slots[0].output_chars, Some(900));
     }
 
     #[test]

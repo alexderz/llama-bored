@@ -159,7 +159,7 @@ use crate::series::{ModelSeries, SeriesBook};
 use crate::setup_rules::{Found, Rules};
 use crate::setup_specs::Specs;
 use crate::sglang_rows::{Claim, SglangBook, Totals};
-use crate::slots::{SlotBook, SlotView, prompt_cells, tail_cells};
+use crate::slots::{ChartPhase, SlotBook, SlotView, prompt_cells, tail_cells};
 use crate::sources::cmdline::{KvLayout, TqKv};
 use crate::sources::events::{
     DisplacedNote, Events, EventsView, GpuReservation, ModelClaim, claim_model,
@@ -168,6 +168,7 @@ use crate::sources::llamaswap;
 use crate::speeds::SpeedBook;
 use crate::tqllm::{RowClaim, TqllmBook};
 use crate::tty::grid::Cell;
+use crate::vllm_phase::VllmPhaseBook;
 
 const RUNNING_CAP: usize = 64 * 1024;
 /// llama-server's `/metrics` is a few KiB.
@@ -332,6 +333,10 @@ pub struct CaptureView {
     pub input_note: String,
     /// The answer.
     pub output: Vec<Cell>,
+    /// Characters of the whole answer [`Self::output`] is the tail of
+    /// (DER-451). IN has no such count: it is the newest messages, not a
+    /// tail of the prompt its token count covers.
+    pub output_chars: Option<usize>,
     /// The model has `/slots` without text (#66): IN and OUT show this
     /// capture over its slots.
     pub over_slots: bool,
@@ -629,6 +634,9 @@ struct State<L> {
     speeds: SpeedBook,
     /// SGLang cached tokens and speeds from a single-request window (#133).
     sglang: SglangBook,
+    /// Prefill or decode of each vLLM model's running requests, for the
+    /// READ chart (DER-451).
+    vllm_phase: VllmPhaseBook,
     /// Per-model cumulative numbers for llama-metrics (#71).
     series: SeriesBook,
     /// Server kind `/metrics` gave each loaded model the launch command did
@@ -765,6 +773,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         engines: EngineBook::default(),
         speeds: SpeedBook::default(),
         sglang: SglangBook::default(),
+        vllm_phase: VllmPhaseBook::default(),
         series: SeriesBook::default(),
         detected: HashMap::new(),
         detect_logged: HashSet::new(),
@@ -1091,6 +1100,7 @@ impl<L: Sink> State<L> {
         self.engines.forget(id);
         self.speeds.forget(id);
         self.sglang.forget(id);
+        self.vllm_phase.forget(id);
         self.series.forget_gauges(id);
     }
 
@@ -1323,6 +1333,9 @@ impl<L: Sink> State<L> {
                 );
                 let engine = self.engines.observe(&model.id, sample);
                 self.speeds.observe(&model.id, now, sample.speeds);
+                if model.backend == Backend::Vllm {
+                    self.vllm_phase.observe(&model.id, sample, now);
+                }
                 if model.backend == Backend::SgLang {
                     self.sglang.observe_scrape(
                         &model.id,
@@ -2126,6 +2139,7 @@ impl<L: Sink> State<L> {
                         ),
                         input_note: text.input_note,
                         output: tail_cells(&text.output, self.limits.output_tail),
+                        output_chars: Some(text.output.chars().count()).filter(|chars| *chars > 0),
                         over_slots: model.backend.has_slots(),
                     };
                     self.capture = Some((model.id.clone(), view));
@@ -2194,6 +2208,7 @@ impl<L: Sink> State<L> {
         // spike back. A slot that is actually in flight still reports its
         // rate, including 0 while it is decoding (#188).
         let slots_rate = self.slots_prompt_rate(now);
+        let burst = self.burst_prompt_engine(now);
         let llama_busy = self.ready.iter().any(|model| {
             model.backend == Backend::LlamaCpp
                 && self
@@ -2243,23 +2258,25 @@ impl<L: Sink> State<L> {
                         .and_then(|live| live.prefill_tps_sum()),
                     _ => None,
                 };
-                let chart_rate = if model.backend == Backend::LlamaCpp {
-                    let active = self
-                        .counter
-                        .requests_processing(&model.id, now)
-                        .unwrap_or(0.0);
-                    match self.slots.chart_phase(
-                        &model.id,
-                        active,
-                        now,
-                        self.limits.slots_interval * 2,
-                    ) {
-                        Some(crate::slots::ChartPhase::Decode) => Some(0.0),
-                        Some(crate::slots::ChartPhase::Prefill) => rate,
-                        None => None,
+                let chart_rate = match model.backend {
+                    Backend::LlamaCpp => {
+                        let active = self
+                            .counter
+                            .requests_processing(&model.id, now)
+                            .unwrap_or(0.0);
+                        match self.slots.chart_phase(
+                            &model.id,
+                            active,
+                            now,
+                            self.limits.slots_interval * 2,
+                        ) {
+                            Some(ChartPhase::Decode) => Some(0.0),
+                            Some(ChartPhase::Prefill) => rate,
+                            None => None,
+                        }
                     }
-                } else {
-                    rate
+                    Backend::Vllm | Backend::SgLang => self.burst_chart_rate(model, now),
+                    _ => rate,
                 };
                 if let Some(value) = chart_rate {
                     chart_sum += value;
@@ -2286,18 +2303,25 @@ impl<L: Sink> State<L> {
                 busy,
                 slots_rate,
                 prompt_rate,
-                self.burst_prompt_engine(now),
+                burst,
                 self.held_burst_prompt(now),
             )
         };
         // #180: with only tqLLM loaded, GEN and PROMPT are its requests'
         // own rates, `--` until it has them.
-        let (gen_tps, prompt_tps) = match self.tqllm_rates(now) {
-            Some(rates) if self.running_up => rates,
-            _ => (gen_tps, prompt_tps),
-        };
+        let tq_rates = self.tqllm_rates(now).filter(|_| self.running_up);
+        let tq_rated = tq_rates.is_some();
+        let (gen_tps, prompt_tps) = tq_rates.unwrap_or((gen_tps, prompt_tps));
         if !llama_busy {
-            chart_prompt_tps = prompt_tps;
+            // DER-451: the headline holds a burst engine's last prefill
+            // speed through the whole request. The chart shows it only
+            // while a request is prefilling, and 0 while all of them decode.
+            let slots_live = slots_rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+            chart_prompt_tps = if self.running_up && busy && burst && !slots_live && !tq_rated {
+                self.burst_chart_prompt(now)
+            } else {
+                prompt_tps
+            };
         }
         let view = LlamaView {
             ai: self.ai,
@@ -2454,6 +2478,45 @@ impl<L: Sink> State<L> {
             }
         }
         (n > 0).then_some(sum)
+    }
+
+    /// READ chart input of one busy burst-engine model (DER-451): its held
+    /// prefill speed while one of its requests is prefilling, 0 while every
+    /// running one decodes, `None` when the phase is unknown. vLLM's phase
+    /// is [`VllmPhaseBook`]'s. SGLang's is never known here: its `/metrics`
+    /// gauges lag its requests by up to 40 decode steps ([`crate::live`]),
+    /// so its running count cannot be set against its first-token count.
+    /// Its chart is unknown while it is busy, not its held speed.
+    fn burst_chart_rate(&self, model: &ReadyModel, now: Instant) -> Option<f64> {
+        if model.backend != Backend::Vllm {
+            return None;
+        }
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        match self.vllm_phase.phase(&model.id, now, fresh)? {
+            ChartPhase::Decode => Some(0.0),
+            ChartPhase::Prefill => self
+                .engines
+                .prefill_tps(&model.id)
+                .filter(|rate| rate.is_finite() && *rate >= 0.0),
+        }
+    }
+
+    /// [`Self::burst_chart_rate`] of every busy vLLM and SGLang model,
+    /// added (DER-451). One unknown makes the sum unknown.
+    fn burst_chart_prompt(&self, now: Instant) -> Option<f64> {
+        let mut sum = 0.0;
+        for model in &self.ready {
+            if !matches!(model.backend, Backend::Vllm | Backend::SgLang)
+                || !self
+                    .counter
+                    .requests_processing(&model.id, now)
+                    .is_some_and(|n| n > 0.0)
+            {
+                continue;
+            }
+            sum += self.burst_chart_rate(model, now)?;
+        }
+        Some(sum)
     }
 
     /// [`Self::model_setup`] with each model's engine-reported values (#54),
@@ -3150,6 +3213,158 @@ mod tests {
         assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
     }
 
+    /// One vLLM `/metrics` read of model `v` at `at`, as the scrape folds
+    /// it in: `running` requests, the TTFT and e2e counts, the generated
+    /// counter, and one finished prefill of 4,000 tokens in 2 s (2,000 tok/s).
+    fn vllm_read(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        running: f64,
+        (ttft, e2e): (f64, f64),
+        generated: u64,
+    ) {
+        use crate::metrics::{Hist, MetricsSample};
+        use crate::speeds::{Phase, SpeedTotals};
+        let count = |n: f64| Some(Hist { sum: n, count: n });
+        let sample = MetricsSample {
+            requests_processing: Some(running),
+            queued: Some(0.0),
+            ttft: count(ttft),
+            e2e: count(e2e),
+            n_decode_total: Some(generated),
+            speeds: Some(SpeedTotals {
+                prefill: Some(Phase {
+                    seconds: Hist {
+                        sum: 2.0,
+                        count: 1.0,
+                    },
+                    tokens: Hist {
+                        sum: 4_000.0,
+                        count: 1.0,
+                    },
+                }),
+                decode: None,
+            }),
+            ..MetricsSample::default()
+        };
+        state.engines.observe("v", &sample);
+        state.vllm_phase.observe("v", &sample, at);
+        state.counter.observe("v", generated, Some(running), at);
+    }
+
+    fn vllm_model() -> ReadyModel {
+        ReadyModel {
+            id: "v".into(),
+            name: "v".into(),
+            backend: Backend::Vllm,
+            probe: false,
+        }
+    }
+
+    /// vLLM's READ chart follows its requests' phase (DER-451): the held
+    /// prefill speed while one is prefilling, 0 while every one decodes,
+    /// unknown when the counts do not add up or the phase read is stale.
+    /// The big number keeps the held speed through all of it.
+    #[test]
+    fn vllm_chart_follows_the_request_phase_not_the_held_headline() {
+        let mut state = blank_state();
+        state.running_up = true;
+        state.ready = vec![
+            ReadyModel {
+                id: "cpp".into(),
+                name: "cpp".into(),
+                backend: Backend::LlamaCpp,
+                probe: false,
+            },
+            vllm_model(),
+        ];
+        state.slots.idle();
+        let rx = state.tx.share_with_thread();
+        let publish = |state: &mut State<llama_core::log::Stderr>| {
+            state.publish().unwrap();
+            let (_, detail) = rx.take().unwrap();
+            (detail.prompt_tps, detail.chart_prompt_tps)
+        };
+        vllm_read(&mut state, Instant::now(), 0.0, (1.0, 1.0), 50);
+        assert_eq!(publish(&mut state), (Some(0.0), Some(0.0)), "idle");
+        vllm_read(&mut state, Instant::now(), 1.0, (1.0, 1.0), 50);
+        assert_eq!(
+            publish(&mut state),
+            (Some(2_000.0), Some(2_000.0)),
+            "prefilling"
+        );
+        vllm_read(&mut state, Instant::now(), 1.0, (2.0, 1.0), 51);
+        assert_eq!(
+            publish(&mut state),
+            (Some(2_000.0), Some(0.0)),
+            "decoding: the headline holds, the chart is 0"
+        );
+        vllm_read(&mut state, Instant::now(), 1.0, (2.0, 1.0), 90);
+        assert_eq!(publish(&mut state), (Some(2_000.0), Some(0.0)));
+        vllm_read(&mut state, Instant::now(), 2.0, (2.0, 1.0), 120);
+        assert_eq!(
+            publish(&mut state),
+            (Some(2_000.0), Some(2_000.0)),
+            "a second request prefills beside the decode"
+        );
+        vllm_read(&mut state, Instant::now(), 1.0, (2.0, 3.0), 150);
+        assert_eq!(
+            publish(&mut state),
+            (Some(2_000.0), None),
+            "more finished than started: unknown, not a fabricated phase"
+        );
+        vllm_read(
+            &mut state,
+            Instant::now() - Duration::from_secs(5),
+            1.0,
+            (3.0, 2.0),
+            160,
+        );
+        state.counter.observe("v", 160, Some(1.0), Instant::now());
+        assert_eq!(publish(&mut state), (Some(2_000.0), None), "stale phase");
+        vllm_read(&mut state, Instant::now(), 0.0, (3.0, 3.0), 170);
+        assert_eq!(publish(&mut state), (Some(0.0), Some(0.0)), "done");
+    }
+
+    /// A busy llama.cpp model beside vLLM (DER-451): each model's chart
+    /// input is gated by its own phase and they add.
+    #[test]
+    fn vllm_chart_adds_to_a_busy_llama_cpp_chart() {
+        let mut state = blank_state();
+        state.running_up = true;
+        state.ready = vec![
+            ReadyModel {
+                id: "cpp".into(),
+                name: "cpp".into(),
+                backend: Backend::LlamaCpp,
+                probe: false,
+            },
+            vllm_model(),
+        ];
+        state.counter.observe("cpp", 1, Some(1.0), Instant::now());
+        state.recent.merge(activity::parse_activity(br#"{"data":[{"id":1,"timestamp":"2026-10-29T01:00:01Z","model":"cpp","tokens":{"input_tokens":100,"prompt_per_second":600}}]}"#).unwrap());
+        state.slots.begin_round();
+        assert!(state.slots.apply(
+            "cpp",
+            "cpp",
+            br#"[{"id":0,"id_task":1,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#,
+            0,
+            0
+        ));
+        state.slots.finish_round(Instant::now());
+        let rx = state.tx.share_with_thread();
+        vllm_read(&mut state, Instant::now(), 0.0, (0.0, 0.0), 0);
+        vllm_read(&mut state, Instant::now(), 1.0, (1.0, 0.0), 1);
+        state.publish().unwrap();
+        let (_, detail) = rx.take().unwrap();
+        assert_eq!(detail.prompt_tps, Some(2_600.0));
+        assert_eq!(detail.chart_prompt_tps, Some(600.0), "vLLM decodes");
+        vllm_read(&mut state, Instant::now(), 2.0, (1.0, 0.0), 9);
+        state.publish().unwrap();
+        let (_, detail) = rx.take().unwrap();
+        assert_eq!(detail.chart_prompt_tps, Some(2_600.0), "both prefill");
+    }
+
     /// One finished SGLang request, alone, holds its prefill on the big
     /// number while llama.cpp sits idle beside it (#188). Replacing the
     /// SGLang arm of [`State::held_burst_prompt`] with `None` loses the 200.
@@ -3202,7 +3417,9 @@ mod tests {
             Some(200.0),
             "the big number is the lone SGLang prefill, not the idle 0 or the spike"
         );
-        assert_eq!(detail.chart_prompt_tps, Some(200.0));
+        // DER-451: SGLang's phase is never known, so its chart is unknown
+        // while it is busy, not the held speed through its decode.
+        assert_eq!(detail.chart_prompt_tps, None);
     }
 
     fn blank_state() -> State<llama_core::log::Stderr> {
@@ -3258,6 +3475,7 @@ mod tests {
             engines: EngineBook::default(),
             speeds: SpeedBook::default(),
             sglang: SglangBook::default(),
+            vllm_phase: VllmPhaseBook::default(),
             series: SeriesBook::default(),
             detected: HashMap::new(),
             detect_logged: HashSet::new(),

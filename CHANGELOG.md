@@ -9,6 +9,8 @@ All notable changes to llama-bored. Versions follow
 ### Fixed
 
 - Rate headlines and timeline consistently say WRITE for decode and READ for prefill, matching RECENT; token counts and generation states keep their names.
+- The READ timeline drops to 0 while a vLLM model's requests are all decoding, and shows its prefill speed only while one of them is prefilling, one prefill beside a decode included. The phase comes from the scrape's own counts: requests past their first token (time-to-first-token count minus end-to-end count) against `num_requests_running`; queued requests are not prefilling. When those counts do not add up, the read is stale, or the decode counter stalls, the timeline is unknown rather than a guess. A busy SGLang model is unknown on the timeline instead of holding its last prefill speed through its decode. The big READ number is unchanged (DER-451).
+- IN and OUT scroll at the prefill and generation speed: characters per second are tok/s times the whole text's characters per token (four when its length is not known), not the capped tail's length over the whole prompt's tokens. A heavily cached 32k-token prompt's 8k-character tail used to crawl for the time a cold prefill of all 32k tokens would take (DER-451).
 
 ## 0.7.2 — 2026-10-29
 

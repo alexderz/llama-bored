@@ -32,6 +32,8 @@ fn busy(task: i64, cached: Option<u64>, processed: u64, decoded: u64) -> SlotVie
         ctx_used: Some(held),
         resets: ResetCounts::default(),
         last_reset: None,
+        input_chars: None,
+        output_chars: None,
     }
 }
 
