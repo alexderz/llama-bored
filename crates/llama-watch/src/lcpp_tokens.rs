@@ -99,10 +99,8 @@ struct Book {
     tasks: HashMap<(i64, i64), u64>,
     /// `tokens_predicted_total` rise less the accounted tokens of the
     /// tasks retired since the last settle. Negative only by what the
-    /// current `/slots` round retired (see [`Book::settle`]).
+    /// last `/slots` round retired (see [`Book::drop_old_debt`]).
     balance: i64,
-    /// Accounted tokens of the tasks retired this `/slots` round.
-    retired_round: u64,
     /// Tokens credited ahead of the `/slots` reads, not yet confirmed.
     advance: u64,
     /// Slots decoding at the last `/slots` read.
@@ -161,20 +159,24 @@ impl Book {
     /// `tokens_predicted_total` adds for it, less its tail.
     fn retire(&mut self, accounted: u64) {
         self.balance = self.balance.saturating_sub(signed(accounted));
-        self.retired_round = self.retired_round.saturating_add(accounted);
+    }
+
+    /// Before a round's retires: debt the `/metrics` read since the last
+    /// round has not paid is dropped. The tasks that round retired were
+    /// released after the read before it, so this read's
+    /// `tokens_predicted_total` has them; what is still owed is a task
+    /// llama.cpp never adds, cancelled or aborted, and must not eat later
+    /// tasks' tails (review M2). This round's debt is kept whole.
+    fn drop_old_debt(&mut self) {
+        self.balance = self.balance.max(0);
     }
 
     /// Settle the tail: a positive balance is tokens no read credited. A
-    /// negative one waits for `tokens_predicted_total` only for the tasks
-    /// retired this round, released after the `/metrics` read before it.
-    /// llama.cpp never adds a cancelled task, so older debt is dropped
-    /// rather than eating later tasks' tails (review M2).
+    /// negative one is this round's tasks, owed until the next read.
     fn settle(&mut self) {
         if self.balance > 0 {
             self.confirm(u64::try_from(self.balance).unwrap_or(0));
             self.balance = 0;
-        } else {
-            self.balance = self.balance.max(-signed(self.retired_round));
         }
     }
 
@@ -183,7 +185,6 @@ impl Book {
         self.synced = false;
         self.tasks.clear();
         self.balance = 0;
-        self.retired_round = 0;
         self.streams = 0;
     }
 }
@@ -272,6 +273,7 @@ impl LcppTokens {
             book.busy_since = None;
             if book.mode == Mode::Slots && book.synced {
                 book.balance = book.balance.saturating_add(signed(predicted));
+                book.drop_old_debt();
                 let retired: Vec<u64> = book.tasks.drain().map(|(_, n)| n).collect();
                 for accounted in retired {
                     book.retire(accounted);
@@ -319,7 +321,7 @@ impl LcppTokens {
             return;
         }
         book.slots_at = Some(now);
-        book.retired_round = 0;
+        book.drop_old_debt();
         if book.mode != Mode::Slots {
             book.mode = Mode::Slots;
             book.unsync();
@@ -803,5 +805,52 @@ mod tests {
             // Busy since t0, stale after 3 s: the reads at 4 s and 5 s count.
             assert_eq!(got, expect, "processing {processing}");
         }
+    }
+
+    /// Review of M2: a cancelled task, then rounds that each retire a task,
+    /// released before the `/metrics` read (paid that round), after it
+    /// (paid the next), or with a tail past their last `/slots` read. The
+    /// cancelled task's debt is dropped once and eats no later tail: every
+    /// task counts exactly what it decoded.
+    #[test]
+    fn a_cancelled_tasks_debt_does_not_follow_later_retires() {
+        let mut book = LcppTokens::default();
+        let t0 = Instant::now();
+        let at = |k: u32| t0 + Duration::from_secs(1) * k;
+        book.observe_metrics("m", &read(0, 0, 4.0), at(0));
+        let start: Vec<SlotTokens> = (0..4).map(|i| slot(i, 1 + i, true, 10)).collect();
+        book.observe_slots("m", &start, at(0));
+        // Task 1 is cancelled at 100: never in tokens_predicted_total.
+        book.observe_metrics("m", &read(0, 0, 4.0), at(1));
+        let round = [
+            slot(0, 1, false, 100),
+            slot(1, 2, true, 50),
+            slot(2, 3, true, 50),
+            slot(3, 4, true, 50),
+        ];
+        book.observe_slots("m", &round, at(1));
+        // Task 2 ends at 90 before this read.
+        book.observe_metrics("m", &read(0, 90, 3.0), at(2));
+        let round = [
+            slot(1, 2, false, 90),
+            slot(2, 3, true, 70),
+            slot(3, 4, true, 70),
+        ];
+        book.observe_slots("m", &round, at(2));
+        // Task 3 ends at 80 after this read.
+        book.observe_metrics("m", &read(0, 90, 2.0), at(3));
+        let round = [
+            slot(1, 2, false, 90),
+            slot(2, 3, false, 80),
+            slot(3, 4, true, 90),
+        ];
+        book.observe_slots("m", &round, at(3));
+        // Task 4 ends at 120, 30 past its last read; task 6 has its slot.
+        book.observe_metrics("m", &read(0, 90 + 80 + 120, 1.0), at(4));
+        book.observe_slots("m", &[slot(3, 6, true, 3)], at(4));
+        // Task 6 ends at 10 between reads.
+        let total = book.observe_metrics("m", &read(0, 90 + 80 + 120 + 10, 0.0), at(5));
+        let decoded = (100 - 10) + (90 - 10) + (80 - 10) + (120 - 10) + 10;
+        assert_eq!(total, Some(decoded));
     }
 }
