@@ -81,7 +81,8 @@ fn rate_headings_name_decode_write_and_prefill_read() {
 
 /// C.1: the lines under WRITE and READ for N = 1, 2 and 4 streams. One
 /// stream with nothing queued draws neither; one stream with a queue says
-/// only that. Per stream is WRITE ÷ running.
+/// only that. Per stream is WRITE ÷ the streams decoding, not those in
+/// prefill.
 #[test]
 fn rate_lines_say_streams_each_and_queue_and_stay_quiet_for_one() {
     use llama_watch::tty::layout::{
@@ -104,18 +105,30 @@ fn rate_lines_say_streams_each_and_queue_and_stay_quiet_for_one() {
     );
     assert_eq!(
         write_line(&lines(2, 0), Some(208.0), WRITE_LINE_COLS),
-        "\u{00d7}2 streams \u{00b7} ~104 each"
+        "\u{00d7}2 streams \u{00b7} ~208 each"
     );
     assert_eq!(
         write_line(&lines(4, 2), Some(312.0), WRITE_LINE_COLS),
-        "\u{00d7}4 \u{00b7} ~78.0 each \u{00b7} +2 queued"
+        "\u{00d7}4 \u{00b7} ~104 each \u{00b7} +2 queued"
+    );
+    let mut all_decoding = lines(4, 0);
+    all_decoding.prefilling = Some(0);
+    assert_eq!(
+        write_line(&all_decoding, Some(312.0), WRITE_LINE_COLS),
+        "\u{00d7}4 streams \u{00b7} ~78.0 each"
+    );
+    let mut all_prefilling = lines(2, 0);
+    all_prefilling.prefilling = Some(2);
+    assert_eq!(
+        write_line(&all_prefilling, Some(40.0), WRITE_LINE_COLS),
+        "\u{00d7}2 streams"
     );
     let mut itl = lines(4, 0);
     itl.itl_p50 = Some(0.0096);
     itl.itl_max = Some((0.05, false));
     assert_eq!(
         write_line(&itl, Some(312.0), WRITE_LINE_COLS),
-        "\u{00d7}4 \u{00b7} ~78.0 each \u{00b7} ITL 9.6/\u{2264}50"
+        "\u{00d7}4 \u{00b7} ~104 each \u{00b7} ITL 9.6/\u{2264}50"
     );
     for n in [2, 4] {
         let read = read_line(&lines(n, 0), READ_LINE_COLS);
@@ -130,10 +143,18 @@ fn rate_lines_say_streams_each_and_queue_and_stay_quiet_for_one() {
     }
 }
 
-/// C.1: at 213 columns the lines sit on the blank row under the digits,
-/// WRITE's inside its half and READ's short of SETUP at column 64.
+/// C.1: at 160 (MIN_COLS), 192 and 213 columns the lines sit on the
+/// blank row under the digits, WRITE's inside its half and READ's short
+/// of SETUP at column 64.
 #[test]
-fn rate_lines_fit_under_the_digits_at_213_columns() {
+fn rate_lines_fit_under_the_digits_at_160_192_and_213_columns() {
+    for cols in [160u16, 192] {
+        rate_lines_fit_at(cols);
+    }
+    rate_lines_fit_at(213);
+}
+
+fn rate_lines_fit_at(cols: u16) {
     let mut model = sample(WatchState::Generating);
     model.gen_tps = Some(312.0);
     model.prompt_tps = Some(1_900.0);
@@ -146,15 +167,15 @@ fn rate_lines_fit_under_the_digits_at_213_columns() {
         read_active: Some(2_100.0),
         read_solo: Some(2_412.0),
     };
-    let grid = draw(&model, 213, 60);
+    let grid = draw(&model, cols, 60);
     let row = (0..grid.rows())
-        .find(|row| row_string(&grid, *row).contains("~78.0 each"))
-        .expect("the line under WRITE");
+        .find(|row| row_string(&grid, *row).contains("~104 each"))
+        .unwrap_or_else(|| panic!("the line under WRITE at {cols} columns"));
     let text = full_row(&grid, row);
     // The console cell of `×` is `x`; the rich glyph keeps `×`.
     let write_at = find_chars(&text, "x4 ").unwrap_or_else(|| panic!("streams: {text}"));
     let read_at = find_chars(&text, "1 prefill").expect("prefilling");
-    assert_eq!((write_at, read_at), (2, 32), "{text}");
+    assert_eq!((write_at, read_at), (2, 32), "{cols}: {text}");
     let read_end = read_at + "1 prefill \u{00b7} 2100 while active".chars().count();
     assert!(read_end <= 63, "{text}");
     assert!(
@@ -166,7 +187,7 @@ fn rate_lines_fit_under_the_digits_at_213_columns() {
     );
     model.rate_lines.running = Some(1);
     model.rate_lines.queued = Some(0);
-    let grid = draw(&model, 213, 60);
+    let grid = draw(&model, cols, 60);
     assert_eq!(
         full_row(&grid, row)
             .chars()

@@ -225,7 +225,9 @@ pub const READ_LINE_COLS: usize = 31;
 
 /// The line under WRITE (DER-451): `×3 streams · ~104 each · +2 queued`,
 /// with the inter-token latency p50 and slowest bucket where the engine
-/// has the histogram. Per stream is WRITE ÷ running. Parts are shortened,
+/// has the histogram. Per stream is WRITE ÷ the streams decoding: those
+/// running less those still in prefill, which write nothing yet (a slot
+/// count where the engine says which prefill). Parts are shortened,
 /// then dropped from the end, to fit `width`. Empty for one stream with
 /// nothing queued; `+2 queued` alone for one stream with a queue.
 #[must_use]
@@ -238,8 +240,9 @@ pub fn write_line(lines: &RateLines, gen_tps: Option<f64>, width: usize) -> Stri
             format!("\u{00d7}{running} streams"),
             format!("\u{00d7}{running}"),
         ));
-        if let Some(rate) = gen_tps.filter(|v| v.is_finite() && *v > 0.0) {
-            let each = format_rate_digits(rate / f64::from(running));
+        let decoding = running.saturating_sub(lines.prefilling.unwrap_or(0));
+        if let Some(rate) = gen_tps.filter(|v| v.is_finite() && *v > 0.0 && decoding > 0) {
+            let each = format_rate_digits(rate / f64::from(decoding));
             parts.push((format!("~{each} each"), format!("~{each} each")));
         }
     }
