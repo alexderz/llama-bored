@@ -1426,6 +1426,7 @@ fn empty_detail() -> LlamaDetail {
         gen_tps: None,
         prompt_tps: None,
         chart_prompt_tps: None,
+        streams: Default::default(),
         latencies: PollLatencies::default(),
         prompt_cache: Vec::new(),
         capture: None,

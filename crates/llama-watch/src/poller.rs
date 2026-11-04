@@ -170,7 +170,7 @@ use crate::speeds::SpeedBook;
 use crate::tqllm::{RowClaim, TqllmBook};
 use crate::tty::grid::Cell;
 use crate::vllm_phase::VllmPhaseBook;
-use crate::window_rate::WindowRate;
+use crate::window_rate::{RatioWindow, WindowRate};
 
 const RUNNING_CAP: usize = 64 * 1024;
 /// Captured requests per model whose message marks are kept for the IN
@@ -224,6 +224,30 @@ pub struct PollLatencies {
     pub activity: Option<Duration>,
 }
 
+/// READ aggregate window of llama.cpp and SGLang (DER-451): the rise of
+/// their live prompt counters over this, or over the prefill episode when
+/// it is younger.
+const READ_WINDOW: Duration = Duration::from_secs(5);
+/// vLLM counts a prompt when its prefill completes, so its READ aggregate
+/// is taken over at least this much wall time, never a landing over a
+/// short gap (DER-451).
+const VLLM_READ_WINDOW: Duration = Duration::from_secs(10);
+
+/// What is known about concurrent requests, for the lines under WRITE and
+/// READ (DER-451). `None` is not known.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Streams {
+    /// Requests in prefill now (llama.cpp's slots with nothing decoded).
+    pub prefilling: Option<u32>,
+    /// READ while active: prompt tokens per second of prefill time
+    /// (llama.cpp's `prompt_tokens_total` ÷ `prompt_seconds_total`).
+    pub read_active: Option<f64>,
+    /// The per-request prefill speed the headline used to hold: llama.cpp's
+    /// last five finished requests, vLLM's histogram window, SGLang's last
+    /// lone finish.
+    pub read_solo: Option<f64>,
+}
+
 /// TTY-facing llama detail. Text leaves the poller only as sanitised cells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlamaDetail {
@@ -235,12 +259,16 @@ pub struct LlamaDetail {
     pub activity: Vec<ActivityRow>,
     /// Generation tok/s from `decoded_total` over the last second.
     pub gen_tps: Option<f64>,
-    /// Prompt tok/s from `/slots`, or zero when nothing is in flight.
+    /// READ: prompt tok/s the engines did, from their prompt counters over
+    /// a window while a request prefills, 0 while none does (DER-451).
+    /// tqLLM's are its requests' own rates; Strata's its counter's.
     pub prompt_tps: Option<f64>,
     /// Chart input: phase-gated historical estimate for active llama.cpp prefill,
     /// true zero for confirmed decode, and unknown for missing phase. Other
     /// engines retain their existing rate semantics; this is not a measurement.
     pub chart_prompt_tps: Option<f64>,
+    /// Concurrent requests, for the lines under WRITE and READ (DER-451).
+    pub streams: Streams,
     /// Last poll durations.
     pub latencies: PollLatencies,
     /// Prompt and cached-prompt counters of each ready model (#10).
@@ -614,6 +642,21 @@ struct State<L> {
     /// SGLang's live `realtime_tokens_total{mode="prefill_compute"}` per
     /// model, for its READ while it prefills (DER-451).
     sglang_prefill: WindowRate,
+    /// SGLang models prefilling at their last read (their live prompt
+    /// counter rose), for the start of a READ episode.
+    sglang_prefill_live: HashSet<String>,
+    /// Prompt tokens llama.cpp's slots processed ([`SlotBook::processed_total`]),
+    /// per `/slots` read, for READ (DER-451).
+    lcpp_prompt: WindowRate,
+    /// llama.cpp models whose READ was live at their last `/slots` read.
+    lcpp_prompt_live: HashSet<String>,
+    /// When each llama.cpp model's `/metrics` first read busy, for a READ
+    /// episode whose last `/slots` read is from before it went idle.
+    lcpp_busy_since: HashMap<String, Instant>,
+    /// llama.cpp prompt tokens per prefill second (READ while active).
+    lcpp_active: RatioWindow,
+    /// vLLM prompt tokens less the cached ones, per `/metrics` read.
+    vllm_uncached: WindowRate,
     /// RECENT's own rows across llama-swap restarts (#44).
     recent: Recent,
     ai: AiState,
@@ -783,6 +826,12 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         lcpp_tokens,
         sglang_realtime: HashMap::new(),
         sglang_prefill: WindowRate::default(),
+        sglang_prefill_live: HashSet::new(),
+        lcpp_prompt: WindowRate::default(),
+        lcpp_prompt_live: HashSet::new(),
+        lcpp_busy_since: HashMap::new(),
+        lcpp_active: RatioWindow::default(),
+        vllm_uncached: WindowRate::default(),
         recent: Recent::default(),
         ai: AiState::Down,
         models: Vec::new(),
@@ -1147,6 +1196,12 @@ impl<L: Sink> State<L> {
         self.lcpp_tokens.forget(id);
         self.sglang_realtime.remove(id);
         self.sglang_prefill.forget(id);
+        self.sglang_prefill_live.remove(id);
+        self.lcpp_prompt.forget(id);
+        self.lcpp_prompt_live.remove(id);
+        self.lcpp_busy_since.remove(id);
+        self.lcpp_active.forget(id);
+        self.vllm_uncached.forget(id);
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
@@ -1377,6 +1432,11 @@ impl<L: Sink> State<L> {
                 self.speeds.observe(&model.id, now, sample.speeds);
                 if model.backend == Backend::Vllm {
                     self.vllm_phase.observe(&model.id, sample, now);
+                    if let (Some(prompt), Some(cached)) = (sample.prompt_total, sample.cached_total)
+                    {
+                        self.vllm_uncached
+                            .observe(&model.id, now, prompt.saturating_sub(cached));
+                    }
                 }
                 if model.backend == Backend::SgLang {
                     self.sglang.observe_scrape(
@@ -1432,13 +1492,141 @@ impl<L: Sink> State<L> {
         self.latencies.metrics = Some(started.elapsed());
     }
 
+    /// One `/slots` read into llama.cpp's READ aggregate (DER-451): live
+    /// while a slot prefills or the slots processed prompt tokens since the
+    /// read before. A new episode's window starts at that read, or when the
+    /// model went busy if that read is from before it was idle.
+    fn observe_lcpp_prompt(&mut self, id: &str, now: Instant) {
+        let total = self.slots.processed_total(id);
+        let newest = self.lcpp_prompt.newest(id);
+        let rose = newest.is_some_and(|(_, last)| total > last);
+        let live = rose || self.slots.prefilling(id) > 0;
+        if live
+            && !self.lcpp_prompt_live.contains(id)
+            && let Some((at, last)) = newest
+        {
+            let since = self.lcpp_busy_since.get(id).copied();
+            let at = since.filter(|since| *since > at).unwrap_or(at);
+            self.lcpp_prompt.rebase_at(id, at, last);
+        }
+        self.lcpp_prompt.observe(id, now, total);
+        if live {
+            self.lcpp_prompt_live.insert(id.to_owned());
+        } else {
+            self.lcpp_prompt_live.remove(id);
+        }
+    }
+
+    /// READ and its line (DER-451) when every busy model is llama.cpp,
+    /// vLLM or SGLang; `None` keeps the headline as before (tqLLM, Strata
+    /// and OpenAI-compatible engines).
+    ///
+    /// READ is the prompt tokens the engines computed per wall second over
+    /// a window, while one of their requests prefills: llama.cpp's slots'
+    /// processed tokens over [`READ_WINDOW`], SGLang's live
+    /// `realtime_tokens_total{mode="prefill_compute"}` over it, vLLM's
+    /// prompt less cached tokens over [`VLLM_READ_WINDOW`]. 0 while none
+    /// prefills. The per-request speed it used to hold is the solo ref.
+    fn read_aggregate(&self, rows: &[ActivityRow], now: Instant) -> Option<(f64, Streams)> {
+        let slots_fresh = (self.limits.slots_interval * 2).max(Duration::from_secs(2));
+        let metrics_fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        let add = |slot: &mut Option<f64>, value: Option<f64>| {
+            if let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) {
+                *slot = Some(slot.unwrap_or(0.0) + value);
+            }
+        };
+        let mut read = 0.0;
+        let mut streams = Streams::default();
+        for model in &self.ready {
+            if !self
+                .counter
+                .requests_processing(&model.id, now)
+                .is_some_and(|n| n > 0.0)
+            {
+                continue;
+            }
+            match model.backend {
+                Backend::LlamaCpp => {
+                    let prefilling =
+                        u32::try_from(self.slots.prefilling(&model.id)).unwrap_or(u32::MAX);
+                    streams.prefilling =
+                        Some(streams.prefilling.unwrap_or(0).saturating_add(prefilling));
+                    if self.lcpp_prompt_live.contains(&model.id) {
+                        read += self
+                            .lcpp_prompt
+                            .rate(&model.id, now, READ_WINDOW, slots_fresh)
+                            .unwrap_or(0.0);
+                    }
+                    add(&mut streams.read_active, self.lcpp_active.ratio(&model.id));
+                    let key = activity::model_key(&model.id);
+                    add(
+                        &mut streams.read_solo,
+                        crate::prompt_head::last_five(
+                            rows.iter()
+                                .filter(|row| row.model == key)
+                                .map(|row| row.prompt_tps.or(row.engine_prompt_tps)),
+                        ),
+                    );
+                }
+                Backend::Vllm => {
+                    if self
+                        .vllm_uncached
+                        .rise(&model.id, VLLM_READ_WINDOW)
+                        .is_some_and(|rise| rise > 0)
+                    {
+                        read += self
+                            .vllm_uncached
+                            .rate_over(
+                                &model.id,
+                                now,
+                                VLLM_READ_WINDOW,
+                                metrics_fresh,
+                                VLLM_READ_WINDOW,
+                            )
+                            .unwrap_or(0.0);
+                    }
+                    add(&mut streams.read_solo, self.engines.prefill_tps(&model.id));
+                }
+                Backend::SgLang => {
+                    let held = self.sglang.prompt_rate(&model.id);
+                    if self.sglang_prefill.newest(&model.id).is_none() {
+                        // No live counter: its last lone finish, as before.
+                        read += held.filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+                    } else if self.sglang_prefill_live.contains(&model.id) {
+                        read += self
+                            .sglang_prefill
+                            .rate(&model.id, now, READ_WINDOW, metrics_fresh)
+                            .unwrap_or(0.0);
+                    }
+                    add(&mut streams.read_solo, held);
+                }
+                _ => return None,
+            }
+        }
+        Some((read, streams))
+    }
+
     /// SGLang's box counter value (DER-451): its live
     /// `realtime_tokens_total{mode="decode"}`, which moves every decode
     /// step, else `generation_tokens_total`, which moves only when a
     /// request finishes. A switch between them rebases the counter.
     fn sglang_decoded(&mut self, id: &str, sample: &MetricsSample, now: Instant) -> Option<u64> {
         if let Some(prefill) = sample.realtime.prefill_compute {
+            let newest = self.sglang_prefill.newest(id);
+            let live = newest.is_some_and(|(_, last)| prefill > last);
+            if live && !self.sglang_prefill_live.contains(id) {
+                // A prefill starts: its READ window starts at the read
+                // before it.
+                if let Some((at, last)) = newest {
+                    self.sglang_prefill.rebase_at(id, at, last);
+                }
+            }
             self.sglang_prefill.observe(id, now, prefill);
+            if live {
+                self.sglang_prefill_live.insert(id.to_owned());
+            } else {
+                self.sglang_prefill_live.remove(id);
+            }
         }
         let live = sample.realtime.decode.is_some();
         let value = sample.realtime.decode.or(sample.n_decode_total)?;
@@ -1452,6 +1640,15 @@ impl<L: Sink> State<L> {
     /// [`LcppTokens`], not its decode calls (DER-451). While they are
     /// unknown the model's gauge is kept and the box total is not fresh.
     fn observe_lcpp(&mut self, id: &str, sample: &MetricsSample, now: Instant) {
+        if sample.requests_processing.is_some_and(|n| n > 0.0) {
+            self.lcpp_busy_since.entry(id.to_owned()).or_insert(now);
+        } else {
+            self.lcpp_busy_since.remove(id);
+        }
+        if let (Some(tokens), Some(seconds)) = (sample.prompt_total, sample.prompt_seconds) {
+            self.lcpp_active
+                .observe(id, now, tokens, seconds, VLLM_READ_WINDOW);
+        }
         let read = MetricsRead {
             calls: sample.n_decode_total,
             predicted: sample.predicted_total,
@@ -1933,11 +2130,13 @@ impl<L: Sink> State<L> {
                         self.limits.input_tail,
                         self.limits.output_tail,
                     ) {
+                        let now = Instant::now();
                         self.lcpp_tokens.observe_slots(
                             &model.id,
                             &self.slots.tokens(&model.id),
-                            Instant::now(),
+                            now,
                         );
+                        self.observe_lcpp_prompt(&model.id, now);
                         self.note_slot_text(&model.id);
                     } else if failure.is_none() {
                         failure = Some("malformed");
@@ -2418,6 +2617,15 @@ impl<L: Sink> State<L> {
                 prompt_tps
             };
         }
+        // DER-451: READ is the engines' aggregate while a request
+        // prefills; the chart above keeps its own input (DER-451 batch 2).
+        let read = if self.running_up && !tq_rated {
+            self.read_aggregate(&self.measured_activity_limit(crate::recent::RING), now)
+        } else {
+            None
+        };
+        let prompt_tps = read.map_or(prompt_tps, |(value, _)| Some(value));
+        let streams = read.map(|(_, streams)| streams).unwrap_or_default();
         let view = LlamaView {
             ai: self.ai,
             models: self.models_with_gauges(now),
@@ -2430,6 +2638,7 @@ impl<L: Sink> State<L> {
             gen_tps,
             prompt_tps,
             chart_prompt_tps,
+            streams,
             latencies: self.latencies,
             prompt_cache: self
                 .ready
@@ -3203,12 +3412,17 @@ mod tests {
             state.slots.begin_round();
             assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
             state.slots.finish_round(at);
+            state.observe_lcpp_prompt("cpp", at);
         }
         assert_eq!(state.slots.prompt_tps(), Some(34_000.0));
         let rx = state.tx.share_with_thread();
         state.publish().expect("publish");
         let (_, detail) = rx.take().expect("sample");
-        assert_eq!(detail.prompt_tps, Some(600.0));
+        // DER-451: READ is the slots' tokens over at least 0.9 s of wall
+        // time, so a batch landing 0.1 s after the last read is not a rate
+        // yet; the completed turns' mean is the solo ref.
+        assert_eq!(detail.prompt_tps, Some(0.0));
+        assert_eq!(detail.streams.read_solo, Some(600.0));
     }
 
     #[test]
@@ -3239,17 +3453,22 @@ mod tests {
             state.slots.begin_round();
             assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
             state.slots.finish_round(Instant::now());
+            state.observe_lcpp_prompt("cpp", Instant::now());
         };
         apply(&mut state, 1, Some(0));
         state.publish().unwrap();
         let (_, prefill) = rx.take().unwrap();
-        assert_eq!(prefill.prompt_tps, Some(600.0));
+        // DER-451: READ is the aggregate, 0 with one read of the slots; the
+        // held completed rate is the solo ref. The chart is unchanged.
+        assert_eq!(prefill.prompt_tps, Some(0.0));
+        assert_eq!(prefill.streams.read_solo, Some(600.0));
         assert_eq!(prefill.chart_prompt_tps, Some(600.0));
         chart.ingest(now, None, prefill.chart_prompt_tps);
         apply(&mut state, 1, Some(1));
         state.publish().unwrap();
         let (_, decode) = rx.take().unwrap();
-        assert_eq!(decode.prompt_tps, Some(600.0));
+        assert_eq!(decode.prompt_tps, Some(0.0), "decoding: no prompt read");
+        assert_eq!(decode.streams.read_solo, Some(600.0));
         assert_eq!(decode.chart_prompt_tps, Some(0.0));
         chart.ingest(now + Duration::from_secs(2), None, decode.chart_prompt_tps);
         chart.ingest(now + Duration::from_secs(4), None, decode.chart_prompt_tps);
@@ -3353,7 +3572,11 @@ mod tests {
         }
         state.publish().unwrap();
         let (_, detail) = rx.take().unwrap();
-        assert_eq!(detail.prompt_tps, Some(1400.0));
+        // DER-451: READ adds the models' aggregates (no prompt tokens
+        // processed here: 0); their held completed rates add as solo ref.
+        assert_eq!(detail.prompt_tps, Some(0.0));
+        assert_eq!(detail.streams.read_solo, Some(1400.0));
+        assert_eq!(detail.streams.prefilling, Some(1), "a's slot 1");
         assert_eq!(detail.chart_prompt_tps, Some(400.0));
         state.slots.begin_round();
         assert!(state.slots.apply("a", "a", br#"[{"id":0,"id_task":1,"is_processing":true},{"id":1,"id_task":2,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#, 0, 0));
@@ -3367,6 +3590,223 @@ mod tests {
         state.slots.finish_round(Instant::now());
         state.publish().unwrap();
         assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
+    }
+
+    /// One llama.cpp `/slots` read of `cpp` at `at` through the poller's
+    /// path: a slot per `(processed, decoded)`, task 20 + slot.
+    fn lcpp_prompt_read(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        slots: &[(u64, u64)],
+    ) {
+        let body: Vec<String> = slots
+            .iter()
+            .enumerate()
+            .map(|(id, (processed, decoded))| {
+                format!(
+                    r#"{{"id":{id},"id_task":{},"is_processing":true,"n_prompt_tokens_processed":{processed},"next_token":[{{"n_decoded":{decoded}}}]}}"#,
+                    20 + id
+                )
+            })
+            .collect();
+        state.slots.begin_round();
+        assert!(state.slots.apply(
+            "cpp",
+            "cpp",
+            format!("[{}]", body.join(",")).as_bytes(),
+            0,
+            0
+        ));
+        state.slots.finish_round(at);
+        let tokens = state.slots.tokens("cpp");
+        state.lcpp_tokens.observe_slots("cpp", &tokens, at);
+        state.observe_lcpp_prompt("cpp", at);
+    }
+
+    fn publish_detail(state: &mut State<llama_core::log::Stderr>) -> LlamaDetail {
+        let rx = state.tx.share_with_thread();
+        state.publish().expect("publish");
+        rx.take().expect("sample").1
+    }
+
+    /// CCR-1 corrected (F3): N requests prefill together, each at 200
+    /// tok/s of its share of the batch. READ is what the engine did, 200 ×
+    /// N, from the slots' processed tokens over the wall time; each
+    /// request's own 200 is the solo ref. N = 1, 2, 3 (the review's case)
+    /// and 4. The chart keeps its 9eeceeb input, the held speed while a
+    /// slot prefills (DER-451 batch 2).
+    #[test]
+    fn read_is_the_aggregate_of_requests_prefilling_together() {
+        for n in [1u64, 2, 3, 4] {
+            let mut state = blank_state();
+            lcpp_ready(&mut state);
+            state.recent.merge(activity::parse_activity(br#"{"data":[
+                {"id":3,"timestamp":"2026-10-29T01:00:03Z","model":"cpp","tokens":{"input_tokens":4000,"prompt_per_second":200}},
+                {"id":2,"timestamp":"2026-10-29T01:00:03Z","model":"cpp","tokens":{"input_tokens":4000,"prompt_per_second":201}},
+                {"id":1,"timestamp":"2026-10-29T01:00:03Z","model":"cpp","tokens":{"input_tokens":4000,"prompt_per_second":199}}
+            ]}"#).unwrap());
+            let now = Instant::now();
+            for i in 0u64..=3 {
+                let at = now - Duration::from_secs(3 - i);
+                lcpp_metrics(&mut state, at, 0, 0, n as f64);
+                let slots = vec![(i * 200, 0); usize::try_from(n).unwrap()];
+                lcpp_prompt_read(&mut state, at, &slots);
+            }
+            let detail = publish_detail(&mut state);
+            assert_eq!(detail.prompt_tps, Some(200.0 * n as f64), "{n} prefilling");
+            assert_eq!(detail.streams.read_solo, Some(200.0), "{n} prefilling");
+            assert_eq!(detail.streams.prefilling, Some(u32::try_from(n).unwrap()));
+            assert_eq!(detail.chart_prompt_tps, Some(200.0), "chart unchanged");
+        }
+    }
+
+    /// F3, one stream: a solo prefill at 1,500 tok/s reads 1,500 while it
+    /// runs and 0 once the slot decodes; the tty then dims the last value.
+    /// The wall-clock spike of a batch landing between two close reads
+    /// never shows.
+    #[test]
+    fn a_solo_prefill_reads_its_speed_then_zero_while_it_decodes() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let now = Instant::now();
+        for i in 0u64..=2 {
+            let at = now - Duration::from_secs(2 - i);
+            lcpp_metrics(&mut state, at, 0, 0, 1.0);
+            lcpp_prompt_read(&mut state, at, &[(i * 1500, 0)]);
+        }
+        assert_eq!(publish_detail(&mut state).prompt_tps, Some(1500.0));
+
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        for i in 0u64..=2 {
+            let at = now - Duration::from_secs(3 - i);
+            lcpp_metrics(&mut state, at, 0, 0, 1.0);
+            lcpp_prompt_read(&mut state, at, &[(i * 1500, 0)]);
+        }
+        lcpp_metrics(&mut state, now, 5, 0, 1.0);
+        lcpp_prompt_read(&mut state, now, &[(3000, 5)]);
+        let detail = publish_detail(&mut state);
+        assert_eq!(detail.prompt_tps, Some(0.0), "decoding: nothing read");
+        assert_eq!(detail.streams.prefilling, Some(0));
+    }
+
+    /// F3: a prefill episode that starts after an idle gap is timed from
+    /// when `/metrics` read the model busy, not from the last `/slots`
+    /// read before the gap, so READ is not divided by the idle time.
+    #[test]
+    fn a_prefill_after_an_idle_gap_is_timed_from_going_busy() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let now = Instant::now();
+        let old = now - Duration::from_secs(60);
+        lcpp_metrics(&mut state, old, 0, 0, 1.0);
+        lcpp_prompt_read(&mut state, old, &[(500, 0)]);
+        lcpp_prompt_read(&mut state, old + Duration::from_secs(1), &[(500, 9)]);
+        lcpp_metrics(&mut state, old + Duration::from_secs(2), 0, 0, 0.0);
+        let busy = now - Duration::from_secs(2);
+        lcpp_metrics(&mut state, busy, 0, 0, 1.0);
+        lcpp_prompt_read(
+            &mut state,
+            now - Duration::from_secs(1),
+            &[(500, 9), (1000, 0)],
+        );
+        lcpp_metrics(&mut state, now, 0, 0, 1.0);
+        lcpp_prompt_read(&mut state, now, &[(500, 9), (2000, 0)]);
+        assert_eq!(
+            publish_detail(&mut state).prompt_tps,
+            Some(1000.0),
+            "2,000 tokens over the 2 s since it went busy"
+        );
+    }
+
+    /// F3: READ while active is llama.cpp's prompt tokens per second of
+    /// prefill time from `prompt_tokens_total` ÷ `prompt_seconds_total`,
+    /// held between prefills.
+    #[test]
+    fn read_while_active_is_the_prompt_counters_ratio() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let now = Instant::now();
+        let read = |state: &mut State<llama_core::log::Stderr>,
+                    at: Instant,
+                    tokens: u64,
+                    seconds: f64| {
+            let sample = crate::metrics::parse_metrics_full(
+                Backend::LlamaCpp,
+                &format!(
+                    "llamacpp:n_decode_total 0\nllamacpp:tokens_predicted_total 0\nllamacpp:requests_processing 2\nllamacpp:prompt_tokens_total {tokens}\nllamacpp:prompt_seconds_total {seconds}\n"
+                ),
+            )
+            .0;
+            state.observe_lcpp("cpp", &sample, at);
+        };
+        read(&mut state, now - Duration::from_secs(2), 1000, 1.0);
+        read(&mut state, now - Duration::from_secs(1), 7000, 3.0);
+        read(&mut state, now, 7000, 3.0);
+        lcpp_prompt_read(&mut state, now, &[(9, 3), (9, 4)]);
+        assert_eq!(publish_detail(&mut state).streams.read_active, Some(3000.0));
+    }
+
+    /// CCR-7 corrected (F3): vLLM's held prefill speed is each request's
+    /// share, 2,000 here, so it is the solo ref. READ is the prompt tokens
+    /// less cached ones over 10 s: N prompts of 4,000 uncached tokens
+    /// landing in that window read 400 × N, for N = 1, 2 and 4.
+    #[test]
+    fn vllm_read_is_uncached_prompt_tokens_over_ten_seconds() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            state.running_up = true;
+            state.ready = vec![vllm_model()];
+            let now = Instant::now();
+            for i in 0u64..=40 {
+                let at = now - Duration::from_millis(10_000 - i * 250);
+                vllm_read(&mut state, at, n as f64, (n as f64, 0.0), 0);
+                let uncached = if i >= 36 { 4000 * n } else { 0 };
+                state.vllm_uncached.observe("v", at, 50_000 + uncached);
+            }
+            let detail = publish_detail(&mut state);
+            assert_eq!(detail.prompt_tps, Some(400.0 * n as f64), "{n} prompts");
+            assert_eq!(detail.streams.read_solo, Some(2000.0), "{n} prompts");
+        }
+    }
+
+    /// F3: SGLang's READ is its live `realtime_tokens_total{mode=
+    /// "prefill_compute"}` over the prefill so far: 300 × N tok/s for N
+    /// requests, 0 once its counter stops.
+    #[test]
+    fn sglang_read_is_the_live_prefill_counter() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            sglang_ready(&mut state);
+            let now = Instant::now();
+            let q = Duration::from_millis(250);
+            for i in 0u32..=8 {
+                let at = now - Duration::from_secs(4) + q * i;
+                sglang_read(&mut state, at, n as f64, 0, Some((0, 1_000)));
+            }
+            for i in 1u32..=8 {
+                let at = now - Duration::from_secs(2) + q * i;
+                let prefill = 1_000 + u64::from(i) * 75 * n;
+                sglang_read(&mut state, at, n as f64, 0, Some((0, prefill)));
+            }
+            assert_eq!(
+                publish_detail(&mut state).prompt_tps,
+                Some(300.0 * n as f64),
+                "{n}"
+            );
+            sglang_read(
+                &mut state,
+                now + q,
+                n as f64,
+                0,
+                Some((10, 1_000 + 600 * n)),
+            );
+            assert_eq!(
+                publish_detail(&mut state).prompt_tps,
+                Some(0.0),
+                "{n} decoding"
+            );
+        }
     }
 
     /// A llama.cpp model `cpp` in `state`, ready and read.
@@ -3589,7 +4029,8 @@ mod tests {
     /// vLLM's READ chart follows its requests' phase (DER-451): the held
     /// prefill speed while one is prefilling, 0 while every one decodes,
     /// unknown when the counts do not add up or the phase read is stale.
-    /// The big number keeps the held speed through all of it.
+    /// The held speed is the solo ref through all of it; READ is vLLM's
+    /// uncached prompt tokens over 10 s, 0 here with no 10 s of reads.
     #[test]
     fn vllm_chart_follows_the_request_phase_not_the_held_headline() {
         let mut state = blank_state();
@@ -3608,10 +4049,11 @@ mod tests {
         let publish = |state: &mut State<llama_core::log::Stderr>| {
             state.publish().unwrap();
             let (_, detail) = rx.take().unwrap();
-            (detail.prompt_tps, detail.chart_prompt_tps)
+            assert_eq!(detail.prompt_tps, Some(0.0));
+            (detail.streams.read_solo, detail.chart_prompt_tps)
         };
         vllm_read(&mut state, Instant::now(), 0.0, (1.0, 1.0), 50);
-        assert_eq!(publish(&mut state), (Some(0.0), Some(0.0)), "idle");
+        assert_eq!(publish(&mut state), (None, Some(0.0)), "idle");
         vllm_read(&mut state, Instant::now(), 1.0, (1.0, 1.0), 50);
         assert_eq!(
             publish(&mut state),
@@ -3648,7 +4090,7 @@ mod tests {
         state.counter.observe("v", 160, Some(1.0), Instant::now());
         assert_eq!(publish(&mut state), (Some(2_000.0), None), "stale phase");
         vllm_read(&mut state, Instant::now(), 0.0, (3.0, 3.0), 170);
-        assert_eq!(publish(&mut state), (Some(0.0), Some(0.0)), "done");
+        assert_eq!(publish(&mut state), (None, Some(0.0)), "done");
     }
 
     /// A busy llama.cpp model beside vLLM (DER-451): each model's chart
@@ -3682,7 +4124,8 @@ mod tests {
         vllm_read(&mut state, Instant::now(), 1.0, (1.0, 0.0), 1);
         state.publish().unwrap();
         let (_, detail) = rx.take().unwrap();
-        assert_eq!(detail.prompt_tps, Some(2_600.0));
+        assert_eq!(detail.prompt_tps, Some(0.0), "no prompt tokens read yet");
+        assert_eq!(detail.streams.read_solo, Some(2_600.0));
         assert_eq!(detail.chart_prompt_tps, Some(600.0), "vLLM decodes");
         vllm_read(&mut state, Instant::now(), 2.0, (1.0, 0.0), 9);
         state.publish().unwrap();
@@ -3917,6 +4360,12 @@ mod tests {
             lcpp_tokens: LcppTokens::default(),
             sglang_realtime: HashMap::new(),
             sglang_prefill: WindowRate::default(),
+            sglang_prefill_live: HashSet::new(),
+            lcpp_prompt: WindowRate::default(),
+            lcpp_prompt_live: HashSet::new(),
+            lcpp_busy_since: HashMap::new(),
+            lcpp_active: RatioWindow::default(),
+            vllm_uncached: WindowRate::default(),
             recent: Recent::default(),
             ai: AiState::Loaded,
             models: Vec::new(),

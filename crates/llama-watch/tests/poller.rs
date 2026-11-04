@@ -852,7 +852,10 @@ fn slots_tails_are_truncated_and_input_is_once_per_task() {
     assert!(!input.contains("SECONDPROMPT"), "{input}");
     assert!(output.contains("gen-two"), "{output}");
     assert_eq!(slot.n_prompt_tokens_processed, 9);
-    assert_eq!(detail.prompt_tps, None, "no completed prefill measurement");
+    assert_eq!(
+        detail.streams.read_solo, None,
+        "no completed prefill measurement"
+    );
 }
 
 #[test]
@@ -1008,6 +1011,7 @@ fn a_stalled_consumer_keeps_only_the_newest_publish() {
                 gen_tps: None,
                 prompt_tps: None,
                 chart_prompt_tps: None,
+                streams: Default::default(),
                 latencies: poller::PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,
@@ -2762,10 +2766,12 @@ fn with_prompt_total(body: Vec<u8>, total: u64) -> Vec<u8> {
     text.into_bytes()
 }
 
-/// #188: 20,000 prompt tokens in 10 s of prefill is 2,000 on the big
-/// number, and it is still 2,000 a second later. The wall-clock counter
-/// would read about 20,000 on the sample that lands the tokens and 0 once
-/// that second has passed.
+/// #188: 20,000 prompt tokens in 10 s of prefill is a held 2,000, still
+/// 2,000 a second later. The wall-clock counter would read about 20,000 on
+/// the sample that lands the tokens and 0 once that second has passed.
+/// DER-451: that held per-request speed is the solo ref; READ is the
+/// uncached prompt tokens over at least 10 s of reads, so it never shows
+/// the landing (0 here, read for under 10 s).
 #[test]
 fn vllm_prefill_speed_holds_the_big_prompt_number() {
     let mut world = World::running(running_cmd("qwen3.8-27b-vllm", CONTAINER_CMD));
@@ -2779,7 +2785,7 @@ fn vllm_prefill_speed_holds_the_big_prompt_number() {
     let (_poller, rx) = spawn(&config, &log);
     let near = |got: Option<f64>, want: f64| got.is_some_and(|got| (got - want).abs() < 1.0);
     wait_msg(&rx, Duration::from_secs(3), |_, detail| {
-        near(detail.prompt_tps, 2_500.0)
+        near(detail.streams.read_solo, 2_500.0)
     });
     server.update(|world| {
         world.metrics.insert(
@@ -2788,24 +2794,27 @@ fn vllm_prefill_speed_holds_the_big_prompt_number() {
         );
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
-        near(detail.prompt_tps, 2_000.0)
+        near(detail.streams.read_solo, 2_000.0)
     });
     assert!(
-        near(detail.prompt_tps, 2_000.0),
+        near(detail.streams.read_solo, 2_000.0),
         "not the 20,000 wall-clock spike: {:?}",
-        detail.prompt_tps
+        detail.streams.read_solo
     );
     thread::sleep(Duration::from_millis(1_200));
     let (_, detail) = wait_msg(&rx, Duration::from_secs(2), |_, _| true);
     assert!(
-        near(detail.prompt_tps, 2_000.0),
+        near(detail.streams.read_solo, 2_000.0),
         "a second later, not 0 and not 20,000: {:?}",
-        detail.prompt_tps
+        detail.streams.read_solo
     );
+    assert_eq!(detail.prompt_tps, Some(0.0), "never the landing");
 }
 
-/// #188: llama.cpp's live slot rate stays the big number even when the
-/// prompt counter jumps by far more in the same second.
+/// #188: llama.cpp's READ is never the jump of its prompt counter.
+/// DER-451: it is the slots' processed tokens over wall time while one
+/// prefills (2,000 here over at least 0.9 s of reads, so at most about
+/// 2,200), and the completed turns' rates are the solo ref.
 #[test]
 fn llamacpp_headline_ignores_polled_batches_until_completed_rates_arrive() {
     let mut world = World::running(running_model("qwen3.6-35b-a3b", "Qwen", "ready"));
@@ -2840,10 +2849,12 @@ fn llamacpp_headline_ignores_polled_batches_until_completed_rates_arrive() {
             .iter()
             .any(|slot| slot.n_prompt_tokens_processed == 2_100)
     });
-    assert_eq!(
-        detail.prompt_tps, None,
-        "neither the slot batch nor the wall-clock spike is a measured prefill rate"
+    assert!(
+        detail.prompt_tps.is_some_and(|rate| rate <= 2_000.0 / 0.9),
+        "the slots' tokens over the wall time, not the 100,000 counter jump: {:?}",
+        detail.prompt_tps
     );
+    assert_eq!(detail.streams.read_solo, None, "no completed turn yet");
     server.update(|world| {
         world.activity = speed_page(&[
             (2, "qwen3.6-35b-a3b", 900.0, 40.0),
@@ -2851,10 +2862,10 @@ fn llamacpp_headline_ignores_polled_batches_until_completed_rates_arrive() {
         ]);
     });
     let (_, detail) = wait_msg(&rx, Duration::from_secs(3), |_, detail| {
-        detail.prompt_tps == Some(600.0)
+        detail.streams.read_solo == Some(600.0)
     });
     assert_eq!(
-        detail.prompt_tps,
+        detail.streams.read_solo,
         Some(600.0),
         "mean of the two measured completed turns"
     );

@@ -488,6 +488,8 @@ struct TickState {
     ctx_sizes: BTreeMap<String, u64>,
     /// Last non-zero decode rate for the dim GEN digits (#163).
     gen_last: Option<f64>,
+    /// Last non-zero READ rate for the dim READ digits (DER-451).
+    prompt_last: Option<f64>,
     /// IN/OUT burst scroll (#188).
     motion: crate::tty::scroll::Motion,
 }
@@ -507,6 +509,7 @@ impl TickState {
                 gen_tps: None,
                 prompt_tps: None,
                 chart_prompt_tps: None,
+                streams: Default::default(),
                 latencies: PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,
@@ -535,6 +538,7 @@ impl TickState {
             flights: crate::inflight::Tracker::default(),
             ctx_sizes: BTreeMap::new(),
             gen_last: None,
+            prompt_last: None,
             motion: crate::tty::scroll::Motion::default(),
         }
     }
@@ -1004,6 +1008,9 @@ fn tty_model(
     if let Some(rate) = tick.detail.gen_tps.filter(|v| v.is_finite() && *v > 0.0) {
         tick.gen_last = Some(rate);
     }
+    if let Some(rate) = tick.detail.prompt_tps.filter(|v| v.is_finite() && *v > 0.0) {
+        tick.prompt_last = Some(rate);
+    }
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
     let (model_loading, model_stopping) = header_swap(sample, watch);
     let no_slots = first_without_slots(sample, watch);
@@ -1115,7 +1122,7 @@ fn tty_model(
         activity_w: sample.activity_w,
         gen_tps: tick.detail.gen_tps,
         prompt_tps: tick.detail.prompt_tps,
-        prompt_last: prompt_last(&tick.detail.slots),
+        prompt_last: tick.prompt_last,
         gen_last: tick.gen_last,
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
@@ -2493,11 +2500,6 @@ fn layout_requests(
         }
     });
     flights.chain(finished).collect()
-}
-
-fn prompt_last(slots: &[SlotView]) -> Option<u64> {
-    // #78: the whole prompt once known, else what the slot holds.
-    pick_slot(slots).map(|slot| slot.prompt_total().unwrap_or(slot.n_prompt_tokens))
 }
 
 fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<HealthSeg> {
@@ -3963,7 +3965,6 @@ mod tests {
         );
         assert!(!inn.contains("hi"), "{inn:?}");
         assert_eq!(out, "BUSY-OUT");
-        assert_eq!(prompt_last(&slots), Some(0));
     }
 
     #[test]
@@ -4297,6 +4298,7 @@ mod tests {
                     gen_tps: Some(40.0),
                     prompt_tps: Some(0.0),
                     chart_prompt_tps: Some(0.0),
+                    streams: Default::default(),
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
@@ -4452,6 +4454,7 @@ mod tests {
                     gen_tps: None,
                     prompt_tps: None,
                     chart_prompt_tps: None,
+                    streams: Default::default(),
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,

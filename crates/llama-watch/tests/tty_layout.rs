@@ -79,6 +79,28 @@ fn rate_headings_name_decode_write_and_prefill_read() {
     }
 }
 
+/// DER-451 (F3, F10): while no prompt is read, READ dims to the last READ
+/// rate and labels it `last`; it is a rate, never a token count.
+#[test]
+fn idle_read_dims_to_its_last_rate_labelled_last() {
+    let mut model = sample(WatchState::Ready);
+    model.prompt_tps = Some(0.0);
+    model.prompt_last = Some(2_412.4);
+    let grid = draw(&model, 240, 67);
+    let headline = (0..grid.rows())
+        .map(|row| row_string(&grid, row))
+        .find(|row| row.contains("READ tok/s"))
+        .expect("rate headings");
+    assert!(headline.contains("last 2412"), "{headline}");
+    model.prompt_tps = Some(1_900.0);
+    let grid = draw(&model, 240, 67);
+    let headline = (0..grid.rows())
+        .map(|row| row_string(&grid, row))
+        .find(|row| row.contains("READ tok/s"))
+        .expect("rate headings");
+    assert!(!headline.contains("last 2412"), "live: {headline}");
+}
+
 #[test]
 fn timeline_labels_write_above_and_read_below() {
     let grid = draw(&sample(WatchState::Generating), 240, 67);
@@ -2227,8 +2249,8 @@ fn sample(state: WatchState) -> TtyModel {
         WatchState::Starting => (None, None, None, None, None, None, None, None, None),
     };
     let (gen_tps, prompt_tps, prompt_last) = match state {
-        WatchState::Generating => (Some(54.2), Some(0.0), Some(1212)),
-        WatchState::Ready => (Some(0.0), Some(0.0), Some(1187)),
+        WatchState::Generating => (Some(54.2), Some(0.0), Some(1212.0)),
+        WatchState::Ready => (Some(0.0), Some(0.0), Some(1187.0)),
         WatchState::AiDown | WatchState::Starting | WatchState::NoLlama => (None, None, None),
     };
     let slots = match state {

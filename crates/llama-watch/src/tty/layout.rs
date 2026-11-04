@@ -241,7 +241,9 @@ pub struct TtyModel {
     pub activity_w: Option<f64>,
     pub gen_tps: Option<f64>,
     pub prompt_tps: Option<f64>,
-    pub prompt_last: Option<u64>,
+    /// Last non-zero READ rate, dimmed with `last` while no prompt is read
+    /// (DER-451). A rate, never a token count.
+    pub prompt_last: Option<f64>,
     /// Last non-zero decode rate. The tick loop remembers it so the GEN
     /// digits stay on that value, dimmed, while a prefill is live (#163).
     pub gen_last: Option<f64>,
@@ -2012,8 +2014,8 @@ const TRACK: char = '\u{00b7}';
 fn draw_rates(grid: &mut Grid, model: &TtyModel, g: &Geom) {
     paint_label_unit(grid, g.right, 3, "WRITE");
     paint_label_unit(grid, g.prompt_x(), 3, "READ");
-    if let Some(last) = model.prompt_last {
-        let text = format!("last {last}");
+    if let Some(last) = model.prompt_last.filter(|v| v.is_finite() && *v > 0.0) {
+        let text = format!("last {}", format_rate_digits(last));
         right_align(
             grid,
             g.prompt_x().saturating_add(g.half).saturating_sub(1),
@@ -6953,7 +6955,10 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16) {
         .gen_last
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(format_rate_digits);
-    let prompt_last_text = model.prompt_last.map(|n| n.to_string());
+    let prompt_last_text = model
+        .prompt_last
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(format_rate_digits);
     paint_rate_label(
         grid,
         2,
@@ -6985,7 +6990,10 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16) {
     } else if down {
         (None, true)
     } else {
-        (model.prompt_last.map(|n| n as f64), true)
+        (
+            model.prompt_last.filter(|v| v.is_finite() && *v > 0.0),
+            true,
+        )
     };
     let gen_text = shown_digit_text(gen_value, gen_dim);
     let prompt_text = shown_digit_text(prompt_value, prompt_dim);

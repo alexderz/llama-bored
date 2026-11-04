@@ -49,6 +49,18 @@ impl WindowRate {
         window: Duration,
         fresh: Duration,
     ) -> Option<f64> {
+        self.rate_over(model, now, window, fresh, MIN_SPAN)
+    }
+
+    /// [`Self::rate`] over a span of at least `min_span`.
+    pub fn rate_over(
+        &self,
+        model: &str,
+        now: Instant,
+        window: Duration,
+        fresh: Duration,
+        min_span: Duration,
+    ) -> Option<f64> {
         let samples = self.models.get(model)?;
         let &(newest_at, newest) = samples.back()?;
         if now.saturating_duration_since(newest_at) > fresh {
@@ -60,7 +72,7 @@ impl WindowRate {
             .find(|(at, _)| newest_at.saturating_duration_since(*at) >= window)
             .or_else(|| samples.front())?;
         let span = newest_at.saturating_duration_since(base_at);
-        if span < MIN_SPAN {
+        if span < min_span.max(MIN_SPAN) {
             return None;
         }
         Some(newest.saturating_sub(base) as f64 / span.as_secs_f64())
@@ -79,7 +91,82 @@ impl WindowRate {
         (samples.len() > 1).then(|| newest.saturating_sub(base))
     }
 
+    /// The newest read of `model`'s counter.
+    #[must_use]
+    pub fn newest(&self, model: &str) -> Option<(Instant, u64)> {
+        self.models.get(model)?.back().copied()
+    }
+
+    /// A new episode starts: its window begins at `at`, where the counter
+    /// stood at `total`, and nothing older counts.
+    pub fn rebase_at(&mut self, model: &str, at: Instant, total: u64) {
+        let samples = self.models.entry(model.to_owned()).or_default();
+        samples.clear();
+        samples.push_back((at, total));
+    }
+
     /// `model`'s process is gone or its counter's source changed.
+    pub fn forget(&mut self, model: &str) {
+        self.models.remove(model);
+    }
+}
+
+/// Tokens per second of busy time from a token counter and a seconds
+/// counter that move together (llama.cpp's `prompt_tokens_total` and
+/// `prompt_seconds_total`), over a window of reads. The last ratio is
+/// held while the seconds do not move.
+#[derive(Debug, Default)]
+pub struct RatioWindow {
+    models: HashMap<String, RatioReads>,
+}
+
+/// One model's reads of both counters, `(at, tokens, seconds)`, and its
+/// held ratio.
+type RatioReads = (VecDeque<(Instant, u64, f64)>, Option<f64>);
+
+impl RatioWindow {
+    /// One read of both counters.
+    pub fn observe(
+        &mut self,
+        model: &str,
+        at: Instant,
+        tokens: u64,
+        seconds: f64,
+        window: Duration,
+    ) {
+        let (samples, held) = self.models.entry(model.to_owned()).or_default();
+        if samples
+            .back()
+            .is_some_and(|&(_, last_tokens, last_seconds)| {
+                tokens < last_tokens || seconds < last_seconds
+            })
+        {
+            samples.clear();
+        }
+        samples.push_back((at, tokens, seconds));
+        while samples.len() > MAX_SAMPLES {
+            samples.pop_front();
+        }
+        let base = samples
+            .iter()
+            .rev()
+            .find(|(base_at, _, _)| at.saturating_duration_since(*base_at) >= window)
+            .or_else(|| samples.front())
+            .copied();
+        if let Some((_, base_tokens, base_seconds)) = base {
+            let busy = seconds - base_seconds;
+            if busy > 0.0 && busy.is_finite() {
+                *held = Some(tokens.saturating_sub(base_tokens) as f64 / busy);
+            }
+        }
+    }
+
+    /// The last ratio, `None` before the seconds first moved.
+    #[must_use]
+    pub fn ratio(&self, model: &str) -> Option<f64> {
+        self.models.get(model)?.1.filter(|rate| rate.is_finite())
+    }
+
     pub fn forget(&mut self, model: &str) {
         self.models.remove(model);
     }
@@ -132,6 +219,52 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_minimum_span_and_an_episode_base() {
+        let steps: Vec<(u64, u64)> = (0..=8).map(|i| (i * 250, i * 100)).collect();
+        let (mut book, t0) = fed(&steps);
+        let now = t0 + Duration::from_secs(2);
+        let ten = Duration::from_secs(10);
+        assert_eq!(
+            book.rate_over("m", now, ten, FRESH, ten),
+            None,
+            "under 10 s read"
+        );
+        assert_eq!(book.rate("m", now, ten, FRESH), Some(400.0));
+        book.rebase_at("m", t0 + Duration::from_millis(1500), 600);
+        book.observe("m", now, 800);
+        assert_eq!(
+            book.rate("m", now, ten, FRESH),
+            None,
+            "0.5 s since the base"
+        );
+        book.observe("m", now + Duration::from_millis(500), 1000);
+        assert_eq!(
+            book.rate("m", now + Duration::from_millis(500), ten, FRESH),
+            Some(400.0)
+        );
+        assert_eq!(
+            book.newest("m"),
+            Some((now + Duration::from_millis(500), 1000))
+        );
+    }
+
+    #[test]
+    fn busy_time_ratio_is_held_while_idle() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let ten = Duration::from_secs(10);
+        let mut book = RatioWindow::default();
+        book.observe("m", t0, 0, 0.0, ten);
+        assert_eq!(book.ratio("m"), None);
+        book.observe("m", t0 + s, 3000, 1.5, ten);
+        assert_eq!(book.ratio("m"), Some(2000.0));
+        book.observe("m", t0 + s * 2, 3000, 1.5, ten);
+        assert_eq!(book.ratio("m"), Some(2000.0), "held");
+        book.observe("m", t0 + s * 20, 4000, 2.5, ten);
+        assert_eq!(book.ratio("m"), Some(1000.0), "the last window only");
     }
 
     #[test]

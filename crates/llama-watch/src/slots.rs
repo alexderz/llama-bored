@@ -298,6 +298,11 @@ pub struct SlotBook {
     /// that replaced another between two reads counts all it processed,
     /// not its difference from the old task's count (DER-451).
     last_processed: HashMap<(String, i64, i64), u64>,
+    /// Prompt tokens each model's slots processed while this book saw them
+    /// in flight, summed over tasks: the counter of its READ aggregate
+    /// (DER-451). A task first seen in flight counts all it processed; one
+    /// first seen already idle is not counted.
+    processed_total: HashMap<String, u64>,
     last_at: Option<Instant>,
     round_delta: u64,
     round_seen: bool,
@@ -630,6 +635,31 @@ impl SlotBook {
         });
     }
 
+    /// [`Self::processed_total`] of `model_id`.
+    #[must_use]
+    pub fn processed_total(&self, model_id: &str) -> u64 {
+        self.processed_total.get(model_id).copied().unwrap_or(0)
+    }
+
+    /// `model_id`'s slots in prefill in its last body: in flight with
+    /// nothing decoded yet.
+    #[must_use]
+    pub fn prefilling(&self, model_id: &str) -> usize {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing && row.n_decoded == 0)
+            .count()
+    }
+
+    /// `model_id`'s slots in flight in its last body.
+    #[must_use]
+    pub fn busy(&self, model_id: &str) -> usize {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing)
+            .count()
+    }
+
     /// `model_id`'s slot numbers from its last body, for its token count
     /// ([`crate::lcpp_tokens`]).
     #[must_use]
@@ -705,11 +735,16 @@ impl SlotBook {
         let processed = slot.n_prompt_tokens_processed;
         // A task first seen counts all it processed (DER-451). The first
         // round of an episode is a baseline anyway.
-        let delta = match self.last_processed.get(&key).copied() {
+        let seen = self.last_processed.get(&key).copied();
+        let delta = match seen {
             Some(previous) => counter_delta(Some(previous), processed),
             None => processed,
         };
         self.round_delta = self.round_delta.saturating_add(delta);
+        if seen.is_some() || slot.is_processing {
+            let total = self.processed_total.entry(model_id.to_owned()).or_default();
+            *total = total.saturating_add(delta);
+        }
         self.last_processed
             .insert(key, slot.n_prompt_tokens_processed);
         // llama.cpp reports `n_decoded == 0` while a slot is still in

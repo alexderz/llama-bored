@@ -963,7 +963,7 @@ fn busy_frame() -> TtyModel {
         activity_w: Some(280.0),
         gen_tps: Some(54.2),
         prompt_tps: Some(1200.0),
-        prompt_last: Some(4096),
+        prompt_last: Some(4096.0),
         gen_last: None,
         gen_ceiling: 250.0,
         prompt_ceiling: 1500.0,
