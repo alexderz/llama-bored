@@ -768,6 +768,18 @@ impl SlotBook {
             .count()
     }
 
+    /// Prompt tokens `model_id`'s slots in prefill have processed so far:
+    /// in [`Self::processed_total`] already, in `prompt_tokens_total` only
+    /// once their prefill ends (DER-451).
+    #[must_use]
+    pub fn prefill_pending(&self, model_id: &str) -> u64 {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing && row.n_decoded == 0)
+            .map(|row| row.n_prompt_tokens_processed)
+            .sum()
+    }
+
     /// `model_id`'s slots in flight in its last body.
     #[must_use]
     pub fn busy(&self, model_id: &str) -> usize {

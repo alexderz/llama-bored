@@ -238,6 +238,22 @@ const VLLM_READ_WINDOW: Duration = Duration::from_secs(10);
 /// reads between two chunks are still the same prefill.
 const PREFILL_HOLD: Duration = Duration::from_millis(1_500);
 
+/// One llama.cpp model's READ tail book ([`State::settle_lcpp_read`]).
+#[derive(Debug, Default)]
+struct ReadTail {
+    /// The `/slots` read it last settled at.
+    at: Option<Instant>,
+    /// `prompt_tokens_total` then.
+    metrics: u64,
+    /// The slots' processed tokens whose prefill had ended then.
+    settled: u64,
+    /// Counter rise less ended prefills since; negative only by the last
+    /// round's ended prefills.
+    balance: i64,
+    /// Tokens the counter counted that no `/slots` read did.
+    tail: u64,
+}
+
 /// The inter-token latency window of vLLM and SGLang (DER-451).
 const ITL_WINDOW: Duration = Duration::from_secs(5);
 /// Inter-token latency reads kept per model.
@@ -683,6 +699,12 @@ struct State<L> {
     lcpp_prompt: WindowRate,
     /// llama.cpp models whose READ was live at their last `/slots` read.
     lcpp_prompt_live: HashSet<String>,
+    /// llama.cpp's `prompt_tokens_total` per `/metrics` read: READ when
+    /// `/slots` is not fresh, and the tail it reconciles (DER-451).
+    lcpp_prompt_metrics: WindowRate,
+    /// Prompt tokens `prompt_tokens_total` counted that no `/slots` read
+    /// saw, per llama.cpp model (DER-451, L2).
+    lcpp_read_tail: HashMap<String, ReadTail>,
     /// When each llama.cpp model's `/metrics` first read busy, for a READ
     /// episode whose last `/slots` read is from before it went idle.
     lcpp_busy_since: HashMap<String, Instant>,
@@ -866,6 +888,8 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         read_rose: HashMap::new(),
         lcpp_prompt: WindowRate::default(),
         lcpp_prompt_live: HashSet::new(),
+        lcpp_prompt_metrics: WindowRate::default(),
+        lcpp_read_tail: HashMap::new(),
         lcpp_busy_since: HashMap::new(),
         lcpp_active: RatioWindow::default(),
         vllm_uncached: WindowRate::default(),
@@ -1238,6 +1262,8 @@ impl<L: Sink> State<L> {
         self.read_rose.remove(id);
         self.lcpp_prompt.forget(id);
         self.lcpp_prompt_live.remove(id);
+        self.lcpp_prompt_metrics.forget(id);
+        self.lcpp_read_tail.remove(id);
         self.lcpp_busy_since.remove(id);
         self.lcpp_active.forget(id);
         self.vllm_uncached.forget(id);
@@ -1549,11 +1575,20 @@ impl<L: Sink> State<L> {
     /// while a slot prefills or the slots processed prompt tokens since the
     /// read before. A new episode's window starts at that read, or when the
     /// model went busy if that read is from before it was idle.
+    ///
+    /// Its counter adds the tail [`Self::settle_lcpp_read`] finds. A rise
+    /// no read saw prefill (a request between two reads, or a prompt done
+    /// before the first) is held live like SGLang's ([`PREFILL_HOLD`]),
+    /// so its window spans a read gap (L2).
     fn observe_lcpp_prompt(&mut self, id: &str, now: Instant) {
-        let total = self.slots.processed_total(id);
+        let tail = self.settle_lcpp_read(id, now);
+        let total = self.slots.processed_total(id).saturating_add(tail);
         let newest = self.lcpp_prompt.newest(id);
         let rose = newest.is_some_and(|(_, last)| total > last);
-        let live = rose || self.slots.prefilling(id) > 0;
+        let prefilling = self.slots.prefilling(id) > 0;
+        let lone = rose && !prefilling && !self.lcpp_prompt_live.contains(id);
+        let held = self.read_held(id, lone, now);
+        let live = rose || prefilling || held;
         if live
             && !self.lcpp_prompt_live.contains(id)
             && let Some((at, last)) = newest
@@ -1570,6 +1605,54 @@ impl<L: Sink> State<L> {
         }
     }
 
+    /// The prompt tokens llama.cpp's `prompt_tokens_total` counted that
+    /// no `/slots` read did (DER-451, L2), as WRITE settles its tail with
+    /// `tokens_predicted_total`. After each `/slots` read the counter's
+    /// rise is matched against the slots' processed tokens whose prefill
+    /// ended, the ones it counts. A surplus is tail. A deficit waits a
+    /// round for prefills that ended after the `/metrics` read, and no
+    /// longer: a cancelled prefill is never counted there. A gap in the
+    /// reads starts again from the next.
+    fn settle_lcpp_read(&mut self, id: &str, now: Instant) -> u64 {
+        let tail = self.lcpp_read_tail.get(id).map_or(0, |book| book.tail);
+        let Some((_, metrics)) = self.lcpp_prompt_metrics.newest(id) else {
+            return tail;
+        };
+        let settled = self
+            .slots
+            .processed_total(id)
+            .saturating_sub(self.slots.prefill_pending(id));
+        let fresh = (self.limits.slots_interval * 2).max(Duration::from_secs(2));
+        let book = self.lcpp_read_tail.entry(id.to_owned()).or_default();
+        let signed = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        if book
+            .at
+            .is_some_and(|at| now.saturating_duration_since(at) <= fresh)
+            && metrics >= book.metrics
+            && settled >= book.settled
+        {
+            let ended = signed(settled - book.settled);
+            book.balance = book
+                .balance
+                .saturating_add(signed(metrics - book.metrics))
+                .saturating_sub(ended);
+            if book.balance > 0 {
+                book.tail = book
+                    .tail
+                    .saturating_add(u64::try_from(book.balance).unwrap_or(0));
+                book.balance = 0;
+            } else {
+                book.balance = book.balance.max(-ended);
+            }
+        } else {
+            book.balance = 0;
+        }
+        book.at = Some(now);
+        book.metrics = metrics;
+        book.settled = settled;
+        book.tail
+    }
+
     /// READ and its line (DER-451) when every busy model is llama.cpp,
     /// vLLM or SGLang; `None` keeps the headline as before (tqLLM, Strata
     /// and OpenAI-compatible engines).
@@ -1583,9 +1666,11 @@ impl<L: Sink> State<L> {
     fn read_aggregate(&self, rows: &[ActivityRow], now: Instant) -> Option<(f64, Streams)> {
         let slots_fresh = (self.limits.slots_interval * 2).max(Duration::from_secs(2));
         let metrics_fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        // L3: while active and the solo ref are one request's speeds, not
+        // amounts: the busy models' fastest, never their sum.
         let add = |slot: &mut Option<f64>, value: Option<f64>| {
             if let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) {
-                *slot = Some(slot.unwrap_or(0.0) + value);
+                *slot = Some(slot.map_or(value, |held| held.max(value)));
             }
         };
         let mut read = 0.0;
@@ -1600,7 +1685,18 @@ impl<L: Sink> State<L> {
             }
             match model.backend {
                 Backend::LlamaCpp => {
-                    if self.lcpp_prompt_live.contains(&model.id) {
+                    let slots_read = self
+                        .lcpp_prompt
+                        .newest(&model.id)
+                        .is_some_and(|(at, _)| now.saturating_duration_since(at) <= slots_fresh);
+                    if !slots_read {
+                        // L1: no fresh `/slots`: `prompt_tokens_total`
+                        // over the whole window, never a landing's spike.
+                        read += self
+                            .lcpp_prompt_metrics
+                            .rate_over(&model.id, now, READ_WINDOW, metrics_fresh, READ_WINDOW)
+                            .unwrap_or(0.0);
+                    } else if self.lcpp_prompt_live.contains(&model.id) {
                         read += self
                             .lcpp_prompt
                             .rate(&model.id, now, READ_WINDOW, slots_fresh)
@@ -1830,6 +1926,9 @@ impl<L: Sink> State<L> {
             self.lcpp_busy_since.entry(id.to_owned()).or_insert(now);
         } else {
             self.lcpp_busy_since.remove(id);
+        }
+        if let Some(tokens) = sample.prompt_total {
+            self.lcpp_prompt_metrics.observe(id, now, tokens);
         }
         if let (Some(tokens), Some(seconds)) = (sample.prompt_total, sample.prompt_seconds) {
             self.lcpp_active
@@ -3787,9 +3886,9 @@ mod tests {
         state.publish().unwrap();
         let (_, detail) = rx.take().unwrap();
         // DER-451: READ adds the models' aggregates (no prompt tokens
-        // processed here: 0); their held completed rates add as solo ref.
+        // processed here: 0); the solo ref is the faster held rate (L3).
         assert_eq!(detail.prompt_tps, Some(0.0));
-        assert_eq!(detail.streams.read_solo, Some(1400.0));
+        assert_eq!(detail.streams.read_solo, Some(1000.0));
         assert_eq!(detail.streams.prefilling, Some(1), "a's slot 1");
         assert_eq!(detail.chart_prompt_tps, Some(400.0));
         state.slots.begin_round();
@@ -3835,6 +3934,96 @@ mod tests {
         let tokens = state.slots.tokens("cpp");
         state.lcpp_tokens.observe_slots("cpp", &tokens, at);
         state.observe_lcpp_prompt("cpp", at);
+    }
+
+    /// One llama.cpp `/metrics` read of `cpp` with `prompt_tokens_total`.
+    fn lcpp_prompt_metrics(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        prompt: u64,
+        processing: f64,
+    ) {
+        let sample = crate::metrics::parse_metrics_full(
+            Backend::LlamaCpp,
+            &format!(
+                "llamacpp:n_decode_total 0\nllamacpp:tokens_predicted_total 0\nllamacpp:prompt_tokens_total {prompt}\nllamacpp:requests_processing {processing}\nllamacpp:n_busy_slots_per_decode 1\n"
+            ),
+        )
+        .0;
+        state.observe_lcpp("cpp", &sample, at);
+    }
+
+    /// One `/slots` read of `cpp`: slot 0 decodes task 20 (its prompt of
+    /// 100 done), slot 1 is idle on `idle_task`.
+    fn lcpp_decode_read(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        decoded: u64,
+        idle_task: i64,
+    ) {
+        let body = format!(
+            r#"[{{"id":0,"id_task":20,"is_processing":true,"n_prompt_tokens_processed":100,"next_token":[{{"n_decoded":{decoded}}}]}},{{"id":1,"id_task":{idle_task},"is_processing":false,"n_prompt_tokens_processed":2000,"next_token":[{{"n_decoded":3}}]}}]"#
+        );
+        state.slots.begin_round();
+        assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
+        state.slots.finish_round(at);
+        state.observe_lcpp_prompt("cpp", at);
+    }
+
+    /// L1: with no fresh `/slots` read, llama.cpp's READ is the rise of
+    /// `prompt_tokens_total` over the whole window, not 0 while busy.
+    #[test]
+    fn lcpp_read_without_slots_is_the_prompt_counter_over_its_window() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let t0 = Instant::now();
+        let q = Duration::from_millis(250);
+        for i in 0u32..=24 {
+            // A 1,000-token prompt lands every second.
+            lcpp_prompt_metrics(&mut state, t0 + q * i, 1_000 * u64::from(i / 4), 1.0);
+        }
+        let read = state.read_aggregate(&[], t0 + q * 24).expect("lcpp").0;
+        assert!((read - 1_000.0).abs() < 1e-6, "{read}");
+    }
+
+    /// L2: a request that starts and ends between two `/slots` reads is
+    /// only in `prompt_tokens_total`. Its tokens are READ's tail, held a
+    /// read; a prompt the slots did see is not counted twice.
+    #[test]
+    fn lcpp_read_counts_a_prompt_no_slots_read_saw_once() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut reads = Vec::new();
+        for k in 0u32..=6 {
+            let at = t0 + s * k;
+            // Task 21's 2,000-token prompt lands between the reads at 2 s
+            // and 3 s; slot 1 shows it already idle at 3 s.
+            let prompt = if k >= 3 { 2_100 } else { 100 };
+            lcpp_prompt_metrics(&mut state, at, prompt, 1.0);
+            let idle = if k >= 3 { 21 } else { 19 };
+            lcpp_decode_read(&mut state, at, 10 * u64::from(k + 1), idle);
+            reads.push(state.read_aggregate(&[], at).expect("lcpp").0);
+        }
+        assert_eq!(reads[..3], [0.0, 0.0, 0.0]);
+        // Rebased at the read before: 2,000 over 1 s, then 2 s; past the
+        // hold it is 0.
+        assert!((reads[3] - 2_000.0).abs() < 1e-6, "{reads:?}");
+        assert!((reads[4] - 1_000.0).abs() < 1e-6, "{reads:?}");
+        assert_eq!(reads[5..], [0.0, 0.0], "{reads:?}");
+
+        // A prompt /slots saw prefilling, then done: counted once.
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        lcpp_prompt_metrics(&mut state, t0, 0, 1.0);
+        lcpp_prompt_read(&mut state, t0, &[(0, 0)]);
+        lcpp_prompt_metrics(&mut state, t0 + s, 0, 1.0);
+        lcpp_prompt_read(&mut state, t0 + s, &[(1_000, 0)]);
+        lcpp_prompt_metrics(&mut state, t0 + s * 2, 1_500, 1.0);
+        lcpp_prompt_read(&mut state, t0 + s * 2, &[(1_500, 1)]);
+        assert_eq!(state.lcpp_read_tail["cpp"].tail, 0);
+        assert_eq!(state.slots.processed_total("cpp"), 1_500);
     }
 
     fn publish_detail(state: &mut State<llama_core::log::Stderr>) -> LlamaDetail {
@@ -4569,7 +4758,8 @@ mod tests {
         state.publish().unwrap();
         let (_, detail) = rx.take().unwrap();
         assert_eq!(detail.prompt_tps, Some(0.0), "no prompt tokens read yet");
-        assert_eq!(detail.streams.read_solo, Some(2_600.0));
+        // The solo ref is the faster model's (L3), not their sum.
+        assert_eq!(detail.streams.read_solo, Some(2_000.0));
         assert_eq!(detail.chart_prompt_tps, Some(600.0), "vLLM decodes");
         vllm_read(&mut state, Instant::now(), 2.0, (1.0, 0.0), 9);
         state.publish().unwrap();
@@ -4808,6 +4998,8 @@ mod tests {
             read_rose: HashMap::new(),
             lcpp_prompt: WindowRate::default(),
             lcpp_prompt_live: HashSet::new(),
+            lcpp_prompt_metrics: WindowRate::default(),
+            lcpp_read_tail: HashMap::new(),
             lcpp_busy_since: HashMap::new(),
             lcpp_active: RatioWindow::default(),
             vllm_uncached: WindowRate::default(),
