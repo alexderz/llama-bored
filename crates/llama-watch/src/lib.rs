@@ -29,3 +29,4 @@ pub mod speeds;
 pub mod tqllm;
 pub mod tty;
 pub mod vllm_phase;
+pub mod window_rate;

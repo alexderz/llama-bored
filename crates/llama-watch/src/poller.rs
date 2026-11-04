@@ -170,6 +170,7 @@ use crate::speeds::SpeedBook;
 use crate::tqllm::{RowClaim, TqllmBook};
 use crate::tty::grid::Cell;
 use crate::vllm_phase::VllmPhaseBook;
+use crate::window_rate::WindowRate;
 
 const RUNNING_CAP: usize = 64 * 1024;
 /// Captured requests per model whose message marks are kept for the IN
@@ -606,6 +607,13 @@ struct State<L> {
     /// `tokens_predicted_total`: what `counter` adds for those models,
     /// not their decode calls (DER-451).
     lcpp_tokens: LcppTokens,
+    /// SGLang models whose box counter is read from
+    /// `realtime_tokens_total{mode="decode"}` (`true`) or from
+    /// `generation_tokens_total` (`false`), to rebase on a switch.
+    sglang_realtime: HashMap<String, bool>,
+    /// SGLang's live `realtime_tokens_total{mode="prefill_compute"}` per
+    /// model, for its READ while it prefills (DER-451).
+    sglang_prefill: WindowRate,
     /// RECENT's own rows across llama-swap restarts (#44).
     recent: Recent,
     ai: AiState,
@@ -773,6 +781,8 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         gen_rate: GenRate::default(),
         slots,
         lcpp_tokens,
+        sglang_realtime: HashMap::new(),
+        sglang_prefill: WindowRate::default(),
         recent: Recent::default(),
         ai: AiState::Down,
         models: Vec::new(),
@@ -1135,6 +1145,8 @@ impl<L: Sink> State<L> {
         self.loads_missing.remove(id);
         self.counter.forget(id);
         self.lcpp_tokens.forget(id);
+        self.sglang_realtime.remove(id);
+        self.sglang_prefill.forget(id);
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
@@ -1346,6 +1358,9 @@ impl<L: Sink> State<L> {
                 }
             }
             let decoded = match &read {
+                Ok(sample) if model.backend == Backend::SgLang => {
+                    self.sglang_decoded(&model.id, sample, now)
+                }
                 Ok(sample) => sample.n_decode_total,
                 Err(_) => None,
             };
@@ -1415,6 +1430,22 @@ impl<L: Sink> State<L> {
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
         self.poll_loads();
         self.latencies.metrics = Some(started.elapsed());
+    }
+
+    /// SGLang's box counter value (DER-451): its live
+    /// `realtime_tokens_total{mode="decode"}`, which moves every decode
+    /// step, else `generation_tokens_total`, which moves only when a
+    /// request finishes. A switch between them rebases the counter.
+    fn sglang_decoded(&mut self, id: &str, sample: &MetricsSample, now: Instant) -> Option<u64> {
+        if let Some(prefill) = sample.realtime.prefill_compute {
+            self.sglang_prefill.observe(id, now, prefill);
+        }
+        let live = sample.realtime.decode.is_some();
+        let value = sample.realtime.decode.or(sample.n_decode_total)?;
+        if self.sglang_realtime.insert(id.to_owned(), live) == Some(!live) {
+            self.counter.rebase(id, value);
+        }
+        Some(value)
     }
 
     /// A llama.cpp `/metrics` read into the box counter: its tokens from
@@ -2547,15 +2578,21 @@ impl<L: Sink> State<L> {
     /// READ chart input of one busy burst-engine model (DER-451): its held
     /// prefill speed while one of its requests is prefilling, 0 while every
     /// running one decodes, `None` when the phase is unknown. vLLM's phase
-    /// is [`VllmPhaseBook`]'s. SGLang's is never known here: its `/metrics`
-    /// gauges lag its requests by up to 40 decode steps ([`crate::live`]),
-    /// so its running count cannot be set against its first-token count.
-    /// Its chart is unknown while it is busy, not its held speed.
+    /// is [`VllmPhaseBook`]'s. SGLang's gauges lag its requests by up to 40
+    /// decode steps ([`crate::live`]), so its phase is not known here; its
+    /// chart is the rate of its live `realtime_tokens_total{mode=
+    /// "prefill_compute"}` over the last second instead, which is 0 while
+    /// it only decodes. Without that counter it is unknown while busy.
     fn burst_chart_rate(&self, model: &ReadyModel, now: Instant) -> Option<f64> {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        if model.backend == Backend::SgLang {
+            return self
+                .sglang_prefill
+                .rate(&model.id, now, Duration::from_secs(1), fresh);
+        }
         if model.backend != Backend::Vllm {
             return None;
         }
-        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
         match self.vllm_phase.phase(&model.id, now, fresh)? {
             ChartPhase::Decode => Some(0.0),
             ChartPhase::Prefill => self
@@ -3710,6 +3747,142 @@ mod tests {
         assert_eq!(detail.chart_prompt_tps, None);
     }
 
+    /// One SGLang `/metrics` read of `flash` at `at` through the poller's
+    /// counter path: `num_running_reqs`, the finish counter and, when
+    /// `realtime` is set, `realtime_tokens_total` as `(decode, prefill)`.
+    fn sglang_read(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        running: f64,
+        generated: u64,
+        realtime: Option<(u64, u64)>,
+    ) {
+        let mut body = format!(
+            "sglang:num_running_reqs{{model_name=\"m\"}} {running}\nsglang:generation_tokens_total{{model_name=\"m\"}} {generated}\n"
+        );
+        if let Some((decode, prefill)) = realtime {
+            body.push_str(&format!(
+                "sglang:realtime_tokens_total{{mode=\"decode\",model_name=\"m\"}} {decode}\nsglang:realtime_tokens_total{{model_name=\"m\",mode=\"prefill_compute\"}} {prefill}\nsglang:realtime_tokens_total{{model_name=\"m\",mode=\"prefill_cache\"}} 7\n"
+            ));
+        }
+        let sample = crate::metrics::parse_metrics_full(Backend::SgLang, &body).0;
+        if let Some(value) = state.sglang_decoded("flash", &sample, at) {
+            state
+                .counter
+                .observe("flash", value, sample.requests_processing, at);
+        }
+    }
+
+    fn sglang_ready(state: &mut State<llama_core::log::Stderr>) {
+        state.ready = vec![ReadyModel {
+            id: "flash".into(),
+            name: "flash".into(),
+            backend: Backend::SgLang,
+            probe: false,
+        }];
+        state.running_up = true;
+    }
+
+    /// F2: SGLang's WRITE is its live `realtime_tokens_total{mode=
+    /// "decode"}`, which moves every step, not `generation_tokens_total`,
+    /// which jumps when a request finishes. N = 1, 2 and 4 streams at 50
+    /// tok/s each read 50 × N while nothing has finished.
+    #[test]
+    fn sglang_write_is_the_live_decode_counter() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            sglang_ready(&mut state);
+            let t0 = Instant::now();
+            let q = Duration::from_millis(250);
+            let mut rate = GenRate::default();
+            let mut last = None;
+            for i in 0u32..=8 {
+                let at = t0 + q * i;
+                let decode = u64::from(i) * 50 * n / 4;
+                sglang_read(&mut state, at, n as f64, 900, Some((1_000 + decode, 0)));
+                last = rate.observe(at, state.counter.total());
+            }
+            assert_eq!(last, Some(50.0 * n as f64), "{n} streams");
+            // A finish moves only the finish counter: no spike.
+            sglang_read(
+                &mut state,
+                t0 + q * 9,
+                0.0,
+                900 + 400 * n,
+                Some((1_000 + 112 * n, 0)),
+            );
+            assert_eq!(state.counter.total(), 112 * n, "{n} streams");
+        }
+    }
+
+    /// F2: without `realtime_tokens_total` the finish counter is used as
+    /// before; when the live counter appears the box counter switches to
+    /// it without counting its whole value, and back again.
+    #[test]
+    fn sglang_write_falls_back_and_rebases_on_a_switch() {
+        let mut state = blank_state();
+        sglang_ready(&mut state);
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        sglang_read(&mut state, t0, 1.0, 500, None);
+        sglang_read(&mut state, t0 + s, 0.0, 640, None);
+        assert_eq!(state.counter.total(), 140, "the finish counter, as before");
+        sglang_read(&mut state, t0 + s * 2, 1.0, 640, Some((90_000, 0)));
+        assert_eq!(state.counter.total(), 140, "a switch adds nothing");
+        sglang_read(&mut state, t0 + s * 3, 1.0, 640, Some((90_030, 0)));
+        assert_eq!(state.counter.total(), 170);
+        sglang_read(&mut state, t0 + s * 4, 0.0, 700, None);
+        assert_eq!(
+            state.counter.total(),
+            170,
+            "back to the finish counter: rebased"
+        );
+        sglang_read(&mut state, t0 + s * 5, 0.0, 710, None);
+        assert_eq!(state.counter.total(), 180);
+    }
+
+    /// F2: SGLang's READ chart is no longer unknown while it is busy. It
+    /// is the rate of `realtime_tokens_total{mode="prefill_compute"}` over
+    /// the last second: N = 1, 2 and 4 requests prefilling together at
+    /// 600 tok/s of engine time read 600 (the engine's aggregate, however
+    /// it is shared), and 0 once they all decode.
+    #[test]
+    fn sglang_chart_read_is_the_live_prefill_counter() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            sglang_ready(&mut state);
+            let now = Instant::now();
+            let start = now - Duration::from_secs(2);
+            let q = Duration::from_millis(250);
+            for i in 0u32..=8 {
+                let at = start + q * i;
+                let prefill = u64::from(i) * 150;
+                sglang_read(&mut state, at, n as f64, 0, Some((0, prefill)));
+            }
+            let rx = state.tx.share_with_thread();
+            state.publish().expect("publish");
+            let (_view, detail) = rx.take().expect("sample");
+            assert_eq!(detail.chart_prompt_tps, Some(600.0), "{n} prefilling");
+
+            let mut state = blank_state();
+            sglang_ready(&mut state);
+            for i in 0u32..=8 {
+                let at = start + q * i;
+                sglang_read(
+                    &mut state,
+                    at,
+                    n as f64,
+                    0,
+                    Some((u64::from(i) * 10 * n, 1200)),
+                );
+            }
+            let rx = state.tx.share_with_thread();
+            state.publish().expect("publish");
+            let (_view, detail) = rx.take().expect("sample");
+            assert_eq!(detail.chart_prompt_tps, Some(0.0), "{n} decoding");
+        }
+    }
+
     fn blank_state() -> State<llama_core::log::Stderr> {
         State {
             limits: Limits {
@@ -3742,6 +3915,8 @@ mod tests {
             gen_rate: GenRate::default(),
             slots: SlotBook::default(),
             lcpp_tokens: LcppTokens::default(),
+            sglang_realtime: HashMap::new(),
+            sglang_prefill: WindowRate::default(),
             recent: Recent::default(),
             ai: AiState::Loaded,
             models: Vec::new(),

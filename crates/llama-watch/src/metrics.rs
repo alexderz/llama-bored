@@ -96,6 +96,9 @@ struct Names {
     /// llama.cpp's busy slots per decode call since the server started
     /// (DER-451).
     busy_per_decode: &'static [&'static str],
+    /// Live token counter labelled `mode` (DER-451): SGLang's
+    /// `realtime_tokens_total`, added per prefill batch and decode step.
+    realtime: &'static [&'static str],
     /// Sum across label sets. llama.cpp keeps its last value, as before T72.
     sum: bool,
 }
@@ -140,6 +143,7 @@ const LLAMACPP: Names = Names {
     prompt_seconds: &["llamacpp:prompt_seconds_total"],
     predicted_seconds: &["llamacpp:tokens_predicted_seconds_total"],
     busy_per_decode: &["llamacpp:n_busy_slots_per_decode"],
+    realtime: NONE,
     sum: false,
 };
 
@@ -181,6 +185,7 @@ const SGLANG: Names = Names {
     prompt_seconds: NONE,
     predicted_seconds: NONE,
     busy_per_decode: NONE,
+    realtime: &["sglang:realtime_tokens_total"],
     sum: true,
 };
 
@@ -230,6 +235,7 @@ const VLLM: Names = Names {
     prompt_seconds: NONE,
     predicted_seconds: NONE,
     busy_per_decode: NONE,
+    realtime: NONE,
     sum: true,
 };
 
@@ -367,6 +373,21 @@ pub struct MetricsSample {
     /// Busy slots per decode call since the server started
     /// (`llamacpp:n_busy_slots_per_decode`, DER-451).
     pub busy_per_decode: Option<f64>,
+    /// SGLang's live token counters (`realtime_tokens_total`, DER-451),
+    /// by `mode`: `decode` tokens generated, `prefill_compute` prompt
+    /// tokens computed and `prefill_cache` prompt tokens reused from the
+    /// cache. They move every step; the finish counters above move once a
+    /// request ends.
+    pub realtime: Realtime,
+}
+
+/// [`MetricsSample::realtime`]: each `mode`'s series summed across the
+/// other labels, `None` when that mode is absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Realtime {
+    pub decode: Option<u64>,
+    pub prefill_compute: Option<u64>,
+    pub prefill_cache: Option<u64>,
 }
 
 /// A model's KV cache in tokens, from its `/metrics` (#79). llama.cpp's
@@ -455,6 +476,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut prompt_seconds = Acc::default();
     let mut predicted_seconds = Acc::default();
     let mut busy_per_decode = Acc::default();
+    let mut realtime: [Acc; 3] = Default::default();
     for line in body.lines() {
         let Some((name, value)) = metric_line(line) else {
             continue;
@@ -485,6 +507,14 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             predicted_seconds.add(value, names.sum);
         } else if names.busy_per_decode.contains(&name) {
             busy_per_decode.add(value, names.sum);
+        } else if names.realtime.contains(&name) {
+            let mode = label_value(line, "mode");
+            if let Some(index) = ["decode", "prefill_compute", "prefill_cache"]
+                .iter()
+                .position(|known| mode.as_deref() == Some(*known))
+            {
+                realtime[index].add(value, true);
+            }
         } else if names.kv_used.contains(&name) {
             kv_used.add(value, names.sum);
         } else if names.kv_cached.contains(&name) {
@@ -628,6 +658,11 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         prompt_seconds: prompt_seconds.0,
         predicted_seconds: predicted_seconds.0,
         busy_per_decode: busy_per_decode.0,
+        realtime: Realtime {
+            decode: realtime[0].0.and_then(finite_u64),
+            prefill_compute: realtime[1].0.and_then(finite_u64),
+            prefill_cache: realtime[2].0.and_then(finite_u64),
+        },
     };
     (sample, facts)
 }
@@ -770,7 +805,8 @@ fn label_value(line: &str, key: &str) -> Option<String> {
 /// left out. Only the keys in [`CACHE_KEYS`] and `sleep_state` are kept,
 /// so the result is small whatever the line holds. `is_streaming` is
 /// kept too: the non-streaming series of `num_requests_total` is counted
-/// on its own (#133).
+/// on its own (#133). So is `mode`, which splits SGLang's
+/// `realtime_tokens_total` (DER-451).
 fn labels_of(line: &str) -> Vec<(&str, String)> {
     let mut out = Vec::new();
     let Some(open) = line.find('{') else {
@@ -823,7 +859,7 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
         }
         if !too_long
             && value.is_ascii()
-            && (key == "sleep_state" || key == "is_streaming" || CACHE_KEYS.contains(&key))
+            && (matches!(key, "sleep_state" | "is_streaming" | "mode") || CACHE_KEYS.contains(&key))
         {
             out.push((key, value));
         }
@@ -2271,6 +2307,13 @@ impl DecodedCounter {
         self.processing.remove(model);
     }
 
+    /// `model`'s counter is now read from another source (DER-451): take
+    /// `value` as its baseline, adding nothing, so the switch neither
+    /// counts the new counter's whole value nor reads as a restart.
+    pub fn rebase(&mut self, model: &str, value: u64) {
+        self.last.insert(model.to_owned(), value);
+    }
+
     /// Running sum when `/running` is up and every ready model was read
     /// within the last second. Zero ready models is a measured total.
     #[must_use]
@@ -2722,6 +2765,43 @@ fn finite_u64(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F2 (DER-451): SGLang's `realtime_tokens_total` split by `mode`
+    /// wherever the label sits, each mode summed across the other labels
+    /// (two TP ranks here), an unknown mode left out, absent when the
+    /// server does not export it.
+    #[test]
+    fn sglang_realtime_tokens_by_mode_in_any_label_order() {
+        let body = "\
+# TYPE sglang:realtime_tokens_total counter
+sglang:realtime_tokens_total{mode=\"decode\",model_name=\"m\",tp_rank=\"0\"} 100
+sglang:realtime_tokens_total{model_name=\"m\",tp_rank=\"1\",mode=\"decode\"} 20
+sglang:realtime_tokens_total{model_name=\"m\",mode=\"prefill_compute\",tp_rank=\"0\"} 3000
+sglang:realtime_tokens_total{ tp_rank=\"0\", mode=\"prefill_cache\"} 9000
+sglang:realtime_tokens_total{mode=\"other\"} 5
+sglang:realtime_tokens_total 7
+sglang:generation_tokens_total{model_name=\"m\"} 80
+";
+        let sample = parse_metrics_for(Backend::SgLang, body);
+        assert_eq!(
+            sample.realtime,
+            Realtime {
+                decode: Some(120),
+                prefill_compute: Some(3000),
+                prefill_cache: Some(9000),
+            }
+        );
+        assert_eq!(
+            sample.n_decode_total,
+            Some(80),
+            "the finish counter is kept"
+        );
+        let without = parse_metrics_for(Backend::SgLang, "sglang:generation_tokens_total 80\n");
+        assert_eq!(without.realtime, Realtime::default());
+        // Not an SGLang name for the other engines.
+        let vllm = parse_metrics_for(Backend::Vllm, body);
+        assert_eq!(vllm.realtime, Realtime::default());
+    }
 
     const STRATA: &str = include_str!("../../../fixtures/llama/strata-metrics.json");
 
