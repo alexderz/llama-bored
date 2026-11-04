@@ -232,6 +232,11 @@ const READ_WINDOW: Duration = Duration::from_secs(5);
 /// is taken over at least this much wall time, never a landing over a
 /// short gap (DER-451).
 const VLLM_READ_WINDOW: Duration = Duration::from_secs(10);
+/// How long an SGLang READ stays live after its prefill counter last
+/// rose (DER-451, M1). Its prefill counter rises only when a
+/// chunk's batch finishes, which takes longer than one 0.25 s read; the
+/// reads between two chunks are still the same prefill.
+const PREFILL_HOLD: Duration = Duration::from_millis(1_500);
 
 /// The inter-token latency window of vLLM and SGLang (DER-451).
 const ITL_WINDOW: Duration = Duration::from_secs(5);
@@ -670,6 +675,9 @@ struct State<L> {
     /// SGLang models prefilling at their last read (their live prompt
     /// counter rose), for the start of a READ episode.
     sglang_prefill_live: HashSet<String>,
+    /// When each SGLang model's prefill counter last rose, for
+    /// [`PREFILL_HOLD`]. llama.cpp's `/slots` says when a prefill ends.
+    read_rose: HashMap<String, Instant>,
     /// Prompt tokens llama.cpp's slots processed ([`SlotBook::processed_total`]),
     /// per `/slots` read, for READ (DER-451).
     lcpp_prompt: WindowRate,
@@ -855,6 +863,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         sglang_realtime: HashMap::new(),
         sglang_prefill: WindowRate::default(),
         sglang_prefill_live: HashSet::new(),
+        read_rose: HashMap::new(),
         lcpp_prompt: WindowRate::default(),
         lcpp_prompt_live: HashSet::new(),
         lcpp_busy_since: HashMap::new(),
@@ -1226,6 +1235,7 @@ impl<L: Sink> State<L> {
         self.sglang_realtime.remove(id);
         self.sglang_prefill.forget(id);
         self.sglang_prefill_live.remove(id);
+        self.read_rose.remove(id);
         self.lcpp_prompt.forget(id);
         self.lcpp_prompt_live.remove(id);
         self.lcpp_busy_since.remove(id);
@@ -1523,6 +1533,18 @@ impl<L: Sink> State<L> {
         self.latencies.metrics = Some(started.elapsed());
     }
 
+    /// Whether `id`'s READ is live at `now`: its counter rose this read,
+    /// or within [`PREFILL_HOLD`] before it (DER-451, M1). Inside the hold
+    /// the window is not rebased, so a prefill in chunks reads as one.
+    fn read_held(&mut self, id: &str, rose: bool, now: Instant) -> bool {
+        if rose {
+            self.read_rose.insert(id.to_owned(), now);
+        }
+        self.read_rose
+            .get(id)
+            .is_some_and(|at| now.saturating_duration_since(*at) <= PREFILL_HOLD)
+    }
+
     /// One `/slots` read into llama.cpp's READ aggregate (DER-451): live
     /// while a slot prefills or the slots processed prompt tokens since the
     /// read before. A new episode's window starts at that read, or when the
@@ -1776,7 +1798,8 @@ impl<L: Sink> State<L> {
     fn sglang_decoded(&mut self, id: &str, sample: &MetricsSample, now: Instant) -> Option<u64> {
         if let Some(prefill) = sample.realtime.prefill_compute {
             let newest = self.sglang_prefill.newest(id);
-            let live = newest.is_some_and(|(_, last)| prefill > last);
+            let rose = newest.is_some_and(|(_, last)| prefill > last);
+            let live = self.read_held(id, rose, now);
             if live && !self.sglang_prefill_live.contains(id) {
                 // A prefill starts: its READ window starts at the read
                 // before it.
@@ -3985,18 +4008,50 @@ mod tests {
                 Some(300.0 * n as f64),
                 "{n}"
             );
-            sglang_read(
-                &mut state,
-                now + q,
-                n as f64,
-                0,
-                Some((10, 1_000 + 600 * n)),
-            );
+            // Decoding, past the hold after the last prefill rise.
+            for i in 1u32..=7 {
+                sglang_read(
+                    &mut state,
+                    now + q * i,
+                    n as f64,
+                    10 * u64::from(i),
+                    Some((10 * u64::from(i), 1_000 + 600 * n)),
+                );
+            }
             assert_eq!(
                 publish_detail(&mut state).prompt_tps,
                 Some(0.0),
                 "{n} decoding"
             );
+        }
+    }
+
+    /// M1 (DER-451): SGLang's prefill counter rises once per finished
+    /// chunk, and a 4k chunk of four requests takes a second, four reads.
+    /// The reads between two chunks keep READ live and its window, so it
+    /// does not drop to 0 at each chunk; past the hold it is 0.
+    #[test]
+    fn sglang_read_holds_between_prefill_chunks() {
+        let mut state = blank_state();
+        sglang_ready(&mut state);
+        let t0 = Instant::now();
+        let q = Duration::from_millis(250);
+        let mut prefill = 1_000u64;
+        for i in 0u32..=28 {
+            if (4..=20).contains(&i) && i % 4 == 0 {
+                prefill += 4_096;
+            }
+            let at = t0 + q * i;
+            sglang_read(&mut state, at, 4.0, 0, Some((0, prefill)));
+            let read = state.read_aggregate(&[], at).expect("sglang").0;
+            if (8..=21).contains(&i) {
+                // Five chunks of 4096 a second; the window started at the
+                // read before the first.
+                assert!(read > 3_000.0 && read < 7_000.0, "read {i}: {read}");
+            }
+            if i == 28 {
+                assert_eq!(read, 0.0, "past the hold");
+            }
         }
     }
 
@@ -4750,6 +4805,7 @@ mod tests {
             sglang_realtime: HashMap::new(),
             sglang_prefill: WindowRate::default(),
             sglang_prefill_live: HashSet::new(),
+            read_rose: HashMap::new(),
             lcpp_prompt: WindowRate::default(),
             lcpp_prompt_live: HashSet::new(),
             lcpp_busy_since: HashMap::new(),
