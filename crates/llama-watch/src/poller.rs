@@ -2717,16 +2717,10 @@ impl<L: Sink> State<L> {
                 };
                 let chart_rate = match model.backend {
                     Backend::LlamaCpp => {
-                        let active = self
-                            .counter
-                            .requests_processing(&model.id, now)
-                            .unwrap_or(0.0);
-                        match self.slots.chart_phase(
-                            &model.id,
-                            active,
-                            now,
-                            self.limits.slots_interval * 2,
-                        ) {
+                        match self
+                            .slots
+                            .chart_phase(&model.id, now, self.limits.slots_interval * 2)
+                        {
                             Some(ChartPhase::Decode) => Some(0.0),
                             Some(ChartPhase::Prefill) => rate,
                             None => None,
@@ -3680,26 +3674,57 @@ mod tests {
         ));
         book.finish_round(now);
         assert_eq!(
-            book.chart_phase("a", 2.0, now, Duration::from_secs(2)),
+            book.chart_phase("a", now, Duration::from_secs(2)),
             Some(crate::slots::ChartPhase::Prefill)
         );
         assert_eq!(
-            book.chart_phase("b", 1.0, now, Duration::from_secs(2)),
+            book.chart_phase("b", now, Duration::from_secs(2)),
             Some(crate::slots::ChartPhase::Decode)
         );
         assert_eq!(
-            book.chart_phase("a", 3.0, now, Duration::from_secs(2)),
+            book.chart_phase("a", now + Duration::from_secs(3), Duration::from_secs(2)),
             None
         );
-        assert_eq!(
-            book.chart_phase(
-                "a",
-                2.0,
-                now + Duration::from_secs(3),
-                Duration::from_secs(2)
-            ),
-            None
-        );
+    }
+
+    /// F8 (DER-451): `/metrics` `requests_processing` and `/slots` are
+    /// read at different moments. When they disagree the READ chart takes
+    /// the busy slots of the `/slots` body and does not gap.
+    #[test]
+    fn chart_phase_ignores_a_metrics_busy_count_from_another_moment() {
+        let mut state = blank_state();
+        state.running_up = true;
+        state.ready.push(ReadyModel {
+            id: "cpp".into(),
+            name: "cpp".into(),
+            backend: Backend::LlamaCpp,
+            probe: false,
+        });
+        // /metrics says three requests; /slots shows one, decoding.
+        state.counter.observe("cpp", 1, Some(3.0), Instant::now());
+        for decoded in [4, 9] {
+            state.slots.begin_round();
+            let body = format!(
+                r#"[{{"id":0,"id_task":1,"is_processing":true,"next_token":[{{"n_decoded":{decoded}}}]}},{{"id":1,"id_task":-1,"is_processing":false}}]"#
+            );
+            assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
+            state.slots.finish_round(Instant::now());
+        }
+        let detail = publish_detail(&mut state);
+        assert_eq!(detail.chart_prompt_tps, Some(0.0));
+        // And the other way: /metrics says none while /slots prefills.
+        state.counter.observe("cpp", 2, Some(0.0), Instant::now());
+        state.slots.begin_round();
+        assert!(state.slots.apply(
+            "cpp",
+            "cpp",
+            br#"[{"id":0,"id_task":2,"is_processing":true,"next_token":[{"n_decoded":0}]}]"#,
+            0,
+            0
+        ));
+        state.slots.finish_round(Instant::now());
+        let detail = publish_detail(&mut state);
+        assert!(detail.chart_prompt_tps.is_some(), "no gap");
     }
 
     #[test]

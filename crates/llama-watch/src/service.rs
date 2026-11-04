@@ -25,7 +25,7 @@ use crate::metrics::EngineLive;
 use crate::poller::{self, CaptureView, LlamaDetail, ModelEngineLive, ModelSetup, PollLatencies};
 use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
 use crate::setup_rules::{LiveCtx, Rules};
-use crate::slots::{SlotView, pick_slot};
+use crate::slots::SlotView;
 use crate::sources::Roots;
 use crate::sources::gpu::{GpuBackend, NvidiaGpu};
 use crate::sources::proc::count_cpus;
@@ -492,6 +492,8 @@ struct TickState {
     prompt_last: Option<f64>,
     /// IN/OUT burst scroll (#188).
     motion: crate::tty::scroll::Motion,
+    /// The stream IN and OUT follow (DER-451, F6).
+    pin: crate::slots::StreamPin,
 }
 
 impl TickState {
@@ -540,6 +542,7 @@ impl TickState {
             gen_last: None,
             prompt_last: None,
             motion: crate::tty::scroll::Motion::default(),
+            pin: crate::slots::StreamPin::default(),
         }
     }
 }
@@ -1025,19 +1028,30 @@ fn tty_model(
                 .first()
                 .is_some_and(|model| model.name == capture.model)
     });
+    // DER-451 (F6): one sticky pick for IN, OUT and their scroll.
+    let picked_key = tick
+        .pin
+        .pick(&tick.detail.slots, mono)
+        .map(|slot| (slot.model.clone(), slot.id, slot.id_task));
+    let picked = picked_key.as_ref().and_then(|(model, id, task)| {
+        tick.detail
+            .slots
+            .iter()
+            .find(|slot| slot.model == *model && slot.id == *id && slot.id_task == *task)
+    });
     // With text off the poller keeps none, and nothing here reads the slot
     // tails either, so no llama text can reach the frame (RR-LV1).
     let mut text = if !ctx.show_text {
         FrameText::default()
     } else if let Some(capture) = capture {
-        capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap)
+        let running = tick.detail.streams.running.unwrap_or(0);
+        let mut text = capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap);
+        text.in_title = capture_in_title(&capture.input_note, running);
+        text
     } else {
-        frame_text(
-            &tick.detail.slots,
-            &mut tick.replay,
-            ctx.input_cap,
-            ctx.output_cap,
-        )
+        let mut text = frame_text(picked, &mut tick.replay, ctx.input_cap, ctx.output_cap);
+        text.in_title = slot_in_title(picked, &tick.detail.slots);
+        text
     };
     if ctx.show_text {
         apply_scroll(
@@ -1045,6 +1059,7 @@ fn tty_model(
             &mut tick.motion,
             &tick.detail,
             capture,
+            picked,
             &sample.snapshot.models,
             mono,
         );
@@ -1424,7 +1439,11 @@ struct ScrollIdentity {
     input_new: Option<usize>,
 }
 
-fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> ScrollIdentity {
+fn scroll_identity(
+    detail: &LlamaDetail,
+    capture: Option<&CaptureView>,
+    picked: Option<&SlotView>,
+) -> ScrollIdentity {
     if let Some(capture) = capture {
         let row = detail.activity.iter().find(|row| row.id == capture.id);
         let model = row
@@ -1448,7 +1467,7 @@ fn scroll_identity(detail: &LlamaDetail, capture: Option<&CaptureView>) -> Scrol
             input_new: capture.input_new,
         };
     }
-    let Some(slot) = pick_slot(&detail.slots) else {
+    let Some(slot) = picked else {
         let model = detail
             .setup
             .first()
@@ -1498,10 +1517,11 @@ fn apply_scroll(
     motion: &mut crate::tty::scroll::Motion,
     detail: &LlamaDetail,
     capture: Option<&CaptureView>,
+    picked: Option<&SlotView>,
     models: &[ModelInfo],
     now: Instant,
 ) {
-    let identity = scroll_identity(detail, capture);
+    let identity = scroll_identity(detail, capture, picked);
     let input = text_chars(&text.in_lines);
     let output = text_chars(&text.out_lines);
     let rows: Vec<crate::tty::scroll::Turn> = detail
@@ -1537,18 +1557,18 @@ fn apply_scroll(
     text.out_scroll = view.out;
 }
 
-/// IN and OUT for one frame, both from [`pick_slot`]. Advances the OUT
-/// replay cursor. IN keeps no cursor: it is rebuilt from the picked slot on
-/// every frame, so a slot switch swaps it at once. OUT's cursor goes through
-/// [`align_shown`], which drops to 0 when the new slot's tail shares nothing
-/// with the old one.
+/// IN and OUT for one frame, both from the picked slot
+/// ([`crate::slots::StreamPin`]). Advances the OUT replay cursor. IN keeps
+/// no cursor: it is rebuilt from the picked slot on every frame, so a slot
+/// switch swaps it at once. OUT's cursor goes through [`align_shown`],
+/// which drops to 0 when the new slot's tail shares nothing with the old
+/// one.
 fn frame_text(
-    slots: &[SlotView],
+    picked: Option<&SlotView>,
     replay: &mut OutReplay,
     input_cap: usize,
     output_cap: usize,
 ) -> FrameText {
-    let picked = pick_slot(slots);
     let output = picked.map_or_else(Vec::new, |slot| sanitised_chars(&slot.output));
     note_output(replay, &output, output_cap);
     let input = picked.map_or_else(Vec::new, |slot| sanitised_chars(&slot.input));
@@ -1578,7 +1598,7 @@ fn capture_text(
     note_output(replay, &output, output_cap);
     let input = cap_chars(&sanitised_chars(&capture.input), input_cap);
     FrameText {
-        in_title: capture_in_title(&capture.input_note),
+        in_title: capture_in_title(&capture.input_note, 0),
         out_title: CAPTURE_OUT_TITLE.to_owned(),
         in_lines: chars_lines(&input),
         out_lines: chars_lines(&replay.tail),
@@ -1593,14 +1613,53 @@ fn capture_text(
 const CAPTURE_IN_TITLE: &str = "IN (last request)";
 
 /// `IN (last request)`, or `IN (last request · 3 tool results)` for a tool
-/// loop (#38).
-fn capture_in_title(note: &str) -> String {
-    if note.is_empty() {
-        CAPTURE_IN_TITLE.to_owned()
+/// loop (#38). With two or more requests running it is not the live one:
+/// `IN (last finished · 2 running)` (DER-451, C.4).
+fn capture_in_title(note: &str, running: u32) -> String {
+    let head = if running >= 2 {
+        format!("IN (last finished \u{00B7} {running} running")
     } else {
-        format!("IN (last request \u{00B7} {note})")
+        "IN (last request".to_owned()
+    };
+    if note.is_empty() && running < 2 {
+        CAPTURE_IN_TITLE.to_owned()
+    } else if note.is_empty() {
+        format!("{head})")
+    } else {
+        format!("{head} \u{00B7} {note})")
     }
 }
+
+/// Most characters of a model name in the IN title.
+const IN_TITLE_MODEL_CHARS: usize = 24;
+
+/// The IN title over a slot (DER-451, F6): `IN · <model> slot 2/4 · 3 busy`
+/// when its model has two or more slots, or two or more slots are busy;
+/// plain `IN` for one slot running one stream. The slot is 1-based of its
+/// model's slots; busy counts every model's.
+fn slot_in_title(picked: Option<&SlotView>, slots: &[SlotView]) -> String {
+    let Some(slot) = picked else {
+        return "IN".to_owned();
+    };
+    let own = slots
+        .iter()
+        .filter(|other| other.model == slot.model)
+        .count();
+    let busy = slots.iter().filter(|other| other.is_processing).count();
+    if own < 2 && busy < 2 {
+        return "IN".to_owned();
+    }
+    let model: String = slot.model.chars().take(IN_TITLE_MODEL_CHARS).collect();
+    let mut title = format!(
+        "IN \u{00B7} {model} slot {}/{own}",
+        slot.id.saturating_add(1)
+    );
+    if busy >= 2 {
+        title.push_str(&format!(" \u{00B7} {busy} busy"));
+    }
+    title
+}
+
 const CAPTURE_OUT_TITLE: &str = "OUT (last response)";
 
 /// The IN/OUT part of a [`TtyModel`]. Empty when `tty.show_text = false`.
@@ -2892,6 +2951,7 @@ fn format_span(duration: Duration) -> String {
 mod tests {
     use super::*;
     use crate::jobs::{Job, JobState};
+    use crate::slots::pick_slot;
     use llama_core::backend::{Backend, BackendInfo};
 
     fn job_at(name: &str, state: JobState, mtime: SystemTime) -> Job {
@@ -2992,14 +3052,14 @@ mod tests {
         busy.prompt_cached = Some(500);
         busy.n_prompt_tokens_processed = 300;
         tick.detail.slots = vec![busy.clone()];
-        let id = scroll_identity(&tick.detail, None);
+        let id = scroll_identity(&tick.detail, None, pick_slot(&tick.detail.slots));
         assert_eq!(id.input_tokens, Some(800));
         assert_eq!(id.input_chars, None, "partial tokens: four per token");
         assert_eq!(id.input_cached, None);
         busy.n_decoded = 1;
         busy.n_prompt_tokens_processed = 9_500;
         tick.detail.slots = vec![busy];
-        let id = scroll_identity(&tick.detail, None);
+        let id = scroll_identity(&tick.detail, None, pick_slot(&tick.detail.slots));
         assert_eq!(id.input_tokens, Some(10_000));
         assert_eq!(id.input_chars, Some(40_000));
         assert_eq!(id.input_cached, Some(500));
@@ -3970,7 +4030,7 @@ mod tests {
         ];
         assert_eq!(pick_slot(&slots).map(|s| s.id), Some(2));
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         let inn = text_of(&text.in_lines);
         let out = text_of(&text.out_lines);
         assert!(
@@ -3989,7 +4049,7 @@ mod tests {
             slot(2, 7, true, "OLD-IN", "OLD-OUT"),
         ];
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "NEW-IN");
         assert_eq!(text_of(&text.out_lines), "NEW-OUT");
     }
@@ -4003,7 +4063,7 @@ mod tests {
             slot(3, -1, false, "", ""),
         ];
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "LAST-IN");
         assert_eq!(text_of(&text.out_lines), "LAST-OUT");
         assert!(pick_slot(&[]).is_none());
@@ -4016,18 +4076,18 @@ mod tests {
             slot(0, 4, true, "PROMPT-A", "alpha output"),
             slot(1, 2, false, "PROMPT-B-OLD", "zzz"),
         ];
-        frame_text(&first, &mut replay, 8192, 8192);
+        frame_text(pick_slot(&first), &mut replay, 8192, 8192);
         // Let the replay finish, then grow the same slot: the cursor keeps
         // what is already on screen.
         for _ in 0..10 {
-            frame_text(&first, &mut replay, 8192, 8192);
+            frame_text(pick_slot(&first), &mut replay, 8192, 8192);
         }
         assert_eq!(replay.frame, None);
         let grown = [
             slot(0, 4, true, "PROMPT-A", "alpha output more"),
             slot(1, 2, false, "PROMPT-B-OLD", "zzz"),
         ];
-        let text = frame_text(&grown, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&grown), &mut replay, 8192, 8192);
         assert_eq!(text.out_shown, "alpha output".len());
         assert_eq!(text.replay_frame, Some(0));
         assert_eq!(text_of(&text.in_lines), "PROMPT-A");
@@ -4038,7 +4098,7 @@ mod tests {
             slot(0, 4, false, "PROMPT-A", "alpha output more"),
             slot(1, 6, true, "PROMPT-B", "beta"),
         ];
-        let text = frame_text(&switched, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&switched), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "PROMPT-B");
         assert_eq!(text_of(&text.out_lines), "beta");
         assert_eq!(text.out_shown, 0);
@@ -6650,5 +6710,100 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    /// F6: the IN title over a slot names the model, the slot of its
+    /// slots and the busy count; one slot running one stream stays `IN`.
+    #[test]
+    fn the_slot_in_title_names_the_stream_shown() {
+        let one = [slot(0, 3, true, "p", "o")];
+        assert_eq!(slot_in_title(one.first(), &one), "IN");
+        assert_eq!(slot_in_title(None, &one), "IN");
+        let four = [
+            slot(0, 3, true, "p", "o"),
+            slot(1, 4, true, "p", "o"),
+            slot(2, 5, false, "p", "o"),
+            slot(3, 6, true, "p", "o"),
+        ];
+        assert_eq!(
+            slot_in_title(four.get(1), &four),
+            "IN \u{00B7} m slot 2/4 \u{00B7} 3 busy"
+        );
+        let quiet = [slot(0, 3, true, "p", "o"), slot(1, 4, false, "p", "o")];
+        assert_eq!(
+            slot_in_title(quiet.first(), &quiet),
+            "IN \u{00B7} m slot 1/2"
+        );
+    }
+
+    /// C.4: over a capture with two or more requests running, IN says it
+    /// is the last one finished, not the live one.
+    #[test]
+    fn the_capture_in_title_says_last_finished_while_others_run() {
+        assert_eq!(capture_in_title("", 0), "IN (last request)");
+        assert_eq!(capture_in_title("", 1), "IN (last request)");
+        assert_eq!(
+            capture_in_title("3 tool results", 1),
+            "IN (last request \u{00B7} 3 tool results)"
+        );
+        assert_eq!(
+            capture_in_title("", 2),
+            "IN (last finished \u{00B7} 2 running)"
+        );
+        assert_eq!(
+            capture_in_title("3 tool results", 4),
+            "IN (last finished \u{00B7} 4 running \u{00B7} 3 tool results)"
+        );
+    }
+
+    /// F6 through the frame: a newer task on another slot does not move IN
+    /// and OUT off the stream shown; once that ends and its dwell passed
+    /// they move to the one still running, and the title follows.
+    #[test]
+    fn in_and_out_stay_on_their_stream_while_another_starts() {
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("m", "ready", Some(llama))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        let t0 = Instant::now();
+        let frame = |tick: &mut TickState, slots: Vec<SlotView>, at: Duration| {
+            tick.detail.slots = slots;
+            tty_model(&sample, tick, t0 + at, UNIX_EPOCH, Zone::utc(), &ctx)
+        };
+        let first = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, true, "ZEROIN", "ZEROOUT"),
+                slot(1, 4, false, "", ""),
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(first.in_title, "IN \u{00B7} m slot 1/2");
+        let both = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, true, "ZEROIN", "ZEROOUT"),
+                slot(1, 11, true, "ONEIN", "ONEOUT"),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(both.in_title, "IN \u{00B7} m slot 1/2 \u{00B7} 2 busy");
+        assert!(text_of(&both.out_lines).contains("ZEROOUT"));
+        assert!(!text_of(&both.out_lines).contains("ONEOUT"));
+        let moved = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, false, "ZEROIN", "ZEROOUT"),
+                slot(1, 11, true, "ONEIN", "ONEOUT"),
+            ],
+            Duration::from_secs(6),
+        );
+        assert_eq!(moved.in_title, "IN \u{00B7} m slot 2/2");
+        assert!(text_of(&moved.in_lines).contains("ONEIN"));
     }
 }

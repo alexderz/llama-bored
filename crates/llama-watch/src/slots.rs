@@ -133,6 +133,75 @@ pub fn pick_slot(slots: &[SlotView]) -> Option<&SlotView> {
         .max_by_key(|slot| (slot.is_processing, slot.id_task))
 }
 
+/// How long IN and OUT stay on a stream they picked before an ended one
+/// gives way to another (DER-451, F6).
+pub const PIN_DWELL: Duration = Duration::from_secs(5);
+
+/// The stream IN and OUT follow (DER-451, F6). It stays on its
+/// `(model, slot, id_task)` while that runs; once it ends, and has been
+/// shown for [`PIN_DWELL`], it moves to the oldest stream still running,
+/// by when this picker first saw each in flight. Task ids of different
+/// servers are never compared. With nothing running it stays on the
+/// stream it showed last.
+#[derive(Debug, Default)]
+pub struct StreamPin {
+    /// When each in-flight `(model, slot, id_task)` was first seen.
+    first_seen: HashMap<(String, i64, i64), Instant>,
+    /// The stream shown, and when it was picked.
+    pinned: Option<((String, i64, i64), Instant)>,
+}
+
+impl StreamPin {
+    /// The slot to show in `slots` at `now`.
+    pub fn pick<'a>(&mut self, slots: &'a [SlotView], now: Instant) -> Option<&'a SlotView> {
+        let key = |slot: &SlotView| (slot.model.clone(), slot.id, slot.id_task);
+        let busy: Vec<&SlotView> = slots
+            .iter()
+            .filter(|slot| slot.is_processing && slot.id_task >= 0)
+            .collect();
+        for slot in &busy {
+            self.first_seen.entry(key(slot)).or_insert(now);
+        }
+        self.first_seen
+            .retain(|seen, _| busy.iter().any(|slot| key(slot) == *seen));
+        if let Some((pinned, at)) = &self.pinned
+            && let Some(slot) = slots.iter().find(|slot| key(slot) == *pinned)
+            && (slot.is_processing
+                || busy.is_empty()
+                || now.saturating_duration_since(*at) < PIN_DWELL)
+        {
+            return Some(slot);
+        }
+        let oldest = busy.iter().copied().min_by(|a, b| {
+            let seen = |slot: &SlotView| self.first_seen.get(&key(slot)).copied();
+            seen(a)
+                .cmp(&seen(b))
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.id_task.cmp(&b.id_task))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(slot) = oldest {
+            self.pinned = Some((key(slot), now));
+            return Some(slot);
+        }
+        // Nothing runs and the stream shown is gone: the newest task of
+        // the first model with one, never comparing servers' task ids.
+        let model = slots
+            .iter()
+            .find(|slot| slot.id_task >= 0)
+            .or_else(|| slots.first())
+            .map(|slot| slot.model.clone())?;
+        let own: Vec<SlotView> = slots
+            .iter()
+            .filter(|slot| slot.model == model)
+            .cloned()
+            .collect();
+        let picked = pick_slot(&own).map(key)?;
+        self.pinned = Some((picked.clone(), now));
+        slots.iter().find(|slot| key(slot) == picked)
+    }
+}
+
 impl SlotView {
     /// The task's whole prompt, once it is known (#78): see [`whole_prompt`].
     #[must_use]
@@ -751,10 +820,11 @@ impl SlotBook {
     }
 
     /// Fresh, complete per-model phase; unknown is never coerced to zero.
+    /// The busy slots are those of the same `/slots` body (F8, DER-451),
+    /// not `/metrics` `requests_processing` read at another moment.
     pub fn chart_phase(
         &self,
         model_id: &str,
-        active: f64,
         now: Instant,
         fresh: std::time::Duration,
     ) -> Option<ChartPhase> {
@@ -766,9 +836,6 @@ impl SlotBook {
             .iter()
             .filter(|row| row.model_id == model_id && row.is_processing)
             .collect();
-        if active_slots.len() as f64 != active {
-            return None;
-        }
         let mut phase = ChartPhase::Decode;
         for slot in active_slots {
             if slot.chart_phase? == ChartPhase::Prefill {
@@ -2179,5 +2246,143 @@ mod tests {
         book.finish_round(resumed + Duration::from_secs(1));
         let rate = book.prompt_tps().expect("rate");
         assert!((rate - 2048.0).abs() < 1e-6, "{rate}");
+    }
+
+    fn view(model: &str, id: i64, id_task: i64, busy: bool) -> SlotView {
+        SlotView {
+            model: model.to_owned(),
+            id,
+            id_task,
+            is_processing: busy,
+            n_prompt_tokens: 0,
+            n_prompt_tokens_processed: 0,
+            n_decoded: 0,
+            n_ctx: None,
+            ctx_prompt: None,
+            prompt_cached: None,
+            input: Vec::new(),
+            output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
+            ctx_used: None,
+            resets: ResetCounts::default(),
+            last_reset: None,
+        }
+    }
+
+    fn picked(pin: &mut StreamPin, slots: &[SlotView], now: Instant) -> (String, i64, i64) {
+        let slot = pin.pick(slots, now).expect("a slot");
+        (slot.model.clone(), slot.id, slot.id_task)
+    }
+
+    /// F6, N=1: one stream is shown while it runs, and stays shown once
+    /// it ends with nothing else running.
+    #[test]
+    fn the_pin_follows_one_stream_and_rests_on_it() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let busy = [view("m", 0, 10, true)];
+        assert_eq!(picked(&mut pin, &busy, t0), ("m".into(), 0, 10));
+        let ended = [view("m", 0, 10, false)];
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(1)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(60)),
+            ("m".into(), 0, 10)
+        );
+    }
+
+    /// F6, N=2: a stream that starts on another slot does not take IN and
+    /// OUT from the one shown; when that ends the next is shown, but not
+    /// before it was shown for PIN_DWELL.
+    #[test]
+    fn a_new_stream_does_not_steal_the_pin_and_an_end_waits_its_dwell() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let one = [view("m", 0, 10, true), view("m", 1, 4, false)];
+        assert_eq!(picked(&mut pin, &one, t0), ("m".into(), 0, 10));
+        // Slot 1 starts a newer task: the pin stays.
+        let two = [view("m", 0, 10, true), view("m", 1, 11, true)];
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &two, at), ("m".into(), 0, 10));
+        // Task 10 ends 2 s after it was pinned: held until 5 s.
+        let ended = [view("m", 0, 10, false), view("m", 1, 11, true)];
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(2)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + PIN_DWELL - Duration::from_millis(1)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + PIN_DWELL),
+            ("m".into(), 1, 11)
+        );
+        // A long-running pin ends past its dwell: it moves at once.
+        let back = [view("m", 0, 12, true), view("m", 1, 11, false)];
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(picked(&mut pin, &back, later), ("m".into(), 0, 12));
+    }
+
+    /// F6, N=4: when the shown stream ends, IN and OUT move to the oldest
+    /// one still running by when it was first seen, not the lowest slot
+    /// or the newest task.
+    #[test]
+    fn an_ended_pin_moves_to_the_oldest_of_four_streams() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let mut slots = vec![
+            view("m", 0, 1, true),
+            view("m", 1, 0, false),
+            view("m", 2, 0, false),
+            view("m", 3, 0, false),
+        ];
+        assert_eq!(picked(&mut pin, &slots, t0), ("m".into(), 0, 1));
+        // Slot 3 starts first, then slot 1, then slot 2.
+        for (step, (slot, task)) in [(3usize, 5i64), (1, 9), (2, 7)].into_iter().enumerate() {
+            slots[slot] = view("m", slot as i64, task, true);
+            let at = t0 + Duration::from_secs(1 + step as u64);
+            assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 0, 1));
+        }
+        slots[0] = view("m", 0, 1, false);
+        let at = t0 + Duration::from_secs(10);
+        assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 3, 5));
+        // That one ends too: slot 1, seen before slot 2's lower task id.
+        slots[3] = view("m", 3, 5, false);
+        let at = at + PIN_DWELL;
+        assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 1, 9));
+    }
+
+    /// CCR-5 corrected (F6): servers number tasks on their own, so a big
+    /// task id on one is not newer than a small one on another. The pin
+    /// moves to the stream seen first.
+    #[test]
+    fn task_ids_of_different_servers_are_not_compared() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let first = [view("a", 0, 300_000, true), view("b", 0, 6, false)];
+        assert_eq!(picked(&mut pin, &first, t0), ("a".into(), 0, 300_000));
+        let both = [view("a", 0, 300_000, true), view("b", 0, 7, true)];
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &both, at), ("a".into(), 0, 300_000));
+        // Fresh picker: b's task is seen first and wins over a's bigger id.
+        let mut pin = StreamPin::default();
+        let b_only = [view("a", 0, 299_999, false), view("b", 0, 7, true)];
+        assert_eq!(picked(&mut pin, &b_only, t0), ("b".into(), 0, 7));
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &both, at), ("b".into(), 0, 7));
+        let b_done = [view("a", 0, 300_000, true), view("b", 0, 7, false)];
+        assert_eq!(
+            picked(&mut pin, &b_done, t0 + PIN_DWELL),
+            ("a".into(), 0, 300_000)
+        );
+        // Nothing runs and the pin is gone: the first model's newest task,
+        // not the biggest id across servers.
+        let mut pin = StreamPin::default();
+        let idle = [view("b", 0, 7, false), view("a", 0, 300_000, false)];
+        assert_eq!(picked(&mut pin, &idle, t0), ("b".into(), 0, 7));
     }
 }
