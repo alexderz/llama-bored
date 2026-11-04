@@ -98,8 +98,11 @@ struct Book {
     /// the baseline of the first read.
     tasks: HashMap<(i64, i64), u64>,
     /// `tokens_predicted_total` rise less the accounted tokens of the
-    /// tasks retired since the last settle.
+    /// tasks retired since the last settle. Negative only by what the
+    /// current `/slots` round retired (see [`Book::settle`]).
     balance: i64,
+    /// Accounted tokens of the tasks retired this `/slots` round.
+    retired_round: u64,
     /// Tokens credited ahead of the `/slots` reads, not yet confirmed.
     advance: u64,
     /// Slots decoding at the last `/slots` read.
@@ -135,13 +138,16 @@ impl Book {
         }
     }
 
-    /// Decode calls while one stream decodes, unknown otherwise.
-    fn calls_mode(&self) -> Mode {
-        if self.ratio.is_none_or(|ratio| ratio <= ONE_STREAM) {
-            Mode::Calls
-        } else {
-            Mode::Unknown
-        }
+    /// Decode calls while one stream decodes, unknown otherwise. Without
+    /// a busy-slot ratio (no `n_busy_slots_per_decode`, or too few calls
+    /// yet) more than one `requests_processing` is unknown (review L4); a
+    /// server without that gauge either is read as before.
+    fn calls_mode(&self, processing: Option<f64>) -> Mode {
+        let one = match self.ratio {
+            Some(ratio) => ratio <= ONE_STREAM,
+            None => processing.is_none_or(|n| n <= 1.0),
+        };
+        if one { Mode::Calls } else { Mode::Unknown }
     }
 
     /// Credit `tokens` that are confirmed: they pay the advance first.
@@ -155,13 +161,20 @@ impl Book {
     /// `tokens_predicted_total` adds for it, less its tail.
     fn retire(&mut self, accounted: u64) {
         self.balance = self.balance.saturating_sub(signed(accounted));
+        self.retired_round = self.retired_round.saturating_add(accounted);
     }
 
-    /// Settle the tail: a positive balance is tokens no read credited.
+    /// Settle the tail: a positive balance is tokens no read credited. A
+    /// negative one waits for `tokens_predicted_total` only for the tasks
+    /// retired this round, released after the `/metrics` read before it.
+    /// llama.cpp never adds a cancelled task, so older debt is dropped
+    /// rather than eating later tasks' tails (review M2).
     fn settle(&mut self) {
         if self.balance > 0 {
             self.confirm(u64::try_from(self.balance).unwrap_or(0));
             self.balance = 0;
+        } else {
+            self.balance = self.balance.max(-signed(self.retired_round));
         }
     }
 
@@ -170,6 +183,7 @@ impl Book {
         self.synced = false;
         self.tasks.clear();
         self.balance = 0;
+        self.retired_round = 0;
         self.streams = 0;
     }
 }
@@ -242,7 +256,7 @@ impl LcppTokens {
         if book.unsettled {
             book.unsync();
             book.busy_since = None;
-            book.mode = book.calls_mode();
+            book.mode = book.calls_mode(read.processing);
             return match book.mode {
                 Mode::Unknown => None,
                 _ => {
@@ -277,7 +291,7 @@ impl LcppTokens {
             .is_none_or(|at| now.saturating_duration_since(at) > stale);
         if slots_stale && now.saturating_duration_since(since) > stale {
             book.unsync();
-            book.mode = book.calls_mode();
+            book.mode = book.calls_mode(read.processing);
         }
         match book.mode {
             Mode::Slots => {
@@ -305,6 +319,7 @@ impl LcppTokens {
             return;
         }
         book.slots_at = Some(now);
+        book.retired_round = 0;
         if book.mode != Mode::Slots {
             book.mode = Mode::Slots;
             book.unsync();
@@ -735,6 +750,58 @@ mod tests {
             } else {
                 assert_eq!((got, after), (None, None), "{n} streams");
             }
+        }
+    }
+
+    /// M2: llama.cpp does not add a cancelled task to
+    /// `tokens_predicted_total`. Its retired tokens are debt for one round
+    /// only, then dropped, so the next task's tail still counts. A task
+    /// released after the `/metrics` read is paid one round later.
+    #[test]
+    fn a_cancelled_task_does_not_eat_a_later_tail() {
+        for cancelled in [true, false] {
+            let mut book = LcppTokens::default();
+            let t0 = Instant::now();
+            let s = Duration::from_secs(1);
+            book.observe_metrics("m", &read(0, 0, 2.0), t0);
+            book.observe_slots("m", &[slot(0, 1, true, 10), slot(1, 2, true, 10)], t0);
+            book.observe_metrics("m", &read(0, 0, 2.0), t0 + s);
+            book.observe_slots("m", &[slot(0, 1, true, 100), slot(1, 2, true, 50)], t0 + s);
+            // Task 1 is released after this /metrics read: cancelled at
+            // 100, or finished at 110.
+            let last = if cancelled { 100 } else { 110 };
+            book.observe_metrics("m", &read(0, 0, 2.0), t0 + s * 2);
+            book.observe_slots(
+                "m",
+                &[slot(0, 1, false, last), slot(1, 2, true, 80)],
+                t0 + s * 2,
+            );
+            let predicted = if cancelled { 0 } else { 110 };
+            book.observe_metrics("m", &read(0, predicted, 1.0), t0 + s * 3);
+            book.observe_slots("m", &[slot(1, 2, true, 120)], t0 + s * 3);
+            // Task 2 ends at 150, 30 past the last /slots read.
+            let total = book.observe_metrics("m", &read(0, predicted + 150, 0.0), t0 + s * 4);
+            let task1 = last - 10;
+            assert_eq!(total, Some(task1 + 140), "cancelled {cancelled}");
+        }
+    }
+
+    /// L4: without `n_busy_slots_per_decode` there is no busy-slot ratio,
+    /// so stale `/slots` reads decode calls only while at most one request
+    /// is processing; with more the total is unknown.
+    #[test]
+    fn without_a_busy_ratio_several_requests_are_unknown() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        for (processing, expect) in [(1.0, Some(100)), (2.0, None)] {
+            let mut book = LcppTokens::new(Duration::from_secs(3));
+            let mut got = None;
+            for i in 0u32..=5 {
+                let calls = 1000 + u64::from(i) * 50;
+                got = book.observe_metrics("m", &read(calls, 0, processing), t0 + s * i);
+            }
+            // Busy since t0, stale after 3 s: the reads at 4 s and 5 s count.
+            assert_eq!(got, expect, "processing {processing}");
         }
     }
 }
