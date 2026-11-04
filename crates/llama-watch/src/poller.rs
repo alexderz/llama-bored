@@ -245,10 +245,12 @@ struct ReadTail {
     at: Option<Instant>,
     /// `prompt_tokens_total` then.
     metrics: u64,
-    /// The slots' processed tokens whose prefill had ended then.
-    settled: u64,
-    /// Counter rise less ended prefills since; negative only by the last
-    /// round's ended prefills.
+    /// The slots' processed tokens then ([`SlotBook::processed_total`]).
+    processed: u64,
+    /// A slot was in prefill then.
+    prefilled: bool,
+    /// Counter rise less processed tokens since, carried while a slot
+    /// prefills.
     balance: i64,
     /// Tokens the counter counted that no `/slots` read did.
     tail: u64,
@@ -1608,20 +1610,25 @@ impl<L: Sink> State<L> {
     /// The prompt tokens llama.cpp's `prompt_tokens_total` counted that
     /// no `/slots` read did (DER-451, L2), as WRITE settles its tail with
     /// `tokens_predicted_total`. After each `/slots` read the counter's
-    /// rise is matched against the slots' processed tokens whose prefill
-    /// ended, the ones it counts. A surplus is tail. A deficit waits a
-    /// round for prefills that ended after the `/metrics` read, and no
-    /// longer: a cancelled prefill is never counted there. A gap in the
-    /// reads starts again from the next.
+    /// rise is matched against the rise of the slots' processed tokens.
+    ///
+    /// Which prompt tokens the counter has while a slot prefills depends on
+    /// the batch: llama.cpp flushes them after any batch with output, so
+    /// beside a decoding slot they rise chunk by chunk, and on a lone
+    /// prefill only once it ends. So while any slot is in prefill the
+    /// difference is carried, either way, and a surplus (a request between
+    /// two reads) is tail only at a read with nothing in prefill. A deficit
+    /// left after the read following one with nothing in prefill is a
+    /// prefill the counter never adds, cancelled, and is dropped before
+    /// that read's processed tokens are matched. A gap in the reads starts
+    /// again from the next.
     fn settle_lcpp_read(&mut self, id: &str, now: Instant) -> u64 {
         let tail = self.lcpp_read_tail.get(id).map_or(0, |book| book.tail);
         let Some((_, metrics)) = self.lcpp_prompt_metrics.newest(id) else {
             return tail;
         };
-        let settled = self
-            .slots
-            .processed_total(id)
-            .saturating_sub(self.slots.prefill_pending(id));
+        let processed = self.slots.processed_total(id);
+        let prefilling = self.slots.prefilling(id) > 0;
         let fresh = (self.limits.slots_interval * 2).max(Duration::from_secs(2));
         let book = self.lcpp_read_tail.entry(id.to_owned()).or_default();
         let signed = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
@@ -1629,27 +1636,28 @@ impl<L: Sink> State<L> {
             .at
             .is_some_and(|at| now.saturating_duration_since(at) <= fresh)
             && metrics >= book.metrics
-            && settled >= book.settled
+            && processed >= book.processed
         {
-            let ended = signed(settled - book.settled);
+            book.balance = book.balance.saturating_add(signed(metrics - book.metrics));
+            if !book.prefilled {
+                book.balance = book.balance.max(0);
+            }
             book.balance = book
                 .balance
-                .saturating_add(signed(metrics - book.metrics))
-                .saturating_sub(ended);
-            if book.balance > 0 {
+                .saturating_sub(signed(processed - book.processed));
+            if !prefilling && book.balance > 0 {
                 book.tail = book
                     .tail
                     .saturating_add(u64::try_from(book.balance).unwrap_or(0));
                 book.balance = 0;
-            } else {
-                book.balance = book.balance.max(-ended);
             }
         } else {
             book.balance = 0;
         }
         book.at = Some(now);
         book.metrics = metrics;
-        book.settled = settled;
+        book.processed = processed;
+        book.prefilled = prefilling;
         book.tail
     }
 
@@ -4024,6 +4032,51 @@ mod tests {
         lcpp_prompt_read(&mut state, t0 + s * 2, &[(1_500, 1)]);
         assert_eq!(state.lcpp_read_tail["cpp"].tail, 0);
         assert_eq!(state.slots.processed_total("cpp"), 1_500);
+    }
+
+    /// H (re-review): llama.cpp b11669 flushes prompt tokens after any
+    /// batch with output, so beside a decoding slot `prompt_tokens_total`
+    /// rises with each chunk of another slot's prefill, while that slot
+    /// still has `n_decoded == 0`. READ is the true rate, 2048 tok/s, not
+    /// twice it: whether the counter keeps up with the chunks or lags a
+    /// read behind, nothing is tail.
+    #[test]
+    fn a_prefill_beside_a_decode_is_not_counted_twice() {
+        for lag in [0u64, 1] {
+            let mut state = blank_state();
+            lcpp_ready(&mut state);
+            let t0 = Instant::now();
+            for k in 0u64..=4 {
+                let at = t0 + Duration::from_secs(k);
+                let chunks = k.min(3);
+                let flushed = chunks.saturating_sub(if k == 4 { 0 } else { lag });
+                lcpp_prompt_metrics(&mut state, at, 100 + 2_048 * flushed, 2.0);
+                let b = if k == 0 {
+                    r#"{"id":1,"id_task":19,"is_processing":false,"n_prompt_tokens_processed":0}"#
+                        .to_owned()
+                } else {
+                    format!(
+                        r#"{{"id":1,"id_task":21,"is_processing":true,"n_prompt_tokens_processed":{},"next_token":[{{"n_decoded":{}}}]}}"#,
+                        2_048 * chunks,
+                        u64::from(k >= 3)
+                    )
+                };
+                let body = format!(
+                    r#"[{{"id":0,"id_task":20,"is_processing":true,"n_prompt_tokens_processed":100,"next_token":[{{"n_decoded":{}}}]}},{b}]"#,
+                    10 * (k + 1)
+                );
+                state.slots.begin_round();
+                assert!(state.slots.apply("cpp", "cpp", body.as_bytes(), 0, 0));
+                state.slots.finish_round(at);
+                state.observe_lcpp_prompt("cpp", at);
+                let read = state.read_aggregate(&[], at).expect("lcpp").0;
+                if (1..=3).contains(&k) {
+                    assert!((read - 2_048.0).abs() < 1e-6, "lag {lag} read {k}: {read}");
+                }
+            }
+            assert_eq!(state.lcpp_read_tail["cpp"].tail, 0, "lag {lag}");
+            assert_eq!(state.lcpp_read_tail["cpp"].balance, 0, "lag {lag}");
+        }
     }
 
     fn publish_detail(state: &mut State<llama_core::log::Stderr>) -> LlamaDetail {
