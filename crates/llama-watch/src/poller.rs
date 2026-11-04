@@ -130,7 +130,7 @@
 //!
 //! The thread never touches the console or the snapshot file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -233,12 +233,37 @@ const READ_WINDOW: Duration = Duration::from_secs(5);
 /// short gap (DER-451).
 const VLLM_READ_WINDOW: Duration = Duration::from_secs(10);
 
+/// The inter-token latency window of vLLM and SGLang (DER-451).
+const ITL_WINDOW: Duration = Duration::from_secs(5);
+/// Inter-token latency reads kept per model.
+const ITL_READS: usize = 64;
+/// A model's running count, its inter-token latency p50 and the bound of
+/// its slowest bucket (DER-451).
+type ItlPick = (u32, f64, Option<(f64, bool)>);
+
 /// What is known about concurrent requests, for the lines under WRITE and
-/// READ (DER-451). `None` is not known.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// READ (DER-451). `None` is not known. Summed over the busy models.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Streams {
-    /// Requests in prefill now (llama.cpp's slots with nothing decoded).
+    /// Requests running: llama.cpp's slots in flight in `/slots`, vLLM's
+    /// `num_requests_running`, SGLang's `num_running_reqs`, tqLLM's
+    /// requests in prefill or decode, Strata's busy slots.
+    pub running: Option<u32>,
+    /// Requests waiting: llama.cpp's `requests_deferred`, vLLM's
+    /// `num_requests_waiting`, SGLang's `num_queue_reqs`, tqLLM's queued
+    /// requests, Strata's `waiting`.
+    pub queued: Option<u32>,
+    /// Requests in prefill now: llama.cpp's slots with nothing decoded,
+    /// tqLLM's in prefill, Strata's reading slots.
     pub prefilling: Option<u32>,
+    /// Inter-token latency p50 and the bound of its slowest bucket over
+    /// [`ITL_WINDOW`], in seconds, from the histogram's bucket rises
+    /// (vLLM, SGLang). The bound is `(bound, open)`: `open` is past the
+    /// last finite bucket.
+    pub itl_p50: Option<f64>,
+    pub itl_max: Option<(f64, bool)>,
+    /// llama.cpp in-flight tasks' own decode rates (F5).
+    pub slot_gen: Vec<crate::slots::SlotRate>,
     /// READ while active: prompt tokens per second of prefill time
     /// (llama.cpp's `prompt_tokens_total` ÷ `prompt_seconds_total`).
     pub read_active: Option<f64>,
@@ -657,6 +682,9 @@ struct State<L> {
     lcpp_active: RatioWindow,
     /// vLLM prompt tokens less the cached ones, per `/metrics` read.
     vllm_uncached: WindowRate,
+    /// vLLM's and SGLang's inter-token latency buckets per `/metrics` read
+    /// (DER-451).
+    itl: HashMap<String, VecDeque<(Instant, crate::metrics::Buckets)>>,
     /// RECENT's own rows across llama-swap restarts (#44).
     recent: Recent,
     ai: AiState,
@@ -832,6 +860,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         lcpp_busy_since: HashMap::new(),
         lcpp_active: RatioWindow::default(),
         vllm_uncached: WindowRate::default(),
+        itl: HashMap::new(),
         recent: Recent::default(),
         ai: AiState::Down,
         models: Vec::new(),
@@ -1202,6 +1231,7 @@ impl<L: Sink> State<L> {
         self.lcpp_busy_since.remove(id);
         self.lcpp_active.forget(id);
         self.vllm_uncached.forget(id);
+        self.itl.remove(id);
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
@@ -1448,6 +1478,7 @@ impl<L: Sink> State<L> {
                         ttft_labeled,
                     );
                 }
+                self.observe_itl(&model.id, sample, now);
                 self.gauges
                     .insert(model.id.clone(), Gauges::of(sample, engine, live, now));
                 if let Some(prompt) = sample.prompt_total {
@@ -1547,10 +1578,6 @@ impl<L: Sink> State<L> {
             }
             match model.backend {
                 Backend::LlamaCpp => {
-                    let prefilling =
-                        u32::try_from(self.slots.prefilling(&model.id)).unwrap_or(u32::MAX);
-                    streams.prefilling =
-                        Some(streams.prefilling.unwrap_or(0).saturating_add(prefilling));
                     if self.lcpp_prompt_live.contains(&model.id) {
                         read += self
                             .lcpp_prompt
@@ -1604,6 +1631,142 @@ impl<L: Sink> State<L> {
             }
         }
         Some((read, streams))
+    }
+
+    /// Running, queued and prefilling requests of the busy models, and
+    /// the inter-token latency of the one running the most streams with a
+    /// histogram (DER-451). A model counts while its gauges are fresh and
+    /// it runs a request.
+    fn stream_counts(&self, now: Instant, streams: &mut Streams) {
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        let add = |slot: &mut Option<u32>, value: Option<u32>| {
+            if let Some(value) = value {
+                *slot = Some(slot.unwrap_or(0).saturating_add(value));
+            }
+        };
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        // The inter-token latency of the model running the most streams:
+        // its running count, p50 and slowest bucket.
+        let mut itl: Option<ItlPick> = None;
+        for model in &self.ready {
+            let gauges = self
+                .gauges
+                .get(&model.id)
+                .filter(|gauges| now.saturating_duration_since(gauges.at) <= fresh);
+            let (running, queued, prefilling) = match model.backend {
+                Backend::LlamaCpp => {
+                    if !self
+                        .counter
+                        .requests_processing(&model.id, now)
+                        .is_some_and(|n| n > 0.0)
+                    {
+                        continue;
+                    }
+                    (
+                        Some(count(self.slots.busy(&model.id))),
+                        gauges.and_then(|g| g.queued).map(u32::from),
+                        Some(count(self.slots.prefilling(&model.id))),
+                    )
+                }
+                Backend::Vllm | Backend::SgLang => {
+                    let Some(gauges) = gauges else { continue };
+                    (
+                        gauges.running.map(u32::from),
+                        gauges.queued.map(u32::from),
+                        None,
+                    )
+                }
+                Backend::Tqllm => {
+                    let Some(live) = gauges.and_then(|g| g.live.as_ref()) else {
+                        continue;
+                    };
+                    let phase = |want: crate::metrics::TqPhase| {
+                        count(
+                            live.requests
+                                .iter()
+                                .filter(|req| req.request.phase == Some(want))
+                                .count(),
+                        )
+                    };
+                    let prefill = phase(crate::metrics::TqPhase::Prefill);
+                    (
+                        Some(prefill.saturating_add(phase(crate::metrics::TqPhase::Decode))),
+                        Some(phase(crate::metrics::TqPhase::Queued)),
+                        Some(prefill),
+                    )
+                }
+                Backend::Strata => {
+                    let Some(live) = gauges.and_then(|g| g.live.as_ref()) else {
+                        continue;
+                    };
+                    let slots = live.slots();
+                    if slots.is_empty() {
+                        let state = live.state.as_deref();
+                        let running = matches!(state, Some("reading" | "generating"));
+                        (
+                            Some(u32::from(running)),
+                            live.waiting,
+                            Some(u32::from(state == Some("reading"))),
+                        )
+                    } else {
+                        let busy = slots.iter().filter(|slot| slot.busy());
+                        (
+                            live.running.or(Some(count(busy.clone().count()))),
+                            live.waiting,
+                            Some(count(busy.filter(|slot| !slot.decoding()).count())),
+                        )
+                    }
+                }
+                Backend::OpenAi => continue,
+            };
+            if !running.is_some_and(|n| n > 0) && !queued.is_some_and(|n| n > 0) {
+                continue;
+            }
+            add(&mut streams.running, running);
+            add(&mut streams.queued, queued);
+            add(&mut streams.prefilling, prefilling);
+            let n = running.unwrap_or(0);
+            if itl.is_none_or(|(most, _, _)| n > most)
+                && let Some(window) = self.itl_window(&model.id, now)
+                && let Some(p50) = window.quantile(0.5)
+            {
+                itl = Some((n, p50, window.max_bound()));
+            }
+        }
+        if let Some((_, p50, max)) = itl {
+            streams.itl_p50 = Some(p50);
+            streams.itl_max = max;
+        }
+        streams.slot_gen = self.slots.slot_rates();
+    }
+
+    /// One `/metrics` read's inter-token latency buckets (DER-451).
+    fn observe_itl(&mut self, id: &str, sample: &MetricsSample, now: Instant) {
+        if let Some(buckets) = sample.itl_buckets {
+            let reads = self.itl.entry(id.to_owned()).or_default();
+            reads.push_back((now, buckets));
+            while reads.len() > ITL_READS {
+                reads.pop_front();
+            }
+        }
+    }
+
+    /// `model`'s inter-token latency observations over [`ITL_WINDOW`], or
+    /// since its oldest read when that is younger. `None` when its reads
+    /// are stale or none was observed.
+    fn itl_window(&self, model: &str, now: Instant) -> Option<crate::metrics::Buckets> {
+        let reads = self.itl.get(model)?;
+        let &(newest_at, newest) = reads.back()?;
+        let fresh = FRESH_GAUGES.max(self.limits.metrics_interval * 2);
+        if now.saturating_duration_since(newest_at) > fresh {
+            return None;
+        }
+        let (_, base) = reads
+            .iter()
+            .rev()
+            .find(|(at, _)| newest_at.saturating_duration_since(*at) >= ITL_WINDOW)
+            .or_else(|| reads.front())?;
+        newest.since(base).filter(|window| window.total() > 0.0)
     }
 
     /// SGLang's box counter value (DER-451): its live
@@ -2624,8 +2787,11 @@ impl<L: Sink> State<L> {
         } else {
             None
         };
-        let prompt_tps = read.map_or(prompt_tps, |(value, _)| Some(value));
-        let streams = read.map(|(_, streams)| streams).unwrap_or_default();
+        let prompt_tps = read.as_ref().map_or(prompt_tps, |(value, _)| Some(*value));
+        let mut streams = read.map(|(_, streams)| streams).unwrap_or_default();
+        if self.running_up {
+            self.stream_counts(now, &mut streams);
+        }
         let view = LlamaView {
             ai: self.ai,
             models: self.models_with_gauges(now),
@@ -3809,6 +3975,204 @@ mod tests {
         }
     }
 
+    /// One `/metrics` read of `id` into its gauges and inter-token latency,
+    /// as `poll_metrics` keeps them.
+    fn gauge_read(
+        state: &mut State<llama_core::log::Stderr>,
+        id: &str,
+        backend: Backend,
+        body: &str,
+        at: Instant,
+    ) {
+        let sample = crate::metrics::parse_metrics_full(backend, body).0;
+        state.observe_itl(id, &sample, at);
+        state.gauges.insert(
+            id.to_owned(),
+            Gauges::of(&sample, EngineStats::default(), None, at),
+        );
+    }
+
+    /// An inter-token latency histogram with `n` × (40 under 25 ms, 8 more
+    /// under 50 ms, 2 more under 100 ms) and `slow` past 100 ms, as vLLM
+    /// and SGLang export it.
+    fn itl_body(name: &str, n: u64, slow: u64) -> String {
+        let cum = [
+            ("0.01", 0),
+            ("0.025", 40 * n),
+            ("0.05", 48 * n),
+            ("0.1", 50 * n),
+            ("+Inf", 50 * n + slow),
+        ];
+        cum.iter()
+            .map(|(le, count)| format!("{name}_bucket{{le=\"{le}\",model_name=\"m\"}} {count}\n"))
+            .collect()
+    }
+
+    /// C.1: the line under WRITE and READ counts llama.cpp's streams from
+    /// the same `/slots` body (in flight, and in prefill with nothing
+    /// decoded) and its queue from `requests_deferred`. N = 1, 2 and 4:
+    /// one slot prefills, the others decode. No inter-token latency: the
+    /// engine has no histogram.
+    #[test]
+    fn lcpp_streams_are_its_busy_slots_and_deferred_requests() {
+        for n in [1usize, 2, 4] {
+            let mut state = blank_state();
+            lcpp_ready(&mut state);
+            let now = Instant::now();
+            lcpp_metrics(&mut state, now, 0, 0, n as f64);
+            gauge_read(
+                &mut state,
+                "cpp",
+                Backend::LlamaCpp,
+                &format!("llamacpp:requests_processing {n}\nllamacpp:requests_deferred 2\n"),
+                now,
+            );
+            let mut slots = vec![(100u64, 0u64)];
+            slots.extend(std::iter::repeat_n((100, 5), n - 1));
+            lcpp_prompt_read(&mut state, now, &slots);
+            let streams = publish_detail(&mut state).streams;
+            let n = u32::try_from(n).unwrap();
+            assert_eq!(streams.running, Some(n), "{n}");
+            assert_eq!(streams.queued, Some(2), "{n}");
+            assert_eq!(streams.prefilling, Some(1), "{n}");
+            assert_eq!((streams.itl_p50, streams.itl_max), (None, None), "{n}");
+        }
+    }
+
+    /// C.1: vLLM's streams are `num_requests_running` and
+    /// `num_requests_waiting`, and its inter-token latency p50 and slowest
+    /// bucket come from the histogram's rise over the last 5 s, not its
+    /// lifetime. N = 1, 2 and 4.
+    #[test]
+    fn vllm_streams_and_itl_from_its_gauges_and_histogram_rise() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            state.running_up = true;
+            state.ready = vec![vllm_model()];
+            let now = Instant::now();
+            let name = "vllm:inter_token_latency_seconds";
+            let old = format!("vllm:num_requests_running 1\n{}", itl_body(name, 100, 9));
+            gauge_read(
+                &mut state,
+                "v",
+                Backend::Vllm,
+                &old,
+                now - Duration::from_secs(5),
+            );
+            let mut body = format!("vllm:num_requests_running {n}\nvllm:num_requests_waiting 1\n");
+            body.push_str(&itl_body(name, 100 + n, 9));
+            gauge_read(&mut state, "v", Backend::Vllm, &body, now);
+            let streams = publish_detail(&mut state).streams;
+            let want = u32::try_from(n).unwrap();
+            assert_eq!(
+                (streams.running, streams.queued),
+                (Some(want), Some(1)),
+                "{n}"
+            );
+            let p50 = streams.itl_p50.expect("p50");
+            assert!((p50 - 0.019_375).abs() < 1e-9, "{n}: {p50}");
+            assert_eq!(
+                streams.itl_max,
+                Some((0.1, false)),
+                "{n}: none of the old slow ones"
+            );
+        }
+    }
+
+    /// C.1: SGLang's streams are `num_running_reqs` and `num_queue_reqs`;
+    /// a slowest token past the last finite bucket reads as open (`> 0.1
+    /// s`). N = 1, 2 and 4.
+    #[test]
+    fn sglang_streams_and_an_open_slowest_itl() {
+        for n in [1u64, 2, 4] {
+            let mut state = blank_state();
+            sglang_ready(&mut state);
+            let now = Instant::now();
+            let name = "sglang:inter_token_latency_seconds";
+            gauge_read(
+                &mut state,
+                "flash",
+                Backend::SgLang,
+                &itl_body(name, 0, 0),
+                now - Duration::from_secs(6),
+            );
+            let mut body = format!(
+                "sglang:num_running_reqs{{model_name=\"m\"}} {n}\nsglang:num_queue_reqs{{model_name=\"m\"}} 0\n"
+            );
+            body.push_str(&itl_body(name, n, 1));
+            gauge_read(&mut state, "flash", Backend::SgLang, &body, now);
+            let streams = publish_detail(&mut state).streams;
+            let want = u32::try_from(n).unwrap();
+            assert_eq!(
+                (streams.running, streams.queued),
+                (Some(want), Some(0)),
+                "{n}"
+            );
+            assert_eq!(streams.itl_max, Some((0.1, true)), "{n}");
+            assert!(
+                streams.itl_p50.is_some_and(|p| p > 0.01 && p < 0.025),
+                "{n}"
+            );
+        }
+    }
+
+    /// CCR-4 corrected (F5): each in-flight llama.cpp row gets its own
+    /// slot's decode rate from its `n_decoded` rise, never the model-wide
+    /// WRITE, and a slot still in prefill has none. N = 1, 2 and 4: slot
+    /// `i` decodes at 10 × (i + 1) tok/s, the last slot prefills.
+    #[test]
+    fn ccr_inflight_rows_get_their_own_slot_write() {
+        for n in [1i64, 2, 4] {
+            let mut book = SlotBook::default();
+            let t0 = Instant::now();
+            for (step, at) in [(0u64, t0), (1, t0 + Duration::from_secs(1))] {
+                let body: Vec<String> = (0..=n)
+                    .map(|id| {
+                        let decoded = if id == n { 0 } else { 5 + step * 10 * (id as u64 + 1) };
+                        format!(
+                            r#"{{"id":{id},"id_task":{},"is_processing":true,"n_prompt_tokens":300,"next_token":[{{"n_decoded":{decoded}}}]}}"#,
+                            40 + id
+                        )
+                    })
+                    .collect();
+                book.begin_round();
+                assert!(book.apply(
+                    "cpp",
+                    "cpp",
+                    format!("[{}]", body.join(",")).as_bytes(),
+                    0,
+                    0
+                ));
+                book.finish_round(at);
+            }
+            let slots = book.slots();
+            let rates = book.slot_rates();
+            let mut tracker = crate::inflight::Tracker::default();
+            tracker.poll(
+                &crate::inflight::Poll {
+                    slots: &slots,
+                    engine_live: &[],
+                    requests: &[],
+                    activity: &[],
+                    ids: &[],
+                    prompt_tps: None,
+                    slot_gen: &rates,
+                },
+                t0 + Duration::from_secs(1),
+                std::time::SystemTime::now(),
+            );
+            let mut got: Vec<(bool, Option<f64>)> = tracker
+                .flights()
+                .iter()
+                .map(|flight| (flight.decoding, flight.gen_tps))
+                .collect();
+            got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let mut want: Vec<(bool, Option<f64>)> = vec![(false, None)];
+            want.extend((0..n).map(|id| (true, Some(10.0 * (id + 1) as f64))));
+            assert_eq!(got, want, "{n} decoding");
+        }
+    }
+
     /// A llama.cpp model `cpp` in `state`, ready and read.
     fn lcpp_ready(state: &mut State<llama_core::log::Stderr>) {
         state.ready = vec![ReadyModel {
@@ -4366,6 +4730,7 @@ mod tests {
             lcpp_busy_since: HashMap::new(),
             lcpp_active: RatioWindow::default(),
             vllm_uncached: WindowRate::default(),
+            itl: HashMap::new(),
             recent: Recent::default(),
             ai: AiState::Loaded,
             models: Vec::new(),

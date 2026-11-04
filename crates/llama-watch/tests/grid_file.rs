@@ -965,6 +965,7 @@ fn busy_frame() -> TtyModel {
         prompt_tps: Some(1200.0),
         prompt_last: Some(4096.0),
         gen_last: None,
+        rate_lines: Default::default(),
         gen_ceiling: 250.0,
         prompt_ceiling: 1500.0,
         slots: vec![slot(0, true), slot(1, true), slot(2, false)],

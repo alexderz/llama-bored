@@ -1124,6 +1124,7 @@ fn tty_model(
         prompt_tps: tick.detail.prompt_tps,
         prompt_last: tick.prompt_last,
         gen_last: tick.gen_last,
+        rate_lines: rate_lines(&tick.detail.streams),
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
         slots: {
@@ -2412,7 +2413,7 @@ fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
         // The llama.cpp headline is a completed-turn average, not this
         // in-flight slot's own measurement.
         prompt_tps: None,
-        gen_tps: state.detail.gen_tps,
+        slot_gen: &state.detail.streams.slot_gen,
     };
     state.flights.poll(&poll, mono, wall);
 }
@@ -2500,6 +2501,19 @@ fn layout_requests(
         }
     });
     flights.chain(finished).collect()
+}
+
+/// The lines under WRITE and READ from the poller's streams (DER-451).
+fn rate_lines(streams: &crate::poller::Streams) -> crate::tty::layout::RateLines {
+    crate::tty::layout::RateLines {
+        running: streams.running,
+        queued: streams.queued,
+        prefilling: streams.prefilling,
+        itl_p50: streams.itl_p50,
+        itl_max: streams.itl_max,
+        read_active: streams.read_active,
+        read_solo: streams.read_solo,
+    }
 }
 
 fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<HealthSeg> {
@@ -3536,7 +3550,7 @@ mod tests {
                 activity: &rows,
                 ids: &ids,
                 prompt_tps: Some(2_000.0),
-                gen_tps: None,
+                slot_gen: &[],
             },
             now,
             UNIX_EPOCH,
@@ -3699,7 +3713,7 @@ mod tests {
                 activity: &[],
                 ids: &[],
                 prompt_tps: None,
-                gen_tps: None,
+                slot_gen: &[],
             },
             now,
             UNIX_EPOCH,

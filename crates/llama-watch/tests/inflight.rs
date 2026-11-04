@@ -9,7 +9,7 @@ use llama_watch::live::LiveTokens;
 use llama_watch::metrics::EngineLive;
 use llama_watch::poller::{LiveRequest, ModelEngineLive};
 use llama_watch::resets::{ResetCounts, ResetReason};
-use llama_watch::slots::{SlotBook, SlotView};
+use llama_watch::slots::{SlotBook, SlotRate, SlotView};
 
 /// A busy llama.cpp slot of the `Qwen 35B` model, as b11429's `/slots`
 /// reads (#78): `n_prompt_tokens` is what the slot holds, cached +
@@ -81,6 +81,8 @@ struct Feed {
     tracker: Tracker,
     t0: Instant,
     ids: Vec<(String, String)>,
+    /// llama.cpp tasks' own decode rates the next poll carries (DER-451).
+    slot_gen: Vec<SlotRate>,
 }
 
 impl Feed {
@@ -89,6 +91,7 @@ impl Feed {
             tracker: Tracker::default(),
             t0: Instant::now(),
             ids: ids(),
+            slot_gen: Vec::new(),
         }
     }
 
@@ -110,7 +113,7 @@ impl Feed {
             activity,
             ids: &self.ids,
             prompt_tps: Some(2_400.0),
-            gen_tps: Some(54.2),
+            slot_gen: &self.slot_gen,
         };
         let mono = self.t0 + Duration::from_millis(at_ms);
         self.tracker.poll(&poll, mono, SystemTime::UNIX_EPOCH);
@@ -131,7 +134,7 @@ impl Feed {
             activity,
             ids: &self.ids,
             prompt_tps: None,
-            gen_tps: None,
+            slot_gen: &[],
         };
         let mono = self.t0 + Duration::from_millis(at_ms);
         self.tracker.poll(&poll, mono, SystemTime::UNIX_EPOCH);

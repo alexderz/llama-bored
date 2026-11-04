@@ -196,6 +196,132 @@ pub struct SetupView {
     pub rows: Vec<SetupRow>,
 }
 
+/// What the lines under WRITE and READ say about concurrent requests
+/// (DER-451). `None` is not known. One stream with nothing queued draws
+/// neither line: the big digits already are that stream.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RateLines {
+    /// Requests running, summed over the busy models.
+    pub running: Option<u32>,
+    /// Requests waiting.
+    pub queued: Option<u32>,
+    /// Requests in prefill.
+    pub prefilling: Option<u32>,
+    /// Inter-token latency p50 in seconds, from the histogram (vLLM, SGLang).
+    pub itl_p50: Option<f64>,
+    /// The bound of the slowest inter-token latency bucket in seconds, and
+    /// whether the slowest was past the last finite bound.
+    pub itl_max: Option<(f64, bool)>,
+    /// Prompt tokens per second of prefill time (llama.cpp).
+    pub read_active: Option<f64>,
+    /// The per-request prefill speed READ used to hold.
+    pub read_solo: Option<f64>,
+}
+
+/// Width of the line under WRITE: its digits' half (columns 2 to 30).
+pub const WRITE_LINE_COLS: usize = 29;
+/// Width of the line under READ: columns 32 to 62, short of SETUP.
+pub const READ_LINE_COLS: usize = 31;
+
+/// The line under WRITE (DER-451): `×3 streams · ~104 each · +2 queued`,
+/// with the inter-token latency p50 and slowest bucket where the engine
+/// has the histogram. Per stream is WRITE ÷ running. Parts are shortened,
+/// then dropped from the end, to fit `width`. Empty for one stream with
+/// nothing queued; `+2 queued` alone for one stream with a queue.
+#[must_use]
+pub fn write_line(lines: &RateLines, gen_tps: Option<f64>, width: usize) -> String {
+    let running = lines.running.unwrap_or(0);
+    let queued = lines.queued.unwrap_or(0);
+    let mut parts: Vec<(String, String)> = Vec::new();
+    if running >= 2 {
+        parts.push((
+            format!("\u{00d7}{running} streams"),
+            format!("\u{00d7}{running}"),
+        ));
+        if let Some(rate) = gen_tps.filter(|v| v.is_finite() && *v > 0.0) {
+            let each = format_rate_digits(rate / f64::from(running));
+            parts.push((format!("~{each} each"), format!("~{each} each")));
+        }
+    }
+    if queued > 0 {
+        parts.push((format!("+{queued} queued"), format!("+{queued} q")));
+    }
+    if running >= 2
+        && let Some(p50) = lines.itl_p50.filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        let max = lines.itl_max.map_or(String::new(), |(bound, open)| {
+            format!("/{}{}", if open { ">" } else { "\u{2264}" }, millis(bound))
+        });
+        let p50 = millis(p50);
+        parts.push((format!("ITL {p50}{max} ms"), format!("ITL {p50}{max}")));
+    }
+    fit_parts(&parts, width)
+}
+
+/// The line under READ (DER-451): `1 prefilling · 2412 while active ·
+/// solo ref 2398`. While active is prompt tokens per second of prefill
+/// time; the solo ref is the per-request speed READ used to hold. Parts
+/// are shortened, then dropped from the end, to fit `width`. Empty for one
+/// stream with nothing queued.
+#[must_use]
+pub fn read_line(lines: &RateLines, width: usize) -> String {
+    if lines.running.unwrap_or(0) < 2 && lines.queued.unwrap_or(0) == 0 {
+        return String::new();
+    }
+    let rate = |value: Option<f64>| {
+        value
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(format_rate_digits)
+    };
+    let mut parts: Vec<(String, String)> = Vec::new();
+    if let Some(n) = lines.prefilling.filter(|n| *n > 0) {
+        parts.push((format!("{n} prefilling"), format!("{n} prefill")));
+    }
+    if let Some(active) = rate(lines.read_active) {
+        parts.push((format!("{active} while active"), format!("{active} active")));
+    }
+    if let Some(solo) = rate(lines.read_solo) {
+        parts.push((format!("solo ref {solo}"), format!("solo {solo}")));
+    }
+    fit_parts(&parts, width)
+}
+
+/// Seconds as whole milliseconds, or tenths under 10 ms.
+fn millis(seconds: f64) -> String {
+    let ms = seconds * 1000.0;
+    if ms < 10.0 {
+        format!("{:.1}", (ms * 10.0).round() / 10.0)
+    } else {
+        format!("{}", ms.round() as i64)
+    }
+}
+
+/// The most parts that fit `width` joined by ` · `: their long forms,
+/// else with the first ones shortened, then dropping parts from the end
+/// until one fits.
+fn fit_parts(parts: &[(String, String)], width: usize) -> String {
+    for keep in (1..=parts.len()).rev() {
+        for shortened in 0..=keep {
+            let text = parts[..keep]
+                .iter()
+                .enumerate()
+                .map(|(at, (long, brief))| {
+                    if at < shortened {
+                        brief.as_str()
+                    } else {
+                        long.as_str()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" \u{00b7} ");
+            if text.chars().count() <= width {
+                return text;
+            }
+        }
+    }
+    String::new()
+}
+
 /// Plain data for one frame. T22 fills it. Text fields are untrusted and are
 /// passed through [`sanitize`] before they are placed.
 #[derive(Clone, Debug)]
@@ -247,6 +373,8 @@ pub struct TtyModel {
     /// Last non-zero decode rate. The tick loop remembers it so the GEN
     /// digits stay on that value, dimmed, while a prefill is live (#163).
     pub gen_last: Option<f64>,
+    /// The lines under WRITE and READ (DER-451).
+    pub rate_lines: RateLines,
     pub gen_ceiling: f64,
     pub prompt_ceiling: f64,
     pub slots: Vec<Slot>,
@@ -6995,6 +7123,15 @@ fn draw_headline(grid: &mut Grid, model: &TtyModel, g: &Geom, top: u16) {
             true,
         )
     };
+    // DER-451: the lines under WRITE and READ take the first blank row
+    // under the digits; with no blank row they are not drawn.
+    if gap > 0 && !down {
+        let row = digit_row + 5 * ph;
+        let write = write_line(&model.rate_lines, model.gen_tps, WRITE_LINE_COLS);
+        paint_str(grid, 2, row, &write, C16::BrightBlack, C16::Black);
+        let read = read_line(&model.rate_lines, READ_LINE_COLS);
+        paint_str(grid, 32, row, &read, C16::BrightBlack, C16::Black);
+    }
     let gen_text = shown_digit_text(gen_value, gen_dim);
     let prompt_text = shown_digit_text(prompt_value, prompt_dim);
     let mut gen_pw = fit_pixel_for(pw_start, &gen_text, 26);

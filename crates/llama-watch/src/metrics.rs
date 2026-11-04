@@ -379,6 +379,140 @@ pub struct MetricsSample {
     /// cache. They move every step; the finish counters above move once a
     /// request ends.
     pub realtime: Realtime,
+    /// The inter-token latency histogram's buckets (vLLM, SGLang), summed
+    /// over label sets, for its p50 and max between reads (DER-451).
+    pub itl_buckets: Option<Buckets>,
+}
+
+/// Most histogram buckets [`Buckets`] keeps. vLLM 0.31's inter-token
+/// latency has 20 and SGLang 0.5.20's 24, `+Inf` included.
+pub const MAX_BUCKETS: usize = 32;
+
+/// A histogram's cumulative buckets: `le` upper bounds, ascending, with
+/// the count at or under each. `+Inf` is [`f64::INFINITY`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Buckets {
+    le: [f64; MAX_BUCKETS],
+    count: [f64; MAX_BUCKETS],
+    len: usize,
+}
+
+impl Default for Buckets {
+    fn default() -> Self {
+        Self {
+            le: [0.0; MAX_BUCKETS],
+            count: [0.0; MAX_BUCKETS],
+            len: 0,
+        }
+    }
+}
+
+impl Buckets {
+    /// Add `value` to the bucket `le`. `false` once there is no room.
+    pub fn add(&mut self, le: f64, value: f64) -> bool {
+        let used = &self.le[..self.len];
+        if let Some(at) = used.iter().position(|bound| *bound == le) {
+            self.count[at] += value;
+            return true;
+        }
+        if self.len == MAX_BUCKETS {
+            return false;
+        }
+        let at = used
+            .iter()
+            .position(|bound| *bound > le)
+            .unwrap_or(self.len);
+        self.le.copy_within(at..self.len, at + 1);
+        self.count.copy_within(at..self.len, at + 1);
+        self.le[at] = le;
+        self.count[at] = value;
+        self.len += 1;
+        true
+    }
+
+    /// `(le, cumulative count)` pairs, ascending.
+    pub fn iter(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.le[..self.len]
+            .iter()
+            .copied()
+            .zip(self.count[..self.len].iter().copied())
+    }
+
+    /// Observations since `base`, bucket by bucket. `None` when the bounds
+    /// differ or a count fell (a restart).
+    #[must_use]
+    pub fn since(&self, base: &Self) -> Option<Self> {
+        if self.len != base.len || self.le[..self.len] != base.le[..base.len] {
+            return None;
+        }
+        let mut out = *self;
+        for at in 0..self.len {
+            let delta = self.count[at] - base.count[at];
+            if !delta.is_finite() || delta < 0.0 {
+                return None;
+            }
+            out.count[at] = delta;
+        }
+        Some(out)
+    }
+
+    /// Observations in all: the `+Inf` bucket, else the last one.
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.len.checked_sub(1).map_or(0.0, |last| self.count[last])
+    }
+
+    /// The `q` quantile, interpolated within its bucket as Prometheus'
+    /// `histogram_quantile` does. A quantile in the `+Inf` bucket reads as
+    /// the last finite bound. `None` with no observations.
+    #[must_use]
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        let total = self.total();
+        if total.is_nan() || total <= 0.0 || !q.is_finite() {
+            return None;
+        }
+        let rank = q.clamp(0.0, 1.0) * total;
+        let mut lower = (0.0, 0.0);
+        for (le, count) in self.iter() {
+            if count >= rank {
+                if le.is_infinite() {
+                    return Some(lower.0);
+                }
+                let width = count - lower.1;
+                if width <= 0.0 {
+                    return Some(le);
+                }
+                return Some(lower.0 + (le - lower.0) * (rank - lower.1) / width);
+            }
+            lower = (le, count);
+        }
+        None
+    }
+
+    /// The upper bound of the highest bucket with an observation: the
+    /// largest observation is at most this. `(bound, open)`, where `open`
+    /// is a largest observation past the last finite bound (`> bound`).
+    #[must_use]
+    pub fn max_bound(&self) -> Option<(f64, bool)> {
+        let total = self.total();
+        if total.is_nan() || total <= 0.0 {
+            return None;
+        }
+        let mut finite = None;
+        for (le, count) in self.iter() {
+            if count >= total {
+                return if le.is_infinite() {
+                    finite.map(|bound| (bound, true))
+                } else {
+                    Some((le, false))
+                };
+            }
+            if le.is_finite() {
+                finite = Some(le);
+            }
+        }
+        None
+    }
 }
 
 /// [`MetricsSample::realtime`]: each `mode`'s series summed across the
@@ -477,6 +611,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut predicted_seconds = Acc::default();
     let mut busy_per_decode = Acc::default();
     let mut realtime: [Acc; 3] = Default::default();
+    let mut itl_buckets: [Option<Buckets>; 2] = [None, None];
+    let mut itl_overflow = [false, false];
     for line in body.lines() {
         let Some((name, value)) = metric_line(line) else {
             continue;
@@ -572,6 +708,15 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
                     hists[which][rank].add(part, value);
                 }
             }
+            if let Some(rank) = name
+                .strip_suffix("_bucket")
+                .and_then(|base| names.itl.iter().position(|candidate| *candidate == base))
+                .filter(|rank| *rank < 2)
+                && let Some(le) = label_value(line, "le").and_then(|le| bucket_bound(&le))
+            {
+                let buckets = itl_buckets[rank].get_or_insert_with(Buckets::default);
+                itl_overflow[rank] |= !buckets.add(le, value);
+            }
         }
         if let Some(rank) = names
             .cached
@@ -663,8 +808,22 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             prefill_compute: realtime[1].0.and_then(finite_u64),
             prefill_cache: realtime[2].0.and_then(finite_u64),
         },
+        itl_buckets: (0..2)
+            .find(|rank| itl_buckets[*rank].is_some())
+            .filter(|rank| !itl_overflow[*rank])
+            .and_then(|rank| itl_buckets[rank]),
     };
     (sample, facts)
+}
+
+/// A bucket's `le` label: a finite bound ≥ 0 or `+Inf`.
+fn bucket_bound(le: &str) -> Option<f64> {
+    if le.eq_ignore_ascii_case("+inf") || le.eq_ignore_ascii_case("inf") {
+        return Some(f64::INFINITY);
+    }
+    le.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 /// `(rank, is_count)` when `name` is `<base>_sum` or `<base>_count` of a
@@ -859,7 +1018,8 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
         }
         if !too_long
             && value.is_ascii()
-            && (matches!(key, "sleep_state" | "is_streaming" | "mode") || CACHE_KEYS.contains(&key))
+            && (matches!(key, "sleep_state" | "is_streaming" | "mode" | "le")
+                || CACHE_KEYS.contains(&key))
         {
             out.push((key, value));
         }
@@ -2765,6 +2925,33 @@ fn finite_u64(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C.1 (DER-451): the inter-token latency buckets are summed by `le`
+    /// over label sets in any series order, a restart reads as no window,
+    /// and llama.cpp, with no histogram, has none.
+    #[test]
+    fn itl_buckets_sum_by_le_and_a_fall_is_no_window() {
+        let body = "vllm:inter_token_latency_seconds_bucket{le=\"+Inf\",engine=\"0\"} 10\n\
+            vllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.05\"} 9\n\
+            vllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.01\"} 2\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"0.01\",engine=\"1\"} 2\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"0.05\",engine=\"1\"} 10\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"+Inf\",engine=\"1\"} 10\n";
+        let buckets = parse_metrics_for(Backend::Vllm, body)
+            .itl_buckets
+            .expect("buckets");
+        let got: Vec<(f64, f64)> = buckets.iter().collect();
+        assert_eq!(got, vec![(0.01, 4.0), (0.05, 19.0), (f64::INFINITY, 20.0)]);
+        assert_eq!(buckets.quantile(0.5), Some(0.01 + 0.04 * 6.0 / 15.0));
+        assert_eq!(buckets.max_bound(), Some((0.05, true)));
+        assert_eq!(buckets.since(&buckets).map(|b| b.total()), Some(0.0));
+        let mut later = Buckets::default();
+        for (le, count) in [(0.01, 1.0), (0.05, 2.0), (f64::INFINITY, 3.0)] {
+            assert!(later.add(le, count));
+        }
+        assert_eq!(later.since(&buckets), None, "a restart");
+        assert_eq!(parse_metrics_for(Backend::LlamaCpp, body).itl_buckets, None);
+    }
 
     /// F2 (DER-451): SGLang's `realtime_tokens_total` split by `mode`
     /// wherever the label sits, each mode summed across the other labels

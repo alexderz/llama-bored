@@ -1,8 +1,8 @@
 //! `/upstream/<model>/slots`: declared fields, tail text, prompt rate, and
 //! each slot's held context and drops by reason for the snapshot (#10, #9).
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use llama_core::backend::Backend;
 use llama_core::rate::{counter_delta, delta_per_s};
@@ -71,6 +71,52 @@ pub struct SlotView {
     pub resets: ResetCounts,
     /// The last decided reason (#9).
     pub last_reset: Option<ResetReason>,
+}
+
+/// One in-flight llama.cpp task's own decode rate (DER-451, F5): its
+/// `n_decoded` rise over the wall time between `/slots` reads, over the
+/// last [`SLOT_RATE_WINDOW`]. RECENT's in-flight rows show it instead of
+/// the model-wide WRITE.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotRate {
+    /// The display name, as in [`SlotView::model`].
+    pub model: String,
+    pub slot: i64,
+    pub id_task: i64,
+    pub gen_tps: f64,
+}
+
+/// [`SlotRate`]'s window.
+pub const SLOT_RATE_WINDOW: Duration = Duration::from_secs(2);
+/// A task's rate needs reads at least this far apart.
+const SLOT_RATE_MIN_SPAN: Duration = Duration::from_millis(500);
+/// Reads kept per task.
+const SLOT_RATE_READS: usize = 32;
+
+/// One in-flight task's reads (DER-451).
+#[derive(Debug)]
+struct StreamMark {
+    /// Display name.
+    model: String,
+    /// The `/slots` read that first saw it in flight.
+    first_seen: Instant,
+    /// `(read at, n_decoded)` once it decodes, oldest first.
+    decoded: VecDeque<(Instant, u64)>,
+}
+
+impl StreamMark {
+    fn gen_tps(&self) -> Option<f64> {
+        let &(newest_at, newest) = self.decoded.back()?;
+        let &(base_at, base) = self
+            .decoded
+            .iter()
+            .rev()
+            .find(|(at, _)| newest_at.saturating_duration_since(*at) >= SLOT_RATE_WINDOW)
+            .or_else(|| self.decoded.front())?;
+        let span = newest_at.saturating_duration_since(base_at);
+        (span >= SLOT_RATE_MIN_SPAN)
+            .then(|| newest.saturating_sub(base) as f64 / span.as_secs_f64())
+    }
 }
 
 /// The one slot that both IN and OUT show.
@@ -303,6 +349,8 @@ pub struct SlotBook {
     /// (DER-451). A task first seen in flight counts all it processed; one
     /// first seen already idle is not counted.
     processed_total: HashMap<String, u64>,
+    /// In-flight tasks by `(model id, slot, id_task)` (DER-451).
+    streams: HashMap<(String, i64, i64), StreamMark>,
     last_at: Option<Instant>,
     round_delta: u64,
     round_seen: bool,
@@ -777,6 +825,7 @@ impl SlotBook {
         if !self.round_seen {
             return;
         }
+        self.note_streams(now);
         for model in self.phase_round.drain() {
             self.phase_at.insert(model, now);
         }
@@ -803,6 +852,67 @@ impl SlotBook {
         self.last_at = Some(now);
     }
 
+    /// The in-flight tasks of the models read this round (DER-451): when
+    /// each was first seen, and its `n_decoded` once it decodes. A task
+    /// no longer in flight is forgotten.
+    fn note_streams(&mut self, now: Instant) {
+        let round = &self.phase_round;
+        let mut live: HashSet<(String, i64, i64)> = HashSet::new();
+        for row in self
+            .slots
+            .iter()
+            .filter(|row| round.contains(&row.model_id) && row.is_processing && row.id_task >= 0)
+        {
+            let key = (row.model_id.clone(), row.id, row.id_task);
+            let mark = self
+                .streams
+                .entry(key.clone())
+                .or_insert_with(|| StreamMark {
+                    model: row.model.clone(),
+                    first_seen: now,
+                    decoded: VecDeque::new(),
+                });
+            if row.n_decoded > 0 {
+                mark.decoded.push_back((now, row.n_decoded));
+                while mark.decoded.len() > SLOT_RATE_READS {
+                    mark.decoded.pop_front();
+                }
+            }
+            live.insert(key);
+        }
+        self.streams
+            .retain(|key, _| !round.contains(&key.0) || live.contains(key));
+    }
+
+    /// Each in-flight llama.cpp task's own decode rate (DER-451, F5).
+    /// None while a task has not decoded for [`SLOT_RATE_MIN_SPAN`].
+    #[must_use]
+    pub fn slot_rates(&self) -> Vec<SlotRate> {
+        let mut out: Vec<SlotRate> = self
+            .streams
+            .iter()
+            .filter_map(|((_, slot, id_task), mark)| {
+                Some(SlotRate {
+                    model: mark.model.clone(),
+                    slot: *slot,
+                    id_task: *id_task,
+                    gen_tps: mark.gen_tps().filter(|v| v.is_finite())?,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.model, a.slot).cmp(&(&b.model, b.slot)));
+        out
+    }
+
+    /// When the `/slots` reads first saw `(model id, slot, id_task)` in
+    /// flight (DER-451).
+    #[must_use]
+    pub fn first_seen(&self, model_id: &str, slot: i64, id_task: i64) -> Option<Instant> {
+        self.streams
+            .get(&(model_id.to_owned(), slot, id_task))
+            .map(|mark| mark.first_seen)
+    }
+
     /// Drop slots whose model is no longer being polled. Their held
     /// context is forgotten; their drop counts stay, and so do the
     /// conversations they lost, for their own TTL (#45): a conversation
@@ -810,6 +920,8 @@ impl SlotBook {
     pub fn retain_models(&mut self, model_ids: &[&str]) {
         self.slots
             .retain(|row| model_ids.iter().any(|id| *id == row.model_id));
+        self.streams
+            .retain(|key, _| model_ids.iter().any(|id| *id == key.0));
         self.text
             .retain(|model, _| model_ids.contains(&model.as_str()));
         self.settle(|model| !model_ids.contains(&model));

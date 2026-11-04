@@ -224,8 +224,10 @@ pub struct Poll<'a> {
     pub ids: &'a [(String, String)],
     /// Prefill tok/s from `/slots`.
     pub prompt_tps: Option<f64>,
-    /// Decode tok/s from the token counter.
-    pub gen_tps: Option<f64>,
+    /// Each in-flight llama.cpp task's own decode tok/s (DER-451, F5).
+    /// A slot with none has no WRITE: the model-wide rate is never copied
+    /// into a row.
+    pub slot_gen: &'a [crate::slots::SlotRate],
 }
 
 /// The flights across polls.
@@ -285,7 +287,14 @@ impl Tracker {
                 .then_some(slot.last_reset)
                 .flatten();
             flight.prompt_tps = poll.prompt_tps;
-            flight.gen_tps = poll.gen_tps;
+            flight.gen_tps = poll
+                .slot_gen
+                .iter()
+                .find(|rate| {
+                    rate.model == slot.model && rate.slot == slot.id && rate.id_task == slot.id_task
+                })
+                .map(|rate| rate.gen_tps)
+                .filter(|_| slot.n_decoded > 0);
             flight.n_ctx = slot.n_ctx.filter(|n| *n > 0);
             flight.engine = Some(Backend::LlamaCpp);
             flight.bump_beats(old_processed, old_decoded);
