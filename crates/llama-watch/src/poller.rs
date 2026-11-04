@@ -148,6 +148,7 @@ use crate::activity::{self, ActivityRow};
 use crate::capture::{CAPTURE_CAP, MessageMark, new_input_chars, parse_capture, shown_new};
 use crate::config::{PromptView, ValidWatchConfig};
 use crate::jobs::{self, Job, Jobs};
+use crate::lcpp_tokens::{LcppTokens, MetricsRead};
 use crate::live::{LOADS_CAP, LiveBook, LiveTokens, parse_loads};
 use crate::metrics::{
     DecodedCounter, EngineBook, EngineFacts, EngineLive, EngineValues, GenRate, KvTokens,
@@ -601,6 +602,10 @@ struct State<L> {
     counter: DecodedCounter,
     gen_rate: GenRate,
     slots: SlotBook,
+    /// llama.cpp tokens from `/slots`, settled with
+    /// `tokens_predicted_total`: what `counter` adds for those models,
+    /// not their decode calls (DER-451).
+    lcpp_tokens: LcppTokens,
     /// RECENT's own rows across llama-swap restarts (#44).
     recent: Recent,
     ai: AiState,
@@ -756,6 +761,9 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
     };
     let specs = Specs::new(limits.specs_dir.clone());
     let jobs = Jobs::new(limits.jobs_dir.clone());
+    // Three `/slots` rounds, at least 3 s, before llama.cpp's WRITE falls
+    // back to decode calls or becomes unknown (DER-451).
+    let lcpp_tokens = LcppTokens::new((limits.slots_interval * 3).max(Duration::from_secs(3)));
     let mut state = State {
         limits,
         agent,
@@ -764,6 +772,7 @@ fn run<L: Sink>(limits: Limits, agent: ureq::Agent, log: L, tx: SampleRx, stop: 
         counter: DecodedCounter::default(),
         gen_rate: GenRate::default(),
         slots,
+        lcpp_tokens,
         recent: Recent::default(),
         ai: AiState::Down,
         models: Vec::new(),
@@ -1125,6 +1134,7 @@ impl<L: Sink> State<L> {
         self.live.forget(id);
         self.loads_missing.remove(id);
         self.counter.forget(id);
+        self.lcpp_tokens.forget(id);
         self.prompt_counter.forget(id);
         self.prompt_box.forget(id);
         self.prompt_cache.forget(id);
@@ -1370,6 +1380,10 @@ impl<L: Sink> State<L> {
                 }
             }
             match (decoded, read) {
+                (Some(_), Ok(sample)) if model.backend == Backend::LlamaCpp => {
+                    self.fallback.remove(&model.id);
+                    self.observe_lcpp(&model.id, &sample, now);
+                }
                 (Some(value), Ok(sample)) => {
                     self.fallback.remove(&model.id);
                     self.counter
@@ -1401,6 +1415,26 @@ impl<L: Sink> State<L> {
         note_flag(&mut self.log, &mut self.metrics_failed, failure, "metrics");
         self.poll_loads();
         self.latencies.metrics = Some(started.elapsed());
+    }
+
+    /// A llama.cpp `/metrics` read into the box counter: its tokens from
+    /// [`LcppTokens`], not its decode calls (DER-451). While they are
+    /// unknown the model's gauge is kept and the box total is not fresh.
+    fn observe_lcpp(&mut self, id: &str, sample: &MetricsSample, now: Instant) {
+        let read = MetricsRead {
+            calls: sample.n_decode_total,
+            predicted: sample.predicted_total,
+            busy_per_decode: sample.busy_per_decode,
+            processing: sample.requests_processing,
+        };
+        match self.lcpp_tokens.observe_metrics(id, &read, now) {
+            Some(tokens) => self
+                .counter
+                .observe(id, tokens, sample.requests_processing, now),
+            None => self
+                .counter
+                .observe_unknown(id, sample.requests_processing, now),
+        }
     }
 
     /// One tqLLM snapshot read (#180), through the fresh gate, in place of
@@ -1868,6 +1902,11 @@ impl<L: Sink> State<L> {
                         self.limits.input_tail,
                         self.limits.output_tail,
                     ) {
+                        self.lcpp_tokens.observe_slots(
+                            &model.id,
+                            &self.slots.tokens(&model.id),
+                            Instant::now(),
+                        );
                         self.note_slot_text(&model.id);
                     } else if failure.is_none() {
                         failure = Some("malformed");
@@ -3293,6 +3332,144 @@ mod tests {
         assert_eq!(rx.take().unwrap().1.chart_prompt_tps, None);
     }
 
+    /// A llama.cpp model `cpp` in `state`, ready and read.
+    fn lcpp_ready(state: &mut State<llama_core::log::Stderr>) {
+        state.ready = vec![ReadyModel {
+            id: "cpp".into(),
+            name: "cpp".into(),
+            backend: Backend::LlamaCpp,
+            probe: false,
+        }];
+        state.running_up = true;
+    }
+
+    /// One llama.cpp `/metrics` read of `cpp` at `at`.
+    fn lcpp_metrics(
+        state: &mut State<llama_core::log::Stderr>,
+        at: Instant,
+        calls: u64,
+        predicted: u64,
+        processing: f64,
+    ) {
+        let sample = crate::metrics::parse_metrics_full(
+            Backend::LlamaCpp,
+            &format!(
+                "llamacpp:n_decode_total {calls}\nllamacpp:tokens_predicted_total {predicted}\nllamacpp:requests_processing {processing}\nllamacpp:n_busy_slots_per_decode {processing}\n"
+            ),
+        )
+        .0;
+        state.observe_lcpp("cpp", &sample, at);
+    }
+
+    /// One llama.cpp `/slots` round of `cpp` at `at`: one decoding slot
+    /// per entry of `decoded`, task 10 + slot.
+    fn lcpp_slots(state: &mut State<llama_core::log::Stderr>, at: Instant, decoded: &[u64]) {
+        let body: Vec<String> = decoded
+            .iter()
+            .enumerate()
+            .map(|(id, n)| {
+                format!(
+                    r#"{{"id":{id},"id_task":{},"is_processing":true,"n_prompt_tokens_processed":100,"next_token":[{{"n_decoded":{n}}}]}}"#,
+                    10 + id
+                )
+            })
+            .collect();
+        state.slots.begin_round();
+        assert!(state.slots.apply(
+            "cpp",
+            "cpp",
+            format!("[{}]", body.join(",")).as_bytes(),
+            0,
+            0
+        ));
+        state.slots.finish_round(at);
+        let tokens = state.slots.tokens("cpp");
+        state.lcpp_tokens.observe_slots("cpp", &tokens, at);
+    }
+
+    /// CCR-3 corrected, through the poller: N slots decoding share one
+    /// `llama_decode` call per step. 50 steps in a second are 50 calls and
+    /// 50 × N tokens; WRITE (the box counter's rate, which also feeds the
+    /// timeline and the LCD) shows 50 × N, for N = 1, 2 and 4.
+    #[test]
+    fn llamacpp_write_counts_every_streams_tokens() {
+        for n in [1usize, 2, 4] {
+            let mut state = blank_state();
+            lcpp_ready(&mut state);
+            let t0 = Instant::now();
+            let s = Duration::from_secs(1);
+            let streams = |decoded: u64| vec![decoded; n];
+            lcpp_metrics(&mut state, t0, 1000, 0, n as f64);
+            lcpp_slots(&mut state, t0, &streams(10));
+            let mut rate = GenRate::default();
+            let base = state
+                .counter
+                .total_if_fresh(true, &["cpp"], t0)
+                .expect("fresh");
+            let _ = rate.observe(t0, base);
+            lcpp_metrics(&mut state, t0 + s, 1050, 0, n as f64);
+            lcpp_slots(&mut state, t0 + s, &streams(60));
+            let total = state
+                .counter
+                .total_if_fresh(true, &["cpp"], t0 + s)
+                .expect("fresh");
+            assert_eq!(
+                rate.observe(t0 + s, total),
+                Some(50.0 * n as f64),
+                "{n} streams"
+            );
+        }
+    }
+
+    /// A long single-stream decode with `/slots` every second and
+    /// `/metrics` every 0.25 s: WRITE moves at every `/metrics` read with
+    /// the decode calls, as before DER-451, and its one-second rate stays
+    /// at the stream's 40 tok/s.
+    #[test]
+    fn llamacpp_single_stream_write_is_unchanged() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let t0 = Instant::now();
+        let q = Duration::from_millis(250);
+        let mut rate = GenRate::default();
+        lcpp_metrics(&mut state, t0, 0, 0, 1.0);
+        lcpp_slots(&mut state, t0, &[1]);
+        let _ = rate.observe(t0, state.counter.total());
+        let mut last = state.counter.total();
+        for i in 1u32..=40 {
+            let at = t0 + q * i;
+            let calls = u64::from(i) * 10;
+            lcpp_metrics(&mut state, at, calls, 0, 1.0);
+            if i % 4 == 0 {
+                lcpp_slots(&mut state, at, &[1 + calls]);
+            }
+            let total = state.counter.total();
+            assert_eq!(total - last, 10, "read {i} moves by its 10 calls");
+            last = total;
+            if i >= 4 {
+                assert_eq!(rate.observe(at, total), Some(40.0), "read {i}");
+            } else {
+                let _ = rate.observe(at, total);
+            }
+        }
+    }
+
+    /// Several llama.cpp streams with `/slots` gone: WRITE is unknown, not
+    /// ÷N; the model's gauge stays, so `/slots` is still tried.
+    #[test]
+    fn llamacpp_write_without_slots_is_unknown_under_concurrency() {
+        let mut state = blank_state();
+        lcpp_ready(&mut state);
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        for i in 0u32..=4 {
+            lcpp_metrics(&mut state, t0 + s * i, 1000 + u64::from(i) * 50, 0, 2.0);
+        }
+        let at = t0 + s * 4;
+        assert_eq!(state.counter.total_if_fresh(true, &["cpp"], at), None);
+        assert_eq!(state.counter.requests_processing("cpp", at), Some(2.0));
+    }
+
     /// One vLLM `/metrics` read of model `v` at `at`, as the scrape folds
     /// it in: `running` requests, the TTFT and e2e counts, the generated
     /// counter, and one finished prefill of 4,000 tokens in 2 s (2,000 tok/s).
@@ -3564,6 +3741,7 @@ mod tests {
             counter: DecodedCounter::default(),
             gen_rate: GenRate::default(),
             slots: SlotBook::default(),
+            lcpp_tokens: LcppTokens::default(),
             recent: Recent::default(),
             ai: AiState::Loaded,
             models: Vec::new(),

@@ -8,6 +8,7 @@ pub mod grid_out;
 pub mod inflight;
 pub mod jobs;
 pub mod kv;
+pub mod lcpp_tokens;
 pub mod live;
 mod load;
 pub mod localtime;

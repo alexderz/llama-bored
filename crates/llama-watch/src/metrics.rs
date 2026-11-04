@@ -93,6 +93,9 @@ struct Names {
     predicted: &'static [&'static str],
     prompt_seconds: &'static [&'static str],
     predicted_seconds: &'static [&'static str],
+    /// llama.cpp's busy slots per decode call since the server started
+    /// (DER-451).
+    busy_per_decode: &'static [&'static str],
     /// Sum across label sets. llama.cpp keeps its last value, as before T72.
     sum: bool,
 }
@@ -136,6 +139,7 @@ const LLAMACPP: Names = Names {
     predicted: &["llamacpp:tokens_predicted_total"],
     prompt_seconds: &["llamacpp:prompt_seconds_total"],
     predicted_seconds: &["llamacpp:tokens_predicted_seconds_total"],
+    busy_per_decode: &["llamacpp:n_busy_slots_per_decode"],
     sum: false,
 };
 
@@ -176,6 +180,7 @@ const SGLANG: Names = Names {
     predicted: NONE,
     prompt_seconds: NONE,
     predicted_seconds: NONE,
+    busy_per_decode: NONE,
     sum: true,
 };
 
@@ -224,6 +229,7 @@ const VLLM: Names = Names {
     predicted: NONE,
     prompt_seconds: NONE,
     predicted_seconds: NONE,
+    busy_per_decode: NONE,
     sum: true,
 };
 
@@ -297,8 +303,10 @@ pub struct Hist {
 /// One parsed metrics document. Missing or rejected values stay `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MetricsSample {
-    /// Decoded-token counter (`llamacpp:n_decode_total`,
-    /// `*:generation_tokens_total`) when finite and ≥ 0.
+    /// Decoded-token counter (`*:generation_tokens_total`) when finite and
+    /// ≥ 0. llama.cpp's is `llamacpp:n_decode_total`, which counts decode
+    /// calls: the box counter takes its tokens from `/slots` instead
+    /// ([`crate::lcpp_tokens`], DER-451).
     pub n_decode_total: Option<u64>,
     /// Requests in flight (`llamacpp:requests_processing`, running requests).
     pub requests_processing: Option<f64>,
@@ -356,6 +364,9 @@ pub struct MetricsSample {
     pub prompt_seconds: Option<f64>,
     /// Seconds of generation (`llamacpp:tokens_predicted_seconds_total`, #71).
     pub predicted_seconds: Option<f64>,
+    /// Busy slots per decode call since the server started
+    /// (`llamacpp:n_busy_slots_per_decode`, DER-451).
+    pub busy_per_decode: Option<f64>,
 }
 
 /// A model's KV cache in tokens, from its `/metrics` (#79). llama.cpp's
@@ -443,6 +454,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut predicted = Acc::default();
     let mut prompt_seconds = Acc::default();
     let mut predicted_seconds = Acc::default();
+    let mut busy_per_decode = Acc::default();
     for line in body.lines() {
         let Some((name, value)) = metric_line(line) else {
             continue;
@@ -471,6 +483,8 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             prompt_seconds.add(value, names.sum);
         } else if names.predicted_seconds.contains(&name) {
             predicted_seconds.add(value, names.sum);
+        } else if names.busy_per_decode.contains(&name) {
+            busy_per_decode.add(value, names.sum);
         } else if names.kv_used.contains(&name) {
             kv_used.add(value, names.sum);
         } else if names.kv_cached.contains(&name) {
@@ -613,6 +627,7 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         predicted_total: predicted.0.and_then(finite_u64),
         prompt_seconds: prompt_seconds.0,
         predicted_seconds: predicted_seconds.0,
+        busy_per_decode: busy_per_decode.0,
     };
     (sample, facts)
 }
@@ -2191,6 +2206,9 @@ fn max_ratio(old: Option<f64>, value: f64) -> Option<f64> {
 pub struct DecodedCounter {
     last: HashMap<String, u64>,
     fresh_at: HashMap<String, Instant>,
+    /// When each model's processing gauge was read; a read whose counter
+    /// is unknown still gives one ([`Self::observe_unknown`]).
+    processing_at: HashMap<String, Instant>,
     /// How long a read stays fresh, when not [`FRESH`] (activity fallback).
     window: HashMap<String, Duration>,
     processing: HashMap<String, f64>,
@@ -2209,6 +2227,21 @@ impl DecodedCounter {
         self.total = self.total.saturating_add(delta);
         self.fresh_at.insert(model.to_owned(), at);
         self.window.remove(model);
+        self.note_processing(model, processing, at);
+    }
+
+    /// A read of `model` whose counter is unknown (DER-451: llama.cpp with
+    /// several streams and no `/slots`): its processing gauge is kept, and
+    /// the box total is not fresh until a counter comes back. The baseline
+    /// stays, so a counter that returns adds only what it rose since.
+    pub fn observe_unknown(&mut self, model: &str, processing: Option<f64>, at: Instant) {
+        self.fresh_at.remove(model);
+        self.window.remove(model);
+        self.note_processing(model, processing, at);
+    }
+
+    fn note_processing(&mut self, model: &str, processing: Option<f64>, at: Instant) {
+        self.processing_at.insert(model.to_owned(), at);
         if let Some(processing) = processing {
             self.processing.insert(model.to_owned(), processing);
         }
@@ -2258,7 +2291,7 @@ impl DecodedCounter {
     /// Gauge from a metrics read that is still ≤ 1 s old.
     #[must_use]
     pub fn requests_processing(&self, model: &str, now: Instant) -> Option<f64> {
-        let at = self.fresh_at.get(model)?;
+        let at = self.processing_at.get(model)?;
         if now.saturating_duration_since(*at) > FRESH {
             return None;
         }

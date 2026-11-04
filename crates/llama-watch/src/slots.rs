@@ -11,6 +11,7 @@ use serde::de::IgnoredAny;
 
 use crate::activity::{ActivityRow, model_key};
 use crate::config::PromptView;
+use crate::lcpp_tokens::SlotTokens;
 use crate::resets::{DISPLACED_MODELS, Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
 use crate::tty::chat_template::clean;
 use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, dropped};
@@ -293,7 +294,10 @@ pub struct SlotBook {
     text_off: bool,
     prompt_view: PromptView,
     slots: Vec<Tracked>,
-    last_processed: HashMap<(String, i64), u64>,
+    /// `n_prompt_tokens_processed` by `(model id, slot, id_task)`: a task
+    /// that replaced another between two reads counts all it processed,
+    /// not its difference from the old task's count (DER-451).
+    last_processed: HashMap<(String, i64, i64), u64>,
     last_at: Option<Instant>,
     round_delta: u64,
     round_seen: bool,
@@ -342,10 +346,9 @@ impl SlotBook {
     /// Reports a true 0 and drops the progress baseline, so the next busy
     /// episode's first round only sets a baseline — as on startup — rather
     /// than dividing its first batch by however long this idle gap was.
-    /// [`Self::last_processed`]'s per-slot counters are left alone: a new
-    /// task's lower count already reads as a reset ([`counter_delta`]),
-    /// and that reset's delta lands in the fresh baseline round, never
-    /// applied to the rate.
+    /// [`Self::last_processed`]'s per-task counters are left alone: a new
+    /// task counts all it processed, and that lands in the fresh baseline
+    /// round, never applied to the rate.
     pub fn idle(&mut self) {
         self.phase_at.clear();
         self.prompt_tps = Some(0.0);
@@ -546,6 +549,7 @@ impl SlotBook {
                 .collect::<Vec<_>>();
             self.slots.retain(|row| row.model_id != model_id);
             self.slots.extend(next);
+            self.prune_processed(model_id);
             return true;
         }
         let Some(parsed) = parse_light(body) else {
@@ -610,7 +614,36 @@ impl SlotBook {
         }
         self.slots.retain(|row| row.model_id != model_id);
         self.slots.extend(next);
+        self.prune_processed(model_id);
         true
+    }
+
+    /// Keep `model_id`'s processed counters for the tasks its last body
+    /// listed only.
+    fn prune_processed(&mut self, model_id: &str) {
+        let slots = &self.slots;
+        self.last_processed.retain(|(model, id, task), _| {
+            model.as_str() != model_id
+                || slots
+                    .iter()
+                    .any(|row| row.model_id == model_id && row.id == *id && row.id_task == *task)
+        });
+    }
+
+    /// `model_id`'s slot numbers from its last body, for its token count
+    /// ([`crate::lcpp_tokens`]).
+    #[must_use]
+    pub fn tokens(&self, model_id: &str) -> Vec<SlotTokens> {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id)
+            .map(|row| SlotTokens {
+                id: row.id,
+                id_task: row.id_task,
+                is_processing: row.is_processing,
+                n_decoded: row.n_decoded,
+            })
+            .collect()
     }
 
     fn phase_for(&self, model_id: &str, slot: &LightSlot) -> Option<ChartPhase> {
@@ -668,11 +701,15 @@ impl SlotBook {
     }
 
     fn note_processed(&mut self, model_id: &str, slot: &LightSlot) {
-        let key = (model_id.to_owned(), slot.id);
-        let previous = self.last_processed.get(&key).copied();
-        self.round_delta = self
-            .round_delta
-            .saturating_add(counter_delta(previous, slot.n_prompt_tokens_processed));
+        let key = (model_id.to_owned(), slot.id, slot.id_task);
+        let processed = slot.n_prompt_tokens_processed;
+        // A task first seen counts all it processed (DER-451). The first
+        // round of an episode is a baseline anyway.
+        let delta = match self.last_processed.get(&key).copied() {
+            Some(previous) => counter_delta(Some(previous), processed),
+            None => processed,
+        };
+        self.round_delta = self.round_delta.saturating_add(delta);
         self.last_processed
             .insert(key, slot.n_prompt_tokens_processed);
         // llama.cpp reports `n_decoded == 0` while a slot is still in
@@ -1849,6 +1886,37 @@ mod tests {
         book.finish_round(t0 + Duration::from_secs(2));
         let reset = book.prompt_tps().expect("reset rate");
         assert!((reset - 5.0).abs() < 1e-6, "{reset}");
+    }
+
+    /// CCR-6 corrected (DER-451): a slot finishes task 1 at 5,000
+    /// processed and starts task 2 between two reads, which is at 6,000
+    /// by the next one. The round credits task 2's 6,000, not the 1,000
+    /// difference from the old task's count. With 1, 2 and 4 slots doing
+    /// the same the round credits each new task in full.
+    #[test]
+    fn a_task_change_between_reads_counts_the_new_tasks_whole_count() {
+        for n in [1i64, 2, 4] {
+            let mut book = SlotBook::default();
+            let t = Instant::now();
+            let bodies = |task: i64, processed: u64| -> Vec<u8> {
+                let slots: Vec<String> = (0..n)
+                    .map(|id| {
+                        format!(
+                            r#"{{"id":{id},"id_task":{},"is_processing":true,"n_prompt_tokens_processed":{processed},"next_token":[{{"n_decoded":0}}]}}"#,
+                            task * 10 + id
+                        )
+                    })
+                    .collect();
+                format!("[{}]", slots.join(",")).into_bytes()
+            };
+            book.begin_round();
+            assert!(book.apply("cpp", "cpp", &bodies(1, 5000), 0, 0));
+            book.finish_round(t);
+            book.begin_round();
+            assert!(book.apply("cpp", "cpp", &bodies(2, 6000), 0, 0));
+            book.finish_round(t + Duration::from_secs(1));
+            assert_eq!(book.prompt_tps(), Some(6000.0 * n as f64), "{n} slots");
+        }
     }
 
     /// A slot in prefill, `is_processing` with `n_decoded == 0`, whose
