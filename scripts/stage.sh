@@ -89,6 +89,7 @@ ReadWritePaths=-/run/llama-watch-grid
 DevicePolicy=closed
 DeviceAllow=/dev/nvidiactl rw
 DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidia1 rw
 DeviceAllow=/dev/tty11 rw
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressAllow=localhost
@@ -230,6 +231,7 @@ assert_packaging_contract() {
     'DeviceAllow=char-hidraw rw'
     'DeviceAllow=/dev/nvidiactl rw'
     'DeviceAllow=/dev/nvidia0 rw'
+    'DeviceAllow=/dev/nvidia1 rw'
     'IPAddressAllow=localhost'
     'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
   )
