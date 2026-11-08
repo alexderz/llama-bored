@@ -2038,6 +2038,38 @@ devices = ["0000:05:00.0", "GPU-abc"]
         assert!(invalid.validate(32).is_err(), "{text}");
     }
     assert!(toml::from_str::<Config>("[gpu]\nunknown = true").is_err());
+    let cfg: Config = toml::from_str("[gpu.fan]\n\"0000:05:00.0\" = \"nct6798/fan1\"\n")
+        .expect("fan table parses");
+    cfg.validate(32).expect("fan table validates");
+    assert_eq!(
+        cfg.gpu.fan.get("0000:05:00.0").map(String::as_str),
+        Some("nct6798/fan1")
+    );
+    for text in [
+        "[gpu.fan]\n\"x\" = \"nct6798\"",
+        "[gpu.fan]\n\"x\" = \"nct6798/pwm1\"",
+        "[gpu.fan]\n\"x\" = \"nct6798/fan0\"",
+        "[gpu.fan]\n\"x\" = \"../nct/fan1\"",
+    ] {
+        let invalid: Config = toml::from_str(text).expect("fan values parse");
+        assert!(invalid.validate(32).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn gpu_fan_spec_prefers_the_most_specific_selector() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABC".into()),
+        pci_bus_id: Some("00000000:05:00.0".into()),
+        name: Some("Tesla V100-PCIE-32GB".into()),
+    };
+    let mut cfg = GpuConfig::default();
+    cfg.fan.insert("1".into(), "other/fan2".into());
+    cfg.fan.insert("0000:05:00.0".into(), "nct6798/fan1".into());
+    assert_eq!(cfg.fan_spec(&device), Some("nct6798/fan1"));
 }
 
 #[test]

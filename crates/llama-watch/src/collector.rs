@@ -69,6 +69,8 @@ pub struct GpuDeviceTelemetry {
     pub util_pct: Option<f32>,
     pub temp_c: Option<f32>,
     pub extra: GpuExtra,
+    /// Optional blower rpm from `[gpu.fan]`. `None` when unset or unreadable.
+    pub fan_rpm: Option<u32>,
 }
 
 /// Compute processes from the last NVML attempt.
@@ -667,6 +669,7 @@ where
                     power_mw: r.power_mw.ok(),
                     power_limit_mw: r.power_limit_mw.ok(),
                 },
+                fan_rpm: None,
             });
         }
         self.process_cache.retain(|key, _| live.contains(key));
@@ -701,6 +704,7 @@ where
             }
         }
         self.gpu_processes = merged;
+        crate::sources::gpu_fan::apply(&self.roots, &self.gpu_config, &mut result);
         result
     }
 

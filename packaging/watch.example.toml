@@ -520,3 +520,7 @@ enabled = true
 # "0000:05:00.0" = 25.0
 # Devices without an override use load.gpu_idle_w.
 # A device with no label gets a short name from NVML, such as 3090 or V100.
+# Optional blower rpm, drawn on that card's GPU row. The chip is the hwmon
+# `name` (never the hwmon number). Only fanN_input is read; pwm is not touched.
+# [gpu.fan]
+# "0000:05:00.0" = "nct6798/fan1"

@@ -1027,6 +1027,34 @@ pub struct GpuConfig {
     /// Idle draw in watts, keyed by selector.
     #[serde(default)]
     pub idle_w: std::collections::BTreeMap<String, f64>,
+    /// Blower or card fan, keyed by selector. The value is
+    /// `"<hwmon name>/fanN"` ([`parse_gpu_fan`]). The chip is resolved by
+    /// its hwmon `name`, and only `fanN_input` is read.
+    #[serde(default)]
+    pub fan: std::collections::BTreeMap<String, String>,
+}
+
+/// `"<hwmon name>/fanN"`. `None` when the chip name or the fan number is
+/// not a plain token. `fan0` is rejected; hwmon fans are numbered from 1.
+pub(crate) fn parse_gpu_fan(value: &str) -> Option<(String, u32)> {
+    let (chip, fan) = value.split_once('/')?;
+    let chip_ok = !chip.is_empty()
+        && chip.len() <= 32
+        && chip
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if !chip_ok {
+        return None;
+    }
+    let number = fan.strip_prefix("fan")?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let channel: u32 = number.parse().ok()?;
+    if channel == 0 || channel > 32 {
+        return None;
+    }
+    Some((chip.to_owned(), channel))
 }
 
 /// Short display name from an NVML device name.
@@ -1152,6 +1180,11 @@ impl GpuConfig {
         Self::best(&self.idle_w, device).copied().unwrap_or(default)
     }
 
+    /// Configured `"<hwmon name>/fanN"` for this device, if any.
+    pub fn fan_spec(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> Option<&str> {
+        Self::best(&self.fan, device).map(String::as_str)
+    }
+
     fn validate(&self) -> Result<(), InvalidWatchConfig> {
         let bad = |reason: &str| InvalidWatchConfig::Gpu {
             reason: reason.into(),
@@ -1188,6 +1221,11 @@ impl GpuConfig {
         for (selector, watts) in &self.idle_w {
             if !valid_selector(selector) || !watts.is_finite() || *watts < 0.0 {
                 return Err(bad("invalid idle_w selector or wattage"));
+            }
+        }
+        for (selector, spec) in &self.fan {
+            if !valid_selector(selector) || parse_gpu_fan(spec).is_none() {
+                return Err(bad("invalid fan selector or hwmon fan"));
             }
         }
         Ok(())
