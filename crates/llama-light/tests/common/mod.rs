@@ -51,6 +51,7 @@ pub fn snap(seq: u64, t_mono_ns: u64) -> SnapshotV1 {
             swap_used_bytes: None,
             swap_total_bytes: None,
         },
+        gpus: Vec::new(),
         ai: Ai {
             state: AiWire::Idle,
             models: Vec::new(),

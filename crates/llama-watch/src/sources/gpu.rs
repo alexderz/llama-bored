@@ -427,15 +427,14 @@ impl<B: GpuBackend> GpuSource<B> {
             })
             .collect();
         // Preserve legacy single-device session recovery semantics.
-        if rows.len() == 1 {
-            if let Some(message) =
+        if rows.len() == 1
+            && let Some(message) =
                 read_failure_message(&rows[0].reading.util_pct, &rows[0].reading.temp_c)
-            {
-                self.backend.disconnect();
-                self.ready = false;
-                self.processes_at = None;
-                return Err(GpuError::new(message));
-            }
+        {
+            self.backend.disconnect();
+            self.ready = false;
+            self.processes_at = None;
+            return Err(GpuError::new(message));
         }
         Ok(rows)
     }

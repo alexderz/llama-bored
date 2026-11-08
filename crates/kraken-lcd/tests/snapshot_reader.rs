@@ -104,6 +104,7 @@ fn wire(run_id: u64, seq: u64, t_mono_ns: u64) -> WireSnapshot {
             swap_used_bytes: None,
             swap_total_bytes: None,
         },
+        gpus: Vec::new(),
         ai: Ai {
             state: AiWire::Loaded,
             models: vec![ModelWire {

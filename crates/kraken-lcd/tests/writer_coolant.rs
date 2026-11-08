@@ -76,6 +76,7 @@ fn publish(path: &std::path::Path, t_mono_ns: u64) {
             swap_used_bytes: None,
             swap_total_bytes: None,
         },
+        gpus: Vec::new(),
         ai: Ai {
             state: AiWire::Idle,
             models: Vec::new(),

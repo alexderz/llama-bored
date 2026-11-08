@@ -713,13 +713,12 @@ where
                 .zip(device.extra.power_limit_mw)
                 .map(|(w, limit)| (f64::from(w) / 1000.0, f64::from(limit) / 1000.0));
             idle.observe(mono, pair.map(|(watts, _)| watts));
-            if let Some((watts, limit)) = pair {
-                if let Some(frac) =
+            if let Some((watts, limit)) = pair
+                && let Some(frac) =
                     crate::load::device_frac(watts, idle.watts(limit), limit, self.nominal_frac)
-                {
-                    if gpu_best.is_none_or(|(best, _)| frac > best) {
-                        gpu_best = Some((frac, watts));
-                    }
+            {
+                if gpu_best.is_none_or(|(best, _)| frac > best) {
+                    gpu_best = Some((frac, watts));
                 }
             }
         }
