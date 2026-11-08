@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- Multi-GPU watt and VRAM totals are omitted unless every selected device reported that field. A failure of every selected device reopens NVML, and an enumeration failure waits out the existing init backoff (DER-674).
+
 ### Added
 
 - llama-watch reads every selected GPU. Legacy host scalars stay aggregates, and a single GPU still omits the per-GPU list. Metrics add per-GPU series keyed by PCI bus ID and UUID. A model's GPU memory is summed across devices, with the device labels kept for a later display (DER-674).
