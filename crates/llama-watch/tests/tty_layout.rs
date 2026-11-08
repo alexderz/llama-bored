@@ -16,7 +16,7 @@ use llama_watch::tty::chart::ChartBucket;
 use llama_watch::tty::grid::C16;
 use llama_watch::tty::layout::{
     Activity, HeaderClaim, HeaderDisplaced, HeaderGpu, HealthSeg, HealthStatus, JobView, SetupItem,
-    SetupRow, SetupView, Slot, TtyModel, WatchState, layout, layout_exact, replay_shown,
+    SetupRow, SetupView, Slot, TtyGpu, TtyModel, WatchState, layout, layout_exact, replay_shown,
 };
 use llama_watch::tty::term::{GLYPHS, Size, Term};
 
@@ -2505,6 +2505,7 @@ fn sample(state: WatchState) -> TtyModel {
         mem_psi: None,
         disk_ceiling_bps: 7e9,
         tz_offset_s: 0,
+        gpus: Vec::new(),
     }
 }
 
@@ -10172,5 +10173,279 @@ fn tqllm_frame_shows_its_lines_and_rows() {
             .collect();
         assert!(flights[0].contains("pp"), "{flights:?}");
         assert!(flights[1].contains("gen"), "{flights:?}");
+    }
+}
+
+fn two_cards() -> Vec<TtyGpu> {
+    vec![
+        TtyGpu {
+            label: "V100".to_owned(),
+            util_pct: Some(8.0),
+            temp_c: Some(44),
+            vram_used_gb: Some(13.1),
+            vram_total_gb: Some(32.0),
+            fan_rpm: None,
+        },
+        TtyGpu {
+            label: "3090".to_owned(),
+            util_pct: Some(61.0),
+            temp_c: Some(61),
+            vram_used_gb: Some(22.8),
+            vram_total_gb: Some(24.0),
+            fan_rpm: Some(1200),
+        },
+    ]
+}
+
+fn with_cards(n: usize) -> TtyModel {
+    let mut model = sample(WatchState::Ready);
+    model.power_w = Some(412.0);
+    model.power_limit_w = Some(650.0);
+    model.gpus = (0..n)
+        .map(|i| TtyGpu {
+            label: format!("a{i}"),
+            util_pct: Some(10.0 + i as f64),
+            temp_c: Some(40 + i as i32),
+            vram_used_gb: Some(1.0 + i as f64),
+            vram_total_gb: Some(16.0),
+            fan_rpm: None,
+        })
+        .collect();
+    model
+}
+
+fn rows_containing(grid: &llama_watch::tty::grid::Grid, needle: &str) -> Vec<String> {
+    (0..grid.rows())
+        .map(|row| row_string(grid, row))
+        .filter(|row| row.contains(needle))
+        .collect()
+}
+
+/// One selected GPU, or a single `gpus` row, is cell-identical to today.
+#[test]
+fn one_gpu_stays_cell_identical() {
+    let today = sample(WatchState::Generating);
+    let mut single = today.clone();
+    single.gpus = vec![TtyGpu {
+        label: "3090".to_owned(),
+        util_pct: Some(97.0),
+        temp_c: Some(80),
+        vram_used_gb: Some(22.8),
+        vram_total_gb: Some(24.0),
+        fan_rpm: Some(1800),
+    }];
+    let job = job_model(example_job(), 0);
+    let mut job_one = job.clone();
+    job_one.gpus = single.gpus.clone();
+    for (cols, rows) in [
+        (160u16, 26u16),
+        (160, 45),
+        (160, 48),
+        (192, 60),
+        (200, 28),
+        (213, 60),
+        (213, 90),
+        (240, 100),
+    ] {
+        let plain = draw(&today, cols, rows);
+        let card = draw(&single, cols, rows);
+        assert_eq!(
+            console_bytes(&plain),
+            console_bytes(&card),
+            "one card {cols}x{rows}"
+        );
+        let plain_job = draw(&job, cols, rows);
+        let card_job = draw(&job_one, cols, rows);
+        assert_eq!(
+            console_bytes(&plain_job),
+            console_bytes(&card_job),
+            "one card job {cols}x{rows}"
+        );
+    }
+}
+
+/// Two cards: own GPU and VRAM rows in PCI order, one POWER row, header temps.
+#[test]
+fn two_gpu_meters_header_and_fan_rpm() {
+    let mut model = sample(WatchState::Ready);
+    model.gpus = two_cards();
+    model.power_w = Some(412.0);
+    model.power_limit_w = Some(650.0);
+    for (cols, rows) in [(213u16, 60u16), (192, 60), (160, 45), (160, 26)] {
+        let grid = draw(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        let text = painted(&model, cols, rows);
+        if cols >= 200 {
+            assert!(text.contains("GPU 44C/61C"), "{at} header: {text}");
+        }
+        assert!(text.contains("GPU  V100"), "{at}");
+        assert!(text.contains("GPU  3090"), "{at}");
+        assert!(text.contains("VRAM V100"), "{at}");
+        assert!(text.contains("VRAM 3090"), "{at}");
+        assert!(text.contains("1.2k"), "{at} fan: {text}");
+        let v100 = rows_containing(&grid, "GPU  V100");
+        let card3090 = rows_containing(&grid, "GPU  3090");
+        assert_eq!(v100.len(), 1, "{at} {v100:?}");
+        assert_eq!(card3090.len(), 1, "{at}");
+        assert!(
+            v100[0].contains("8 %") && !v100[0].contains("rpm") && !v100[0].contains("1.2k"),
+            "{at} v100 has no fan: {}",
+            v100[0]
+        );
+        assert!(
+            card3090[0].contains("1.2k"),
+            "{at} 3090 fan: {}",
+            card3090[0]
+        );
+        assert!(
+            meter_row(&grid, "GPU  V100") < meter_row(&grid, "GPU  3090"),
+            "{at}"
+        );
+        assert!(
+            meter_row(&grid, "VRAM V100") < meter_row(&grid, "VRAM 3090"),
+            "{at}"
+        );
+        assert_eq!(meter_row(&grid, "POWER"), meter_row(&grid, "SWAP"), "{at}");
+        assert!(meter_row(&grid, "CPU") < timeline_rule(&grid), "{at}");
+        assert!(meter_row(&grid, "MEM") < timeline_rule(&grid), "{at}");
+        assert_blank_edges(&grid);
+        let power = row_string(&grid, meter_row(&grid, "POWER"));
+        assert!(power.contains("412/650 W"), "{at} {power}");
+    }
+    let mut quiet = model.clone();
+    for gpu in &mut quiet.gpus {
+        gpu.fan_rpm = None;
+    }
+    let text = painted(&quiet, 213, 60);
+    assert!(!text.contains("rpm"), "{text}");
+    assert!(!text.contains("1.2k"), "{text}");
+}
+
+/// The job view's single column lists the same cards, and the rpm fits there.
+#[test]
+fn two_gpu_legacy_meters_list_each_card() {
+    let mut model = job_model(example_job(), 0);
+    model.gpus = two_cards();
+    model.power_w = Some(412.0);
+    model.power_limit_w = Some(650.0);
+    for (cols, rows) in [(213u16, 60u16), (160, 45), (192, 60)] {
+        let grid = draw(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        let header = row_string(&grid, 0);
+        if cols >= 200 {
+            assert!(header.contains("GPU 44C/61C"), "{at} {header}");
+        }
+        let v100 = meter_row(&grid, "GPU  V100");
+        let card = meter_row(&grid, "GPU  3090");
+        assert!(v100 < card, "{at}");
+        assert!(
+            meter_row(&grid, "VRAM V100") < meter_row(&grid, "VRAM 3090"),
+            "{at}"
+        );
+        let fan = row_string(&grid, card);
+        assert!(fan.contains("1.2k rpm"), "{at} {fan}");
+        let bare = row_string(&grid, v100);
+        assert!(!bare.contains("rpm"), "{at} {bare}");
+        assert!(
+            row_string(&grid, meter_row(&grid, "POWER")).contains("412/650 W"),
+            "{at}"
+        );
+        assert!(meter_row(&grid, "LOAD") < grid.rows() - 3, "{at}");
+        assert_blank_edges(&grid);
+    }
+}
+
+/// Four cards fit per-card VRAM on a tall gauge band and collapse it at 160x26.
+#[test]
+fn small_gauge_height_drops_per_card_vram() {
+    let wide = draw(&with_cards(4), 213, 60);
+    let wide_text = (0..wide.rows())
+        .map(|row| row_string(&wide, row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for label in ["VRAM a0", "VRAM a1", "VRAM a2", "VRAM a3"] {
+        assert!(wide_text.contains(label), "{label} missing\n{wide_text}");
+    }
+    let short = draw(&with_cards(4), 160, 26);
+    let short_rows = rows_containing(&short, "VRAM");
+    assert!(
+        short_rows.iter().all(|row| !row.contains("VRAM a")),
+        "collapsed vram: {short_rows:?}"
+    );
+    assert_eq!(short_rows.len(), 1, "{short_rows:?}");
+    for label in ["GPU  a0", "GPU  a1", "GPU  a2", "GPU  a3"] {
+        assert!(
+            rows_containing(&short, label).len() == 1,
+            "{label} on the short screen"
+        );
+    }
+    assert!(meter_row(&short, "GPU  a3") < timeline_rule(&short));
+    assert_blank_edges(&short);
+    assert_blank_edges(&wide);
+}
+
+/// Eight cards on the legacy column collapse VRAM and still leave POWER on screen.
+#[test]
+fn small_legacy_height_drops_per_card_vram() {
+    let mut model = job_model(example_job(), 0);
+    model.gpus = with_cards(8).gpus;
+    let grid = draw(&model, 160, 26);
+    let vram = rows_containing(&grid, "VRAM");
+    assert!(vram.iter().all(|row| !row.contains("VRAM a")), "{vram:?}");
+    assert_eq!(rows_containing(&grid, "GPU  a0").len(), 1);
+    assert_eq!(rows_containing(&grid, "GPU  a7").len(), 1);
+    assert!(
+        row_string(&grid, meter_row(&grid, "POWER")).contains('W')
+            || row_string(&grid, meter_row(&grid, "POWER")).contains("--")
+    );
+    assert!(meter_row(&grid, "LOAD") < grid.rows() - 3);
+    assert_blank_edges(&grid);
+}
+
+#[test]
+fn setup_draws_the_spanned_gpu_line() {
+    let mut model = sample(WatchState::Ready);
+    model.setup = Some(SetupView {
+        id: "qwen".to_owned(),
+        name: String::new(),
+        more: 0,
+        rows: vec![SetupRow {
+            label: "gpus".to_owned(),
+            items: vec![SetupItem {
+                sep: String::new(),
+                text: "3090 + V100".to_owned(),
+                dim: false,
+                text_value: false,
+            }],
+        }],
+    });
+    for (cols, rows) in [(213u16, 60u16), (160, 45), (192, 60)] {
+        let text = painted(&model, cols, rows);
+        assert!(text.contains("gpus"), "{cols}x{rows}");
+        assert!(text.contains("3090 + V100"), "{cols}x{rows}\n{text}");
+    }
+}
+
+#[test]
+#[ignore = "writes reviewer frames; not part of check.sh"]
+fn dump_der674_phase2_frames() {
+    let dir =
+        std::path::Path::new("/home/alex.derzhi/src/kraken-dash-wt/_run/der674-phase2-frames");
+    std::fs::create_dir_all(dir).expect("frames dir");
+    let one = sample(WatchState::Ready);
+    let mut two = one.clone();
+    two.gpus = two_cards();
+    two.power_w = Some(412.0);
+    two.power_limit_w = Some(650.0);
+    for (name, model) in [("one", &one), ("two", &two)] {
+        for (cols, rows) in [(213u16, 60u16), (160, 45)] {
+            let grid = draw(model, cols, rows);
+            let text = (0..grid.rows())
+                .map(|row| row_string(&grid, row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let path = dir.join(format!("{name}-{cols}x{rows}.txt"));
+            std::fs::write(&path, text).expect("write frame");
+        }
     }
 }

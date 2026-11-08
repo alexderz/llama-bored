@@ -1064,6 +1064,7 @@ fn busy_frame() -> TtyModel {
         mem_psi: None,
         disk_ceiling_bps: 7e9,
         tz_offset_s: 0,
+        gpus: Vec::new(),
     }
 }
 

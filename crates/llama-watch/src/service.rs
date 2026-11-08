@@ -1259,6 +1259,7 @@ fn tty_model(
         mem_psi: sample.host_io.mem_psi.map(f64::from),
         disk_ceiling_bps: ctx.disk_ceiling_bps,
         tz_offset_s: zone.offset_at(unix_secs_of(wall)),
+        gpus: tty_gpus(&sample.gpu_devices),
     }
 }
 
@@ -1328,13 +1329,77 @@ fn setup_view(
         info: model.backend.as_ref(),
         engine: Some(&setup.engine),
     };
-    let rows = rules.rows(&setup.found, &live);
+    let mut rows = rules.rows(&setup.found, &live);
+    if let Some(text) = spanned_cards(&sample.gpu_devices, &sample.gpu_processes.list) {
+        rows.push(layout::SetupRow {
+            label: "gpus".to_owned(),
+            items: vec![layout::SetupItem {
+                sep: String::new(),
+                text,
+                dim: false,
+                text_value: false,
+            }],
+        });
+    }
     Some(SetupView {
         id: setup.id,
         name: setup.name,
         more: sample.snapshot.models.len() - 1,
         rows,
     })
+}
+
+/// Cards the busiest GPU process spans, in PCI order (`3090 + V100` is the
+/// device order, not the order the labels were first stored). `None` for a
+/// single selected GPU, so the SETUP block stays unchanged.
+fn spanned_cards(
+    devices: &[crate::collector::GpuDeviceTelemetry],
+    processes: &[crate::collector::GpuProcess],
+) -> Option<String> {
+    if devices.len() < 2 {
+        return None;
+    }
+    let process = processes
+        .iter()
+        .filter(|process| !process.device_labels.is_empty())
+        .max_by_key(|process| process.memory_bytes)?;
+    let mut labels: Vec<String> = devices
+        .iter()
+        .filter(|device| {
+            process
+                .device_labels
+                .iter()
+                .any(|label| label == &device.label)
+        })
+        .map(|device| device.label.clone())
+        .collect();
+    for label in &process.device_labels {
+        if !labels.iter().any(|have| have == label) {
+            labels.push(label.clone());
+        }
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join(" + "))
+    }
+}
+
+fn tty_gpus(devices: &[crate::collector::GpuDeviceTelemetry]) -> Vec<layout::TtyGpu> {
+    if devices.len() < 2 {
+        return Vec::new();
+    }
+    devices
+        .iter()
+        .map(|device| layout::TtyGpu {
+            label: device.label.clone(),
+            util_pct: pct(device.util_pct),
+            temp_c: temp_i(device.temp_c),
+            vram_used_gb: device.extra.vram_used.map(gib),
+            vram_total_gb: device.extra.vram_total.map(gib),
+            fan_rpm: device.fan_rpm,
+        })
+        .collect()
 }
 
 /// The SETUP entry that [`setup_view`] would show, and the snapshot model
@@ -4617,6 +4682,59 @@ mod tests {
         // #33: no model loaded.
         sample.snapshot.models.clear();
         assert_eq!(model_detail(&sample, WatchState::Ready), "engine --");
+    }
+
+    #[test]
+    fn setup_names_cards_in_pci_order_and_skips_one_gpu() {
+        let rules = Rules::builtin();
+        let mut sample = backend_sample(vec![served(
+            "Qwen 35B",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::LlamaCpp,
+                ..BackendInfo::default()
+            }),
+        )]);
+        let device = |index: u32, label: &str, pci: &str| crate::collector::GpuDeviceTelemetry {
+            identity: crate::sources::gpu::GpuDeviceIdentity {
+                index,
+                uuid: None,
+                pci_bus_id: Some(pci.to_owned()),
+                name: None,
+            },
+            label: label.to_owned(),
+            util_pct: Some(1.0),
+            temp_c: Some(40.0),
+            extra: crate::collector::GpuExtra {
+                vram_used: Some(1),
+                vram_total: Some(2),
+                power_mw: Some(1_000),
+                power_limit_mw: Some(2_000),
+            },
+            fan_rpm: None,
+        };
+        sample.gpu_devices = vec![
+            device(0, "V100", "0000:05:00.0"),
+            device(1, "3090", "0000:0b:00.0"),
+        ];
+        sample.gpu_processes.list = vec![crate::collector::GpuProcess {
+            pid: 9,
+            memory_bytes: 20_000_000_000,
+            name: "llama-server".to_owned(),
+            device_labels: vec!["3090".to_owned(), "V100".to_owned()],
+        }];
+        let detail = TickState::new(2, 6).detail;
+        let view = setup_view(&sample, &detail, WatchState::Ready, &rules).expect("setup");
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.label == "gpus")
+            .expect("gpus row");
+        assert_eq!(row.items[0].text, "V100 + 3090");
+        sample.gpu_devices.pop();
+        let one = setup_view(&sample, &detail, WatchState::Ready, &rules).expect("one");
+        assert!(one.rows.iter().all(|row| row.label != "gpus"));
+        assert!(spanned_cards(&[], &sample.gpu_processes.list).is_none());
     }
 
     /// #52: SETUP shows the model generating now, else the one RECENT saw
