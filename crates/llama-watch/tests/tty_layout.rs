@@ -10390,10 +10390,13 @@ fn small_legacy_height_drops_per_card_vram() {
     let mut model = job_model(example_job(), 0);
     model.gpus = with_cards(8).gpus;
     let grid = draw(&model, 160, 26);
-    let vram = rows_containing(&grid, "VRAM");
-    assert!(vram.iter().all(|row| !row.contains("VRAM a")), "{vram:?}");
-    assert_eq!(rows_containing(&grid, "GPU  a0").len(), 1);
-    assert_eq!(rows_containing(&grid, "GPU  a7").len(), 1);
+    let text = painted(&model, 160, 26);
+    assert!(
+        rows_containing(&grid, "GPU  a").is_empty(),
+        "cards collapse before SETUP is lost: {text}"
+    );
+    assert!(text.contains("elapsed"), "job SETUP stays: {text}");
+    assert!(text.contains("running"), "{text}");
     assert!(
         row_string(&grid, meter_row(&grid, "POWER")).contains('W')
             || row_string(&grid, meter_row(&grid, "POWER")).contains("--")
@@ -10426,6 +10429,92 @@ fn setup_draws_the_spanned_gpu_line() {
     }
 }
 
+fn titan_hwmon(cards: Vec<TtyGpu>) -> TtyModel {
+    let mut model = temps_model();
+    model.gpus = cards;
+    model.power_w = Some(412.0);
+    model.power_limit_w = Some(650.0);
+    if let Some(setup) = model.setup.as_mut() {
+        setup.rows.push(SetupRow {
+            label: "gpus".to_owned(),
+            items: vec![SetupItem {
+                sep: String::new(),
+                text: "V100 + 3090".to_owned(),
+                dim: false,
+                text_value: false,
+            }],
+        });
+    }
+    model
+}
+
+/// Two cards must not spend the temps or fans that fit beside one GPU.
+#[test]
+fn two_cards_keep_temps_and_fans_on_a_full_band() {
+    let model = titan_hwmon(two_cards());
+    let wide = painted(&model, 213, 60);
+    for label in [
+        "coolant", "NVMe0", "NVMe1", "board", "NIC", "front1", "front2", "rear", "top",
+    ] {
+        assert!(wide.contains(label), "213x60 missing {label}");
+    }
+    assert!(
+        !wide.contains("GPU  V100") && !wide.contains("VRAM V100"),
+        "per-card rows must collapse before temps or fans are shed"
+    );
+    let short = painted(&model, 160, 45);
+    for label in ["coolant", "NVMe0", "board", "NIC"] {
+        assert!(short.contains(label), "160x45 missing {label}");
+    }
+    assert!(
+        !short.contains("GPU  V100"),
+        "160x45 kept per-card GPU rows"
+    );
+}
+
+#[test]
+fn legacy_fan_keeps_the_card_name_at_full_util() {
+    let mut model = job_model(example_job(), 0);
+    model.gpus = vec![
+        TtyGpu {
+            label: "3090".to_owned(),
+            util_pct: Some(100.0),
+            temp_c: Some(70),
+            vram_used_gb: Some(22.8),
+            vram_total_gb: Some(24.0),
+            fan_rpm: Some(1200),
+        },
+        TtyGpu {
+            label: "V100".to_owned(),
+            util_pct: Some(100.0),
+            temp_c: Some(44),
+            vram_used_gb: Some(13.1),
+            vram_total_gb: Some(32.0),
+            fan_rpm: Some(900),
+        },
+    ];
+    let grid = draw(&model, 192, 60);
+    let row = row_string(&grid, meter_row(&grid, "GPU  3090"));
+    assert!(row.contains("3090"), "{row}");
+    assert!(!row.contains("GPU  309 "), "{row}");
+    assert!(row.contains("1.2k"), "{row}");
+    assert!(!row.contains("rpm"), "{row}");
+}
+
+/// One GPU with temps and fans is the 503ffac golden. `gpus` stays empty.
+#[test]
+fn one_gpu_temps_and_fans_match_the_503ffac_goldens() {
+    for (name, model) in [
+        ("temps-192.json", temps_model()),
+        ("temps-240.json", temps_model()),
+        ("fans-192.json", fans_model()),
+        ("fans-240.json", fans_model()),
+    ] {
+        assert!(model.gpus.is_empty(), "{name}");
+        assert_frame(name, &load(name), &model);
+    }
+}
+
 #[test]
 #[ignore = "writes reviewer frames; not part of check.sh"]
 fn dump_der674_phase2_frames() {
@@ -10437,7 +10526,8 @@ fn dump_der674_phase2_frames() {
     two.gpus = two_cards();
     two.power_w = Some(412.0);
     two.power_limit_w = Some(650.0);
-    for (name, model) in [("one", &one), ("two", &two)] {
+    let hwmon = titan_hwmon(two_cards());
+    for (name, model) in [("one", &one), ("two", &two), ("two-hwmon", &hwmon)] {
         for (cols, rows) in [(213u16, 60u16), (160, 45)] {
             let grid = draw(model, cols, rows);
             let text = (0..grid.rows())

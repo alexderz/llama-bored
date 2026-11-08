@@ -1833,7 +1833,7 @@ fn detail_width(text: &str) -> usize {
 }
 
 fn draw_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
-    if legacy_card_split(model.gpus.len(), g.rows, g.pitch, g.bar_rows) != CardSplit::Combined {
+    if legacy_card_split(model, g.rows, g.pitch, g.bar_rows) != CardSplit::Combined {
         draw_card_meters(grid, model, g);
         return;
     }
@@ -1926,15 +1926,17 @@ fn fits_rows(need: usize, room: u16) -> bool {
     }
 }
 
-/// Gauge rows for `n` cards: the fixed pairs, then one row per card for
-/// each split kind. The first GPU row keeps CPU; the first VRAM row keeps MEM.
-fn gauge_card_split(n: usize, height: u16) -> CardSplit {
+/// Gauge rows for `n` cards. `reserved` is the temps and fans blocks, which
+/// stay ahead of a per-card split: VRAM collapses first, then the GPU rows,
+/// and only a combined meter list may crowd those blocks.
+fn gauge_card_split(n: usize, height: u16, reserved: u16) -> CardSplit {
     if n < 2 {
         return CardSplit::Combined;
     }
-    if fits_rows(4 + 2 * n, height) {
+    let room = height.saturating_sub(reserved);
+    if fits_rows(4 + 2 * n, room) {
         CardSplit::Both
-    } else if fits_rows(5 + n, height) {
+    } else if fits_rows(5 + n, room) {
         CardSplit::GpuOnly
     } else {
         CardSplit::Combined
@@ -1950,11 +1952,27 @@ fn legacy_meter_room(rows: u16, pitch: u16, bar_rows: u16) -> usize {
     1 + usize::from(steps)
 }
 
-fn legacy_card_split(n: usize, rows: u16, pitch: u16, bar_rows: u16) -> CardSplit {
+/// Meters that still leave the job SETUP above the health cutoff.
+/// `setup_top < rows - 8`, and `setup_top` is
+/// `4 + (count - 1) * pitch + 2 * bar_rows`.
+fn legacy_setup_room(rows: u16, pitch: u16, bar_rows: u16) -> usize {
+    let span = rows
+        .saturating_sub(13)
+        .saturating_sub(bar_rows.saturating_mul(2));
+    let steps = span.checked_div(pitch).unwrap_or(0);
+    1 + usize::from(steps)
+}
+
+fn legacy_card_split(model: &TtyModel, rows: u16, pitch: u16, bar_rows: u16) -> CardSplit {
+    let n = model.gpus.len();
     if n < 2 {
         return CardSplit::Combined;
     }
-    let room = u16::try_from(legacy_meter_room(rows, pitch, bar_rows)).unwrap_or(u16::MAX);
+    let mut room = legacy_meter_room(rows, pitch, bar_rows);
+    if model.job.is_some() {
+        room = room.min(legacy_setup_room(rows, pitch, bar_rows));
+    }
+    let room = u16::try_from(room).unwrap_or(u16::MAX);
     if fits_rows(4 + 2 * n, room) {
         CardSplit::Both
     } else if fits_rows(5 + n, room) {
@@ -2182,6 +2200,20 @@ fn card_work_gauges(model: &TtyModel, split: CardSplit) -> Vec<Gauge> {
     out
 }
 
+/// Fan rpm on a legacy meter. Drop ` rpm` before cutting the card name.
+fn legacy_gpu_meter(gpu: &TtyGpu, starting: bool) -> (String, String) {
+    let base = pct_value(gpu.util_pct);
+    let full = with_fan(base.clone(), gpu.fan_rpm, METER_VALUE_CHARS);
+    let wide = card_label("GPU", &gpu.label);
+    let value = if meter_label_room(&full) >= wide.chars().count() {
+        full
+    } else {
+        with_fan(base, gpu.fan_rpm, METER_VALUE_CHARS.saturating_sub(1))
+    };
+    let shown = if starting { "--" } else { value.as_str() };
+    (meter_label_for("GPU", &gpu.label, shown), value)
+}
+
 type MeterSpec = (String, String, Option<f64>, bool);
 
 fn card_meter_specs(model: &TtyModel, split: CardSplit) -> Vec<MeterSpec> {
@@ -2189,14 +2221,8 @@ fn card_meter_specs(model: &TtyModel, split: CardSplit) -> Vec<MeterSpec> {
     let mut rows = Vec::new();
     rows.push(("CPU".to_owned(), cpu_value(model), model.cpu_pct, true));
     for gpu in &model.gpus {
-        let value = with_fan(pct_value(gpu.util_pct), gpu.fan_rpm, METER_VALUE_CHARS);
-        let shown = if starting { "--" } else { value.as_str() };
-        rows.push((
-            meter_label_for("GPU", &gpu.label, shown),
-            value,
-            gpu.util_pct,
-            true,
-        ));
+        let (label, value) = legacy_gpu_meter(gpu, starting);
+        rows.push((label, value, gpu.util_pct, true));
     }
     if split == CardSplit::Both {
         for gpu in &model.gpus {
@@ -2239,7 +2265,7 @@ fn card_meter_specs(model: &TtyModel, split: CardSplit) -> Vec<MeterSpec> {
 }
 
 fn legacy_meter_len(model: &TtyModel, rows: u16, pitch: u16, bar_rows: u16) -> u16 {
-    let split = legacy_card_split(model.gpus.len(), rows, pitch, bar_rows);
+    let split = legacy_card_split(model, rows, pitch, bar_rows);
     if split == CardSplit::Combined {
         6
     } else {
@@ -2248,7 +2274,7 @@ fn legacy_meter_len(model: &TtyModel, rows: u16, pitch: u16, bar_rows: u16) -> u
 }
 
 fn draw_card_meters(grid: &mut Grid, model: &TtyModel, g: &Geom) {
-    let split = legacy_card_split(model.gpus.len(), g.rows, g.pitch, g.bar_rows);
+    let split = legacy_card_split(model, g.rows, g.pitch, g.bar_rows);
     let meters = card_meter_specs(model, split);
     let starting = model.state == WatchState::Starting;
     for (i, (label, value, percent, level)) in meters.into_iter().enumerate() {
@@ -7880,7 +7906,9 @@ impl GaugeGroup {
 /// A further pair of work gauges (MEMBW beside SWAP, CPU W beside POWER,
 /// CLK, PCIE in the #163 design) is two more entries in [`work_gauges`].
 fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, height: u16) {
-    let split = gauge_card_split(model.gpus.len(), height);
+    let mut temps = temp_gauges(grid, model);
+    let mut fans = fan_gauges(model);
+    let split = gauge_card_split(model.gpus.len(), height, temps.block() + fans.block());
     let cols = if split == CardSplit::Combined {
         gauge_cols(x, right)
     } else {
@@ -7895,8 +7923,6 @@ fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, 
         },
         note: None,
     };
-    let mut temps = temp_gauges(grid, model);
-    let mut fans = fan_gauges(model);
     shed_gauges(work.rows(), &mut temps, &mut fans, height);
     let end = top.saturating_add(height);
     let mut row = top;

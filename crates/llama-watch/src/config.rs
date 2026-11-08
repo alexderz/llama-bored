@@ -1043,7 +1043,7 @@ pub(crate) fn parse_gpu_fan(value: &str) -> Option<(String, u32)> {
         && chip
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    if !chip_ok {
+    if !chip_ok || chip == "." || chip == ".." {
         return None;
     }
     let number = fan.strip_prefix("fan")?;

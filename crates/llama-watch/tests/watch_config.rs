@@ -2050,6 +2050,8 @@ devices = ["0000:05:00.0", "GPU-abc"]
         "[gpu.fan]\n\"x\" = \"nct6798/pwm1\"",
         "[gpu.fan]\n\"x\" = \"nct6798/fan0\"",
         "[gpu.fan]\n\"x\" = \"../nct/fan1\"",
+        "[gpu.fan]\n\"x\" = \"../fan1\"",
+        "[gpu.fan]\n\"x\" = \"./fan1\"",
     ] {
         let invalid: Config = toml::from_str(text).expect("fan values parse");
         assert!(invalid.validate(32).is_err(), "{text}");
