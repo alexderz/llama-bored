@@ -890,13 +890,13 @@ fn process_list_is_named_once_a_second_and_an_error_is_logged_once() {
                 pid: 4242,
                 memory_bytes: 24_051_816_858,
                 name: "example-bench".to_owned(),
-                device_labels: Vec::new(),
+                device_labels: vec!["GPU0".to_owned()],
             },
             GpuProcess {
                 pid: 7,
                 memory_bytes: 100,
                 name: String::new(),
-                device_labels: Vec::new(),
+                device_labels: vec!["GPU0".to_owned()],
             },
         ]
     );
