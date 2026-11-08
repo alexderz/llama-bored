@@ -1029,6 +1029,41 @@ pub struct GpuConfig {
     pub idle_w: std::collections::BTreeMap<String, f64>,
 }
 
+/// Short display name from an NVML device name.
+///
+/// Vendor and family words are dropped. A model token keeps the part before
+/// a hyphen, so `NVIDIA GeForce RTX 3090` is `3090` and
+/// `Tesla V100-PCIE-32GB` is `V100`. With nothing usable, the label is
+/// `GPU` plus the NVML index.
+pub fn short_gpu_label(name: &str, index: u32) -> String {
+    const FILLER: &[&str] = &["nvidia", "geforce", "tesla", "quadro", "rtx", "gtx"];
+    let mut parts = Vec::new();
+    for word in name.split_whitespace() {
+        let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+        if bare.is_empty()
+            || FILLER
+                .iter()
+                .any(|filler| bare.eq_ignore_ascii_case(filler))
+        {
+            continue;
+        }
+        parts.push(bare);
+    }
+    if let Some(token) = parts
+        .iter()
+        .find(|token| token.chars().any(|c| c.is_ascii_digit()))
+    {
+        let model = token.split('-').next().unwrap_or(token);
+        if !model.is_empty() {
+            return model.to_owned();
+        }
+    }
+    parts
+        .first()
+        .map(|token| (*token).to_owned())
+        .unwrap_or_else(|| format!("GPU{index}"))
+}
+
 impl GpuConfig {
     /// Match an index, UUID, PCI bus address, or case-insensitive full name.
     pub fn matches(selector: &str, device: &crate::sources::gpu::GpuDeviceIdentity) -> bool {
@@ -1075,7 +1110,12 @@ impl GpuConfig {
             .iter()
             .find(|(selector, _)| Self::matches(selector, device))
             .map_or_else(
-                || format!("GPU{}", device.index),
+                || {
+                    device.name.as_deref().map_or_else(
+                        || format!("GPU{}", device.index),
+                        |name| short_gpu_label(name, device.index),
+                    )
+                },
                 |(_, label)| label.clone(),
             )
     }

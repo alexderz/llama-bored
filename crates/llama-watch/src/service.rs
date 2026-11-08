@@ -6169,6 +6169,7 @@ mod tests {
             pid,
             memory_bytes,
             name: name.to_owned(),
+            device_labels: Vec::new(),
         }
     }
 

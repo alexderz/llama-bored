@@ -55,6 +55,10 @@ pub struct GpuProcess {
     pub memory_bytes: u64,
     /// Sanitised executable name. Empty when `comm` could not be read.
     pub name: String,
+    /// Short labels of the devices this process occupies. A model that spans
+    /// more than one GPU keeps every label here for a later per-GPU display.
+    /// Empty when the device has no label.
+    pub device_labels: Vec<String>,
 }
 
 /// One selected GPU's independently sampled telemetry.
@@ -602,6 +606,7 @@ where
             match r.processes {
                 ProcessRead::Ready(items) => {
                     self.process_errors.remove(&key);
+                    let device_label = self.gpu_config.label(&row.identity);
                     self.process_cache.insert(
                         key,
                         items
@@ -613,6 +618,11 @@ where
                                     &self.roots.proc,
                                     p.pid,
                                 ),
+                                device_labels: if device_label.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![device_label.clone()]
+                                },
                             })
                             .collect(),
                     );
@@ -663,6 +673,11 @@ where
         for process in self.process_cache.values().flatten() {
             if let Some(p) = merged.iter_mut().find(|p| p.pid == process.pid) {
                 p.memory_bytes = p.memory_bytes.saturating_add(process.memory_bytes);
+                for label in &process.device_labels {
+                    if !p.device_labels.iter().any(|have| have == label) {
+                        p.device_labels.push(label.clone());
+                    }
+                }
             } else {
                 merged.push(process.clone());
             }

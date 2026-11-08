@@ -6,7 +6,12 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Added
+
+- llama-watch reads every selected GPU. Legacy host scalars stay aggregates, and a single GPU still omits the per-GPU list. Metrics add per-GPU series keyed by PCI bus ID and UUID. A model's GPU memory is summed across devices, with the device labels kept for a later display (DER-674).
+
 ### Documentation
+
 
 - Document Fedora 45 Server installation and current two-GPU hardware (DER-674).
 

@@ -2055,3 +2055,19 @@ fn gpu_selectors_match_case_insensitive_identity_and_pci_domain_width() {
     }
     assert!(!GpuConfig::matches("2", &device));
 }
+
+#[test]
+fn short_gpu_labels_drop_vendor_words() {
+    use llama_watch::config::{GpuConfig, short_gpu_label};
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    assert_eq!(short_gpu_label("NVIDIA GeForce RTX 3090", 1), "3090");
+    assert_eq!(short_gpu_label("Tesla V100-PCIE-32GB", 0), "V100");
+    assert_eq!(short_gpu_label("   ", 4), "GPU4");
+    let named = GpuDeviceIdentity {
+        index: 1,
+        uuid: None,
+        pci_bus_id: None,
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    assert_eq!(GpuConfig::default().label(&named), "3090");
+}

@@ -889,6 +889,10 @@ fn multi_gpu_aggregates_and_process_cache_survives_index_reordering() {
     assert_eq!(first.activity_w, Some(80.0));
     assert_eq!(first.gpu_devices[1].label, "work");
     assert_eq!(first.gpu_processes.list[0].memory_bytes, 30);
+    assert_eq!(
+        first.gpu_processes.list[0].device_labels,
+        vec!["GPU0".to_owned(), "work".to_owned()]
+    );
     swapped.store(true, Ordering::Relaxed);
     let second = collector.sample(
         now + Duration::from_millis(100),
