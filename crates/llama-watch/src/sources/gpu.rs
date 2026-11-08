@@ -371,6 +371,17 @@ impl<B: GpuBackend> GpuSource<B> {
         }
     }
 
+    fn note_session_failure(&mut self, message: String, backoff: bool) {
+        self.backend.disconnect();
+        self.ready = false;
+        self.processes_at = None;
+        self.init_error = message;
+        if backoff {
+            self.init_wait = self.init_backoff;
+            self.init_backoff = self.init_backoff.saturating_mul(2).min(INIT_BACKOFF_MAX);
+        }
+    }
+
     fn ensure_ready(&mut self) -> bool {
         if !self.ready {
             if self.init_wait > 0 {
@@ -401,9 +412,8 @@ impl<B: GpuBackend> GpuSource<B> {
         let mut devices = match self.backend.devices() {
             Ok(devices) => devices,
             Err(err) => {
-                self.backend.disconnect();
-                self.ready = false;
-                self.processes_at = None;
+                // A card falling off the bus must not reopen NVML every tick.
+                self.note_session_failure(err.to_string(), true);
                 return Err(err);
             }
         };
@@ -426,14 +436,20 @@ impl<B: GpuBackend> GpuSource<B> {
                 GpuDeviceSample { identity, reading }
             })
             .collect();
-        // Preserve legacy single-device session recovery semantics.
-        if rows.len() == 1
-            && let Some(message) =
-                read_failure_message(&rows[0].reading.util_pct, &rows[0].reading.temp_c)
+        // One failed device stays. If every selected device failed util or
+        // temperature, drop the session as the one-GPU path does. The next
+        // read opens NVML immediately; enumeration failure is what backs off.
+        if !rows.is_empty()
+            && rows.iter().all(|row| {
+                read_failure_message(&row.reading.util_pct, &row.reading.temp_c).is_some()
+            })
         {
-            self.backend.disconnect();
-            self.ready = false;
-            self.processes_at = None;
+            let message = rows
+                .iter()
+                .filter_map(|row| read_failure_message(&row.reading.util_pct, &row.reading.temp_c))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.note_session_failure(message.clone(), false);
             return Err(GpuError::new(message));
         }
         Ok(rows)
@@ -543,6 +559,32 @@ impl NvidiaGpu {
     }
 }
 
+fn identities_from_count(
+    count: u32,
+    mut open: impl FnMut(u32) -> Result<GpuDeviceIdentity, ()>,
+) -> Result<Vec<GpuDeviceIdentity>, GpuError> {
+    let mut devices = Vec::new();
+    let mut failed = 0u32;
+    for index in 0..count {
+        match open(index) {
+            Ok(identity) => devices.push(identity),
+            Err(()) => {
+                failed += 1;
+                devices.push(GpuDeviceIdentity {
+                    index,
+                    uuid: None,
+                    pci_bus_id: None,
+                    name: None,
+                });
+            }
+        }
+    }
+    if count > 0 && failed == count {
+        return Err(GpuError::new("every GPU device open failed"));
+    }
+    Ok(devices)
+}
+
 impl GpuBackend for NvidiaGpu {
     fn init(&mut self) -> Result<(), GpuError> {
         self.library = None;
@@ -597,24 +639,16 @@ impl GpuBackend for NvidiaGpu {
             .library
             .as_ref()
             .ok_or_else(|| GpuError::new("GPU library is not initialised"))?;
-        let mut devices = Vec::new();
-        for index in 0..library.device_count()? {
-            devices.push(match library.device_by_index(index) {
-                Ok(device) => GpuDeviceIdentity {
-                    index,
-                    uuid: device.uuid().ok(),
-                    pci_bus_id: device.pci_info().ok().map(|info| info.bus_id),
-                    name: device.name().ok(),
-                },
-                Err(_) => GpuDeviceIdentity {
-                    index,
-                    uuid: None,
-                    pci_bus_id: None,
-                    name: None,
-                },
-            });
-        }
-        Ok(devices)
+        let count = library.device_count()?;
+        identities_from_count(count, |index| match library.device_by_index(index) {
+            Ok(device) => Ok(GpuDeviceIdentity {
+                index,
+                uuid: device.uuid().ok(),
+                pci_bus_id: device.pci_info().ok().map(|info| info.bus_id),
+                name: device.name().ok(),
+            }),
+            Err(_) => Err(()),
+        })
     }
     fn device_reading(&mut self, index: u32, processes: bool) -> GpuDeviceReading {
         let device = self
@@ -1445,6 +1479,7 @@ mod tests {
         init_count: usize,
         disconnect_count: usize,
         fail_enum: bool,
+        fail_reads: bool,
     }
     impl GpuBackend for MultiFake {
         fn init(&mut self) -> Result<(), GpuError> {
@@ -1482,7 +1517,7 @@ mod tests {
         }
         fn device_reading(&mut self, index: u32, processes: bool) -> GpuDeviceReading {
             let mut reading = GpuDeviceReading::unavailable(index, "failure");
-            if index == 1 {
+            if !self.fail_reads && index == 1 {
                 reading.util_pct = Ok(25.0);
                 reading.temp_c = Ok(55.0);
             }
@@ -1503,6 +1538,7 @@ mod tests {
             init_count: 0,
             disconnect_count: 0,
             fail_enum: false,
+            fail_reads: false,
         });
         let now = Instant::now();
         let samples = source.read_devices(now).unwrap();
@@ -1536,15 +1572,56 @@ mod tests {
         assert_eq!(source.backend.disconnect_count, 0);
     }
     #[test]
+    fn every_selected_device_failing_drops_the_session_immediately() {
+        let mut source = GpuSource::new(MultiFake {
+            init_count: 0,
+            disconnect_count: 0,
+            fail_enum: false,
+            fail_reads: true,
+        });
+        let now = Instant::now();
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(source.backend.disconnect_count, 1);
+        source.backend.fail_reads = false;
+        assert_eq!(source.read_devices(now).unwrap().len(), 2);
+        assert_eq!(source.backend.init_count, 2);
+    }
+    #[test]
+    fn every_device_open_failing_is_a_session_error() {
+        let err = identities_from_count(2, |_| Err(())).unwrap_err();
+        assert!(err.to_string().contains("every GPU device open failed"));
+        let rows = identities_from_count(2, |index| {
+            if index == 0 {
+                Err(())
+            } else {
+                Ok(GpuDeviceIdentity {
+                    index,
+                    uuid: Some("u".into()),
+                    pci_bus_id: None,
+                    name: None,
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].uuid.is_none());
+        assert_eq!(rows[1].uuid.as_deref(), Some("u"));
+    }
+    #[test]
     fn multi_device_enumeration_failure_disconnects_then_reconnects() {
         let mut source = GpuSource::new(MultiFake {
             init_count: 0,
             disconnect_count: 0,
             fail_enum: true,
+            fail_reads: false,
         });
-        assert!(source.read_devices(Instant::now()).is_err());
+        let now = Instant::now();
+        assert!(source.read_devices(now).is_err());
         assert_eq!(source.backend.disconnect_count, 1);
-        assert_eq!(source.read_devices(Instant::now()).unwrap().len(), 2);
+        assert_eq!(source.backend.init_count, 1);
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(source.backend.init_count, 1);
+        assert_eq!(source.read_devices(now).unwrap().len(), 2);
         assert_eq!(source.backend.init_count, 2);
     }
     #[test]

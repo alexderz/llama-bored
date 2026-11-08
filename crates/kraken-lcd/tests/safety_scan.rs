@@ -78,6 +78,7 @@ const NVML_CALLS: &[&str] = &[
     "power_usage",
     "and_then",
     "device_count",
+    "identities_from_count",
     "Failed",
     "map",
     "name",
