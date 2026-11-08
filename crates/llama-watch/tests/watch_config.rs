@@ -2082,10 +2082,29 @@ fn gpu_selectors_match_case_insensitive_identity_and_pci_domain_width() {
         pci_bus_id: Some("00000000:0B:00.0".into()),
         name: Some("NVIDIA GeForce RTX 3090".into()),
     };
-    for selector in ["1", "gpu-abcd", "0000:0b:00.0", "nvidia geforce rtx 3090"] {
+    for selector in [
+        "1",
+        "gpu-abcd",
+        "0000:0b:00.0",
+        "00000000:0B:00.0",
+        "nvidia geforce rtx 3090",
+    ] {
         assert!(GpuConfig::matches(selector, &device), "{selector}");
     }
     assert!(!GpuConfig::matches("2", &device));
+    let short = GpuDeviceIdentity {
+        pci_bus_id: Some("0000:0b:00.0".into()),
+        ..device.clone()
+    };
+    assert!(GpuConfig::matches("00000000:0B:00.0", &short));
+    let v100 = GpuDeviceIdentity {
+        index: 0,
+        uuid: None,
+        pci_bus_id: Some("00000000:05:00.0".into()),
+        name: Some("Tesla V100-PCIE-32GB".into()),
+    };
+    assert!(GpuConfig::matches("0000:05:00.0", &v100));
+    assert!(GpuConfig::matches("00000000:05:00.0", &v100));
 }
 
 #[test]

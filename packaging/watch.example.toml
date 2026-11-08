@@ -513,6 +513,8 @@ enabled = true
 # NVML index, UUID, PCI bus ID or a case-insensitive device name:
 # [gpu]
 # devices = ["0000:05:00.0", "0000:0b:00.0"]
+# PCI selectors match NVML's 8-digit domain form too, case-insensitive:
+# 0000:0b:00.0 and 00000000:0B:00.0 are the same bus.
 # [gpu.labels]
 # "0000:05:00.0" = "V100"
 # "0000:0b:00.0" = "3090"
