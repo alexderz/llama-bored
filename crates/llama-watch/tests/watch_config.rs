@@ -2071,3 +2071,39 @@ fn short_gpu_labels_drop_vendor_words() {
     };
     assert_eq!(GpuConfig::default().label(&named), "3090");
 }
+
+#[test]
+fn the_most_specific_gpu_override_wins() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABC".into()),
+        pci_bus_id: Some("00000000:0B:00.0".into()),
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    let mut cfg = GpuConfig::default();
+    cfg.labels.insert("1".into(), "by-index".into());
+    cfg.labels
+        .insert("NVIDIA GeForce RTX 3090".into(), "by-name".into());
+    cfg.labels.insert("0000:0b:00.0".into(), "by-pci".into());
+    cfg.labels.insert("GPU-ABC".into(), "by-uuid".into());
+    cfg.idle_w.insert("1".into(), 1.0);
+    cfg.idle_w.insert("NVIDIA GeForce RTX 3090".into(), 2.0);
+    cfg.idle_w.insert("0000:0b:00.0".into(), 3.0);
+    cfg.idle_w.insert("GPU-ABC".into(), 4.0);
+    assert_eq!(cfg.label(&device), "by-uuid");
+    assert_eq!(cfg.idle_w(&device, 0.0), 4.0);
+    cfg.labels.remove("GPU-ABC");
+    cfg.idle_w.remove("GPU-ABC");
+    assert_eq!(cfg.label(&device), "by-pci");
+    assert_eq!(cfg.idle_w(&device, 0.0), 3.0);
+    cfg.labels.remove("0000:0b:00.0");
+    cfg.idle_w.remove("0000:0b:00.0");
+    assert_eq!(cfg.label(&device), "by-name");
+    assert_eq!(cfg.idle_w(&device, 0.0), 2.0);
+    cfg.labels.remove("NVIDIA GeForce RTX 3090");
+    cfg.idle_w.remove("NVIDIA GeForce RTX 3090");
+    assert_eq!(cfg.label(&device), "by-index");
+    assert_eq!(cfg.idle_w(&device, 0.0), 1.0);
+}

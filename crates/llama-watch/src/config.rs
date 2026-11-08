@@ -1067,6 +1067,12 @@ pub fn short_gpu_label(name: &str, index: u32) -> String {
 impl GpuConfig {
     /// Match an index, UUID, PCI bus address, or case-insensitive full name.
     pub fn matches(selector: &str, device: &crate::sources::gpu::GpuDeviceIdentity) -> bool {
+        Self::rank(selector, device).is_some()
+    }
+
+    /// Specificity of a matching selector: uuid, then PCI, then name, then index.
+    /// Equal ranks keep the lexicographically first key.
+    fn rank(selector: &str, device: &crate::sources::gpu::GpuDeviceIdentity) -> Option<u8> {
         fn pci(s: &str) -> Option<(u32, u8, u8, u8)> {
             let mut parts = s.split([':', '.']);
             let (domain, bus, slot, function) =
@@ -1081,22 +1087,46 @@ impl GpuConfig {
                 u8::from_str_radix(function, 16).ok()?,
             ))
         }
-        selector.parse::<u32>().ok() == Some(device.index)
-            || device
-                .uuid
-                .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case(selector))
-            || device
-                .name
-                .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case(selector))
-            || device
-                .pci_bus_id
-                .as_deref()
-                .is_some_and(|s| pci(selector).is_some() && pci(selector) == pci(s))
+        if device
+            .uuid
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(selector))
+        {
+            return Some(0);
+        }
+        if device
+            .pci_bus_id
+            .as_deref()
+            .and_then(pci)
+            .is_some_and(|bus| pci(selector) == Some(bus))
+        {
+            return Some(1);
+        }
+        if device
+            .name
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(selector))
+        {
+            return Some(2);
+        }
+        if selector.parse::<u32>().ok() == Some(device.index) {
+            return Some(3);
+        }
+        None
     }
 
-    /// Whether a discovered device is selected.
+    fn best<'a, T>(
+        map: &'a std::collections::BTreeMap<String, T>,
+        device: &crate::sources::gpu::GpuDeviceIdentity,
+    ) -> Option<&'a T> {
+        map.iter()
+            .filter_map(|(selector, value)| {
+                Self::rank(selector, device).map(|rank| (rank, selector.as_str(), value))
+            })
+            .min_by_key(|(rank, selector, _)| (*rank, *selector))
+            .map(|(_, _, value)| value)
+    }
+
     pub fn selects(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> bool {
         match &self.devices {
             GpuDevices::All(_) => true,
@@ -1106,26 +1136,20 @@ impl GpuConfig {
 
     /// Configured or generic short display label.
     pub fn label(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> String {
-        self.labels
-            .iter()
-            .find(|(selector, _)| Self::matches(selector, device))
-            .map_or_else(
-                || {
-                    device.name.as_deref().map_or_else(
-                        || format!("GPU{}", device.index),
-                        |name| short_gpu_label(name, device.index),
-                    )
-                },
-                |(_, label)| label.clone(),
-            )
+        Self::best(&self.labels, device).map_or_else(
+            || {
+                device.name.as_deref().map_or_else(
+                    || format!("GPU{}", device.index),
+                    |name| short_gpu_label(name, device.index),
+                )
+            },
+            |label| label.clone(),
+        )
     }
 
     /// Configured idle draw, otherwise the legacy default.
     pub fn idle_w(&self, device: &crate::sources::gpu::GpuDeviceIdentity, default: f64) -> f64 {
-        self.idle_w
-            .iter()
-            .find(|(selector, _)| Self::matches(selector, device))
-            .map_or(default, |(_, watts)| *watts)
+        Self::best(&self.idle_w, device).copied().unwrap_or(default)
     }
 
     fn validate(&self) -> Result<(), InvalidWatchConfig> {
