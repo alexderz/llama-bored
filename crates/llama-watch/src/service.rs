@@ -2776,6 +2776,31 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
         }
     }
     Extras {
+        gpus: if sample.gpu_devices.len() > 1 {
+            sample
+                .gpu_devices
+                .iter()
+                .map(|gpu| llama_core::wire::GpuWire {
+                    index: gpu.identity.index,
+                    uuid: gpu.identity.uuid.clone().unwrap_or_default(),
+                    pci: gpu.identity.pci_bus_id.clone().unwrap_or_default(),
+                    label: gpu.label.clone(),
+                    name: gpu
+                        .identity
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| gpu.label.clone()),
+                    gpu_pct: gpu.util_pct,
+                    gpu_c: gpu.temp_c,
+                    gpu_w: gpu.extra.power_mw.map(|mw| mw as f32 / 1000.0),
+                    gpu_limit_w: gpu.extra.power_limit_mw.map(|mw| mw as f32 / 1000.0),
+                    vram_used_bytes: gpu.extra.vram_used,
+                    vram_total_bytes: gpu.extra.vram_total,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         gpu_w: sample.gpu.power_mw.map(|mw| f64::from(mw) / 1000.0),
         gpu_limit_w: sample.gpu.power_limit_mw.map(|mw| f64::from(mw) / 1000.0),
         cpu_w: sample.cpu_w,
@@ -6600,6 +6625,7 @@ mod tests {
                     errors: std::collections::BTreeSet::new(),
                 },
                 gpu: crate::collector::GpuExtra::default(),
+                gpu_devices: Vec::new(),
                 cpu_w: None,
                 activity_w: None,
                 load_source: crate::collector::LoadSource::Util,

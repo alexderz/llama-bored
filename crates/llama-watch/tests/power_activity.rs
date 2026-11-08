@@ -793,3 +793,138 @@ impl GpuBackend for StepGpu {
 
     fn disconnect(&mut self) {}
 }
+
+#[derive(Clone)]
+struct MultiGpu {
+    swapped: Arc<std::sync::atomic::AtomicBool>,
+    remove_first: Arc<std::sync::atomic::AtomicBool>,
+}
+impl GpuBackend for MultiGpu {
+    fn init(&mut self) -> Result<(), GpuError> {
+        Ok(())
+    }
+    fn disconnect(&mut self) {}
+    fn util_pct(&mut self) -> Result<f32, GpuError> {
+        unreachable!()
+    }
+    fn temp_c(&mut self) -> Result<f32, GpuError> {
+        unreachable!()
+    }
+    fn devices(&mut self) -> Result<Vec<llama_watch::sources::gpu::GpuDeviceIdentity>, GpuError> {
+        use llama_watch::sources::gpu::GpuDeviceIdentity;
+        let swapped = self.swapped.load(Ordering::Relaxed);
+        Ok((0..2)
+            .map(|index| {
+                let physical = index ^ u32::from(swapped);
+                GpuDeviceIdentity {
+                    index,
+                    uuid: Some(format!("GPU-{physical}")),
+                    pci_bus_id: Some(format!("00000000:0{}:00.0", physical + 1)),
+                    name: None,
+                }
+            })
+            .filter(|id| {
+                !self.remove_first.load(Ordering::Relaxed) || id.uuid.as_deref() != Some("GPU-0")
+            })
+            .collect())
+    }
+    fn device_reading(
+        &mut self,
+        index: u32,
+        processes: bool,
+    ) -> llama_watch::sources::gpu::GpuDeviceReading {
+        use llama_watch::sources::gpu::{ComputeProcess, GpuDeviceReading, ProcessRead};
+        let physical = index ^ u32::from(self.swapped.load(Ordering::Relaxed));
+        GpuDeviceReading {
+            index,
+            util_pct: Ok(if physical == 0 { 30.0 } else { 90.0 }),
+            temp_c: Ok(if physical == 0 { 50.0 } else { 80.0 }),
+            memory: Ok((u64::from(physical + 1) * 100, 1000)),
+            power_mw: Ok(if physical == 0 { 50_000 } else { 80_000 }),
+            power_limit_mw: Ok(100_000),
+            processes: if processes {
+                ProcessRead::Ready(vec![ComputeProcess {
+                    pid: 42,
+                    memory_bytes: u64::from(physical + 1) * 10,
+                }])
+            } else {
+                ProcessRead::Cached
+            },
+        }
+    }
+}
+
+fn multi_config(rig: &Rig, selection: &str) -> ValidWatchConfig {
+    let path = rig.scratch.path().join("multi.toml");
+    std::fs::write(&path, format!(
+        "[collector]\ntick_s=0.1\ncpu_window_s=1.0\ncpu_top_k=1\n[llama]\nurl=\"http://127.0.0.1:9\"\n[load]\nnominal_frac=1.0\nidle=\"fixed\"\ngpu_idle_w=0\nsmooth_s=0\n[gpu]\ndevices={selection}\n[gpu.labels]\n\"GPU-1\"=\"work\"\n[gpu.idle_w]\n\"GPU-1\"=20\n"
+    )).unwrap();
+    Config::load_validated(&path, 1).unwrap()
+}
+
+#[test]
+fn multi_gpu_aggregates_and_process_cache_survives_index_reordering() {
+    let rig = Rig::new("multi");
+    let config = multi_config(&rig, "\"all\"");
+    let swapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let remove_first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut collector = WatchCollector::new(
+        rig.roots(),
+        MultiGpu {
+            swapped: swapped.clone(),
+            remove_first: remove_first.clone(),
+        },
+        &config,
+        Quiet,
+    );
+    let now = Instant::now();
+    let first = collector.sample(now, SystemTime::now(), &idle_view());
+    assert_eq!(first.snapshot.gpu_pct, Some(90.0));
+    assert_eq!(first.snapshot.gpu_c, Some(80.0));
+    assert_eq!(first.gpu.vram_used, Some(300));
+    assert_eq!(first.gpu.vram_total, Some(2000));
+    assert_eq!(first.gpu.power_mw, Some(130_000));
+    assert_eq!(first.gpu.power_limit_mw, Some(200_000));
+    assert_eq!(first.snapshot.activity, Some(75.0));
+    assert_eq!(first.activity_w, Some(80.0));
+    assert_eq!(first.gpu_devices[1].label, "work");
+    assert_eq!(first.gpu_processes.list[0].memory_bytes, 30);
+    swapped.store(true, Ordering::Relaxed);
+    let second = collector.sample(
+        now + Duration::from_millis(100),
+        SystemTime::now(),
+        &idle_view(),
+    );
+    assert_eq!(second.gpu_processes.list[0].memory_bytes, 30);
+    assert_eq!(second.gpu_devices[1].identity.index, 0);
+    remove_first.store(true, Ordering::Relaxed);
+    let third = collector.sample(
+        now + Duration::from_millis(200),
+        SystemTime::now(),
+        &idle_view(),
+    );
+    assert_eq!(third.gpu_processes.list[0].memory_bytes, 20);
+    assert_eq!(third.gpu_devices[0].identity.uuid.as_deref(), Some("GPU-1"));
+}
+
+#[test]
+fn multi_gpu_selection_and_override_apply_before_aggregation() {
+    let rig = Rig::new("multi-selected");
+    let config = multi_config(&rig, "[\"GPU-1\"]");
+    let mut collector = WatchCollector::new(
+        rig.roots(),
+        MultiGpu {
+            swapped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            remove_first: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        &config,
+        Quiet,
+    );
+    let sample = collector.sample(Instant::now(), SystemTime::now(), &idle_view());
+    assert_eq!(sample.gpu_devices.len(), 1);
+    assert_eq!(sample.gpu_devices[0].label, "work");
+    assert_eq!(sample.gpu.vram_used, Some(200));
+    assert_eq!(sample.gpu.power_mw, Some(80_000));
+    assert_eq!(sample.gpu_processes.list[0].memory_bytes, 20);
+    assert_eq!(sample.snapshot.activity, Some(75.0));
+}

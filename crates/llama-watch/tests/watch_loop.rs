@@ -1659,6 +1659,7 @@ fn blank_sample(mono: Instant, wall: SystemTime) -> WatchSample {
             errors: std::collections::BTreeSet::new(),
         },
         gpu: GpuExtra::default(),
+        gpu_devices: Vec::new(),
         cpu_w: None,
         activity_w: None,
         load_source: llama_watch::collector::LoadSource::Util,

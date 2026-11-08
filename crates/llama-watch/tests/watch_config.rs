@@ -356,6 +356,7 @@ enum Rule {
     GridPath,
     JobsDir,
     JobsStale,
+    Gpu,
 }
 
 fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
@@ -397,6 +398,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
         Err(InvalidWatchConfig::JobsDir { .. }) => Rule::JobsDir,
         Err(InvalidWatchConfig::JobsStale { .. }) => Rule::JobsStale,
+        Err(InvalidWatchConfig::Gpu { .. }) => Rule::Gpu,
     }
 }
 
@@ -2009,4 +2011,47 @@ fn jobs_dir_is_an_absolute_path_and_stale_s_is_bounded() {
         Some(std::path::Path::new("/var/lib/llama-bored/jobs"))
     );
     cfg.validate(8).expect("jobs dir with llama off");
+}
+
+#[test]
+fn gpu_config_accepts_pci_selectors_and_rejects_invalid_values() {
+    let cfg: Config = toml::from_str(
+        r#"
+[gpu]
+devices = ["0000:05:00.0", "GPU-abc"]
+[gpu.labels]
+"0000:05:00.0" = "V100"
+[gpu.idle_w]
+"GPU-abc" = 30.0
+"#,
+    )
+    .expect("GPU config parses");
+    cfg.validate(32).expect("GPU config validates");
+    for text in [
+        "[gpu]\ndevices = []",
+        "[gpu]\ndevices = \"bogus\"",
+        "[gpu]\ndevices = [\"GPU-a\", \"gpu-A\"]",
+        "[gpu.labels]\n\"x\" = \"\"",
+        "[gpu.idle_w]\n\"x\" = -1.0",
+    ] {
+        let invalid: Config = toml::from_str(text).expect("parse invalid values");
+        assert!(invalid.validate(32).is_err(), "{text}");
+    }
+    assert!(toml::from_str::<Config>("[gpu]\nunknown = true").is_err());
+}
+
+#[test]
+fn gpu_selectors_match_case_insensitive_identity_and_pci_domain_width() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABCD".into()),
+        pci_bus_id: Some("00000000:0B:00.0".into()),
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    for selector in ["1", "gpu-abcd", "0000:0b:00.0", "nvidia geforce rtx 3090"] {
+        assert!(GpuConfig::matches(selector, &device), "{selector}");
+    }
+    assert!(!GpuConfig::matches("2", &device));
 }

@@ -5,12 +5,12 @@
 //! first window is empty. It never calls `/running` and never returns
 //! [`AiState::NoData`].
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::sources::fans::{FanPanel, FanSource};
-use crate::sources::gpu::{GpuBackend, GpuSource, ProcessRead};
+use crate::sources::gpu::{GpuBackend, GpuDeviceIdentity, GpuSource, ProcessRead};
 use crate::sources::hostio::{
     self, DiskCounters, HostIo, LinkSpeeds, NetCounters, Probe, RateWindow, SourceHealth,
 };
@@ -57,6 +57,16 @@ pub struct GpuProcess {
     pub name: String,
 }
 
+/// One selected GPU's independently sampled telemetry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuDeviceTelemetry {
+    pub identity: GpuDeviceIdentity,
+    pub label: String,
+    pub util_pct: Option<f32>,
+    pub temp_c: Option<f32>,
+    pub extra: GpuExtra,
+}
+
 /// Compute processes from the last NVML attempt.
 ///
 /// `failed` stays true for the whole second after an error, including ticks
@@ -98,6 +108,8 @@ pub struct WatchSample {
     pub snapshot: Snapshot,
     /// VRAM and power. Absent from [`Snapshot`].
     pub gpu: GpuExtra,
+    /// Selected devices for per-device publishing.
+    pub gpu_devices: Vec<GpuDeviceTelemetry>,
     /// Socket power in watts. `None` until two zenergy reads span a tick.
     pub cpu_w: Option<f64>,
     /// Watts of the device in [`Self::load_source`]. `None` for `Util`.
@@ -184,6 +196,26 @@ fn composite_load(gpu_pct: Option<f32>, other: Option<f32>) -> Option<f32> {
     }
 }
 
+fn device_key(id: &GpuDeviceIdentity, now: Instant, single: bool) -> String {
+    if let Some(uuid) = id.uuid.as_deref().filter(|s| !s.is_empty()) {
+        format!("uuid:{}", uuid.to_ascii_lowercase())
+    } else if let Some(pci) = id.pci_bus_id.as_deref().filter(|s| !s.is_empty()) {
+        format!("pci:{}", pci.to_ascii_lowercase())
+    } else if single {
+        // Legacy single-device backends have no identity; retain their idle learning.
+        "anonymous-single".into()
+    } else {
+        // Never carry an unidentified device's state across multi-device reads.
+        format!("anonymous-tick:{now:?}:{}", id.index)
+    }
+}
+fn sum_u64(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    values.flatten().reduce(u64::saturating_add)
+}
+fn sum_u32(values: impl Iterator<Item = Option<u32>>) -> Option<u32> {
+    values.flatten().reduce(u32::saturating_add)
+}
+
 /// Host and GPU reads for one [`WatchCollector`] tick.
 pub(crate) struct Collector<'a, B, L> {
     roots: Roots,
@@ -193,7 +225,12 @@ pub(crate) struct Collector<'a, B, L> {
     cpu_window: Duration,
     cpu_limit_w: f64,
     nominal_frac: f64,
-    gpu_idle: IdleFloor,
+    gpu_idle: BTreeMap<String, IdleFloor>,
+    gpu_config: crate::config::GpuConfig,
+    gpu_idle_w: f64,
+    gpu_learn: bool,
+    process_cache: BTreeMap<String, Vec<GpuProcess>>,
+    process_errors: BTreeMap<String, String>,
     cpu_idle: IdleFloor,
     smooth_s: f64,
     ema: Option<f64>,
@@ -256,19 +293,6 @@ where
                 self.note(id, Err(err.message));
                 None
             }
-        }
-    }
-
-    /// `failed` is true when init or a util/temp read failed. Both percents are then `None`.
-    fn read_gpu(&mut self, errors: &mut BTreeSet<SourceId>) -> (Option<f32>, Option<f32>, bool) {
-        let sample = self.gpu.read();
-        if let Some(err) = sample.error {
-            errors.insert(SourceId::Gpu);
-            self.note(SourceId::Gpu, Err(err.message));
-            (None, None, true)
-        } else {
-            self.note(SourceId::Gpu, Ok(()));
-            (sample.gpu_pct, sample.gpu_c, false)
         }
     }
 
@@ -345,7 +369,12 @@ where
             cpu_window: window,
             cpu_limit_w: config.load.cpu_limit_w,
             nominal_frac: config.load.nominal_frac,
-            gpu_idle: IdleFloor::new(config.load.gpu_idle_w, learn, config.load.nominal_frac),
+            gpu_idle: BTreeMap::new(),
+            gpu_config: config.gpu.clone(),
+            gpu_idle_w: config.load.gpu_idle_w,
+            gpu_learn: learn,
+            process_cache: BTreeMap::new(),
+            process_errors: BTreeMap::new(),
             cpu_idle: IdleFloor::new(config.load.cpu_idle_w, learn, config.load.nominal_frac),
             smooth_s: config.load.smooth_s,
             ema: None,
@@ -386,21 +415,21 @@ where
             .fans
             .as_mut()
             .map(|source| source.read(&self.roots, mono, &mut self.log));
-        let (gpu_pct, gpu_c, gpu_failed) = self.read_gpu(&mut errors);
+        let devices = self.read_selected_devices(mono, &mut errors);
+        let gpu_pct = devices.iter().filter_map(|d| d.util_pct).reduce(f32::max);
+        let gpu_c = devices.iter().filter_map(|d| d.temp_c).reduce(f32::max);
         let temps = self
             .temps
             .as_mut()
             .map(|source| source.read(&self.roots, mono, gpu_c, &mut self.log));
-        let gpu = if gpu_failed {
-            GpuExtra::default()
-        } else {
-            self.read_gpu_extra()
+        let gpu = GpuExtra {
+            vram_used: sum_u64(devices.iter().map(|d| d.extra.vram_used)),
+            vram_total: sum_u64(devices.iter().map(|d| d.extra.vram_total)),
+            power_mw: sum_u32(devices.iter().map(|d| d.extra.power_mw)),
+            power_limit_mw: sum_u32(devices.iter().map(|d| d.extra.power_limit_mw)),
         };
-        // After the util read, so a session that just dropped clears the list
-        // and the one-second stamp on this same tick.
-        self.poll_processes(mono);
         let (ai, models) = self.apply_view(llama, &mut errors);
-        let activity = self.activity_load(mono, gpu_pct, cpu_pct, &gpu);
+        let activity = self.activity_load(mono, gpu_pct, cpu_pct, &devices);
         let host_io = self.sample_host_io(mono, &mut errors);
         WatchSample {
             snapshot: Snapshot {
@@ -421,6 +450,7 @@ where
                 errors,
             },
             gpu,
+            gpu_devices: devices,
             cpu_w: activity.cpu_w,
             activity_w: activity.device_w,
             load_source: activity.source,
@@ -520,33 +550,125 @@ where
         }
     }
 
-    /// At most one NVML process read a second. Names are read from
-    /// `{proc}/<pid>/comm` only on a fresh success.
-    fn poll_processes(&mut self, now: Instant) {
-        match self.gpu.read_processes(now) {
-            ProcessRead::Cached => {}
-            ProcessRead::Unavailable => {
+    fn read_selected_devices(
+        &mut self,
+        now: Instant,
+        errors: &mut BTreeSet<SourceId>,
+    ) -> Vec<GpuDeviceTelemetry> {
+        let rows = match self.gpu.read_devices(now) {
+            Ok(rows) => rows,
+            Err(err) => {
+                errors.insert(SourceId::Gpu);
+                self.note(SourceId::Gpu, Err(err.to_string()));
+                self.process_cache.clear();
+                self.process_errors.clear();
                 self.gpu_processes.clear();
-            }
-            ProcessRead::Ready(list) => {
-                self.processes_failed = self.note_part(self.processes_failed, "processes", None);
-                self.gpu_processes.clear();
-                for process in list {
-                    let name =
-                        crate::sources::gpu::read_process_name(&self.roots.proc, process.pid);
-                    self.gpu_processes.push(GpuProcess {
-                        pid: process.pid,
-                        memory_bytes: process.memory_bytes,
-                        name,
-                    });
+                for idle in self.gpu_idle.values_mut() {
+                    idle.observe(now, None);
                 }
+                return Vec::new();
             }
-            ProcessRead::Failed(message) => {
-                self.processes_failed =
-                    self.note_part(self.processes_failed, "processes", Some(&message));
-                self.gpu_processes.clear();
+        };
+        let rows = rows
+            .into_iter()
+            .filter(|r| self.gpu_config.selects(&r.identity))
+            .collect::<Vec<_>>();
+        let mut failed = None;
+        let mut vram_error = None;
+        let mut power_error = None;
+        let mut limit_error = None;
+        let mut live = BTreeSet::new();
+        let mut result = Vec::new();
+        let single = rows.len() == 1;
+        for row in rows {
+            let key = device_key(&row.identity, now, single);
+            live.insert(key.clone());
+            let r = row.reading;
+            if let Err(e) = &r.util_pct {
+                failed = Some(e.to_string());
+            }
+            if let Err(e) = &r.temp_c {
+                failed = Some(e.to_string());
+            }
+            if let Err(e) = &r.memory {
+                vram_error = Some(e.to_string());
+            }
+            if let Err(e) = &r.power_mw {
+                power_error = Some(e.to_string());
+            }
+            if let Err(e) = &r.power_limit_mw {
+                limit_error = Some(e.to_string());
+            }
+            match r.processes {
+                ProcessRead::Ready(items) => {
+                    self.process_errors.remove(&key);
+                    self.process_cache.insert(
+                        key,
+                        items
+                            .into_iter()
+                            .map(|p| GpuProcess {
+                                pid: p.pid,
+                                memory_bytes: p.memory_bytes,
+                                name: crate::sources::gpu::read_process_name(
+                                    &self.roots.proc,
+                                    p.pid,
+                                ),
+                            })
+                            .collect(),
+                    );
+                }
+                ProcessRead::Failed(message) => {
+                    self.process_cache.remove(&key);
+                    self.process_errors.insert(key, message);
+                }
+                ProcessRead::Unavailable => {
+                    self.process_cache.remove(&key);
+                    self.process_errors.remove(&key);
+                }
+                ProcessRead::Cached => {}
+            }
+            let memory = r.memory.ok();
+            result.push(GpuDeviceTelemetry {
+                label: self.gpu_config.label(&row.identity),
+                identity: row.identity,
+                util_pct: r.util_pct.ok(),
+                temp_c: r.temp_c.ok(),
+                extra: GpuExtra {
+                    vram_used: memory.map(|m| m.0),
+                    vram_total: memory.map(|m| m.1),
+                    power_mw: r.power_mw.ok(),
+                    power_limit_mw: r.power_limit_mw.ok(),
+                },
+            });
+        }
+        self.process_cache.retain(|key, _| live.contains(key));
+        self.gpu_idle.retain(|key, _| live.contains(key));
+        self.process_errors.retain(|key, _| live.contains(key));
+        if let Some(message) = failed {
+            errors.insert(SourceId::Gpu);
+            self.note(SourceId::Gpu, Err(message));
+        } else {
+            self.note(SourceId::Gpu, Ok(()));
+        }
+        if !result.is_empty() {
+            self.vram_failed = self.note_part(self.vram_failed, "vram", vram_error.as_deref());
+            self.power_failed = self.note_part(self.power_failed, "power", power_error.as_deref());
+            self.limit_failed =
+                self.note_part(self.limit_failed, "power limit", limit_error.as_deref());
+        }
+        let proc_error = self.process_errors.values().next().cloned();
+        self.processes_failed =
+            self.note_part(self.processes_failed, "processes", proc_error.as_deref());
+        let mut merged: Vec<GpuProcess> = Vec::new();
+        for process in self.process_cache.values().flatten() {
+            if let Some(p) = merged.iter_mut().find(|p| p.pid == process.pid) {
+                p.memory_bytes = p.memory_bytes.saturating_add(process.memory_bytes);
+            } else {
+                merged.push(process.clone());
             }
         }
+        self.gpu_processes = merged;
+        result
     }
 
     /// `max(gpu_frac, cpu_frac)`; one device's fraction when the other has no
@@ -556,18 +678,39 @@ where
         mono: Instant,
         gpu_pct: Option<f32>,
         cpu_pct: Option<f32>,
-        gpu: &GpuExtra,
+        devices: &[GpuDeviceTelemetry],
     ) -> Activity {
         let cpu_w = self.poll_socket_watts(mono);
-        let gpu_w = gpu.power_mw.map(|mw| f64::from(mw) / 1000.0);
-        let gpu_limit_w = gpu.power_limit_mw.map(|mw| f64::from(mw) / 1000.0);
-        let gpu_pair = gpu_w.zip(gpu_limit_w);
-        self.gpu_idle
-            .observe(mono, gpu_pair.map(|(watts, _)| watts));
+        let mut gpu_best: Option<(f64, f64)> = None;
+        for device in devices {
+            let key = device_key(&device.identity, mono, devices.len() == 1);
+            let idle_w = self.gpu_config.idle_w(&device.identity, self.gpu_idle_w);
+            let has_override =
+                self.gpu_config.idle_w.iter().any(|(selector, _)| {
+                    crate::config::GpuConfig::matches(selector, &device.identity)
+                });
+            let idle = self.gpu_idle.entry(key).or_insert_with(|| {
+                IdleFloor::new(idle_w, self.gpu_learn && !has_override, self.nominal_frac)
+            });
+            let pair = device
+                .extra
+                .power_mw
+                .zip(device.extra.power_limit_mw)
+                .map(|(w, limit)| (f64::from(w) / 1000.0, f64::from(limit) / 1000.0));
+            idle.observe(mono, pair.map(|(watts, _)| watts));
+            if let Some((watts, limit)) = pair {
+                if let Some(frac) =
+                    crate::load::device_frac(watts, idle.watts(limit), limit, self.nominal_frac)
+                {
+                    if gpu_best.is_none_or(|(best, _)| frac > best) {
+                        gpu_best = Some((frac, watts));
+                    }
+                }
+            }
+        }
+        let gpu_frac = gpu_best.map(|(frac, _)| frac);
+        let gpu_w = gpu_best.map(|(_, watts)| watts);
         self.cpu_idle.observe(mono, cpu_w);
-        let gpu_frac = gpu_pair.and_then(|(watts, limit)| {
-            crate::load::device_frac(watts, self.gpu_idle.watts(limit), limit, self.nominal_frac)
-        });
         let cpu_frac = cpu_w.and_then(|watts| {
             crate::load::device_frac(
                 watts,
@@ -675,50 +818,6 @@ where
         };
         for _ in 0..keep {
             self.cpu_history.pop_front();
-        }
-    }
-
-    fn read_gpu_extra(&mut self) -> GpuExtra {
-        let reading = self.gpu.read_extra();
-        let (vram_used, vram_total) = match reading.memory {
-            Ok((used, total)) => {
-                self.vram_failed = self.note_part(self.vram_failed, "vram", None);
-                (Some(used), Some(total))
-            }
-            Err(err) => {
-                let message = err.to_string();
-                self.vram_failed = self.note_part(self.vram_failed, "vram", Some(&message));
-                (None, None)
-            }
-        };
-        let power_mw = match reading.power_mw {
-            Ok(mw) => {
-                self.power_failed = self.note_part(self.power_failed, "power", None);
-                Some(mw)
-            }
-            Err(err) => {
-                let message = err.to_string();
-                self.power_failed = self.note_part(self.power_failed, "power", Some(&message));
-                None
-            }
-        };
-        let power_limit_mw = match reading.power_limit_mw {
-            Ok(mw) => {
-                self.limit_failed = self.note_part(self.limit_failed, "power_limit", None);
-                Some(mw)
-            }
-            Err(err) => {
-                let message = err.to_string();
-                self.limit_failed =
-                    self.note_part(self.limit_failed, "power_limit", Some(&message));
-                None
-            }
-        };
-        GpuExtra {
-            vram_used,
-            vram_total,
-            power_mw,
-            power_limit_mw,
         }
     }
 
