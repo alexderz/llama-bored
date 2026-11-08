@@ -6,6 +6,10 @@ All notable changes to llama-bored. Versions follow
 
 ## Unreleased
 
+### Documentation
+
+- Document Fedora 45 Server installation and current two-GPU hardware (DER-674).
+
 ### Fixed
 
 - Rate headlines and timeline consistently say WRITE for decode and READ for prefill, matching RECENT; token counts and generation states keep their names.
