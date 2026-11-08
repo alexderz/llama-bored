@@ -716,10 +716,9 @@ where
             if let Some((watts, limit)) = pair
                 && let Some(frac) =
                     crate::load::device_frac(watts, idle.watts(limit), limit, self.nominal_frac)
+                && gpu_best.is_none_or(|(best, _)| frac > best)
             {
-                if gpu_best.is_none_or(|(best, _)| frac > best) {
-                    gpu_best = Some((frac, watts));
-                }
+                gpu_best = Some((frac, watts));
             }
         }
         let gpu_frac = gpu_best.map(|(frac, _)| frac);
