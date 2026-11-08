@@ -11,6 +11,7 @@ const SEED: u64 = 0x17C0_FFEE_5A17_0017;
 
 fn sample() -> WireSnapshot {
     WireSnapshot {
+        gpus: Vec::new(),
         schema: 1,
         run_id: 9,
         seq: 4,

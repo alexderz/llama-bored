@@ -37,6 +37,7 @@ fn host_ok() -> Host {
 
 fn valid() -> WireSnapshot {
     WireSnapshot {
+        gpus: Vec::new(),
         schema: wire::SCHEMA,
         run_id: 17_461_234_567_890_123,
         seq: 48_213,
@@ -1673,4 +1674,64 @@ fn kv_is_additive_compact_and_bounded() {
         let json = insert_after(&base_json(), r#""state":"ready""#, extra);
         assert_eq!(parse_validated(&json), Err(WireError::Parse), "{extra}");
     }
+}
+
+fn gpu_row(index: u32) -> wire::GpuWire {
+    wire::GpuWire {
+        index,
+        uuid: format!("GPU-{index}"),
+        pci: format!("0000:{index:02x}:00.0"),
+        label: format!("GPU{index}"),
+        name: "NVIDIA \"GPU\"".into(),
+        gpu_pct: Some(50.0),
+        gpu_c: Some(70.0),
+        gpu_w: Some(100.0),
+        gpu_limit_w: Some(250.0),
+        vram_used_bytes: Some(10),
+        vram_total_bytes: Some(20),
+    }
+}
+
+#[test]
+fn gpu_schema_is_additive_and_round_trips() {
+    let legacy = valid();
+    let old = to_json(&legacy).unwrap();
+    let mut explicit: serde_json::Value = serde_json::from_slice(&old).unwrap();
+    explicit["gpus"] = serde_json::json!([]);
+    let decoded = parse_validated(&serde_json::to_vec(&explicit).unwrap()).unwrap();
+    assert_eq!(to_json(&decoded).unwrap(), old);
+    let mut multi = legacy;
+    multi.gpus = vec![gpu_row(0), gpu_row(1)];
+    assert_eq!(parse_validated(&to_json(&multi).unwrap()).unwrap(), multi);
+}
+
+#[test]
+fn gpu_schema_rejects_unbounded_or_invalid_rows() {
+    let mut snap = valid();
+    snap.gpus = (0..=wire::MAX_GPUS as u32).map(gpu_row).collect();
+    assert!(validate(&snap).is_err());
+    snap.gpus = vec![gpu_row(0), gpu_row(0)];
+    assert!(validate(&snap).is_err());
+    snap.gpus = vec![gpu_row(0), gpu_row(1)];
+    snap.gpus[1].uuid = snap.gpus[0].uuid.clone();
+    assert!(validate(&snap).is_err());
+    snap.gpus[1] = gpu_row(1);
+    snap.gpus[1].pci = snap.gpus[0].pci.clone();
+    assert!(validate(&snap).is_err());
+    snap.gpus.truncate(1);
+    snap.gpus[0].uuid.clear();
+    assert!(validate(&snap).is_ok());
+    snap.gpus[0].pci.clear();
+    assert!(validate(&snap).is_err());
+    snap.gpus[0] = gpu_row(0);
+    snap.gpus[0].name = "x".repeat(wire::MAX_GPU_LABEL_CHARS + 1);
+    assert!(validate(&snap).is_err());
+    snap.gpus[0] = gpu_row(0);
+    snap.gpus[0].gpu_pct = Some(101.0);
+    assert!(validate(&snap).is_err());
+    snap.gpus[0].gpu_pct = Some(f32::NAN);
+    assert!(validate(&snap).is_err());
+    snap.gpus[0] = gpu_row(0);
+    snap.gpus[0].vram_total_bytes = Some(wire::MAX_MEM_BYTES + 1);
+    assert!(validate(&snap).is_err());
 }

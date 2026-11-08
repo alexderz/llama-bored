@@ -100,6 +100,10 @@ pub const MAX_CTX_TOKENS: u64 = u32::MAX as u64;
 pub const MAX_SUSPECTED_LOADS: usize = 8;
 /// Most `fan_rows` one snapshot carries (#74).
 pub const MAX_FAN_ROWS: usize = 16;
+/// Maximum individual GPU rows.
+pub const MAX_GPUS: usize = 16;
+/// Maximum GPU label length in characters.
+pub const MAX_GPU_LABEL_CHARS: usize = 128;
 
 /// Most temperature rows one snapshot carries (#74).
 pub const MAX_TEMPS: usize = 32;
@@ -207,6 +211,9 @@ pub struct WireSnapshot {
     pub t_wall_ms: u64,
     /// Host telemetry. `None` means that source failed.
     pub host: Host,
+    /// Individual GPUs, omitted for legacy or unavailable data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<GpuWire>,
     /// llama-swap state and display names.
     pub ai: Ai,
     /// Decoded-token counter.
@@ -239,6 +246,41 @@ pub struct SuspectedLoadWire {
     pub model: String,
     /// Suspected loads since the watcher started; at least 1.
     pub count: u64,
+}
+
+/// One physical GPU; host GPU fields remain the legacy primary device.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuWire {
+    /// Unique device index.
+    pub index: u32,
+    /// Stable device UUID.
+    pub uuid: String,
+    /// PCI bus address, if reported.
+    #[serde(default)]
+    pub pci: String,
+    /// Short user-facing label.
+    #[serde(default)]
+    pub label: String,
+    /// Human-readable device name.
+    pub name: String,
+    /// Utilisation, percent.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_pct: Option<f32>,
+    /// Temperature, Celsius.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_c: Option<f32>,
+    /// Power draw, watts.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_w: Option<f32>,
+    /// Power limit, watts.
+    #[serde(default, with = "finite_f32", skip_serializing_if = "Option::is_none")]
+    pub gpu_limit_w: Option<f32>,
+    /// Used device memory, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_used_bytes: Option<u64>,
+    /// Total device memory, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_total_bytes: Option<u64>,
 }
 
 /// Host numbers. Percents are 0..=100, except `activity_pct`, which is
@@ -885,6 +927,7 @@ pub fn validate(snapshot: &WireSnapshot) -> Result<(), WireError> {
             return Err(WireError::OutOfRange { field });
         }
     }
+    validate_gpus(&snapshot.gpus)?;
     validate_fans(&snapshot.fans)?;
     validate_temps(&snapshot.temps)?;
     validate_fan_rows(&snapshot.fan_rows)?;
@@ -1010,6 +1053,43 @@ fn validate_fans(fans: &[FanWire]) -> Result<(), WireError> {
     Ok(())
 }
 
+fn validate_gpus(rows: &[GpuWire]) -> Result<(), WireError> {
+    if rows.len() > MAX_GPUS {
+        return Err(WireError::OutOfRange { field: "gpus" });
+    }
+    for (i, gpu) in rows.iter().enumerate() {
+        let valid_label = |s: &str| {
+            !s.is_empty()
+                && s.chars().count() <= MAX_GPU_LABEL_CHARS
+                && !s.chars().any(char::is_control)
+        };
+        if gpu.index > 255
+            || (gpu.uuid.is_empty() && gpu.pci.is_empty())
+            || (!gpu.uuid.is_empty() && !valid_label(&gpu.uuid))
+            || !valid_label(&gpu.name)
+            || (!gpu.pci.is_empty() && !valid_label(&gpu.pci))
+            || (!gpu.label.is_empty() && !valid_label(&gpu.label))
+            || rows[..i].iter().any(|g| {
+                g.index == gpu.index
+                    || (!gpu.uuid.is_empty() && g.uuid.eq_ignore_ascii_case(&gpu.uuid))
+                    || (!gpu.pci.is_empty() && g.pci.eq_ignore_ascii_case(&gpu.pci))
+            })
+        {
+            return Err(WireError::OutOfRange { field: "gpus" });
+        }
+        check_pct("gpu_pct", gpu.gpu_pct)?;
+        check_temp("gpu_c", gpu.gpu_c)?;
+        check_range("gpu_w", gpu.gpu_w, 0.0, MAX_WATTS)?;
+        check_range("gpu_limit_w", gpu.gpu_limit_w, 0.0, MAX_WATTS)?;
+        if gpu.vram_used_bytes.is_some_and(|v| v > MAX_MEM_BYTES)
+            || gpu.vram_total_bytes.is_some_and(|v| v > MAX_MEM_BYTES)
+        {
+            return Err(WireError::OutOfRange { field: "gpus" });
+        }
+    }
+    Ok(())
+}
+
 fn validate_fan_rows(rows: &[FanRowWire]) -> Result<(), WireError> {
     if rows.len() > MAX_FAN_ROWS {
         return Err(WireError::FanRow);
@@ -1128,6 +1208,7 @@ mod tests {
 
     fn down() -> WireSnapshot {
         WireSnapshot {
+            gpus: Vec::new(),
             schema: SCHEMA,
             run_id: 1,
             seq: 1,
