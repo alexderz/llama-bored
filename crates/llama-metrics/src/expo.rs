@@ -658,11 +658,9 @@ fn gpus(out: &mut Out, snap: &WireSnapshot) {
                 out.family($name, "gauge", $help);
                 for gpu in &snap.gpus {
                     if let Some(value) = gpu.$field {
-                        let index = gpu.index.to_string();
                         out.sample(
                             $name,
                             &[
-                                ("index", &index),
                                 ("uuid", &gpu.uuid),
                                 ("pci", &gpu.pci),
                                 ("label", &gpu.label),

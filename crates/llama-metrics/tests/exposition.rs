@@ -1672,7 +1672,7 @@ fn individual_gpus_are_labelled_escaped_and_do_not_replace_legacy_metrics() {
         vram_total_bytes: None,
     }];
     let text = render(&Ok(snap), T0);
-    assert!(text.contains("llamabored_gpu_device_utilization_percent{index=\"2\",uuid=\"GPU-abc\\\\def\",pci=\"0000:05:00.0\",label=\"V100\",name=\"GPU \\\"two\\\"\"} 42\n"));
+    assert!(text.contains("llamabored_gpu_device_utilization_percent{uuid=\"GPU-abc\\\\def\",pci=\"0000:05:00.0\",label=\"V100\",name=\"GPU \\\"two\\\"\"} 42\n"));
     assert!(text.contains("llamabored_gpu_device_memory_used_bytes"));
     assert!(!text.contains("llamabored_gpu_device_celsius"));
     for line in legacy
