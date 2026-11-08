@@ -213,11 +213,24 @@ fn device_key(id: &GpuDeviceIdentity, now: Instant, single: bool) -> String {
         format!("anonymous-tick:{now:?}:{}", id.index)
     }
 }
-fn sum_u64(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
-    values.flatten().reduce(u64::saturating_add)
+fn sum_u64(device_count: usize, values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    sum_complete(device_count, values, u64::saturating_add)
 }
-fn sum_u32(values: impl Iterator<Item = Option<u32>>) -> Option<u32> {
-    values.flatten().reduce(u32::saturating_add)
+fn sum_u32(device_count: usize, values: impl Iterator<Item = Option<u32>>) -> Option<u32> {
+    sum_complete(device_count, values, u32::saturating_add)
+}
+/// With one device, a present reading is the total. With more than one, every
+/// device must report: a partial watt or VRAM sum would look complete.
+fn sum_complete<T>(
+    device_count: usize,
+    values: impl Iterator<Item = Option<T>>,
+    add: impl Fn(T, T) -> T,
+) -> Option<T> {
+    let values: Vec<Option<T>> = values.collect();
+    if device_count > 1 && values.iter().any(Option::is_none) {
+        return None;
+    }
+    values.into_iter().flatten().reduce(add)
 }
 
 /// Host and GPU reads for one [`WatchCollector`] tick.
@@ -420,6 +433,8 @@ where
             .as_mut()
             .map(|source| source.read(&self.roots, mono, &mut self.log));
         let devices = self.read_selected_devices(mono, &mut errors);
+        // Max keeps a reported util or temperature when a sibling failed, so
+        // the hotter card still shows. Sums below do not: see `sum_complete`.
         let gpu_pct = devices.iter().filter_map(|d| d.util_pct).reduce(f32::max);
         let gpu_c = devices.iter().filter_map(|d| d.temp_c).reduce(f32::max);
         let temps = self
@@ -427,10 +442,13 @@ where
             .as_mut()
             .map(|source| source.read(&self.roots, mono, gpu_c, &mut self.log));
         let gpu = GpuExtra {
-            vram_used: sum_u64(devices.iter().map(|d| d.extra.vram_used)),
-            vram_total: sum_u64(devices.iter().map(|d| d.extra.vram_total)),
-            power_mw: sum_u32(devices.iter().map(|d| d.extra.power_mw)),
-            power_limit_mw: sum_u32(devices.iter().map(|d| d.extra.power_limit_mw)),
+            vram_used: sum_u64(devices.len(), devices.iter().map(|d| d.extra.vram_used)),
+            vram_total: sum_u64(devices.len(), devices.iter().map(|d| d.extra.vram_total)),
+            power_mw: sum_u32(devices.len(), devices.iter().map(|d| d.extra.power_mw)),
+            power_limit_mw: sum_u32(
+                devices.len(),
+                devices.iter().map(|d| d.extra.power_limit_mw),
+            ),
         };
         let (ai, models) = self.apply_view(llama, &mut errors);
         let activity = self.activity_load(mono, gpu_pct, cpu_pct, &devices);
@@ -910,5 +928,20 @@ mod tests {
         assert_eq!(composite_load(None, Some(12.5)), Some(12.5));
         assert_eq!(composite_load(Some(40.0), None), Some(40.0));
         assert_eq!(composite_load(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod sum_tests {
+    use super::{sum_u32, sum_u64};
+
+    #[test]
+    fn a_partial_sum_is_absent_only_for_several_devices() {
+        assert_eq!(sum_u64(1, [Some(5)].into_iter()), Some(5));
+        assert_eq!(sum_u64(1, [None].into_iter()), None);
+        assert_eq!(sum_u64(2, [Some(5), Some(7)].into_iter()), Some(12));
+        assert_eq!(sum_u64(2, [Some(5), None].into_iter()), None);
+        assert_eq!(sum_u32(2, [Some(1), None].into_iter()), None);
+        assert_eq!(sum_u32(0, std::iter::empty()), None);
     }
 }
