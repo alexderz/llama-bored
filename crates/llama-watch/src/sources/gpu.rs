@@ -194,6 +194,27 @@ fn retain_compute(listed: Vec<ProcessInfo>) -> Vec<ComputeProcess> {
     processes
 }
 
+/// Merge engine lists for one device without double-counting a process that
+/// appears in both. Either engine may be unsupported on a given device.
+fn merge_engine_processes(
+    compute: Result<Vec<ComputeProcess>, GpuError>,
+    graphics: Result<Vec<ComputeProcess>, GpuError>,
+) -> Result<Vec<ComputeProcess>, GpuError> {
+    let (compute, graphics) = match (compute, graphics) {
+        (Err(err), Err(_)) => return Err(err),
+        (compute, graphics) => (compute.unwrap_or_default(), graphics.unwrap_or_default()),
+    };
+    let mut merged = compute;
+    for process in graphics {
+        if let Some(existing) = merged.iter_mut().find(|row| row.pid == process.pid) {
+            existing.memory_bytes = existing.memory_bytes.max(process.memory_bytes);
+        } else {
+            merged.push(process);
+        }
+    }
+    Ok(merged)
+}
+
 /// VRAM and power from one extra read. Independent of util and temperature.
 #[derive(Debug)]
 #[must_use]
@@ -434,7 +455,17 @@ impl GpuBackend for NvidiaGpu {
     }
 
     fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
-        Ok(retain_compute(self.device()?.running_compute_processes()?))
+        let device = self.device()?;
+        merge_engine_processes(
+            device
+                .running_compute_processes()
+                .map(retain_compute)
+                .map_err(GpuError::from),
+            device
+                .running_graphics_processes()
+                .map(retain_compute)
+                .map_err(GpuError::from),
+        )
     }
 
     fn disconnect(&mut self) {
@@ -535,6 +566,26 @@ mod tests {
             probe: Arc::clone(&probe),
         };
         (GpuSource::new(backend), probe)
+    }
+
+    #[test]
+    fn engine_processes_merge_and_tolerate_one_unsupported_engine() {
+        let p = |pid, memory_bytes| ComputeProcess { pid, memory_bytes };
+        assert_eq!(
+            merge_engine_processes(Ok(vec![p(1, 100)]), Ok(vec![p(1, 150), p(2, 40)])).unwrap(),
+            vec![p(1, 150), p(2, 40)]
+        );
+        assert_eq!(
+            merge_engine_processes(Err(GpuError::new("unsupported")), Ok(vec![p(2, 40)])).unwrap(),
+            vec![p(2, 40)]
+        );
+        assert!(
+            merge_engine_processes(
+                Err(GpuError::new("compute")),
+                Err(GpuError::new("graphics"))
+            )
+            .is_err()
+        );
     }
 
     #[test]
