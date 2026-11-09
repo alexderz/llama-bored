@@ -10659,27 +10659,37 @@ fn one_gpu_temps_and_fans_match_the_503ffac_goldens() {
     }
 }
 
+/// Two GPUs, temps and fans, at the live tty size plus 213x60 and 160x45.
+/// Fan labels are the reference host's (`front1`, `front2`, `rear`, `top`);
+/// the live file names the chip and the channels, not the labels.
 #[test]
 #[ignore = "writes reviewer frames; not part of check.sh"]
 fn dump_der674_phase2_frames() {
-    let dir =
-        std::path::Path::new("/home/alex.derzhi/src/kraken-dash-wt/_run/der674-phase2-frames");
+    let cfg = llama_watch::config::Config::load("/var/tmp/llama-bored-relay/titan-live/watch.toml")
+        .expect("titan live watch.toml");
+    let live = cfg.tty.size.expect("tty size");
+    assert_eq!((live.cols, live.rows), (192, 60), "live tty size");
+    assert!(cfg.fans.enabled, "live fans");
+    assert_eq!(cfg.fans.hwmon, "nct6798");
+    assert_eq!(cfg.fans.channels, [2, 3, 5, 6]);
+    let dir = std::path::Path::new("/var/tmp/llama-bored-relay/frames");
     std::fs::create_dir_all(dir).expect("frames dir");
-    let one = sample(WatchState::Ready);
-    let mut two = one.clone();
-    two.gpus = two_cards();
-    two.power_w = Some(412.0);
-    two.power_limit_w = Some(650.0);
-    let hwmon = titan_hwmon(two_cards());
-    for (name, model) in [("one", &one), ("two", &two), ("two-hwmon", &hwmon)] {
-        for (cols, rows) in [(213u16, 60u16), (160, 45)] {
-            let grid = draw(model, cols, rows);
-            let text = (0..grid.rows())
-                .map(|row| row_string(&grid, row))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let path = dir.join(format!("{name}-{cols}x{rows}.txt"));
-            std::fs::write(&path, text).expect("write frame");
-        }
+    let mut model = titan_hwmon(two_cards());
+    model.chart_glyphs = cfg.tty.chart_glyphs;
+    let fans = model.fans.as_ref().expect("fans");
+    assert_eq!(fans.chip, cfg.fans.hwmon);
+    assert_eq!(
+        fans.fans.iter().map(|fan| fan.channel).collect::<Vec<_>>(),
+        cfg.fans.channels
+    );
+    for (cols, rows) in [(live.cols, live.rows), (213, 60), (160, 45)] {
+        let grid = draw(&model, cols, rows);
+        let mut text = (0..grid.rows())
+            .map(|row| row_string(&grid, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+        let path = dir.join(format!("two-hwmon-{cols}x{rows}.txt"));
+        std::fs::write(&path, text).expect("write frame");
     }
 }
