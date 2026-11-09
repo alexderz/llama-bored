@@ -8543,10 +8543,13 @@ fn byte_rates_roll_over_to_the_next_unit() {
         let mut model = with_host_rates(false);
         model.disk_read_bps = Some(bps);
         let grid = draw(&model, 192, 60);
-        // The gauge's value field: label and value, 18 cells.
+        // Label, two spaces, then the unit. The bar starts on the next cell.
         let (row, col) = label_hit(&grid, "DISK R");
-        let field = cells_between(&grid, row, col, col + 18);
-        assert!(field.ends_with(&format!(" {text}")), "{bps}: {field}");
+        let field = cells_between(&grid, row, col, col + 24);
+        assert!(
+            field.starts_with(&format!("DISK R  {text}")),
+            "{bps}: {field}"
+        );
     }
 }
 
@@ -8641,8 +8644,8 @@ fn gauge_cells(grid: &llama_watch::tty::grid::Grid, row: u16, at: u16) -> Vec<ch
 }
 
 /// #165: at every size the work gauges are the first six rows of the right
-/// half, two to a row, every bar the same length and starting at the same
-/// column in its column, nothing past it but a blank.
+/// half, two to a row. Bars in one column end on the same cell (a short
+/// value grows left into the old padding). Nothing past that cell but a blank.
 #[test]
 fn gauge_bars_line_up_at_every_size() {
     let model = gauge_model();
@@ -8663,7 +8666,7 @@ fn gauge_bars_line_up_at_every_size() {
                 })
                 .expect("LOAD");
             let x = [left, load_at];
-            let mut bar_len = None;
+            let mut bar_end = [None, None];
             for (i, pair) in WORK_GAUGES.iter().enumerate() {
                 let row = 2 + u16::try_from(i).unwrap();
                 for (side, label) in pair.iter().enumerate() {
@@ -8674,22 +8677,23 @@ fn gauge_bars_line_up_at_every_size() {
                     );
                     let bar = bar_after(&grid, row, x[side] + label.len() as u16);
                     let cells = gauge_cells(&grid, row, bar);
-                    match bar_len {
-                        None => bar_len = Some(cells.len()),
-                        Some(len) => assert_eq!(cells.len(), len, "{at}: {label}"),
-                    }
+                    assert!(!cells.is_empty(), "{at}: {label}");
                     assert_eq!(grid.get(bar - 1, row).unwrap().ch, ' ', "{at}: {label} gap");
                     let end = bar + u16::try_from(cells.len()).unwrap();
+                    match bar_end[side] {
+                        None => bar_end[side] = Some(end),
+                        Some(at_end) => assert_eq!(end, at_end, "{at}: {label}"),
+                    }
                     assert_eq!(grid.get(end, row).unwrap().ch, ' ', "{at}: {label} ends");
                 }
             }
-            let bar_len = bar_len.expect("a bar");
-            // The groups below keep the same columns and length.
+            // The groups below keep the same columns and the same bar end.
             for (label, side) in [("coolant", 0), ("NVMe0", 1)] {
                 if let Some(row) = gauge_row(&grid, label, x[side], 9) {
                     let bar = bar_after(&grid, row, x[side] + label.len() as u16);
                     let cells = gauge_cells(&grid, row, bar);
-                    assert_eq!(cells.len(), bar_len, "{at}: {label}");
+                    let end = bar + u16::try_from(cells.len()).unwrap();
+                    assert_eq!(Some(end), bar_end[side], "{at}: {label}");
                 }
             }
             assert_blank_edges(&grid);
@@ -10049,13 +10053,15 @@ fn a_temperature_gauge_picks_the_reading_nearest_its_limit() {
         temp_marked("hot", 80, Level::Normal, Some((1000, 1100))),
         temp_marked("near", 60, Level::Normal, Some((650, 750))),
     ]);
-    assert_eq!(near, "probe    60 C");
+    assert!(near.starts_with("probe  60 C"), "{near}");
+    assert!(!near.starts_with("probe   "), "{near}");
     // 50 C of 80 and 35 C of 50 are both half way from 20 C.
     let tie = gauge_text(vec![
         temp_marked("a", 35, Level::Normal, Some((500, 600))),
         temp_marked("b", 50, Level::Normal, Some((800, 900))),
     ]);
-    assert_eq!(tie, "probe    50 C");
+    assert!(tie.starts_with("probe  50 C"), "{tie}");
+    assert!(!tie.starts_with("probe   "), "{tie}");
 }
 
 // ---- #180: tqLLM, one request reading and one generating ----------------------
@@ -10650,31 +10656,54 @@ fn up_to_four_gpus_keep_temps_fans_and_per_card_rows_at_213x60() {
     }
 }
 
-/// The widest label in a column is two spaces from the value, values in
-/// that column start together, and integer ones-digits line up.
+/// Every gauge label, including the longest in its column, is two spaces
+/// from its value. The bar starts one cell after that value.
 #[test]
 fn gauge_values_sit_beside_their_labels_with_aligned_digits() {
     let grid = draw(&gauge_model(), 213, 60);
-    let (cool_row, cool_col) = label_hit(&grid, "coolant");
-    let cool = row_string(&grid, cool_row);
-    let rpm_at = row_string(&grid, meter_row(&grid, "front1"))
-        .find("1939")
-        .expect("1939");
-    assert_eq!(
-        cool_col + "coolant".len() as u16 + 2,
-        u16::try_from(rpm_at).unwrap(),
-        "widest label, then two spaces, then the value column: {cool}"
-    );
-    let forty = cool.find("40").expect("40");
-    assert_eq!(forty + 1, rpm_at + 3, "ones digits line up: {cool}");
+    // `coolant` is the longest label in the temperature column.
+    assert_label_gap(&grid, "coolant", "40 C");
+    assert_label_gap(&grid, "CPU", "68 C");
+    assert_label_gap(&grid, "front1", "1939 rpm");
+    assert_label_gap(&grid, "DISK R", "1.8 G/s");
+
+    let mut cards = gauge_model();
+    cards.gpus = two_cards();
+    let grid = draw(&cards, 213, 60);
+    assert_label_gap(&grid, "GPU  V100", "8 %");
+    assert_label_gap(&grid, "GPU  3090", "61 % 1.2k");
+    assert_label_gap(&grid, "coolant", "40 C");
+    assert_label_gap(&grid, "front1", "1939 rpm");
 
     let mut job = job_model(example_job(), 0);
     job.gpus = two_cards();
     let grid = draw(&job, 213, 60);
-    let vram = row_string(&grid, meter_row(&grid, "VRAM 3090"));
-    let at = vram.find("VRAM 3090").expect("vram");
-    let chars: Vec<char> = vram.chars().collect();
-    assert_eq!(chars[at + "VRAM 3090".len()], ' ', "{vram}");
-    assert_eq!(chars[at + "VRAM 3090".len() + 1], ' ', "{vram}");
-    assert!(vram.contains("22.8/24.0 GB"), "{vram}");
+    assert_label_gap(&grid, "VRAM 3090", "22.8/24.0 GB");
+    assert_label_gap(&grid, "CPU", "3 %  16c");
+}
+
+/// `label`, two spaces, `value`, one space, then the bar.
+fn assert_label_gap(grid: &llama_watch::tty::grid::Grid, label: &str, value: &str) {
+    let (row, col) = label_hit(grid, label);
+    let chars: Vec<char> = row_string(grid, row).chars().collect();
+    let at = usize::from(col);
+    let end = at + label.chars().count();
+    assert_eq!(chars[end], ' ', "{label} on {}", row_string(grid, row));
+    assert_eq!(chars[end + 1], ' ', "{label} on {}", row_string(grid, row));
+    let rest: String = chars[end + 2..].iter().collect();
+    assert!(
+        rest.starts_with(value),
+        "{label}: want {value:?} after two spaces, got {rest:?}"
+    );
+    assert!(
+        !value.starts_with(' '),
+        "{label} value must not carry its own pad"
+    );
+    let bar = bar_after(grid, row, col + label.chars().count() as u16);
+    let value_at = col + label.chars().count() as u16 + 2;
+    assert_eq!(
+        bar,
+        value_at + value.chars().count() as u16 + 1,
+        "{label}: bar starts one cell after {value}"
+    );
 }
