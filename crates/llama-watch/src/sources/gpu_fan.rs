@@ -1,8 +1,9 @@
-//! Optional per-GPU blower rpm. Read only.
+//! Optional per-GPU blower rpm and duty. Read only.
 //!
 //! `[gpu.fan]` maps a device selector to `"<hwmon name>/fanN"`. The chip is
 //! the hwmon directory whose `name` file matches, never `hwmonN` itself.
-//! Only `fanN_input` is opened.
+//! `fanN_input` and `pwmN` are opened to read. Nothing writes them, and
+//! `pwmN_enable` is never opened.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,7 +13,7 @@ use crate::config::{self, GpuConfig};
 use crate::sources::hwmon::{self, Located};
 use crate::sources::{Roots, SourceId};
 
-/// Fill [`GpuDeviceTelemetry::fan_rpm`] from `[gpu.fan]`.
+/// Fill [`GpuDeviceTelemetry::fan_rpm`] and [`GpuDeviceTelemetry::fan_pwm`] from `[gpu.fan]`.
 ///
 /// A missing chip, a duplicate name, or an unreadable file leaves `None`.
 /// Nothing here writes sysfs.
@@ -39,11 +40,12 @@ pub(crate) fn apply(roots: &Roots, config: &GpuConfig, devices: &mut [GpuDeviceT
             continue;
         };
         device.fan_rpm = read_input(&root, &dir, channel);
+        device.fan_pwm = read_pwm(&root, &dir, channel);
     }
 }
 
 /// `fan{channel}_input` as rpm. `None` when the file is missing or not a
-/// non-negative integer. `pwm*` is never opened.
+/// non-negative integer.
 fn read_input(root: &Path, dir: &Path, channel: u32) -> Option<u32> {
     let path = dir.join(format!("fan{channel}_input"));
     let Ok(Located::Inside(path)) = hwmon::locate(SourceId::Gpu, root, &path) else {
@@ -52,6 +54,18 @@ fn read_input(root: &Path, dir: &Path, channel: u32) -> Option<u32> {
     let text = std::fs::read_to_string(path).ok()?;
     let rpm: u64 = text.trim().parse().ok()?;
     u32::try_from(rpm).ok()
+}
+
+/// `pwm{channel}` as a duty 0..=255. `None` when the file is missing, not an
+/// integer, or above 255. The file is only read.
+fn read_pwm(root: &Path, dir: &Path, channel: u32) -> Option<u8> {
+    let path = dir.join(format!("pwm{channel}"));
+    let Ok(Located::Inside(path)) = hwmon::locate(SourceId::Gpu, root, &path) else {
+        return None;
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    let pwm: u16 = text.trim().parse().ok()?;
+    u8::try_from(pwm).ok()
 }
 
 #[cfg(test)]
@@ -112,7 +126,9 @@ mod tests {
                 power_mw: None,
                 power_limit_mw: None,
             },
+            mem_temp_c: None,
             fan_rpm: None,
+            fan_pwm: None,
         }
     }
 
@@ -127,7 +143,9 @@ mod tests {
         let mut devices = vec![device(0, "0000:05:00.0"), device(1, "0000:0b:00.0")];
         apply(&scratch.roots(), &cfg, &mut devices);
         assert_eq!(devices[0].fan_rpm, Some(900));
+        assert_eq!(devices[0].fan_pwm, Some(128));
         assert_eq!(devices[1].fan_rpm, None);
+        assert_eq!(devices[1].fan_pwm, None);
         let pwm = std::fs::read_to_string(scratch.0.join("class/hwmon/hwmon9/pwm1")).unwrap();
         assert_eq!(pwm, "128\n", "pwm is not written");
     }

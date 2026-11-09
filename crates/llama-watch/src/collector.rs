@@ -69,8 +69,14 @@ pub struct GpuDeviceTelemetry {
     pub util_pct: Option<f32>,
     pub temp_c: Option<f32>,
     pub extra: GpuExtra,
+    /// Memory-junction °C from `NVML_FI_DEV_MEMORY_TEMP`. `None` when the
+    /// card has no such sensor or the read failed. Never a stand-in zero.
+    pub mem_temp_c: Option<f32>,
     /// Optional blower rpm from `[gpu.fan]`. `None` when unset or unreadable.
     pub fan_rpm: Option<u32>,
+    /// `pwmN` duty 0..=255 from the same chip. `None` when the file is absent.
+    /// Read only; a missing duty draws no fan mark.
+    pub fan_pwm: Option<u8>,
 }
 
 /// Compute processes from the last NVML attempt.
@@ -669,7 +675,9 @@ where
                     power_mw: r.power_mw.ok(),
                     power_limit_mw: r.power_limit_mw.ok(),
                 },
+                mem_temp_c: r.mem_temp_c,
                 fan_rpm: None,
+                fan_pwm: None,
             });
         }
         self.process_cache.retain(|key, _| live.contains(key));

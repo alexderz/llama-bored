@@ -16,9 +16,8 @@ use super::sanitize::{detail_char, detail_glyph, sanitize};
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
-use crate::sources::chips::Kind;
 use crate::sources::fans::{FanPanel, FanReading, mode_word};
-use crate::sources::temps::{Level, TempGroup, TempItem, TempPanel, kind_limits};
+use crate::sources::temps::{GpuHeat, Level, TempGroup, TempItem, TempPanel, gpu_heat_limits};
 
 /// How many of `new_chars` are visible on frame `frame` of a 10-frame second.
 ///
@@ -345,6 +344,9 @@ pub struct TtyGpu {
     pub vram_total_gb: Option<f64>,
     /// Blower rpm from `[gpu.fan]`. Drawn on the card's heat line.
     pub fan_rpm: Option<u32>,
+    /// Blower duty 0..=255. A mark is drawn only when this and [`Self::fan_rpm`]
+    /// are both present. A missing duty is not idle.
+    pub fan_pwm: Option<u8>,
 }
 
 /// Plain data for one frame. T22 fills it. Text fields are untrusted and are
@@ -7792,11 +7794,14 @@ fn heat_fg(frac: Option<f64>, ink: BarInk) -> C16 {
 
 fn value_span(gauge: &Gauge) -> u16 {
     let mut n = gauge.value.chars().count();
-    for part in &gauge.parts {
-        n = n.saturating_add(part.text.chars().count());
-    }
     if gauge.mark.is_some() {
         n = n.saturating_add(1);
+    }
+    for part in &gauge.parts {
+        n = n.saturating_add(part.text.chars().count());
+        if part.mark.is_some() {
+            n = n.saturating_add(1);
+        }
     }
     u16::try_from(n).unwrap_or(u16::MAX)
 }
@@ -7975,16 +7980,21 @@ enum GaugeStyle {
     Bar,
     /// Heat: one eighths-block level mark, no bar.
     Heat,
-    /// GPU card line: coloured temps and a fan, no bar and no mark.
+    /// GPU card line: coloured temps and a fan, no bar. The first
+    /// temperature's mark is [`Gauge::mark`], painted in that temperature's
+    /// colour. Later temperatures and the fan carry their own
+    /// [`GaugePart::mark`]. A block inside the text would be sanitized away.
     Line,
 }
 
-/// A coloured run after the main value (` 49°`, ` fan 1.5k`).
+/// A coloured run after the main value (` 49°`, ` fan 1.5k`). `mark` is
+/// painted with [`paint`], not inside `text`, so the block is not sanitized.
 #[derive(Clone)]
 struct GaugePart {
     text: String,
     fg: C16,
     exact: Option<Rgb>,
+    mark: Option<char>,
 }
 
 /// One gauge: label, value, and either a bar, a heat mark, or extra parts.
@@ -8161,7 +8171,7 @@ fn gpu_band(grid: &Grid, model: &TtyModel, degree: bool) -> Vec<Gauge> {
             .gpus
             .iter()
             .enumerate()
-            .map(|(i, gpu)| gpu_card_line(i, gpu, degree))
+            .map(|(i, gpu)| gpu_card_line(model, i, gpu, degree))
             .collect()
     } else {
         gpu_temp_lines(grid, model, degree)
@@ -8191,10 +8201,14 @@ fn heat_temps(grid: &Grid, model: &TtyModel, degree: bool) -> Vec<Gauge> {
     let Some(panel) = &model.temps else {
         return Vec::new();
     };
+    // GPU-named groups leave this band when the card lines absorbed them,
+    // and when there is no card line (they are drawn by `gpu_temp_lines`).
+    // A group that cannot be matched onto a card stays here, or it vanishes.
+    let hide_gpu = gpu_names_leave_the_heat_band(model);
     panel
         .groups
         .iter()
-        .filter(|group| !is_gpu_heat_name(&group.name))
+        .filter(|group| !(hide_gpu && is_gpu_heat_name(&group.name)))
         .filter_map(|group| {
             Some(heat_temp_gauge(
                 abbreviate(&group.name),
@@ -8265,56 +8279,249 @@ fn shed_fans_then_temps(
     }
 }
 
-fn gpu_card_line(index: usize, gpu: &TtyGpu, degree: bool) -> Gauge {
+/// One coloured temperature. The mark is painted on its own: a block inside
+/// the text is sanitized away (`▄` and `█` are not text glyphs).
+struct HeatBit {
+    text: String,
+    mark: char,
+    fg: C16,
+    exact: Option<Rgb>,
+    pct: f64,
+}
+
+fn heat_bit(tenths: i32, limits: (i32, i32), degree: bool, caption: &str) -> HeatBit {
+    let pct = temp_percent(tenths, limits.0, limits.1);
+    let fill = (pct > 0.0).then_some((pct / 100.0).min(1.0));
+    let ink = level_ink(Some(pct));
+    let c = (f64::from(tenths) / 10.0).round() as i32;
+    let temp = format_heat_temp(c, degree);
+    let text = if caption.is_empty() {
+        temp
+    } else {
+        format!("{caption} {temp}")
+    };
+    HeatBit {
+        text,
+        mark: heat_mark(fill),
+        fg: heat_fg(fill.or(Some(0.0)), ink),
+        exact: (pct > 0.0).then_some(act_color(pct as f32)),
+        pct,
+    }
+}
+
+fn round_c(tenths: i32) -> i32 {
+    (f64::from(tenths) / 10.0).round() as i32
+}
+
+fn heat_label(label: &str) -> String {
+    label.trim().to_ascii_lowercase()
+}
+
+/// Empty, `edge`, `gpu`, `gpu core`, or `t` plus digits: the die, not a
+/// second sensor. A junction or hotspot keeps its own name even at the same number.
+fn is_die_label(label: &str) -> bool {
+    let label = heat_label(label);
+    label.is_empty()
+        || label == "edge"
+        || label == "gpu"
+        || label == "gpu core"
+        || (label.len() > 1
+            && label.starts_with('t')
+            && label[1..].bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_hotspot_label(label: &str) -> bool {
+    let label = heat_label(label);
+    if label.contains("mem") {
+        return false;
+    }
+    label.contains("hotspot") || label.contains("hot spot") || label.contains("junction")
+}
+
+fn is_mem_label(label: &str) -> bool {
+    heat_label(label).contains("mem")
+}
+
+fn caption_for(label: &str) -> String {
+    let lower = heat_label(label);
+    if lower.contains("hotspot") || lower.contains("hot spot") {
+        return "hotspot".to_owned();
+    }
+    if lower.contains("junction") && !lower.contains("mem") {
+        return "junction".to_owned();
+    }
+    if is_mem_label(label) {
+        return "mem".to_owned();
+    }
+    if is_die_label(label) {
+        return String::new();
+    }
+    label.trim().chars().take(8).collect()
+}
+
+/// Die stays 88/92. Junction, hotspot, and memory use 100/110.
+fn limits_for_label(label: &str) -> (i32, i32) {
+    if is_hotspot_label(label) {
+        gpu_heat_limits(GpuHeat::Hotspot)
+    } else if is_mem_label(label) {
+        gpu_heat_limits(GpuHeat::Memory)
+    } else {
+        gpu_heat_limits(GpuHeat::Die)
+    }
+}
+
+fn gpu_heat_groups(model: &TtyModel) -> Vec<&TempGroup> {
+    model
+        .temps
+        .as_ref()
+        .map(|panel| {
+            panel
+                .groups
+                .iter()
+                .filter(|group| is_gpu_heat_name(&group.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when GPU-named groups are drawn somewhere other than the host heat band.
+fn gpu_names_leave_the_heat_band(model: &TtyModel) -> bool {
+    let n = model.gpus.len();
+    if !(1..=4).contains(&n) {
+        return true;
+    }
+    let groups = gpu_heat_groups(model).len();
+    groups == n || groups == 1
+}
+
+/// Hwmon GPU inputs that belong on this card, after the NVML numbers.
+fn card_hwmon_items(model: &TtyModel, index: usize) -> Vec<&TempItem> {
+    let n = model.gpus.len();
+    if !(1..=4).contains(&n) || index >= n {
+        return Vec::new();
+    }
+    let groups = gpu_heat_groups(model);
+    let shared = groups.len() == 1 && n > 1;
+    let group = if groups.len() == n {
+        groups[index]
+    } else if groups.len() == 1 {
+        if shared && index != 0 {
+            return Vec::new();
+        }
+        groups[0]
+    } else {
+        return Vec::new();
+    };
+    group
+        .items
+        .iter()
+        .filter(|item| !hwmon_already_on_card(item, &model.gpus[index], &model.gpus, shared))
+        .collect()
+}
+
+/// A die-like reading at a card's die temperature is the same sensor.
+/// Junction and hotspot stay even when the number matches the die.
+fn hwmon_already_on_card(item: &TempItem, card: &TtyGpu, cards: &[TtyGpu], shared: bool) -> bool {
+    let c = round_c(item.tenths);
+    if is_hotspot_label(&item.label) {
+        return card.hotspot_c == Some(c);
+    }
+    if is_mem_label(&item.label) {
+        return card.mem_temp_c == Some(c);
+    }
+    if is_die_label(&item.label) {
+        if shared {
+            return cards.iter().any(|gpu| gpu.temp_c == Some(c));
+        }
+        return card.temp_c == Some(c);
+    }
+    false
+}
+
+fn fan_part(rpm: Option<u32>, pwm: Option<u8>) -> Option<GaugePart> {
+    let rpm = rpm?;
+    let compact = fan_compact(rpm);
+    let stalled = rpm == 0 && pwm.is_some_and(|duty| duty > 0);
+    let (fg, mark) = if stalled {
+        let frac = pwm.map(|duty| f64::from(duty) / 255.0);
+        (C16::Red, Some(heat_mark(frac)))
+    } else if let Some(pwm) = pwm {
+        let frac = f64::from(pwm) / 255.0;
+        let fill = (frac > 0.0).then_some(frac);
+        let ink = level_ink(Some(frac * 100.0));
+        (
+            heat_fg(fill.or(Some(0.0)), ink),
+            Some(heat_mark(Some(frac))),
+        )
+    } else {
+        (shown_fg(&compact), None)
+    };
+    Some(GaugePart {
+        text: format!(" fan {compact}"),
+        fg,
+        exact: None,
+        mark,
+    })
+}
+
+fn gpu_card_line(model: &TtyModel, index: usize, gpu: &TtyGpu, degree: bool) -> Gauge {
     let label = format!("GPU{index} {}", tty_card(&gpu.label));
+    let mut bits = Vec::new();
+    if let Some(c) = gpu.temp_c {
+        bits.push(heat_bit(c * 10, gpu_heat_limits(GpuHeat::Die), degree, ""));
+    }
+    if let Some(c) = gpu.mem_temp_c {
+        bits.push(heat_bit(
+            c * 10,
+            gpu_heat_limits(GpuHeat::Memory),
+            degree,
+            "",
+        ));
+    }
+    if let Some(c) = gpu.hotspot_c {
+        bits.push(heat_bit(
+            c * 10,
+            gpu_heat_limits(GpuHeat::Hotspot),
+            degree,
+            "",
+        ));
+    }
+    for item in card_hwmon_items(model, index) {
+        let caption = caption_for(&item.label);
+        bits.push(heat_bit(
+            item.tenths,
+            limits_for_label(&item.label),
+            degree,
+            &caption,
+        ));
+    }
     let mut parts = Vec::new();
-    let mut value = String::new();
+    let mut value = "--".to_owned();
     let mut value_fg = C16::BrightBlack;
     let mut value_exact = None;
     let mut frac = None;
     let mut ink = level_ink(None);
-    let mut heat = 0.0;
-    for tenths in [
-        gpu.temp_c.map(|c| c * 10),
-        gpu.mem_temp_c.map(|c| c * 10),
-        gpu.hotspot_c.map(|c| c * 10),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let (warn, crit) = kind_limits(Kind::Gpu);
-        let pct = temp_percent(tenths, warn, crit);
-        let fill = (pct > 0.0).then_some((pct / 100.0).min(1.0));
-        let part_ink = level_ink(Some(pct));
-        let fg = heat_fg(fill.or(Some(0.0)), part_ink);
-        let text = format_heat_temp((f64::from(tenths) / 10.0).round() as i32, degree);
-        if value.is_empty() {
-            value = text;
-            value_fg = fg;
-            frac = fill;
-            ink = part_ink;
-            heat = pct;
-            value_exact = (pct > 0.0).then_some(act_color(pct as f32));
-        } else {
+    let mut mark = None;
+    let heat = bits.iter().map(|bit| bit.pct).fold(0.0, f64::max);
+    if !bits.is_empty() {
+        let first = bits.remove(0);
+        value = first.text;
+        value_fg = first.fg;
+        value_exact = first.exact;
+        mark = Some(first.mark);
+        frac = (first.pct > 0.0).then_some((first.pct / 100.0).min(1.0));
+        ink = level_ink(Some(first.pct));
+        for bit in bits {
             parts.push(GaugePart {
-                text: format!(" {text}"),
-                fg,
-                exact: (pct > 0.0).then_some(act_color(pct as f32)),
+                text: format!(" {}", bit.text),
+                fg: bit.fg,
+                exact: bit.exact,
+                mark: Some(bit.mark),
             });
         }
     }
-    if let Some(rpm) = gpu.fan_rpm {
-        let compact = fan_compact(rpm);
-        let fg = shown_fg(&compact);
-        parts.push(GaugePart {
-            text: format!(" fan {compact}"),
-            fg,
-            exact: None,
-        });
-    }
-    if value.is_empty() {
-        value = "--".to_string();
-        value_fg = C16::BrightBlack;
+    if let Some(part) = fan_part(gpu.fan_rpm, gpu.fan_pwm) {
+        parts.push(part);
     }
     Gauge {
         label,
@@ -8327,7 +8534,7 @@ fn gpu_card_line(index: usize, gpu: &TtyGpu, degree: bool) -> Gauge {
         heat,
         style: GaugeStyle::Line,
         parts,
-        mark: None,
+        mark,
     }
 }
 
@@ -8355,6 +8562,9 @@ fn heat_fan_gauge(fan: &FanReading) -> Gauge {
     let stalled = fan_stalled(fan);
     let frac = fan.pwm.map(|pwm| f64::from(pwm) / 255.0);
     let value = fan.rpm.map_or_else(|| "--".to_owned(), fan_compact);
+    // A mark needs both a speed and a duty. Missing either is not idle: `▁`
+    // would claim the fan is stopped when the sensor was simply unread.
+    let duty = fan.rpm.is_some() && fan.pwm.is_some();
     let ink = if stalled {
         BarInk::Fixed(C16::Red, C16::Red)
     } else {
@@ -8362,8 +8572,10 @@ fn heat_fan_gauge(fan: &FanReading) -> Gauge {
     };
     let value_fg = if stalled {
         C16::Red
-    } else {
+    } else if duty {
         heat_fg(frac, ink)
+    } else {
+        shown_fg(&value)
     };
     Gauge {
         label: fan.label.clone(),
@@ -8371,12 +8583,12 @@ fn heat_fan_gauge(fan: &FanReading) -> Gauge {
         value,
         value_fg,
         value_exact: None,
-        frac: frac.filter(|f| *f > 0.0),
+        frac: frac.filter(|f| duty && *f > 0.0),
         ink,
-        heat: frac.map_or(0.0, |f| f * 100.0),
+        heat: frac.filter(|_| duty).map_or(0.0, |f| f * 100.0),
         style: GaugeStyle::Heat,
         parts: Vec::new(),
-        mark: Some(heat_mark(frac)),
+        mark: duty.then(|| heat_mark(frac)),
     }
 }
 
@@ -8431,34 +8643,20 @@ fn draw_bands(
     if columns.is_empty() {
         return;
     }
-    let bars: Vec<bool> = columns.iter().map(|col| col.bars).collect();
-    let mut text_w: Vec<u16> = columns
-        .iter()
-        .map(|col| aligned_text_w(&col.gauges))
-        .collect();
-    let mut laid = fit_mixed_columns(x, right, &mut text_w, &bars);
-    if laid.1 == 0 {
-        let mut dropped = false;
-        for col in &mut columns {
-            for gauge in &mut col.gauges {
-                if gauge.value.contains('°') || gauge.parts.iter().any(|p| p.text.contains('°')) {
-                    gauge.value = gauge.value.replace('°', "");
-                    for part in &mut gauge.parts {
-                        part.text = part.text.replace('°', "");
-                    }
-                    dropped = true;
-                }
+    // Never shorten a value. Drop the degree sign, then the bars, then a
+    // whole right-hand column, then whole gauges. A clipped number that
+    // still looks like a number is a bug.
+    let Some((xs, bar, text_w)) = fit_band_columns(&mut columns, x, right) else {
+        let mut note_row = top.saturating_add(inner);
+        let end = top.saturating_add(height);
+        for (name, text) in notes {
+            if note_row < end {
+                draw_gauge_note(grid, x, note_row, right, name, text);
             }
+            note_row = note_row.saturating_add(1);
         }
-        if dropped {
-            text_w = columns
-                .iter()
-                .map(|col| aligned_text_w(&col.gauges))
-                .collect();
-            laid = fit_mixed_columns(x, right, &mut text_w, &bars);
-        }
-    }
-    let (xs, bar, _) = laid;
+        return;
+    };
     for (c, col) in columns.iter().enumerate() {
         let label_w = col
             .gauges
@@ -8509,33 +8707,86 @@ fn aligned_place(x: u16, label_w: u16, text_w: u16, bar: u16, gauge: &Gauge) -> 
     }
 }
 
-fn fit_mixed_columns(
+/// Lay the columns out without cutting a value. Degrees drop first, then
+/// bars, then the rightmost column (so GPU and heat stay). One column that
+/// is still wider than the screen loses whole gauges from the end.
+fn fit_band_columns(
+    columns: &mut Vec<BandCol>,
     x: u16,
     right: u16,
-    text_w: &mut [u16],
-    bars: &[bool],
-) -> (Vec<u16>, u16, u16) {
-    let mut laid = mixed_column_layouts(x, right, text_w, bars);
-    let mut guard = text_w.iter().copied().fold(0u16, u16::saturating_add);
-    let wants_bar = bars.iter().any(|b| *b);
-    while laid.1 == 0 && wants_bar && guard > 0 {
-        let Some(widest) = text_w
-            .iter_mut()
-            .enumerate()
-            .filter(|(i, _)| bars.get(*i).copied().unwrap_or(false))
-            .map(|(_, w)| w)
-            .max_by_key(|w| **w)
-        else {
-            break;
-        };
-        if *widest <= 1 {
-            break;
+) -> Option<(Vec<u16>, u16, Vec<u16>)> {
+    let mut wanted: Vec<bool> = columns.iter().map(|col| col.bars).collect();
+    let mut degrees_dropped = false;
+    let mut bars_dropped = false;
+    loop {
+        if columns.is_empty() || columns.iter().all(|col| col.gauges.is_empty()) {
+            return None;
         }
-        *widest -= 1;
-        guard -= 1;
-        laid = mixed_column_layouts(x, right, text_w, bars);
+        for (col, want) in columns.iter_mut().zip(wanted.iter()) {
+            col.bars = *want && !bars_dropped;
+        }
+        let bars: Vec<bool> = columns.iter().map(|col| col.bars).collect();
+        let text_w: Vec<u16> = columns
+            .iter()
+            .map(|col| aligned_text_w(&col.gauges))
+            .collect();
+        let (xs, bar, _) = mixed_column_layouts(x, right, &text_w, &bars);
+        if columns_fit(right, &text_w, &bars, &xs, bar) {
+            return Some((xs, bar, text_w));
+        }
+        if !degrees_dropped && band_has_degree(columns) {
+            strip_degrees(columns);
+            degrees_dropped = true;
+            continue;
+        }
+        if !bars_dropped && wanted.iter().any(|want| *want) {
+            bars_dropped = true;
+            continue;
+        }
+        if columns.len() > 1 {
+            columns.pop();
+            wanted.pop();
+            bars_dropped = false;
+            continue;
+        }
+        let col = columns.last_mut()?;
+        col.gauges.pop()?;
     }
-    laid
+}
+
+fn band_has_degree(columns: &[BandCol]) -> bool {
+    columns.iter().any(|col| {
+        col.gauges.iter().any(|gauge| {
+            gauge.value.contains('°') || gauge.parts.iter().any(|part| part.text.contains('°'))
+        })
+    })
+}
+
+fn strip_degrees(columns: &mut [BandCol]) {
+    for col in columns {
+        for gauge in &mut col.gauges {
+            gauge.value = gauge.value.replace('°', "");
+            for part in &mut gauge.parts {
+                part.text = part.text.replace('°', "");
+            }
+        }
+    }
+}
+
+/// The last occupied cell is `right` or before it. A wanted bar of width 0
+/// does not count: that layout would paint no bar while still asking for one.
+fn columns_fit(right: u16, text_w: &[u16], bars: &[bool], xs: &[u16], bar: u16) -> bool {
+    if text_w.is_empty() || xs.len() != text_w.len() {
+        return text_w.is_empty();
+    }
+    if bars.iter().any(|want| *want) && bar == 0 {
+        return false;
+    }
+    let last = text_w.len() - 1;
+    let end = xs[last]
+        .saturating_add(text_w[last])
+        .saturating_add(if bars[last] { bar } else { 0 });
+    end <= right.saturating_add(1)
 }
 
 fn mixed_column_layouts(x: u16, right: u16, text_w: &[u16], bars: &[bool]) -> (Vec<u16>, u16, u16) {
@@ -8645,6 +8896,15 @@ fn draw_gauge(
     paint_exact_span(grid, at, row, shown, gauge.value_exact);
     let end = place.bar_x;
     let mut cursor = at.saturating_add(u16::try_from(shown.chars().count().min(room)).unwrap_or(0));
+    cursor = paint_heat_mark(
+        grid,
+        cursor,
+        row,
+        end,
+        gauge.mark,
+        gauge.value_fg,
+        gauge.value_exact,
+    );
     for part in &gauge.parts {
         if cursor >= end {
             break;
@@ -8660,14 +8920,7 @@ fn draw_gauge(
             part.exact,
         );
         cursor = cursor.saturating_add(u16::try_from(room).unwrap_or(0));
-    }
-    if let Some(mark) = gauge.mark
-        && cursor < end
-    {
-        paint(grid, cursor, row, mark, gauge.value_fg, C16::Black);
-        if let Some(rgb) = gauge.value_exact.filter(|_| grid.records_exact()) {
-            grid.set_exact_fg(cursor, row, rgb);
-        }
+        cursor = paint_heat_mark(grid, cursor, row, end, part.mark, part.fg, part.exact);
     }
     if gauge.style != GaugeStyle::Bar {
         return;
@@ -8694,6 +8947,30 @@ fn draw_gauge(
             grid.put(col, row, Cell::with_rich(lit.ch, cell.rich, lit.fg, lit.bg));
         }
     }
+}
+
+/// Paint one heat mark with [`paint`]. `paint_fit` would turn `▄` and `█`
+/// into U+FFFD: those blocks are not in the text allowlist.
+fn paint_heat_mark(
+    grid: &mut Grid,
+    cursor: u16,
+    row: u16,
+    end: u16,
+    mark: Option<char>,
+    fg: C16,
+    exact: Option<Rgb>,
+) -> u16 {
+    let Some(mark) = mark else {
+        return cursor;
+    };
+    if cursor >= end {
+        return cursor;
+    }
+    paint(grid, cursor, row, mark, fg, C16::Black);
+    if let Some(rgb) = exact.filter(|_| grid.records_exact()) {
+        grid.set_exact_fg(cursor, row, rgb);
+    }
+    cursor.saturating_add(1)
 }
 
 fn paint_exact_span(grid: &mut Grid, at: u16, row: u16, text: &str, rgb: Option<Rgb>) {

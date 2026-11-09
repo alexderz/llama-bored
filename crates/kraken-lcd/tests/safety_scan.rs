@@ -94,6 +94,7 @@ const NVML_CALLS: &[&str] = &[
     "uuid",
     "to_string",
     "utilization_rates",
+    "field_values_for",
 ];
 
 const NVML_PATH: &[&str] = &[
@@ -109,6 +110,14 @@ const NVML_PATH: &[&str] = &[
     "Nvml",
     "error",
     "NvmlError",
+    // Memory junction is a field read, not TemperatureSensor::Gpu.
+    "SampleValue",
+    "FieldValueSample",
+    "structs",
+    "FieldId",
+    "sys_exports",
+    "field_id",
+    "NVML_FI_DEV_MEMORY_TEMP",
 ];
 
 #[test]

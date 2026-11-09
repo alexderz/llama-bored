@@ -842,6 +842,7 @@ impl GpuBackend for MultiGpu {
             memory: Ok((u64::from(physical + 1) * 100, 1000)),
             power_mw: Ok(if physical == 0 { 50_000 } else { 80_000 }),
             power_limit_mw: Ok(100_000),
+            mem_temp_c: None,
             processes: if processes {
                 ProcessRead::Ready(vec![ComputeProcess {
                     pid: 42,

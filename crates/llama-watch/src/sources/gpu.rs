@@ -13,8 +13,10 @@
 
 use super::{SourceError, SourceId};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
-use nvml_wrapper::enums::device::UsedGpuMemory;
-use nvml_wrapper::struct_wrappers::device::ProcessInfo;
+use nvml_wrapper::enums::device::{SampleValue, UsedGpuMemory};
+use nvml_wrapper::struct_wrappers::device::{FieldValueSample, ProcessInfo};
+use nvml_wrapper::structs::device::FieldId;
+use nvml_wrapper::sys_exports::field_id::NVML_FI_DEV_MEMORY_TEMP;
 use nvml_wrapper::{Device, Nvml};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -122,6 +124,8 @@ pub trait GpuBackend {
             memory: self.memory_info(),
             power_mw: self.power_usage(),
             power_limit_mw: self.enforced_power_limit(),
+            // Legacy backends have no memory-junction field.
+            mem_temp_c: None,
             processes: if processes {
                 match self.compute_processes() {
                     Ok(items) => ProcessRead::Ready(items),
@@ -155,6 +159,12 @@ pub struct GpuDeviceReading {
     pub memory: Result<(u64, u64), GpuError>,
     pub power_mw: Result<u32, GpuError>,
     pub power_limit_mw: Result<u32, GpuError>,
+    /// Memory-junction temperature in °C from `NVML_FI_DEV_MEMORY_TEMP`.
+    /// `None` when the card has no such sensor, the read failed, or the
+    /// value is not a plausible temperature. Never `Some(0)` for a miss:
+    /// the line omits the number. This wrapper has no hotspot field;
+    /// hotspot comes from hwmon, not from an invented NVML query.
+    pub mem_temp_c: Option<f32>,
     pub processes: ProcessRead,
 }
 impl GpuDeviceReading {
@@ -166,6 +176,7 @@ impl GpuDeviceReading {
             memory: Err(GpuError::new(reason)),
             power_mw: Err(GpuError::new(reason)),
             power_limit_mw: Err(GpuError::new(reason)),
+            mem_temp_c: None,
             processes: ProcessRead::Failed(reason.into()),
         }
     }
@@ -676,6 +687,11 @@ impl GpuBackend for NvidiaGpu {
                 .map_err(GpuError::from),
             power_mw: device.power_usage().map_err(GpuError::from),
             power_limit_mw: device.enforced_power_limit().map_err(GpuError::from),
+            // A miss is None. It does not drop the session and it is not 0.
+            mem_temp_c: device
+                .field_values_for(&[FieldId(NVML_FI_DEV_MEMORY_TEMP)])
+                .ok()
+                .and_then(memory_celsius),
             processes: if processes {
                 match merge_engine_processes(
                     device
@@ -701,14 +717,88 @@ impl GpuBackend for NvidiaGpu {
     }
 }
 
+/// Degrees from one `NVML_FI_DEV_MEMORY_TEMP` sample list.
+///
+/// The outer call already failed into `None` before this runs. An
+/// unsupported field, a sample error, a non-finite value, zero, or anything
+/// outside 5..127 °C is omitted. Zero is not a reading: a failed sensor
+/// must not paint `0°` or leave a hole where a number was.
+fn memory_celsius(
+    samples: Vec<Result<FieldValueSample, nvml_wrapper::error::NvmlError>>,
+) -> Option<f32> {
+    let sample = samples.into_iter().next()?.ok()?;
+    let degrees = match sample.value.ok()? {
+        SampleValue::U32(v) => f64::from(v),
+        SampleValue::U64(v) => v as f64,
+        SampleValue::I64(v) => v as f64,
+        SampleValue::F64(v) => v,
+    };
+    if !degrees.is_finite() {
+        return None;
+    }
+    let rounded = degrees.round();
+    if !(5.0..127.0).contains(&rounded) {
+        return None;
+    }
+    Some(rounded as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nvml_wrapper::enums::device::UsedGpuMemory;
+    use nvml_wrapper::error::NvmlError;
     use nvml_wrapper::struct_wrappers::device::ProcessInfo;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn memory_sample(value: Result<SampleValue, NvmlError>) -> FieldValueSample {
+        FieldValueSample {
+            field: FieldId(NVML_FI_DEV_MEMORY_TEMP),
+            timestamp: 0,
+            latency: 0,
+            value,
+        }
+    }
+
+    #[test]
+    fn memory_temp_omits_errors_zero_and_implausible() {
+        assert_eq!(memory_celsius(vec![]), None);
+        assert_eq!(memory_celsius(vec![Err(NvmlError::NotSupported)]), None);
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Err(NvmlError::NotSupported)))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(0))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::I64(4))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(127))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::I64(-3))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::F64(f64::NAN))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::F64(92.2))))]),
+            Some(92.0)
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(92))))]),
+            Some(92.0)
+        );
+    }
 
     #[derive(Default)]
     struct Probe {
@@ -1520,6 +1610,7 @@ mod tests {
             if !self.fail_reads && index == 1 {
                 reading.util_pct = Ok(25.0);
                 reading.temp_c = Ok(55.0);
+                reading.mem_temp_c = None;
             }
             reading.processes = if processes {
                 ProcessRead::Ready(vec![ComputeProcess {

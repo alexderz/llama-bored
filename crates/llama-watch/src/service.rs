@@ -1395,11 +1395,14 @@ fn tty_gpus(devices: &[crate::collector::GpuDeviceTelemetry]) -> Vec<layout::Tty
             label: device.label.clone(),
             util_pct: pct(device.util_pct),
             temp_c: temp_i(device.temp_c),
-            mem_temp_c: None,
+            mem_temp_c: temp_i(device.mem_temp_c),
+            // nvml-wrapper 0.13 has no hotspot field. A junction reading
+            // comes from hwmon and is drawn on the card line from there.
             hotspot_c: None,
             vram_used_gb: device.extra.vram_used.map(gib),
             vram_total_gb: device.extra.vram_total.map(gib),
             fan_rpm: device.fan_rpm,
+            fan_pwm: device.fan_pwm,
         })
         .collect()
 }
@@ -4713,7 +4716,9 @@ mod tests {
                 power_mw: Some(1_000),
                 power_limit_mw: Some(2_000),
             },
+            mem_temp_c: None,
             fan_rpm: None,
+            fan_pwm: None,
         };
         sample.gpu_devices = vec![
             device(0, "V100", "0000:05:00.0"),

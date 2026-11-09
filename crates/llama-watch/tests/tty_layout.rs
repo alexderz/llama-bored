@@ -3382,11 +3382,18 @@ fn missing_values_draw_dashes_and_absent_chip_says_so() {
     let row = meter_row(&grid, "front2");
     let text = row_string(&grid, row);
     assert!(text.contains("front2") && text.contains("--"), "{text}");
-    let col = meter_bar_col(&grid, row, "front2");
-    assert_eq!(
-        grid.get(col, row).unwrap().ch,
-        '▁',
-        "no duty, the empty heat mark"
+    let (row, col) = label_hit(&grid, "front2");
+    let chars: Vec<char> = row_string(&grid, row).chars().collect();
+    let from = usize::from(col) + "front2".chars().count();
+    let rel = chars[from..]
+        .windows(2)
+        .position(|pair| pair == ['-', '-'])
+        .expect("dashes");
+    let next = chars.get(from + rel + 2).copied().unwrap_or(' ');
+    assert!(
+        !('\u{2581}'..='\u{2588}').contains(&next),
+        "no rpm and no pwm is a missing mark, not idle, got {next} on {}",
+        row_string(&grid, row)
     );
     model.fans = Some(FanPanel {
         chip: "nct6798".to_string(),
@@ -8928,7 +8935,8 @@ fn gauges_draw_at_every_size_and_stay_in_the_right_half() {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
-/// A fan with rpm but no duty shows its rpm over an empty track, not red.
+/// A fan with rpm but no duty shows the rpm and no level mark. `▁` would
+/// claim the fan is idle when the duty file was never read.
 #[test]
 fn a_fan_with_rpm_but_no_duty_is_an_empty_track() {
     let mut model = gauge_model();
@@ -8937,17 +8945,23 @@ fn a_fan_with_rpm_but_no_duty_is_an_empty_track() {
     let grid = draw(&model, 213, 60);
     let row = meter_row(&grid, "front1");
     let text = row_string(&grid, row);
-    assert!(
-        text.contains("front1") && (text.contains("1.5k") || text.contains("1500")),
-        "{text}"
-    );
+    assert!(text.contains("front1") && text.contains("1.5k"), "{text}");
     let (_, col) = label_hit(&grid, "front1");
     assert_ne!(grid.get(col, row).unwrap().fg, C16::Red);
-    let ch = grid
-        .get(meter_bar_col(&grid, row, "front1"), row)
+    let at = col_of(&grid, row, "1.5k");
+    let next = grid
+        .get(at + "1.5k".chars().count() as u16, row)
         .unwrap()
         .ch;
-    assert_eq!(ch, '▁', "no duty is the empty mark, got {ch}");
+    assert!(
+        !('\u{2581}'..='\u{2588}').contains(&next),
+        "missing duty drew {next} on {text}"
+    );
+    assert_ne!(
+        grid.get(at, row).unwrap().fg,
+        C16::BrightBlack,
+        "a real rpm stays visible: {text}"
+    );
 }
 
 /// A reading without thresholds runs on the TEMPS default, full at 80 C.
@@ -10158,6 +10172,7 @@ fn two_cards() -> Vec<TtyGpu> {
             vram_used_gb: Some(13.1),
             vram_total_gb: Some(32.0),
             fan_rpm: None,
+            fan_pwm: None,
         },
         TtyGpu {
             label: "3090".to_owned(),
@@ -10168,6 +10183,7 @@ fn two_cards() -> Vec<TtyGpu> {
             vram_used_gb: Some(22.8),
             vram_total_gb: Some(24.0),
             fan_rpm: Some(1200),
+            fan_pwm: Some(128),
         },
     ]
 }
@@ -10186,6 +10202,7 @@ fn with_cards(n: usize) -> TtyModel {
             vram_used_gb: Some(1.0 + i as f64),
             vram_total_gb: Some(16.0),
             fan_rpm: Some(1000 + i as u32 * 100),
+            fan_pwm: None,
         })
         .collect();
     model
@@ -10212,6 +10229,7 @@ fn one_gpu_stays_cell_identical() {
         vram_used_gb: Some(22.8),
         vram_total_gb: Some(24.0),
         fan_rpm: Some(1800),
+        fan_pwm: None,
     }];
     let job = job_model(example_job(), 0);
     let mut job_one = job.clone();
@@ -10497,6 +10515,7 @@ fn legacy_fan_keeps_the_card_name_at_full_util() {
             vram_used_gb: Some(22.8),
             vram_total_gb: Some(24.0),
             fan_rpm: Some(1200),
+            fan_pwm: None,
         },
         TtyGpu {
             label: "V100".to_owned(),
@@ -10507,6 +10526,7 @@ fn legacy_fan_keeps_the_card_name_at_full_util() {
             vram_used_gb: Some(13.1),
             vram_total_gb: Some(32.0),
             fan_rpm: Some(900),
+            fan_pwm: None,
         },
     ];
     let grid = draw(&model, 192, 60);
@@ -10534,8 +10554,10 @@ fn one_gpu_temps_and_fans_match_the_503ffac_goldens() {
 #[test]
 #[ignore = "writes reviewer frames; not part of check.sh"]
 fn dump_der674_phase2_frames() {
-    let dir = std::path::Path::new("/var/tmp/llama-bored-relay/frames");
-    std::fs::create_dir_all(dir).expect("frames dir");
+    let dir = std::env::var_os("LLAMA_BORED_FRAMES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp/llama-bored-relay/frames"));
+    std::fs::create_dir_all(&dir).expect("frames dir");
     let two = titan_hwmon(two_cards());
     let four = titan_hwmon(with_cards(4).gpus);
     let frames = [
@@ -10721,6 +10743,12 @@ fn dense_gauges_at_213x60_for_one_two_and_four_gpus() {
     assert!(two_text.contains("44°") && two_text.contains("38°") && two_text.contains("49°"));
     assert!(two_text.contains("fan 1.2k"));
     assert!(painted(&four, 213, 60).contains("GPU3 a3"));
+    let hwmon = rows_containing(&draw(&two, 213, 60), "71°");
+    assert_eq!(hwmon.len(), 1, "hwmon GPU reading stays once: {hwmon:?}");
+    assert!(
+        hwmon[0].contains("GPU0 V100"),
+        "a different GPU sensor stays on the card line: {hwmon:?}"
+    );
 
     let mut hole = two.clone();
     hole.gpus[0].mem_temp_c = None;
@@ -10730,10 +10758,130 @@ fn dense_gauges_at_213x60_for_one_two_and_four_gpus() {
     assert!(line[0].contains("44°"), "{}", line[0]);
     assert!(line[0].contains("49°"), "{}", line[0]);
     assert!(!line[0].contains("38°"), "memory temp omitted: {}", line[0]);
-    let rest = line[0].split("44°").nth(1).unwrap();
     assert!(
-        rest.trim_start().starts_with("49°"),
+        !line[0].contains("0°"),
+        "a failed memory read is not zero: {}",
+        line[0]
+    );
+    let rest = line[0].split("44°").nth(1).unwrap();
+    let rest = rest.trim_start_matches(|ch: char| {
+        ch.is_whitespace() || ('\u{2581}'..='\u{2588}').contains(&ch)
+    });
+    assert!(
+        rest.starts_with("49°"),
         "no hole after a missing memory temp: {}",
         line[0]
+    );
+}
+
+/// Die 91 °C is on the 88/92 scale (past warning, white-hot). Memory at the
+/// same number is on 100/110 and stays below warning. A distinct hwmon
+/// hotspot is labelled and uses 100/110 as well.
+#[test]
+fn die_memory_and_hotspot_use_their_own_scales() {
+    let mut model = sample(WatchState::Ready);
+    model.temps = Some(TempPanel {
+        groups: vec![TempGroup {
+            name: "GPU".to_owned(),
+            items: vec![temp_item("hotspot", 98, Level::Normal)],
+        }],
+    });
+    model.gpus = vec![TtyGpu {
+        label: "3090".to_owned(),
+        util_pct: Some(50.0),
+        temp_c: Some(91),
+        mem_temp_c: Some(91),
+        hotspot_c: None,
+        vram_used_gb: Some(10.0),
+        vram_total_gb: Some(24.0),
+        fan_rpm: Some(1200),
+        fan_pwm: Some(128),
+    }];
+    let grid = draw(&model, 213, 60);
+    let rows = rows_containing(&grid, "GPU0 3090");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = row_with(&grid, "GPU0 3090");
+    let text = row_string(&grid, row);
+    assert!(text.contains("hotspot"), "{text}");
+    assert!(text.contains("98"), "{text}");
+    assert_eq!(text.matches("91").count(), 2, "{text}");
+    assert_eq!(
+        nth_fg(&grid, row, "91", 0),
+        C16::BrightWhite,
+        "die 91 on 88/92 is past warning: {text}"
+    );
+    assert_eq!(
+        nth_fg(&grid, row, "91", 1),
+        C16::BrightMagenta,
+        "memory 91 on 100/110 stays under warning: {text}"
+    );
+    assert_eq!(
+        nth_fg(&grid, row, "98", 0),
+        C16::BrightRed,
+        "hotspot 98 on 100/110 is not the die's white-hot: {text}"
+    );
+    let fan_at = col_of(&grid, row, "1.2k");
+    let digit = grid.get(fan_at, row).unwrap();
+    let mark = grid
+        .get(fan_at + "1.2k".chars().count() as u16, row)
+        .unwrap();
+    assert!(
+        ('\u{2581}'..='\u{2588}').contains(&mark.ch),
+        "fan duty draws a mark, got {}",
+        mark.ch
+    );
+    assert_eq!(mark.fg, digit.fg, "fan mark matches the rpm");
+}
+
+fn nth_fg(grid: &llama_watch::tty::grid::Grid, row: u16, needle: &str, n: usize) -> C16 {
+    let text = row_string(grid, row);
+    let mut start = 0usize;
+    let mut byte_at = 0usize;
+    for _ in 0..=n {
+        let rel = text[start..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} #{n} on {text}"));
+        byte_at = start + rel;
+        start = byte_at + needle.len();
+    }
+    let col = u16::try_from(text[..byte_at].chars().count()).expect("column");
+    grid.get(col, row).unwrap().fg
+}
+
+/// A 160-column frame keeps every capacity and power value whole.
+#[test]
+fn wide_values_stay_whole_at_160_columns() {
+    let model = titan_hwmon(two_cards());
+    let grid = draw(&model, 160, 45);
+    let text = painted(&model, 160, 45);
+    for whole in [
+        "13.1/32.0 G",
+        "22.8/24.0 G",
+        "412/650 W",
+        "38.1/62.6 G",
+        "41 %  16c",
+        "42 % gpu",
+    ] {
+        assert!(text.contains(whole), "clipped value, want {whole}\n{text}");
+    }
+    let power = row_string(&grid, meter_row(&grid, "POWER"));
+    assert!(power.contains("412/650 W"), "{power}");
+    let quiet = {
+        let mut model = model.clone();
+        model.gpus[1].fan_pwm = None;
+        model
+    };
+    let grid = draw(&quiet, 213, 60);
+    let row = row_with(&grid, "GPU1 3090");
+    let text = row_string(&grid, row);
+    assert!(text.contains("fan 1.2k"), "{text}");
+    let at = col_of(&grid, row, "1.2k");
+    let next = grid
+        .get(at + "1.2k".chars().count() as u16, row)
+        .unwrap()
+        .ch;
+    assert!(
+        !('\u{2581}'..='\u{2588}').contains(&next),
+        "rpm without pwm drew {next} on {text}"
     );
 }
