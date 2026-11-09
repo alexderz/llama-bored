@@ -1395,6 +1395,8 @@ fn tty_gpus(devices: &[crate::collector::GpuDeviceTelemetry]) -> Vec<layout::Tty
             label: device.label.clone(),
             util_pct: pct(device.util_pct),
             temp_c: temp_i(device.temp_c),
+            mem_temp_c: None,
+            hotspot_c: None,
             vram_used_gb: device.extra.vram_used.map(gib),
             vram_total_gb: device.extra.vram_total.map(gib),
             fan_rpm: device.fan_rpm,

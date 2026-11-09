@@ -173,7 +173,7 @@ pub fn detect_layout(vcsa: &[u8], vcsu: Option<&[u8]>) -> Option<AttrLayout> {
 /// collapsing to `?` here too.
 const GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇',
+    '\u{fffd}', '°', '▁', '▂', '▃', '▅', '▆', '▇',
 ];
 
 /// Printable ASCII and [`GLYPHS`] stay. The gauge segment U+E584 (#165),

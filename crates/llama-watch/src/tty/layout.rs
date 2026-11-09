@@ -16,8 +16,9 @@ use super::sanitize::{detail_char, detail_glyph, sanitize};
 use crate::collector::LoadSource;
 use crate::config::{ChartGlyphs, MAX_FAN_LABEL};
 use crate::resets::ResetReason;
+use crate::sources::chips::Kind;
 use crate::sources::fans::{FanPanel, FanReading, mode_word};
-use crate::sources::temps::{Level, TempGroup, TempItem, TempPanel};
+use crate::sources::temps::{Level, TempGroup, TempItem, TempPanel, kind_limits};
 
 /// How many of `new_chars` are visible on frame `frame` of a 10-frame second.
 ///
@@ -325,17 +326,24 @@ fn fit_parts(parts: &[(String, String)], width: usize) -> String {
     String::new()
 }
 
-/// One selected GPU, in PCI order. Drawn only when [`TtyModel::gpus`] holds
-/// two or more; a single entry is ignored so one card stays cell-identical.
+/// One selected GPU, in PCI order. Two to four cards draw a heat line each
+/// (`GPU0 V100 56° 49° 61° fan 1.5k`) and their own util / VRAM bars. A
+/// single entry still uses the summed GPU and VRAM meters; its temperatures
+/// and fan sit on the GPU heat line. Empty, or five or more, stays summed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TtyGpu {
     /// Short label, such as `3090` or `V100`.
     pub label: String,
     pub util_pct: Option<f64>,
+    /// Die / main temperature, whole degrees C.
     pub temp_c: Option<i32>,
+    /// Memory or junction temperature, when the source exposes it.
+    pub mem_temp_c: Option<i32>,
+    /// Hotspot temperature, when the source exposes it.
+    pub hotspot_c: Option<i32>,
     pub vram_used_gb: Option<f64>,
     pub vram_total_gb: Option<f64>,
-    /// Blower rpm from `[gpu.fan]`. Shown on the GPU row when it fits.
+    /// Blower rpm from `[gpu.fan]`. Drawn on the card's heat line.
     pub fan_rpm: Option<u32>,
 }
 
@@ -486,8 +494,8 @@ pub struct TtyModel {
     pub mem_psi: Option<f64>,
     /// Three-decade disk bar ceiling, bytes/s (`[tty] disk_ceiling_bps`).
     pub disk_ceiling_bps: f64,
-    /// Per-card rows when two or more GPUs are selected, PCI order. Empty
-    /// or a single entry keeps today's GPU and VRAM meters.
+    /// Per-card rows when GPUs are selected, PCI order. Empty keeps today's
+    /// summed GPU and VRAM meters; two to four cards add a heat line each.
     pub gpus: Vec<TtyGpu>,
 }
 
@@ -7697,6 +7705,18 @@ const HOST_GAUGES: usize = 9;
 const GAUGE_GAP: u16 = 4;
 /// Blank cells kept right of the last column.
 const GAUGE_MARGIN: u16 = 2;
+/// Heat labels shortened to pack the band. Looked up from this table only.
+const HEAT_ABBREVS: &[(&str, &str)] = &[
+    ("NVMe0", "nv0"),
+    ("NVMe1", "nv1"),
+    ("Wi-Fi", "wf"),
+    ("board", "bd"),
+    ("coolant", "cl"),
+];
+/// Lower eighths U+2581–2588, the one-cell heat mark.
+const HEAT_MARKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Columns a gauge band may occupy.
+const GAUGE_MAX_COLS: usize = 4;
 /// 0 % of a temperature gauge, tenths of a degree: 20 °C.
 const TEMP_FLOOR: i32 = 200;
 /// Ramp points past full scale at a sensor's critical point: past its
@@ -7709,6 +7729,7 @@ const TEMP_FALLBACK: (i32, i32) = (800, 900);
 struct GaugePlace {
     x: u16,
     label_w: u16,
+    value_x: u16,
     bar_x: u16,
     bar: u16,
 }
@@ -7724,8 +7745,92 @@ fn gauge_row_text_w(label: &str, value: &str) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
+fn abbreviate(name: &str) -> &str {
+    HEAT_ABBREVS
+        .iter()
+        .find(|(long, _)| *long == name)
+        .map(|(_, short)| *short)
+        .unwrap_or(name)
+}
+
+fn is_gpu_heat_name(name: &str) -> bool {
+    name.strip_prefix("GPU")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// One-cell level mark for `frac` of full scale: `▁` empty, `█` full.
+fn heat_mark(frac: Option<f64>) -> char {
+    let f = frac.unwrap_or(0.0).clamp(0.0, 1.0);
+    let n = (f * 8.0).round() as usize;
+    HEAT_MARKS[n.saturating_sub(1).min(HEAT_MARKS.len() - 1)]
+}
+
+fn format_heat_temp(c: i32, degree: bool) -> String {
+    if degree {
+        format!("{c}°")
+    } else {
+        c.to_string()
+    }
+}
+
+/// Console colour of a heat number: the last lit cell of a 5-step spectrum
+/// bar at this fill, which is how the old temperature bar read as hot.
+fn heat_fg(frac: Option<f64>, ink: BarInk) -> C16 {
+    match ink {
+        BarInk::Fixed(top, _) => top,
+        BarInk::Spectrum { hot, .. } => {
+            let f = frac.unwrap_or(0.0).clamp(0.0, 1.0);
+            let lit = lit_cells((f > 0.0).then_some(f), 5);
+            if lit == 0 {
+                C16::BrightBlack
+            } else {
+                spectrum_colours(lit - 1, 5, hot).0
+            }
+        }
+    }
+}
+
+fn value_span(gauge: &Gauge) -> u16 {
+    let mut n = gauge.value.chars().count();
+    for part in &gauge.parts {
+        n = n.saturating_add(part.text.chars().count());
+    }
+    if gauge.mark.is_some() {
+        n = n.saturating_add(1);
+    }
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+fn aligned_text_w(gauges: &[Gauge]) -> u16 {
+    let label_w = gauges
+        .iter()
+        .map(|g| u16::try_from(g.label.chars().count()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    gauges
+        .iter()
+        .map(|g| {
+            let extra = if g.style == GaugeStyle::Bar { 1 } else { 0 };
+            label_w
+                .saturating_add(GAUGE_VALUE_GAP)
+                .saturating_add(value_span(g))
+                .saturating_add(extra)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn cols_for(n: usize, height: u16) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n.div_ceil(usize::from(height.max(1)))
+    }
+}
+
 /// The widest row of text in a column. Shorter rows keep their own width
 /// and their bars run on to this edge.
+#[cfg(test)]
 fn column_text_w<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> u16 {
     rows.into_iter()
         .map(|(label, value)| gauge_row_text_w(label, value))
@@ -7735,6 +7840,7 @@ fn column_text_w<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> u16 
 
 /// One row in a column. The value starts two spaces after this label. The
 /// bar starts one cell after the value and ends with the column.
+#[cfg(test)]
 fn gauge_place(x: u16, text_w: u16, bar: u16, label: &str, value: &str) -> GaugePlace {
     let label_w = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
     let natural = gauge_row_text_w(label, value);
@@ -7744,6 +7850,7 @@ fn gauge_place(x: u16, text_w: u16, bar: u16, label: &str, value: &str) -> Gauge
     GaugePlace {
         x,
         label_w,
+        value_x: x.saturating_add(label_w).saturating_add(GAUGE_VALUE_GAP),
         bar_x,
         bar: bar_end.saturating_sub(bar_x),
     }
@@ -7794,6 +7901,7 @@ fn meter_bar(label: &str, value: &str, left_end: u16) -> (u16, u16) {
 
 /// Column origins and one shared bar length. The gap and the right margin
 /// shrink when the text would otherwise leave no bar.
+#[cfg(test)]
 fn column_layouts(x: u16, right: u16, text_w: &[u16]) -> (Vec<u16>, u16, u16) {
     let n = text_w.len();
     if n == 0 {
@@ -7833,24 +7941,6 @@ fn column_layouts(x: u16, right: u16, text_w: &[u16]) -> (Vec<u16>, u16, u16) {
     (xs, bar, gap)
 }
 
-/// Steal cells from the widest text until a bar of at least one cell fits.
-fn fit_columns(x: u16, right: u16, text_w: &mut [u16]) -> (Vec<u16>, u16, u16) {
-    let mut laid = column_layouts(x, right, text_w);
-    let mut guard = text_w.iter().copied().fold(0u16, u16::saturating_add);
-    while laid.1 == 0 && guard > 0 {
-        let Some(widest) = text_w.iter_mut().max_by_key(|w| **w) else {
-            break;
-        };
-        if *widest <= 1 {
-            break;
-        }
-        *widest -= 1;
-        guard -= 1;
-        laid = column_layouts(x, right, text_w);
-    }
-    laid
-}
-
 /// A lit bar cell: the console's glyph and the grid file's.
 #[derive(Clone, Copy, Debug)]
 struct BarCell {
@@ -7878,7 +7968,26 @@ fn gauge_glyph(glyphs: ChartGlyphs, segments: bool) -> BarCell {
     }
 }
 
-/// One gauge: label, value and bar.
+/// How a gauge spends the cells after its value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GaugeStyle {
+    /// Performance: a bar to the column edge.
+    Bar,
+    /// Heat: one eighths-block level mark, no bar.
+    Heat,
+    /// GPU card line: coloured temps and a fan, no bar and no mark.
+    Line,
+}
+
+/// A coloured run after the main value (` 49°`, ` fan 1.5k`).
+#[derive(Clone)]
+struct GaugePart {
+    text: String,
+    fg: C16,
+    exact: Option<Rgb>,
+}
+
+/// One gauge: label, value, and either a bar, a heat mark, or extra parts.
 #[derive(Clone)]
 struct Gauge {
     label: String,
@@ -7891,11 +8000,15 @@ struct Gauge {
     ink: BarInk,
     /// The bar's percent of full scale. The coolest temperatures shed first.
     heat: f64,
+    style: GaugeStyle,
+    parts: Vec<GaugePart>,
+    mark: Option<char>,
 }
 
 /// A group of gauges, or a one-row note when its source has nothing.
 #[derive(Default)]
 struct GaugeGroup {
+    #[allow(dead_code)]
     gauges: Vec<Gauge>,
     note: Option<(&'static str, String)>,
 }
@@ -7908,11 +8021,13 @@ impl GaugeGroup {
         }
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.gauges.is_empty() && self.note.is_none()
     }
 
     /// Rows the group takes: two gauges a row.
+    #[allow(dead_code)]
     fn rows(&self) -> u16 {
         if self.note.is_some() {
             return 1;
@@ -7921,6 +8036,7 @@ impl GaugeGroup {
     }
 
     /// Rows with the blank row above it; none when empty.
+    #[allow(dead_code)]
     fn block(&self) -> u16 {
         if self.is_empty() { 0 } else { 1 + self.rows() }
     }
@@ -7935,26 +8051,20 @@ struct GaugeBox {
     cell: BarCell,
 }
 
-/// The right-hand block (#165): gauges in columns. Each label is two spaces
-/// from its own value (`GPU  V100  8 %`, `coolant  40 C`). The bar starts
-/// one cell after that value and runs to the column edge, so a short row
-/// grows into the padding the old fixed field left empty. One GPU (and more
-/// than four) keeps the two-column groups with a blank row between work,
-/// temperatures and fans. Short of rows the fans go first, then the coolest
-/// temperatures; the work gauges stay.
-///
-/// Two to four cards keep every temperature and every fan. Their per-card
-/// GPU and VRAM rows, one POWER row and the other gauges fill the smallest
-/// number of columns that holds them (up to four). Summed rows are the last
-/// resort: more than four cards, per-card rows that do not fit in two
-/// columns, or a band that cannot hold the list in four columns.
-///
-/// A further pair of work gauges (MEMBW beside SWAP, CPU W beside POWER,
-/// CLK, PCIE in the #163 design) is two more entries in [`work_gauges`].
+/// The right-hand block: three bands, GPUs then heat then performance.
+/// Heat is a coloured number plus one eighths-block mark. Bars stay on
+/// util, VRAM, memory, power, disk, network, IO PSI, load, and activity.
+/// Values in a column share a start cell, padded from that column's longest
+/// label. Short of columns the fans go first, then the coolest temperatures.
 fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, height: u16) {
-    let mut temps = temp_gauges(grid, model);
-    let mut fans = fan_gauges(model);
     let cell = gauge_glyph(model.chart_glyphs, model.bar_segments);
+    let notes = gauge_notes(model);
+    let inner = height.saturating_sub(u16::try_from(notes.len()).unwrap_or(u16::MAX));
+    if inner == 0 {
+        return;
+    }
+    let work = work_band(model);
+    let (gpu, heat) = fit_heat_bands(grid, model, work.len(), inner);
     let band = GaugeBox {
         top,
         x,
@@ -7962,19 +8072,11 @@ fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, 
         height,
         cell,
     };
-    if let Some(cols) = card_column_count(model.gpus.len(), height, &temps, &fans) {
-        draw_card_columns(grid, model, &temps, &fans, cols, band);
-        return;
-    }
-    let work = GaugeGroup {
-        gauges: work_gauges(model),
-        note: None,
-    };
-    shed_gauges(work.rows(), &mut temps, &mut fans, height);
-    draw_grouped(grid, &work, &temps, &fans, band);
+    draw_bands(grid, &gpu, &heat, &work, &notes, band);
 }
 
-/// Columns for `n` cards, or `None` when the summed list is the fallback.
+/// Columns a band of `n` items occupies at `height`, capped at four.
+#[cfg(test)]
 fn card_column_count(
     n: usize,
     height: u16,
@@ -7989,89 +8091,44 @@ fn card_column_count(
     if inner == 0 {
         return None;
     }
-    let per_card = 2 * n + 1;
-    // Per-card rows may flow into a second column. Past that, sum them.
-    if per_card > usize::from(inner) * 2 {
-        return None;
-    }
-    let items = per_card + HOST_GAUGES + temps.gauges.len() + fans.gauges.len();
-    (1..=4).find(|&cols| items <= cols * usize::from(inner))
+    let gpu = n;
+    let heat = temps.gauges.len() + fans.gauges.len();
+    let work = 2 * n + 1 + HOST_GAUGES;
+    let cols = cols_for(gpu, inner) + cols_for(heat, inner) + cols_for(work, inner);
+    (cols > 0 && cols <= GAUGE_MAX_COLS).then_some(cols)
 }
 
-/// Per-card GPU and VRAM, one POWER, then the other work gauges, temps and
-/// fans. Column-major into `cols` columns of `inner` rows.
-fn draw_card_columns(
-    grid: &mut Grid,
-    model: &TtyModel,
-    temps: &GaugeGroup,
-    fans: &GaugeGroup,
-    cols: usize,
-    GaugeBox {
-        top,
-        x,
-        right,
-        height,
-        cell,
-    }: GaugeBox,
-) {
-    let notes = u16::from(temps.note.is_some()) + u16::from(fans.note.is_some());
-    let inner = height.saturating_sub(notes);
-    if inner == 0 {
-        return;
+fn gauge_notes(model: &TtyModel) -> Vec<(&'static str, String)> {
+    let mut notes = Vec::new();
+    if let Some(note) = temp_gauges_note(model) {
+        notes.push(note);
     }
-    let items = per_card_items(model, temps, fans);
-    let mut columns: Vec<Vec<Gauge>> = (0..cols).map(|_| Vec::new()).collect();
-    for (i, gauge) in items.into_iter().enumerate() {
-        let col = i / usize::from(inner);
-        if col < columns.len() {
-            columns[col].push(gauge);
-        }
+    if let Some(note) = fan_gauges(model).note {
+        notes.push(note);
     }
-    let mut text_w: Vec<u16> = columns
-        .iter()
-        .map(|col| column_text_w(col.iter().map(|g| (g.label.as_str(), g.value.as_str()))))
-        .collect();
-    let (xs, bar, _) = fit_columns(x, right, &mut text_w);
-    for (c, col) in columns.iter().enumerate() {
-        for (r, gauge) in col.iter().enumerate() {
-            let row = top.saturating_add(u16::try_from(r).unwrap_or(u16::MAX));
-            if row >= top.saturating_add(inner) {
-                break;
-            }
-            draw_gauge(
-                grid,
-                gauge,
-                gauge.value.as_str(),
-                row,
-                gauge_place(xs[c], text_w[c], bar, &gauge.label, &gauge.value),
-                cell,
-            );
+    notes
+}
+
+fn temp_gauges_note(model: &TtyModel) -> Option<(&'static str, String)> {
+    match &model.temps {
+        Some(panel) if panel.groups.is_empty() => {
+            Some(("TEMPS", "no temperature inputs found".into()))
         }
-    }
-    let mut note_row = top.saturating_add(inner);
-    let end = top.saturating_add(height);
-    for group in [temps, fans] {
-        if let Some((name, text)) = &group.note {
-            if note_row < end {
-                draw_gauge_note(grid, x, note_row, right, name, text);
-            }
-            note_row = note_row.saturating_add(1);
-        }
+        _ => None,
     }
 }
 
-fn per_card_items(model: &TtyModel, temps: &GaugeGroup, fans: &GaugeGroup) -> Vec<Gauge> {
+fn work_band(model: &TtyModel) -> Vec<Gauge> {
     let starting = model.state == WatchState::Starting;
+    let n = model.gpus.len();
+    if !(2..=4).contains(&n) {
+        return work_gauges(model);
+    }
     let mut out = Vec::new();
     for gpu in &model.gpus {
-        let value = with_fan(
-            pct_value(gpu.util_pct),
-            gpu.fan_rpm,
-            usize::from(GAUGE_VALUE_W),
-        );
         out.push(level_gauge(
             &card_label("GPU", &gpu.label),
-            value,
+            pct_value(gpu.util_pct),
             gpu.util_pct,
             starting,
         ));
@@ -8094,18 +8151,266 @@ fn per_card_items(model: &TtyModel, temps: &GaugeGroup, fans: &GaugeGroup) -> Ve
         .collect();
     debug_assert_eq!(host.len(), HOST_GAUGES);
     out.extend(host);
-    out.extend(temps.gauges.iter().cloned());
-    out.extend(fans.gauges.iter().cloned());
     out
 }
 
-/// The one-GPU grid: two columns, row-major within each group, a blank row
-/// between groups. Each label is two spaces from its value.
-fn draw_grouped(
+fn gpu_band(grid: &Grid, model: &TtyModel, degree: bool) -> Vec<Gauge> {
+    let n = model.gpus.len();
+    if (1..=4).contains(&n) {
+        model
+            .gpus
+            .iter()
+            .enumerate()
+            .map(|(i, gpu)| gpu_card_line(i, gpu, degree))
+            .collect()
+    } else {
+        gpu_temp_lines(grid, model, degree)
+    }
+}
+
+fn gpu_temp_lines(grid: &Grid, model: &TtyModel, degree: bool) -> Vec<Gauge> {
+    let Some(panel) = &model.temps else {
+        return Vec::new();
+    };
+    panel
+        .groups
+        .iter()
+        .filter(|group| is_gpu_heat_name(&group.name))
+        .filter_map(|group| {
+            Some(heat_temp_gauge(
+                &group.name,
+                nearest_limit(group)?,
+                degree,
+                grid,
+            ))
+        })
+        .collect()
+}
+
+fn heat_temps(grid: &Grid, model: &TtyModel, degree: bool) -> Vec<Gauge> {
+    let Some(panel) = &model.temps else {
+        return Vec::new();
+    };
+    panel
+        .groups
+        .iter()
+        .filter(|group| !is_gpu_heat_name(&group.name))
+        .filter_map(|group| {
+            Some(heat_temp_gauge(
+                abbreviate(&group.name),
+                nearest_limit(group)?,
+                degree,
+                grid,
+            ))
+        })
+        .collect()
+}
+
+fn heat_fans(model: &TtyModel) -> Vec<Gauge> {
+    match &model.fans {
+        Some(panel) if panel.present => panel.fans.iter().map(heat_fan_gauge).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn fit_heat_bands(
+    grid: &Grid,
+    model: &TtyModel,
+    work_n: usize,
+    inner: u16,
+) -> (Vec<Gauge>, Vec<Gauge>) {
+    let pack = |degree: bool| {
+        let gpu = gpu_band(grid, model, degree);
+        let mut temps = heat_temps(grid, model, degree);
+        let mut fans = heat_fans(model);
+        shed_fans_then_temps(&mut fans, &mut temps, gpu.len(), work_n, inner);
+        let mut heat = temps;
+        heat.extend(fans);
+        (gpu, heat)
+    };
+    let (gpu, heat) = pack(true);
+    let cols = cols_for(gpu.len(), inner) + cols_for(heat.len(), inner) + cols_for(work_n, inner);
+    if cols > GAUGE_MAX_COLS {
+        pack(false)
+    } else {
+        (gpu, heat)
+    }
+}
+
+fn shed_fans_then_temps(
+    fans: &mut Vec<Gauge>,
+    temps: &mut Vec<Gauge>,
+    gpu_n: usize,
+    work_n: usize,
+    inner: u16,
+) {
+    let cols = |t: usize, f: usize| {
+        cols_for(gpu_n, inner) + cols_for(t + f, inner) + cols_for(work_n, inner)
+    };
+    while cols(temps.len(), fans.len()) > GAUGE_MAX_COLS && !fans.is_empty() {
+        fans.pop();
+    }
+    while cols(temps.len(), fans.len()) > GAUGE_MAX_COLS && !temps.is_empty() {
+        let coolest = temps
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.heat.total_cmp(&b.1.heat))
+            .map(|(i, _)| i);
+        match coolest {
+            Some(i) => {
+                temps.remove(i);
+            }
+            None => break,
+        }
+    }
+}
+
+fn gpu_card_line(index: usize, gpu: &TtyGpu, degree: bool) -> Gauge {
+    let label = format!("GPU{index} {}", tty_card(&gpu.label));
+    let mut parts = Vec::new();
+    let mut value = String::new();
+    let mut value_fg = C16::BrightBlack;
+    let mut value_exact = None;
+    let mut frac = None;
+    let mut ink = level_ink(None);
+    let mut heat = 0.0;
+    for tenths in [
+        gpu.temp_c.map(|c| c * 10),
+        gpu.mem_temp_c.map(|c| c * 10),
+        gpu.hotspot_c.map(|c| c * 10),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (warn, crit) = kind_limits(Kind::Gpu);
+        let pct = temp_percent(tenths, warn, crit);
+        let fill = (pct > 0.0).then_some((pct / 100.0).min(1.0));
+        let part_ink = level_ink(Some(pct));
+        let fg = heat_fg(fill.or(Some(0.0)), part_ink);
+        let text = format_heat_temp((f64::from(tenths) / 10.0).round() as i32, degree);
+        if value.is_empty() {
+            value = text;
+            value_fg = fg;
+            frac = fill;
+            ink = part_ink;
+            heat = pct;
+            value_exact = (pct > 0.0).then_some(act_color(pct as f32));
+        } else {
+            parts.push(GaugePart {
+                text: format!(" {text}"),
+                fg,
+                exact: (pct > 0.0).then_some(act_color(pct as f32)),
+            });
+        }
+    }
+    if let Some(rpm) = gpu.fan_rpm {
+        let compact = fan_compact(rpm);
+        let fg = shown_fg(&compact);
+        parts.push(GaugePart {
+            text: format!(" fan {compact}"),
+            fg,
+            exact: None,
+        });
+    }
+    if value.is_empty() {
+        value = "--".to_string();
+        value_fg = C16::BrightBlack;
+    }
+    Gauge {
+        label,
+        label_fg: C16::White,
+        value,
+        value_fg,
+        value_exact,
+        frac,
+        ink,
+        heat,
+        style: GaugeStyle::Line,
+        parts,
+        mark: None,
+    }
+}
+
+fn heat_temp_gauge(name: &str, item: &TempItem, degree: bool, grid: &Grid) -> Gauge {
+    let pct = temp_item_percent(item);
+    let fill = Some((pct / 100.0).clamp(0.0, 1.0));
+    let ink = level_ink(Some(pct));
+    let c = (f64::from(item.tenths) / 10.0).round() as i32;
+    Gauge {
+        label: name.to_string(),
+        label_fg: C16::White,
+        value: format_heat_temp(c, degree),
+        value_fg: heat_fg(fill, ink),
+        value_exact: temp_exact(grid, item).or_else(|| Some(act_color(pct as f32))),
+        frac: fill.filter(|f| *f > 0.0),
+        ink,
+        heat: pct,
+        style: GaugeStyle::Heat,
+        parts: Vec::new(),
+        mark: Some(heat_mark(fill)),
+    }
+}
+
+fn heat_fan_gauge(fan: &FanReading) -> Gauge {
+    let stalled = fan_stalled(fan);
+    let frac = fan.pwm.map(|pwm| f64::from(pwm) / 255.0);
+    let value = fan.rpm.map_or_else(|| "--".to_owned(), fan_compact);
+    let ink = if stalled {
+        BarInk::Fixed(C16::Red, C16::Red)
+    } else {
+        level_ink(frac.map(|f| f * 100.0))
+    };
+    let value_fg = if stalled {
+        C16::Red
+    } else {
+        heat_fg(frac, ink)
+    };
+    Gauge {
+        label: fan.label.clone(),
+        label_fg: if stalled { C16::Red } else { C16::White },
+        value,
+        value_fg,
+        value_exact: None,
+        frac: frac.filter(|f| *f > 0.0),
+        ink,
+        heat: frac.map_or(0.0, |f| f * 100.0),
+        style: GaugeStyle::Heat,
+        parts: Vec::new(),
+        mark: Some(heat_mark(frac)),
+    }
+}
+
+struct BandCol {
+    gauges: Vec<Gauge>,
+    bars: bool,
+}
+
+fn split_band(items: &[Gauge], inner: u16, bars: bool) -> Vec<BandCol> {
+    if items.is_empty() || inner == 0 {
+        return Vec::new();
+    }
+    let cols = cols_for(items.len(), inner).max(1);
+    let mut out: Vec<BandCol> = (0..cols)
+        .map(|_| BandCol {
+            gauges: Vec::new(),
+            bars,
+        })
+        .collect();
+    for (i, gauge) in items.iter().cloned().enumerate() {
+        let col = i / usize::from(inner);
+        if col < out.len() {
+            out[col].gauges.push(gauge);
+        }
+    }
+    out
+}
+
+fn draw_bands(
     grid: &mut Grid,
-    work: &GaugeGroup,
-    temps: &GaugeGroup,
-    fans: &GaugeGroup,
+    gpu: &[Gauge],
+    heat: &[Gauge],
+    work: &[Gauge],
+    notes: &[(&'static str, String)],
     GaugeBox {
         top,
         x,
@@ -8114,63 +8419,169 @@ fn draw_grouped(
         cell,
     }: GaugeBox,
 ) {
-    let groups = [work, temps, fans];
-    let mut members: [Vec<(usize, usize)>; 2] = [Vec::new(), Vec::new()];
-    for (gi, group) in groups.iter().enumerate() {
-        for (ii, gauge) in group.gauges.iter().enumerate() {
-            if gauge.label.is_empty() && gauge.value.is_empty() {
-                continue;
-            }
-            members[ii % 2].push((gi, ii));
-        }
+    let notes_n = u16::try_from(notes.len()).unwrap_or(u16::MAX);
+    let inner = height.saturating_sub(notes_n);
+    if inner == 0 {
+        return;
     }
-    let mut text_w: Vec<u16> = members
+    let mut columns = Vec::new();
+    columns.extend(split_band(gpu, inner, false));
+    columns.extend(split_band(heat, inner, false));
+    columns.extend(split_band(work, inner, true));
+    if columns.is_empty() {
+        return;
+    }
+    let bars: Vec<bool> = columns.iter().map(|col| col.bars).collect();
+    let mut text_w: Vec<u16> = columns
         .iter()
-        .map(|col| {
-            column_text_w(col.iter().map(|(gi, ii)| {
-                let gauge = &groups[*gi].gauges[*ii];
-                (gauge.label.as_str(), gauge.value.as_str())
-            }))
-        })
+        .map(|col| aligned_text_w(&col.gauges))
         .collect();
-    let (xs, bar, _) = fit_columns(x, right, &mut text_w);
-    let end = top.saturating_add(height);
-    let mut row = top;
-    for (gi, group) in groups.iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        if gi > 0 {
-            row = row.saturating_add(1);
-        }
-        if let Some((name, text)) = &group.note {
-            debug_assert!(row < end, "gauge note at row {row} past the band end {end}");
-            if row < end {
-                draw_gauge_note(grid, x, row, right, name, text);
-            }
-        } else {
-            for (ii, gauge) in group.gauges.iter().enumerate() {
-                let at = row.saturating_add(u16::try_from(ii / 2).unwrap_or(u16::MAX));
-                debug_assert!(at < end, "gauge at row {at} past the band end {end}");
-                if at >= end {
-                    break;
+    let mut laid = fit_mixed_columns(x, right, &mut text_w, &bars);
+    if laid.1 == 0 {
+        let mut dropped = false;
+        for col in &mut columns {
+            for gauge in &mut col.gauges {
+                if gauge.value.contains('°') || gauge.parts.iter().any(|p| p.text.contains('°')) {
+                    gauge.value = gauge.value.replace('°', "");
+                    for part in &mut gauge.parts {
+                        part.text = part.text.replace('°', "");
+                    }
+                    dropped = true;
                 }
-                if gauge.label.is_empty() && gauge.value.is_empty() {
-                    continue;
-                }
-                let side = ii % 2;
-                draw_gauge(
-                    grid,
-                    gauge,
-                    gauge.value.as_str(),
-                    at,
-                    gauge_place(xs[side], text_w[side], bar, &gauge.label, &gauge.value),
-                    cell,
-                );
             }
         }
-        row = row.saturating_add(group.rows());
+        if dropped {
+            text_w = columns
+                .iter()
+                .map(|col| aligned_text_w(&col.gauges))
+                .collect();
+            laid = fit_mixed_columns(x, right, &mut text_w, &bars);
+        }
     }
+    let (xs, bar, _) = laid;
+    for (c, col) in columns.iter().enumerate() {
+        let label_w = col
+            .gauges
+            .iter()
+            .map(|g| u16::try_from(g.label.chars().count()).unwrap_or(u16::MAX))
+            .max()
+            .unwrap_or(0);
+        for (r, gauge) in col.gauges.iter().enumerate() {
+            let row = top.saturating_add(u16::try_from(r).unwrap_or(u16::MAX));
+            if row >= top.saturating_add(inner) {
+                break;
+            }
+            let place = aligned_place(xs[c], label_w, text_w[c], bar, gauge);
+            draw_gauge(grid, gauge, gauge.value.as_str(), row, place, cell);
+        }
+    }
+    let mut note_row = top.saturating_add(inner);
+    let end = top.saturating_add(height);
+    for (name, text) in notes {
+        if note_row < end {
+            draw_gauge_note(grid, x, note_row, right, name, text);
+        }
+        note_row = note_row.saturating_add(1);
+    }
+}
+
+fn aligned_place(x: u16, label_w: u16, text_w: u16, bar: u16, gauge: &Gauge) -> GaugePlace {
+    let value_x = x.saturating_add(label_w).saturating_add(GAUGE_VALUE_GAP);
+    let span = value_span(gauge);
+    let col_end = x
+        .saturating_add(text_w)
+        .saturating_add(if gauge.style == GaugeStyle::Bar {
+            bar
+        } else {
+            0
+        });
+    let bar_x = if gauge.style == GaugeStyle::Bar {
+        value_x.saturating_add(span).saturating_add(1).min(col_end)
+    } else {
+        value_x.saturating_add(span).min(col_end)
+    };
+    GaugePlace {
+        x,
+        label_w: u16::try_from(gauge.label.chars().count()).unwrap_or(u16::MAX),
+        value_x,
+        bar_x,
+        bar: col_end.saturating_sub(bar_x),
+    }
+}
+
+fn fit_mixed_columns(
+    x: u16,
+    right: u16,
+    text_w: &mut [u16],
+    bars: &[bool],
+) -> (Vec<u16>, u16, u16) {
+    let mut laid = mixed_column_layouts(x, right, text_w, bars);
+    let mut guard = text_w.iter().copied().fold(0u16, u16::saturating_add);
+    let wants_bar = bars.iter().any(|b| *b);
+    while laid.1 == 0 && wants_bar && guard > 0 {
+        let Some(widest) = text_w
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| bars.get(*i).copied().unwrap_or(false))
+            .map(|(_, w)| w)
+            .max_by_key(|w| **w)
+        else {
+            break;
+        };
+        if *widest <= 1 {
+            break;
+        }
+        *widest -= 1;
+        guard -= 1;
+        laid = mixed_column_layouts(x, right, text_w, bars);
+    }
+    laid
+}
+
+fn mixed_column_layouts(x: u16, right: u16, text_w: &[u16], bars: &[bool]) -> (Vec<u16>, u16, u16) {
+    let n = text_w.len();
+    if n == 0 {
+        return (Vec::new(), 0, GAUGE_GAP);
+    }
+    let n_u = u16::try_from(n).unwrap_or(u16::MAX);
+    let n_bars = u16::try_from(bars.iter().filter(|b| **b).count()).unwrap_or(0);
+    let avail = right.saturating_sub(x).saturating_add(1);
+    let text_sum: u16 = text_w.iter().copied().fold(0, u16::saturating_add);
+    let mut gap = GAUGE_GAP;
+    let mut margin = GAUGE_MARGIN;
+    let bar_for = |gap: u16, margin: u16| -> u16 {
+        if n_bars == 0 {
+            return 0;
+        }
+        let gaps = gap.saturating_mul(n_u.saturating_sub(1));
+        avail.saturating_sub(text_sum.saturating_add(gaps).saturating_add(margin)) / n_bars
+    };
+    let mut bar = bar_for(gap, margin);
+    if bar < 4 && gap > 2 {
+        gap = 2;
+        bar = bar_for(gap, margin);
+    }
+    if bar < 2 && gap > 1 {
+        gap = 1;
+        bar = bar_for(gap, margin);
+    }
+    if bar == 0 && margin > 0 {
+        margin = 0;
+        bar = bar_for(gap, margin);
+    }
+    let mut xs = Vec::with_capacity(n);
+    let mut at = x;
+    for (i, w) in text_w.iter().copied().enumerate() {
+        xs.push(at);
+        at = at.saturating_add(w);
+        if bars.get(i).copied().unwrap_or(false) {
+            at = at.saturating_add(bar);
+        }
+        if i + 1 < n {
+            at = at.saturating_add(gap);
+        }
+    }
+    (xs, bar, gap)
 }
 
 fn draw_gauge_note(grid: &mut Grid, x: u16, row: u16, right: u16, name: &str, text: &str) {
@@ -8182,6 +8593,7 @@ fn draw_gauge_note(grid: &mut Grid, x: u16, row: u16, right: u16, name: &str, te
 
 /// Drop fans from the end, then the coolest temperatures, until the groups
 /// fit `height` rows. The work gauges are never dropped.
+#[cfg(test)]
 fn shed_gauges(work: u16, temps: &mut GaugeGroup, fans: &mut GaugeGroup, height: u16) {
     let need = |t: &GaugeGroup, f: &GaugeGroup| work + t.block() + f.block();
     while need(temps, fans) > height && !fans.is_empty() {
@@ -8226,19 +8638,39 @@ fn draw_gauge(
         C16::Black,
         usize::from(place.label_w),
     );
-    let at = place.x + place.label_w + GAUGE_VALUE_GAP;
-    let room = usize::from(place.bar_x.saturating_sub(at).saturating_sub(1));
+    let at = place.value_x;
+    let gap = if gauge.style == GaugeStyle::Bar { 1 } else { 0 };
+    let room = usize::from(place.bar_x.saturating_sub(at).saturating_sub(gap));
     paint_fit(grid, at, row, shown, gauge.value_fg, C16::Black, room);
-    if let Some(rgb) = gauge.value_exact.filter(|_| grid.records_exact()) {
-        let raw = gauge.value.chars().count();
-        let shown_len = shown.chars().count();
-        let skip = shown_len.saturating_sub(raw);
-        let start = at.saturating_add(u16::try_from(skip).unwrap_or(0));
-        let painted = shown_len.min(room);
-        let end = at.saturating_add(u16::try_from(painted).unwrap_or(0));
-        for col in start..end {
-            grid.set_exact_fg(col, row, rgb);
+    paint_exact_span(grid, at, row, shown, gauge.value_exact);
+    let end = place.bar_x;
+    let mut cursor = at.saturating_add(u16::try_from(shown.chars().count().min(room)).unwrap_or(0));
+    for part in &gauge.parts {
+        if cursor >= end {
+            break;
         }
+        let n = part.text.chars().count();
+        let room = usize::from(end.saturating_sub(cursor)).min(n);
+        paint_fit(grid, cursor, row, &part.text, part.fg, C16::Black, room);
+        paint_exact_span(
+            grid,
+            cursor,
+            row,
+            &part.text.chars().take(room).collect::<String>(),
+            part.exact,
+        );
+        cursor = cursor.saturating_add(u16::try_from(room).unwrap_or(0));
+    }
+    if let Some(mark) = gauge.mark
+        && cursor < end
+    {
+        paint(grid, cursor, row, mark, gauge.value_fg, C16::Black);
+        if let Some(rgb) = gauge.value_exact.filter(|_| grid.records_exact()) {
+            grid.set_exact_fg(cursor, row, rgb);
+        }
+    }
+    if gauge.style != GaugeStyle::Bar {
+        return;
     }
     draw_h_bar(
         grid,
@@ -8264,6 +8696,16 @@ fn draw_gauge(
     }
 }
 
+fn paint_exact_span(grid: &mut Grid, at: u16, row: u16, text: &str, rgb: Option<Rgb>) {
+    let Some(rgb) = rgb.filter(|_| grid.records_exact()) else {
+        return;
+    };
+    let n = u16::try_from(text.chars().count()).unwrap_or(0);
+    for col in at..at.saturating_add(n) {
+        grid.set_exact_fg(col, row, rgb);
+    }
+}
+
 fn shown_fg(value: &str) -> C16 {
     if value == "--" || value.is_empty() {
         C16::BrightBlack
@@ -8286,6 +8728,9 @@ fn level_gauge(label: &str, value: String, pct: Option<f64>, blank: bool) -> Gau
         frac: pct.and_then(|p| (p > 0.0).then_some((p / 100.0).min(1.0))),
         ink: level_ink(pct),
         heat: pct.unwrap_or(0.0),
+        style: GaugeStyle::Bar,
+        parts: Vec::new(),
+        mark: None,
     }
 }
 
@@ -8300,6 +8745,9 @@ fn frac_gauge(label: &str, value: String, frac: Option<f64>) -> Gauge {
         frac,
         ink: level_ink(frac.map(|f| f * 100.0)),
         heat: frac.map_or(0.0, |f| f * 100.0),
+        style: GaugeStyle::Bar,
+        parts: Vec::new(),
+        mark: None,
     }
 }
 
@@ -8387,26 +8835,6 @@ fn capacity_text(used: Option<f64>, total: Option<f64>) -> String {
     }
 }
 
-/// One gauge per TEMPS row, labelled with the row's name: the reading
-/// nearest its own limit (#177). Nothing with `[temps]` off; a note when
-/// there is no input.
-fn temp_gauges(grid: &Grid, model: &TtyModel) -> GaugeGroup {
-    let Some(panel) = &model.temps else {
-        return GaugeGroup::default();
-    };
-    if panel.groups.is_empty() {
-        return GaugeGroup::noted("TEMPS", "no temperature inputs found");
-    }
-    GaugeGroup {
-        gauges: panel
-            .groups
-            .iter()
-            .filter_map(|group| Some(temp_gauge(grid, &group.name, nearest_limit(group)?)))
-            .collect(),
-        note: None,
-    }
-}
-
 /// The group's reading with the highest gauge percent, each against its
 /// own thresholds ([`TEMP_FALLBACK`] without), so a sensor near a low
 /// limit is not hidden behind a hotter one with a higher limit. Ties go to
@@ -8425,18 +8853,9 @@ fn temp_item_percent(item: &TempItem) -> f64 {
     temp_percent(item.tenths, warn, crit)
 }
 
+#[cfg(test)]
 fn temp_gauge(grid: &Grid, name: &str, item: &TempItem) -> Gauge {
-    let pct = temp_item_percent(item);
-    Gauge {
-        label: name.to_string(),
-        label_fg: C16::White,
-        value: format!("{} C", celsius(item.tenths)),
-        value_fg: level_fg(item.level),
-        value_exact: temp_exact(grid, item),
-        frac: (pct > 0.0).then_some(pct / 100.0),
-        ink: level_ink(Some(pct)),
-        heat: pct,
-    }
+    heat_temp_gauge(abbreviate(name), item, true, grid)
 }
 
 /// Percent of a temperature gauge: 0 at 20 °C, 100 at the sensor's warning
@@ -8500,6 +8919,9 @@ fn fan_gauge(fan: &FanReading) -> Gauge {
         frac: frac.filter(|f| *f > 0.0),
         ink,
         heat: frac.map_or(0.0, |f| f * 100.0),
+        style: GaugeStyle::Bar,
+        parts: Vec::new(),
+        mark: None,
     }
 }
 
@@ -9471,16 +9893,18 @@ mod tests {
             note: None,
         };
         assert_eq!(card_column_count(1, 14, &temps, &fans), None);
-        assert_eq!(card_column_count(2, 14, &temps, &fans), Some(2));
-        assert_eq!(card_column_count(3, 14, &temps, &fans), Some(2));
-        assert_eq!(card_column_count(4, 14, &temps, &fans), Some(3));
+        // GPU + heat + work bands, one column each at height 14.
+        assert_eq!(card_column_count(2, 14, &temps, &fans), Some(3));
+        // Three cards: work needs a second column (16 items).
+        assert_eq!(card_column_count(3, 14, &temps, &fans), Some(4));
+        assert_eq!(card_column_count(4, 14, &temps, &fans), Some(4));
         assert_eq!(card_column_count(5, 14, &temps, &fans), None);
-        // Nine per-card rows do not fit in two columns of four.
+        // Four cards at height 4: work and heat overflow four columns.
         assert_eq!(card_column_count(4, 4, &temps, &fans), None);
         let noted = GaugeGroup::noted("TEMPS", "no temperature inputs found");
         let quiet = GaugeGroup::default();
-        // The note takes a row off the bottom. Fourteen items fit one column.
-        assert_eq!(card_column_count(2, 20, &noted, &quiet), Some(1));
+        // Note takes a row; GPU (2) and work (14) still fit two columns of 19.
+        assert_eq!(card_column_count(2, 20, &noted, &quiet), Some(2));
     }
 
     #[test]
@@ -10205,6 +10629,6 @@ mod tests {
         shed_gauges(6, &mut temps, &mut fans, 8);
         let left: Vec<&str> = temps.gauges.iter().map(|g| g.label.as_str()).collect();
         assert_eq!(left, ["near", "mid"]);
-        assert_eq!(temps.gauges[0].value, "60 C");
+        assert_eq!(temps.gauges[0].value, "60°");
     }
 }

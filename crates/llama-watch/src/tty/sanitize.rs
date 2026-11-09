@@ -166,6 +166,8 @@ fn typography(c: char) -> Option<char> {
         '\u{2190}' => '<',
         '\u{2191}' => '^',
         '\u{2193}' => 'v',
+        // Degree sign: Latin-1, in the console fonts, used on heat numbers.
+        '\u{b0}' => c,
         // Multiplication sign.
         '\u{d7}' => 'x',
         // NBSP, figure space, thin space, narrow NBSP: all become a plain

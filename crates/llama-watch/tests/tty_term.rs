@@ -27,7 +27,7 @@ fn paint(term: &mut Term<Vec<u8>>, grid: &Grid, now: Instant) -> Vec<u8> {
 /// first eleven, for when llama-hack-12x24 failed to load.
 const EURLATGR: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}',
+    '\u{fffd}', '°',
 ];
 
 /// Lower eighths U+2581–2587 other than `▄`. Verified present in
