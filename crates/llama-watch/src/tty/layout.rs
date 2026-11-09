@@ -1926,21 +1926,16 @@ fn fits_rows(need: usize, room: u16) -> bool {
     }
 }
 
-/// Gauge rows for `n` cards. `reserved` is the temps and fans blocks, which
-/// stay ahead of a per-card split: VRAM collapses first, then the GPU rows,
-/// and only a combined meter list may crowd those blocks.
-fn gauge_card_split(n: usize, height: u16, reserved: u16) -> CardSplit {
-    if n < 2 {
-        return CardSplit::Combined;
-    }
-    let room = height.saturating_sub(reserved);
-    if fits_rows(4 + 2 * n, room) {
-        CardSplit::Both
-    } else if fits_rows(5 + n, room) {
-        CardSplit::GpuOnly
-    } else {
-        CardSplit::Combined
-    }
+/// Work-gauge rows for `n` cards. Combined is the twelve gauges in
+/// [`work_gauges`]. The others match [`card_work_gauges`]: the fixed pairs,
+/// then one row per card for each split kind.
+fn split_work_rows(n: usize, split: CardSplit) -> u16 {
+    let rows = match split {
+        CardSplit::Combined => 6,
+        CardSplit::GpuOnly => 5usize.saturating_add(n),
+        CardSplit::Both => 4usize.saturating_add(n.saturating_mul(2)),
+    };
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Left-column meters that fit above the health rule.
@@ -7863,11 +7858,14 @@ struct Gauge {
     heat: f64,
 }
 
-/// A group of gauges, or a one-row note when its source has nothing.
+/// A group of gauges, a one-row note when its source has nothing, or one
+/// folded line (the compact fan row).
 #[derive(Default)]
 struct GaugeGroup {
     gauges: Vec<Gauge>,
     note: Option<(&'static str, String)>,
+    /// One full-width line, drawn instead of the gauges. The folded fans.
+    line: Option<Vec<FanSpan>>,
 }
 
 impl GaugeGroup {
@@ -7875,16 +7873,17 @@ impl GaugeGroup {
         Self {
             gauges: Vec::new(),
             note: Some((name, text.into())),
+            line: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.gauges.is_empty() && self.note.is_none()
+        self.gauges.is_empty() && self.note.is_none() && self.line.is_none()
     }
 
-    /// Rows the group takes: two gauges a row.
+    /// Rows the group takes: two gauges a row, or one row for a note or line.
     fn rows(&self) -> u16 {
-        if self.note.is_some() {
+        if self.note.is_some() || self.line.is_some() {
             return 1;
         }
         u16::try_from(self.gauges.len().div_ceil(2)).unwrap_or(u16::MAX)
@@ -7900,15 +7899,30 @@ impl GaugeGroup {
 /// is its label (left, [`GAUGE_LABEL_W`] cells), its value (right-aligned
 /// in [`GAUGE_VALUE_W`]) and a bar of one length that starts at the same
 /// column within its column. Three groups with a blank row between: the
-/// work gauges, one per TEMPS row, one per fan. Short of rows the fans go
-/// first, then the coolest temperatures; the work gauges always stay.
+/// work gauges, one per TEMPS row, one per fan.
+///
+/// One GPU keeps today's meters. Short of rows the fans go first, then the
+/// coolest temperatures; the work gauges always stay.
+///
+/// Two or more GPUs keep a row per card for GPU and for VRAM (DER-674).
+/// Short of rows those rows win: the Wi-Fi gauge goes, then the NIC gauge,
+/// then the fan gauges fold into one line, and only then VRAM and GPU sum
+/// back into the single rows.
 ///
 /// A further pair of work gauges (MEMBW beside SWAP, CPU W beside POWER,
 /// CLK, PCIE in the #163 design) is two more entries in [`work_gauges`].
 fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, height: u16) {
     let mut temps = temp_gauges(grid, model);
     let mut fans = fan_gauges(model);
-    let split = gauge_card_split(model.gpus.len(), height, temps.block() + fans.block());
+    let n = model.gpus.len();
+    let width = usize::from(right.saturating_sub(x).saturating_add(1));
+    // One GPU, or none, never spends a temperature or a fan row on a card
+    // label. Its frame stays the combined meters, byte for byte.
+    let split = if n < 2 {
+        CardSplit::Combined
+    } else {
+        fit_card_rows(n, height, width, model, &mut temps, &mut fans)
+    };
     let cols = if split == CardSplit::Combined {
         gauge_cols(x, right)
     } else {
@@ -7922,8 +7936,12 @@ fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, 
             card_work_gauges(model, split)
         },
         note: None,
+        line: None,
     };
-    shed_gauges(work.rows(), &mut temps, &mut fans, height);
+    debug_assert_eq!(work.rows(), split_work_rows(n, split));
+    if n < 2 {
+        shed_gauges(work.rows(), &mut temps, &mut fans, height);
+    }
     let end = top.saturating_add(height);
     let mut row = top;
     for (i, group) in [&work, &temps, &fans].into_iter().enumerate() {
@@ -7939,10 +7957,14 @@ fn draw_gauges(grid: &mut Grid, model: &TtyModel, top: u16, x: u16, right: u16, 
 }
 
 /// Drop fans from the end, then the coolest temperatures, until the groups
-/// fit `height` rows. The work gauges are never dropped.
+/// fit `height` rows. A folded fan line goes in one step. The work gauges
+/// are never dropped.
 fn shed_gauges(work: u16, temps: &mut GaugeGroup, fans: &mut GaugeGroup, height: u16) {
     let need = |t: &GaugeGroup, f: &GaugeGroup| work + t.block() + f.block();
     while need(temps, fans) > height && !fans.is_empty() {
+        if fans.line.take().is_some() {
+            continue;
+        }
         if fans.gauges.pop().is_none() {
             fans.note = None;
         }
@@ -7974,6 +7996,13 @@ fn draw_gauge_group(
 ) {
     // Shedding makes every group fit; the guards below only clip, and a
     // clipped gauge would hide a shedding bug.
+    if let Some(spans) = &group.line {
+        debug_assert!(top < end, "fan line at row {top} past the band end {end}");
+        if top < end {
+            draw_fan_line(grid, spans, cols.x[0], top);
+        }
+        return;
+    }
     if let Some((name, text)) = &group.note {
         debug_assert!(top < end, "gauge note at row {top} past the band end {end}");
         if top < end {
@@ -8187,6 +8216,7 @@ fn temp_gauges(grid: &Grid, model: &TtyModel) -> GaugeGroup {
             .filter_map(|group| Some(temp_gauge(grid, &group.name, nearest_limit(group)?)))
             .collect(),
         note: None,
+        line: None,
     }
 }
 
@@ -8256,6 +8286,7 @@ fn fan_gauges(model: &TtyModel) -> GaugeGroup {
     GaugeGroup {
         gauges: panel.fans.iter().map(fan_gauge).collect(),
         note: None,
+        line: None,
     }
 }
 
@@ -8283,6 +8314,167 @@ fn fan_gauge(fan: &FanReading) -> Gauge {
         frac: frac.filter(|f| *f > 0.0),
         ink,
         heat: frac.map_or(0.0, |f| f * 100.0),
+    }
+}
+
+/// One run of a folded fan line. A stalled fan is red, as on its gauge.
+struct FanSpan {
+    text: String,
+    fg: C16,
+}
+
+/// Rows the work gauges, the temperature block and the fan block take.
+fn gauge_need(work: u16, temps: &GaugeGroup, fans: &GaugeGroup) -> u16 {
+    work.saturating_add(temps.block())
+        .saturating_add(fans.block())
+}
+
+/// Drop every gauge labelled `name`. `false` when none had that name.
+fn drop_gauge_named(group: &mut GaugeGroup, name: &str) -> bool {
+    let before = group.gauges.len();
+    group.gauges.retain(|gauge| gauge.label != name);
+    group.gauges.len() != before
+}
+
+/// Per-card GPU and VRAM rows win over the temperature and fan blocks.
+/// Short of rows, drop the Wi-Fi gauge, then the NIC gauge, then fold the
+/// fan gauges into one line. Only after those three, sum VRAM and then
+/// GPU. One GPU never reaches here.
+fn fit_card_rows(
+    n: usize,
+    height: u16,
+    width: usize,
+    model: &TtyModel,
+    temps: &mut GaugeGroup,
+    fans: &mut GaugeGroup,
+) -> CardSplit {
+    let mut split = CardSplit::Both;
+    loop {
+        let work = split_work_rows(n, split);
+        if gauge_need(work, temps, fans) <= height {
+            return split;
+        }
+        if drop_gauge_named(temps, "Wi-Fi") {
+            continue;
+        }
+        if drop_gauge_named(temps, "NIC") {
+            continue;
+        }
+        if fold_fans(fans, model, width) {
+            continue;
+        }
+        match split {
+            CardSplit::Both => split = CardSplit::GpuOnly,
+            CardSplit::GpuOnly => split = CardSplit::Combined,
+            CardSplit::Combined => {
+                shed_gauges(work, temps, fans, height);
+                return CardSplit::Combined;
+            }
+        }
+    }
+}
+
+/// Replace two or more fan rows with one `FANS  front1 1.9k ...` line.
+/// `false` when that would not free a row.
+fn fold_fans(fans: &mut GaugeGroup, model: &TtyModel, width: usize) -> bool {
+    if fans.rows() <= 1 {
+        return false;
+    }
+    let Some(panel) = model.fans.as_ref() else {
+        return false;
+    };
+    if !panel.present || panel.fans.is_empty() {
+        return false;
+    }
+    let line = compact_fan_spans(&panel.fans, width);
+    if line.is_empty() {
+        return false;
+    }
+    fans.gauges.clear();
+    fans.note = None;
+    fans.line = Some(line);
+    true
+}
+
+/// `FANS  front1 1.9k  front2 1.9k  ...`, tightened until it fits `width`.
+/// Two spaces first, then one space, then fans dropped from the end, then
+/// the first fan cut with `…`.
+fn compact_fan_spans(fans: &[FanReading], width: usize) -> Vec<FanSpan> {
+    if fans.is_empty() || width == 0 {
+        return Vec::new();
+    }
+    for sep in ["  ", " "] {
+        let spans = fan_spans(fans, sep);
+        if spans_len(&spans) <= width {
+            return spans;
+        }
+    }
+    for n in (1..fans.len()).rev() {
+        let spans = fan_spans(&fans[..n], " ");
+        if spans_len(&spans) <= width {
+            return spans;
+        }
+    }
+    let spans = fan_spans(&fans[..1], " ");
+    let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+    if text.chars().count() <= width {
+        return spans;
+    }
+    vec![FanSpan {
+        text: cut_text(&text, width),
+        fg: C16::White,
+    }]
+}
+
+fn fan_spans(fans: &[FanReading], sep: &str) -> Vec<FanSpan> {
+    let mut out = vec![FanSpan {
+        text: "FANS".to_owned(),
+        fg: C16::White,
+    }];
+    for fan in fans {
+        let stalled = fan_stalled(fan);
+        let (label_fg, value_fg) = if stalled {
+            (C16::Red, C16::Red)
+        } else {
+            (C16::White, C16::BrightWhite)
+        };
+        let rpm = match fan.rpm {
+            Some(rpm) => fan_compact(rpm),
+            None => "--".to_owned(),
+        };
+        out.push(FanSpan {
+            text: sep.to_owned(),
+            fg: C16::Black,
+        });
+        out.push(FanSpan {
+            text: fan.label.clone(),
+            fg: label_fg,
+        });
+        out.push(FanSpan {
+            text: " ".to_owned(),
+            fg: C16::Black,
+        });
+        out.push(FanSpan {
+            text: rpm,
+            fg: value_fg,
+        });
+    }
+    out
+}
+
+fn spans_len(spans: &[FanSpan]) -> usize {
+    spans.iter().map(|span| span.text.chars().count()).sum()
+}
+
+fn draw_fan_line(grid: &mut Grid, spans: &[FanSpan], x: u16, row: u16) {
+    let mut col = x;
+    for span in spans {
+        let n = span.text.chars().count();
+        if n == 0 {
+            continue;
+        }
+        paint_fit(grid, col, row, &span.text, span.fg, C16::Black, n);
+        col = col.saturating_add(u16::try_from(n).unwrap_or(u16::MAX));
     }
 }
 
@@ -9927,6 +10119,7 @@ mod tests {
                 })
                 .collect(),
             note: None,
+            line: None,
         };
         let mut fans = GaugeGroup::default();
         // Six work rows, the blank row and one row of temperatures.
@@ -9934,5 +10127,55 @@ mod tests {
         let left: Vec<&str> = temps.gauges.iter().map(|g| g.label.as_str()).collect();
         assert_eq!(left, ["near", "mid"]);
         assert_eq!(temps.gauges[0].value, "60 C");
+    }
+
+    fn fan_at(label: &str, rpm: Option<u32>, pwm: Option<u8>) -> FanReading {
+        FanReading {
+            chip: "nct6798".to_owned(),
+            channel: 2,
+            label: label.to_owned(),
+            rpm,
+            pwm,
+            mode: Some(5),
+        }
+    }
+
+    fn line_of(fans: &[FanReading], width: usize) -> String {
+        compact_fan_spans(fans, width)
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    /// The folded fan row keeps two spaces while it fits, then one space,
+    /// then drops fans from the end, then cuts the first with `…`.
+    #[test]
+    fn compact_fan_line_tightens_to_the_width() {
+        let fans = [
+            fan_at("front1", Some(1939), Some(224)),
+            fan_at("front2", Some(1877), Some(224)),
+            fan_at("rear", Some(3026), Some(162)),
+            fan_at("top", Some(1272), Some(255)),
+        ];
+        let full = "FANS  front1 1.9k  front2 1.9k  rear 3.0k  top 1.3k";
+        assert_eq!(full.chars().count(), 51);
+        assert_eq!(line_of(&fans, 80), full);
+        assert_eq!(line_of(&fans, 51), full);
+        assert_eq!(
+            line_of(&fans, 50),
+            "FANS front1 1.9k front2 1.9k rear 3.0k top 1.3k"
+        );
+        assert_eq!(line_of(&fans, 40), "FANS front1 1.9k front2 1.9k rear 3.0k");
+        assert_eq!(line_of(&fans, 16), "FANS front1 1.9k");
+        assert_eq!(line_of(&fans, 10), "FANS fron\u{2026}");
+        assert!(line_of(&fans, 0).is_empty());
+        // A stalled fan stays red. Missing rpm is `--`.
+        let odd = [fan_at("rear", Some(0), Some(40)), fan_at("top", None, None)];
+        let spans = compact_fan_spans(&odd, 40);
+        let rear = spans.iter().find(|span| span.text == "rear").unwrap();
+        let zero = spans.iter().find(|span| span.text == "0").unwrap();
+        assert_eq!(rear.fg, C16::Red);
+        assert_eq!(zero.fg, C16::Red);
+        assert!(spans.iter().any(|span| span.text == "--"));
     }
 }

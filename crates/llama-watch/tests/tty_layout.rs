@@ -10448,28 +10448,172 @@ fn titan_hwmon(cards: Vec<TtyGpu>) -> TtyModel {
     model
 }
 
-/// Two cards must not spend the temps or fans that fit beside one GPU.
+const FAN_LINE: &str = "FANS  front1 1.9k  front2 1.9k  rear 3.0k  top 1.3k";
+
+/// Titan's temperature rows, keeping `names` in panel order.
+fn titan_temps(names: &[&str]) -> TtyModel {
+    let mut model = titan_hwmon(two_cards());
+    if let Some(panel) = model.temps.as_mut() {
+        panel
+            .groups
+            .retain(|group| names.iter().any(|name| *name == group.name));
+    }
+    model
+}
+
+/// Two cards at Titan's sizes. 192x60 and 213x60 (14 gauge rows) keep a
+/// GPU and a VRAM row per card: Wi-Fi, then NIC, then the fan gauges give
+/// way, and the fans fold into one line. 160x45 has 12 gauge rows, two
+/// short of that, so VRAM and then GPU sum after the same sheds.
 #[test]
-fn two_cards_keep_temps_and_fans_on_a_full_band() {
+fn two_cards_keep_per_card_rows_on_titan_sizes() {
     let model = titan_hwmon(two_cards());
-    let wide = painted(&model, 213, 60);
-    for label in [
-        "coolant", "NVMe0", "NVMe1", "board", "NIC", "front1", "front2", "rear", "top",
+    for (cols, rows) in [(192u16, 60u16), (213, 60)] {
+        let grid = draw(&model, cols, rows);
+        let text = painted(&model, cols, rows);
+        let at = format!("{cols}x{rows}");
+        assert_eq!(timeline_rule(&grid), 16, "{at}");
+        for label in ["GPU  V100", "GPU  3090", "VRAM V100", "VRAM 3090"] {
+            assert!(text.contains(label), "{at} missing {label}");
+        }
+        assert!(
+            meter_row(&grid, "GPU  V100") < meter_row(&grid, "GPU  3090"),
+            "{at}"
+        );
+        assert!(
+            meter_row(&grid, "VRAM V100") < meter_row(&grid, "VRAM 3090"),
+            "{at}"
+        );
+        assert!(
+            meter_row(&grid, "GPU  3090") < meter_row(&grid, "VRAM V100"),
+            "{at}"
+        );
+        let power = rows_containing(&grid, "POWER");
+        assert_eq!(power.len(), 1, "{at} {power:?}");
+        assert!(power[0].contains("412/650 W"), "{at} {power:?}");
+        for label in ["coolant", "NVMe0", "NVMe1", "board"] {
+            assert!(text.contains(label), "{at} missing {label}");
+        }
+        assert!(!text.contains("Wi-Fi"), "{at} kept Wi-Fi\n{text}");
+        assert!(!text.contains("NIC"), "{at} kept NIC\n{text}");
+        assert!(text.contains(FAN_LINE), "{at}\n{text}");
+        assert!(!text.contains("1939"), "{at} fans stayed gauges");
+        let fans = row_with(&grid, "FANS  front1");
+        assert!(meter_row(&grid, "board") < fans, "{at}");
+        assert!(fans < timeline_rule(&grid), "{at}");
+        // The gpus span is still the last SETUP row. Beside the digits it
+        // is the row the `+N` counts; `setup_draws_the_spanned_gpu_line`
+        // covers it where the block has room.
+        assert!(text.contains("SETUP"), "{at}");
+        assert_blank_edges(&grid);
+    }
+    let wide = draw(&model, 213, 60);
+    assert!(
+        row_string(&wide, 0).contains("GPU 44C/61C"),
+        "header temps stay"
+    );
+    let short = draw(&model, 160, 45);
+    let text = painted(&model, 160, 45);
+    assert_eq!(timeline_rule(&short), 14, "160x45 gauge band");
+    assert!(
+        !text.contains("GPU  V100") && !text.contains("VRAM V100"),
+        "160x45 still sums both cards\n{text}"
+    );
+    assert!(text.contains(FAN_LINE), "{text}");
+    assert!(!text.contains("Wi-Fi") && !text.contains("NIC"), "{text}");
+    for label in ["coolant", "NVMe0", "NVMe1", "board"] {
+        assert!(text.contains(label), "160x45 missing {label}");
+    }
+    assert!(text.contains("412/650 W"), "{text}");
+    assert_blank_edges(&short);
+}
+
+/// Wi-Fi goes before NIC, and NIC goes before the fan gauges fold. With
+/// room left after a shed, the next sacrifice is not taken.
+#[test]
+fn per_card_rows_shed_wifi_then_nic_then_fold_fans() {
+    // Five temperatures: Wi-Fi is the odd gauge, so dropping it frees a
+    // row and the NIC gauge and the fan gauges stay.
+    let wifi = titan_temps(&["CPU", "GPU", "coolant", "NIC", "Wi-Fi"]);
+    let grid = draw(&wifi, 213, 60);
+    let text = painted(&wifi, 213, 60);
+    assert!(text.contains("VRAM V100"), "{text}");
+    assert!(!text.contains("Wi-Fi"), "{text}");
+    assert!(text.contains("NIC"), "{text}");
+    assert!(text.contains("1939 rpm"), "{text}");
+    assert!(!text.contains("FANS"), "{text}");
+    assert!(meter_row(&grid, "front1") < timeline_rule(&grid));
+    // Six temperatures: dropping Wi-Fi leaves an odd gauge, so the row
+    // stays until NIC goes. The fans still fit as gauges.
+    let nic = titan_temps(&["CPU", "GPU", "coolant", "board", "NIC", "Wi-Fi"]);
+    let text = painted(&nic, 213, 60);
+    assert!(
+        text.contains("VRAM V100") && text.contains("board"),
+        "{text}"
+    );
+    assert!(!text.contains("Wi-Fi") && !text.contains("NIC"), "{text}");
+    assert!(text.contains("1939 rpm"), "{text}");
+    assert!(!text.contains("FANS"), "{text}");
+    // No temperature block: the fan gauges fit beside both card rows, so
+    // nothing folds.
+    let mut fans_only = titan_hwmon(two_cards());
+    fans_only.temps = None;
+    let text = painted(&fans_only, 213, 60);
+    assert!(text.contains("VRAM V100"), "{text}");
+    assert!(text.contains("1939 rpm"), "{text}");
+    assert!(!text.contains("FANS"), "{text}");
+}
+
+/// After Wi-Fi, NIC and the folded fan line, a band that is still one row
+/// short sums VRAM and keeps the per-card GPU rows. One row shorter still
+/// sums GPU too. That is 160x45 with six, then eight, temperature rows.
+#[test]
+fn per_card_rows_sum_vram_before_gpu() {
+    let six = titan_temps(&["CPU", "GPU", "coolant", "board", "NIC", "Wi-Fi"]);
+    let text = painted(&six, 160, 45);
+    assert!(
+        text.contains("GPU  V100") && text.contains("GPU  3090"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("VRAM V100") && !text.contains("VRAM 3090"),
+        "{text}"
+    );
+    assert!(text.contains("VRAM"), "{text}");
+    assert!(text.contains(FAN_LINE), "{text}");
+    assert!(!text.contains("Wi-Fi") && !text.contains("NIC"), "{text}");
+    assert!(text.contains("coolant") && text.contains("board"), "{text}");
+    let eight = titan_hwmon(two_cards());
+    let text = painted(&eight, 160, 45);
+    assert!(
+        !text.contains("GPU  V100") && !text.contains("VRAM V100"),
+        "{text}"
+    );
+    assert!(text.contains(FAN_LINE), "{text}");
+}
+
+/// One selected GPU with temps and fans is the cardless frame.
+#[test]
+fn one_gpu_with_temps_and_fans_matches_the_cardless_frame() {
+    let cardless = temps_model();
+    let mut one = cardless.clone();
+    one.gpus = vec![two_cards().pop().expect("3090")];
+    for (cols, rows) in [
+        (160u16, 26u16),
+        (160, 45),
+        (192, 60),
+        (213, 60),
+        (213, 90),
+        (240, 67),
     ] {
-        assert!(wide.contains(label), "213x60 missing {label}");
+        let plain = draw(&cardless, cols, rows);
+        let card = draw(&one, cols, rows);
+        assert_eq!(
+            console_bytes(&plain),
+            console_bytes(&card),
+            "one gpu {cols}x{rows}"
+        );
     }
-    assert!(
-        !wide.contains("GPU  V100") && !wide.contains("VRAM V100"),
-        "per-card rows must collapse before temps or fans are shed"
-    );
-    let short = painted(&model, 160, 45);
-    for label in ["coolant", "NVMe0", "board", "NIC"] {
-        assert!(short.contains(label), "160x45 missing {label}");
-    }
-    assert!(
-        !short.contains("GPU  V100"),
-        "160x45 kept per-card GPU rows"
-    );
 }
 
 #[test]
