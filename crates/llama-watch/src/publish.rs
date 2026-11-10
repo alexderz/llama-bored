@@ -56,6 +56,8 @@ pub enum PublishError {
 /// the wire for llama-metrics (#11). `Default` is "nothing known".
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Extras {
+    /// Individual GPUs, emitted only on multi-GPU systems.
+    pub gpus: Vec<wire::GpuWire>,
     /// GPU power, watts.
     pub gpu_w: Option<f64>,
     /// GPU enforced power limit, watts.
@@ -336,9 +338,57 @@ pub fn build(
         fans: Vec::new(),
         fan_rows: fan_rows_of(&extras.fans),
         temps: temps_of(&extras.temps),
+        gpus: gpus_of(&extras.gpus),
         sources: extras.sources.map(sources_of),
         suspected_loads: suspected_of(&extras.suspected_loads),
     }
+}
+
+/// Keep independently invalid device fields from preventing a complete snapshot.
+fn gpus_of(rows: &[wire::GpuWire]) -> Vec<wire::GpuWire> {
+    let mut out: Vec<wire::GpuWire> = Vec::new();
+    for row in rows {
+        let valid_text = |s: &str| {
+            !s.is_empty()
+                && s.chars().count() <= wire::MAX_GPU_LABEL_CHARS
+                && !s.chars().any(char::is_control)
+        };
+        if out.len() == wire::MAX_GPUS
+            || row.index > 255
+            || !valid_text(&row.name)
+            || (!row.uuid.is_empty() && !valid_text(&row.uuid))
+            || (!row.pci.is_empty() && !valid_text(&row.pci))
+            || (!row.label.is_empty() && !valid_text(&row.label))
+            || (row.uuid.is_empty() && row.pci.is_empty())
+            || out.iter().any(|prior| {
+                prior.index == row.index
+                    || (!row.uuid.is_empty() && prior.uuid.eq_ignore_ascii_case(&row.uuid))
+                    || (!row.pci.is_empty() && prior.pci.eq_ignore_ascii_case(&row.pci))
+            })
+        {
+            continue;
+        }
+        let mut row = row.clone();
+        row.gpu_pct = row
+            .gpu_pct
+            .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+        row.gpu_c = row
+            .gpu_c
+            .filter(|v| v.is_finite() && (-20.0..=150.0).contains(v));
+        row.gpu_w = row
+            .gpu_w
+            .filter(|v| v.is_finite() && (0.0..=wire::MAX_WATTS).contains(v));
+        row.gpu_limit_w = row
+            .gpu_limit_w
+            .filter(|v| v.is_finite() && (0.0..=wire::MAX_WATTS).contains(v));
+        row.vram_used_bytes = mem_bytes(row.vram_used_bytes);
+        row.vram_total_bytes = mem_bytes(row.vram_total_bytes);
+        out.push(row);
+    }
+    if out.len() < 2 {
+        out.clear();
+    }
+    out
 }
 
 fn bps(value: Option<f64>) -> Option<f32> {
@@ -779,4 +829,38 @@ fn write_full(fd: &OwnedFd, mut bytes: &[u8]) -> Result<(), PublishError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gpu_output_tests {
+    use super::*;
+
+    fn row(index: u32) -> wire::GpuWire {
+        wire::GpuWire {
+            index,
+            uuid: format!("GPU-{index}"),
+            pci: format!("0000:{index:02x}:00.0"),
+            label: format!("GPU{index}"),
+            name: "GPU".into(),
+            gpu_pct: Some(50.0),
+            gpu_c: Some(60.0),
+            gpu_w: Some(100.0),
+            gpu_limit_w: Some(200.0),
+            vram_used_bytes: Some(1),
+            vram_total_bytes: Some(2),
+        }
+    }
+
+    #[test]
+    fn single_gpu_stays_scalar_and_bad_fields_do_not_poison_multi_gpu() {
+        assert!(gpus_of(&[row(0)]).is_empty());
+        let mut bad = row(1);
+        bad.gpu_pct = Some(f32::NAN);
+        bad.gpu_c = Some(151.0);
+        let output = gpus_of(&[row(0), bad]);
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1].gpu_pct, None);
+        assert_eq!(output[1].gpu_c, None);
+        assert_eq!(output[1].gpu_w, Some(100.0));
+    }
 }

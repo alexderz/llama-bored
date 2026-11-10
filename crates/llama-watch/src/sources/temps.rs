@@ -591,9 +591,12 @@ const CONFIGURED_GAP: i32 = 50;
 
 /// Default warning and critical points of a sensor, tenths of a degree
 /// (the #163 design's table): coolant 45/50, CPU 80/90 (Tctl and its dies
-/// `Tccd*` alike; a Zen 3 throttles at 90), GPU 88/92, NVMe 82/85, board
-/// 60/75, NIC 70/90, Wi-Fi 70/85, memory 60/75, disks 50/60, ACPI and
-/// anything else 70/90.
+/// `Tccd*` alike; a Zen 3 throttles at 90), GPU die 88/92, NVMe 82/85,
+/// board 60/75, NIC 70/90, Wi-Fi 70/85, memory 60/75, disks 50/60, ACPI
+/// and anything else 70/90.
+///
+/// Memory junction and hotspot are not [`Kind::Gpu`]. Those run near
+/// 110 °C; [`gpu_heat_limits`] gives them 100/110.
 #[must_use]
 pub fn kind_limits(kind: Kind) -> (i32, i32) {
     match kind {
@@ -605,6 +608,35 @@ pub fn kind_limits(kind: Kind) -> (i32, i32) {
         Kind::Wifi => (700, 850),
         Kind::Disk => (500, 600),
         Kind::Nic | Kind::Acpi | Kind::Other => (700, 900),
+    }
+}
+
+/// Which temperature on a GPU the screen is colouring.
+///
+/// [`Kind::Gpu`] is only the die. Memory junction and hotspot are a
+/// different pair: see [`gpu_heat_limits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuHeat {
+    /// GPU die. A modern die throttles near 90 °C.
+    Die,
+    /// GDDR6X memory junction, which throttles near 110 °C.
+    Memory,
+    /// Ampere (and later) hotspot, which throttles near 110 °C.
+    Hotspot,
+}
+
+/// Warning and critical points for one GPU temperature, tenths of a degree.
+///
+/// The die stays on [`kind_limits`] of [`Kind::Gpu`]: 88/92. Memory junction
+/// and hotspot throttle near 110 °C (GDDR6X, and the Ampere hotspot), so
+/// they warn at 100 and go critical at 110 — the same ten degrees as CPU
+/// 80/90. A 3090 memory temperature in the low 90s under load stays green.
+/// Reusing the die pair would paint that red when nothing is wrong.
+#[must_use]
+pub fn gpu_heat_limits(heat: GpuHeat) -> (i32, i32) {
+    match heat {
+        GpuHeat::Die => kind_limits(Kind::Gpu),
+        GpuHeat::Memory | GpuHeat::Hotspot => (1000, 1100),
     }
 }
 
@@ -739,5 +771,13 @@ mod tests {
         assert!(plausible(1269));
         assert!(!plausible(1270));
         assert!(!plausible(-620));
+    }
+
+    #[test]
+    fn memory_and_hotspot_are_not_the_die_pair() {
+        assert_eq!(gpu_heat_limits(GpuHeat::Die), kind_limits(Kind::Gpu));
+        assert_eq!(kind_limits(Kind::Gpu), (880, 920));
+        assert_eq!(gpu_heat_limits(GpuHeat::Memory), (1000, 1100));
+        assert_eq!(gpu_heat_limits(GpuHeat::Hotspot), (1000, 1100));
     }
 }

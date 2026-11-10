@@ -1652,3 +1652,33 @@ fn swap_total_bytes_is_exported() {
         host.swap_total_bytes = Some(16_777_216);
     });
 }
+
+#[test]
+fn individual_gpus_are_labelled_escaped_and_do_not_replace_legacy_metrics() {
+    let mut snap = load("snapshot-loaded.json");
+    let legacy = render(&Ok(snap.clone()), T0);
+    assert!(!legacy.contains("llamabored_gpu_device_"));
+    snap.gpus = vec![llama_core::wire::GpuWire {
+        index: 2,
+        pci: "0000:05:00.0".into(),
+        label: "V100".into(),
+        uuid: "GPU-abc\\def".into(),
+        name: "GPU \"two\"".into(),
+        gpu_pct: Some(42.0),
+        gpu_c: None,
+        gpu_w: Some(123.0),
+        gpu_limit_w: None,
+        vram_used_bytes: Some(1234),
+        vram_total_bytes: None,
+    }];
+    let text = render(&Ok(snap), T0);
+    assert!(text.contains("llamabored_gpu_device_utilization_percent{uuid=\"GPU-abc\\\\def\",pci=\"0000:05:00.0\",label=\"V100\",name=\"GPU \\\"two\\\"\"} 42\n"));
+    assert!(text.contains("llamabored_gpu_device_memory_used_bytes"));
+    assert!(!text.contains("llamabored_gpu_device_celsius"));
+    for line in legacy
+        .lines()
+        .filter(|line| line.starts_with("llamabored_gpu_"))
+    {
+        assert!(text.lines().any(|candidate| candidate == line));
+    }
+}

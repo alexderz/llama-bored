@@ -377,6 +377,7 @@ fn tick_loop_keeps_a_chart_ring_from_the_decoded_counter() {
     let mut detail = empty_detail();
     detail.gen_tps = Some(20.0);
     detail.prompt_tps = Some(400.0);
+    detail.chart_prompt_tps = Some(400.0);
     feed.items.push_back((view_named("beta"), detail));
     fx.drive(
         feed,
@@ -406,6 +407,42 @@ fn tick_loop_keeps_a_chart_ring_from_the_decoded_counter() {
             .all(|b| b.gen_tps == Some(0.0) && b.prompt_tps == Some(400.0)),
         "{last:?}"
     );
+}
+
+#[test]
+fn tick_loop_chart_uses_live_phase_not_held_headline() {
+    let fx = Fixture::new("chart-live-phase");
+    let models = Arc::new(Mutex::new(Vec::new()));
+    let mut feed = Sparse {
+        items: VecDeque::new(),
+        every: 20,
+        wait: 0,
+        gave: false,
+    };
+    let mut prefill = empty_detail();
+    prefill.prompt_tps = Some(600.0);
+    prefill.chart_prompt_tps = Some(600.0);
+    let mut decode = empty_detail();
+    decode.prompt_tps = Some(600.0);
+    decode.chart_prompt_tps = Some(0.0);
+    feed.items.push_back((view_named("beta"), prefill));
+    feed.items.push_back((view_named("beta"), decode));
+    fx.drive(
+        feed,
+        fx.collector(),
+        OkPublish,
+        RecRender {
+            models: Arc::clone(&models),
+        },
+        RecNotify::default(),
+        StopAfter::new(61),
+        MemLog::new(),
+    );
+    let models = models.lock().expect("models");
+    let last = &models[60].chart;
+    assert!(last.len() >= 3, "{last:?}");
+    assert_eq!(last[last.len() - 1].prompt_tps, Some(0.0));
+    assert_eq!(last[last.len() - 2].prompt_tps, Some(0.0));
 }
 
 #[test]
@@ -1388,6 +1425,8 @@ fn empty_detail() -> LlamaDetail {
         activity: Vec::new(),
         gen_tps: None,
         prompt_tps: None,
+        chart_prompt_tps: None,
+        streams: Default::default(),
         latencies: PollLatencies::default(),
         prompt_cache: Vec::new(),
         capture: None,
@@ -1424,6 +1463,8 @@ fn detail_output(text: &str) -> LlamaDetail {
             .chars()
             .map(|ch| Cell::new(ch, C16::White, C16::Black))
             .collect(),
+        input_chars: None,
+        output_chars: None,
     });
     detail
 }
@@ -1462,6 +1503,8 @@ fn slot_text(id: i64, text: &str, busy: bool) -> SlotView {
             .chars()
             .map(|ch| Cell::new(ch, C16::White, C16::Black))
             .collect(),
+        input_chars: None,
+        output_chars: None,
     }
 }
 
@@ -1616,6 +1659,7 @@ fn blank_sample(mono: Instant, wall: SystemTime) -> WatchSample {
             errors: std::collections::BTreeSet::new(),
         },
         gpu: GpuExtra::default(),
+        gpu_devices: Vec::new(),
         cpu_w: None,
         activity_w: None,
         load_source: llama_watch::collector::LoadSource::Util,

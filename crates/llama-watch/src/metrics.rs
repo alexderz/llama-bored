@@ -93,6 +93,12 @@ struct Names {
     predicted: &'static [&'static str],
     prompt_seconds: &'static [&'static str],
     predicted_seconds: &'static [&'static str],
+    /// llama.cpp's busy slots per decode call since the server started
+    /// (DER-451).
+    busy_per_decode: &'static [&'static str],
+    /// Live token counter labelled `mode` (DER-451): SGLang's
+    /// `realtime_tokens_total`, added per prefill batch and decode step.
+    realtime: &'static [&'static str],
     /// Sum across label sets. llama.cpp keeps its last value, as before T72.
     sum: bool,
 }
@@ -136,6 +142,8 @@ const LLAMACPP: Names = Names {
     predicted: &["llamacpp:tokens_predicted_total"],
     prompt_seconds: &["llamacpp:prompt_seconds_total"],
     predicted_seconds: &["llamacpp:tokens_predicted_seconds_total"],
+    busy_per_decode: &["llamacpp:n_busy_slots_per_decode"],
+    realtime: NONE,
     sum: false,
 };
 
@@ -176,6 +184,8 @@ const SGLANG: Names = Names {
     predicted: NONE,
     prompt_seconds: NONE,
     predicted_seconds: NONE,
+    busy_per_decode: NONE,
+    realtime: &["sglang:realtime_tokens_total"],
     sum: true,
 };
 
@@ -224,6 +234,8 @@ const VLLM: Names = Names {
     predicted: NONE,
     prompt_seconds: NONE,
     predicted_seconds: NONE,
+    busy_per_decode: NONE,
+    realtime: NONE,
     sum: true,
 };
 
@@ -297,8 +309,10 @@ pub struct Hist {
 /// One parsed metrics document. Missing or rejected values stay `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MetricsSample {
-    /// Decoded-token counter (`llamacpp:n_decode_total`,
-    /// `*:generation_tokens_total`) when finite and ≥ 0.
+    /// Decoded-token counter (`*:generation_tokens_total`) when finite and
+    /// ≥ 0. llama.cpp's is `llamacpp:n_decode_total`, which counts decode
+    /// calls: the box counter takes its tokens from `/slots` instead
+    /// ([`crate::lcpp_tokens`], DER-451).
     pub n_decode_total: Option<u64>,
     /// Requests in flight (`llamacpp:requests_processing`, running requests).
     pub requests_processing: Option<f64>,
@@ -356,6 +370,158 @@ pub struct MetricsSample {
     pub prompt_seconds: Option<f64>,
     /// Seconds of generation (`llamacpp:tokens_predicted_seconds_total`, #71).
     pub predicted_seconds: Option<f64>,
+    /// Busy slots per decode call since the server started
+    /// (`llamacpp:n_busy_slots_per_decode`, DER-451).
+    pub busy_per_decode: Option<f64>,
+    /// SGLang's live token counters (`realtime_tokens_total`, DER-451),
+    /// by `mode`: `decode` tokens generated, `prefill_compute` prompt
+    /// tokens computed and `prefill_cache` prompt tokens reused from the
+    /// cache. They move every step; the finish counters above move once a
+    /// request ends.
+    pub realtime: Realtime,
+    /// The inter-token latency histogram's buckets (vLLM, SGLang), summed
+    /// over label sets, for its p50 and max between reads (DER-451).
+    pub itl_buckets: Option<Buckets>,
+}
+
+/// Most histogram buckets [`Buckets`] keeps. vLLM 0.31's inter-token
+/// latency has 20 and SGLang 0.5.20's 24, `+Inf` included.
+pub const MAX_BUCKETS: usize = 32;
+
+/// A histogram's cumulative buckets: `le` upper bounds, ascending, with
+/// the count at or under each. `+Inf` is [`f64::INFINITY`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Buckets {
+    le: [f64; MAX_BUCKETS],
+    count: [f64; MAX_BUCKETS],
+    len: usize,
+}
+
+impl Default for Buckets {
+    fn default() -> Self {
+        Self {
+            le: [0.0; MAX_BUCKETS],
+            count: [0.0; MAX_BUCKETS],
+            len: 0,
+        }
+    }
+}
+
+impl Buckets {
+    /// Add `value` to the bucket `le`. `false` once there is no room.
+    pub fn add(&mut self, le: f64, value: f64) -> bool {
+        let used = &self.le[..self.len];
+        if let Some(at) = used.iter().position(|bound| *bound == le) {
+            self.count[at] += value;
+            return true;
+        }
+        if self.len == MAX_BUCKETS {
+            return false;
+        }
+        let at = used
+            .iter()
+            .position(|bound| *bound > le)
+            .unwrap_or(self.len);
+        self.le.copy_within(at..self.len, at + 1);
+        self.count.copy_within(at..self.len, at + 1);
+        self.le[at] = le;
+        self.count[at] = value;
+        self.len += 1;
+        true
+    }
+
+    /// `(le, cumulative count)` pairs, ascending.
+    pub fn iter(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.le[..self.len]
+            .iter()
+            .copied()
+            .zip(self.count[..self.len].iter().copied())
+    }
+
+    /// Observations since `base`, bucket by bucket. `None` when the bounds
+    /// differ or a count fell (a restart).
+    #[must_use]
+    pub fn since(&self, base: &Self) -> Option<Self> {
+        if self.len != base.len || self.le[..self.len] != base.le[..base.len] {
+            return None;
+        }
+        let mut out = *self;
+        for at in 0..self.len {
+            let delta = self.count[at] - base.count[at];
+            if !delta.is_finite() || delta < 0.0 {
+                return None;
+            }
+            out.count[at] = delta;
+        }
+        Some(out)
+    }
+
+    /// Observations in all: the `+Inf` bucket, else the last one.
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.len.checked_sub(1).map_or(0.0, |last| self.count[last])
+    }
+
+    /// The `q` quantile, interpolated within its bucket as Prometheus'
+    /// `histogram_quantile` does. A quantile in the `+Inf` bucket reads as
+    /// the last finite bound. `None` with no observations.
+    #[must_use]
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        let total = self.total();
+        if total.is_nan() || total <= 0.0 || !q.is_finite() {
+            return None;
+        }
+        let rank = q.clamp(0.0, 1.0) * total;
+        let mut lower = (0.0, 0.0);
+        for (le, count) in self.iter() {
+            if count >= rank {
+                if le.is_infinite() {
+                    return Some(lower.0);
+                }
+                let width = count - lower.1;
+                if width <= 0.0 {
+                    return Some(le);
+                }
+                return Some(lower.0 + (le - lower.0) * (rank - lower.1) / width);
+            }
+            lower = (le, count);
+        }
+        None
+    }
+
+    /// The upper bound of the highest bucket with an observation: the
+    /// largest observation is at most this. `(bound, open)`, where `open`
+    /// is a largest observation past the last finite bound (`> bound`).
+    #[must_use]
+    pub fn max_bound(&self) -> Option<(f64, bool)> {
+        let total = self.total();
+        if total.is_nan() || total <= 0.0 {
+            return None;
+        }
+        let mut finite = None;
+        for (le, count) in self.iter() {
+            if count >= total {
+                return if le.is_infinite() {
+                    finite.map(|bound| (bound, true))
+                } else {
+                    Some((le, false))
+                };
+            }
+            if le.is_finite() {
+                finite = Some(le);
+            }
+        }
+        None
+    }
+}
+
+/// [`MetricsSample::realtime`]: each `mode`'s series summed across the
+/// other labels, `None` when that mode is absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Realtime {
+    pub decode: Option<u64>,
+    pub prefill_compute: Option<u64>,
+    pub prefill_cache: Option<u64>,
 }
 
 /// A model's KV cache in tokens, from its `/metrics` (#79). llama.cpp's
@@ -443,6 +609,10 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
     let mut predicted = Acc::default();
     let mut prompt_seconds = Acc::default();
     let mut predicted_seconds = Acc::default();
+    let mut busy_per_decode = Acc::default();
+    let mut realtime: [Acc; 3] = Default::default();
+    let mut itl_buckets: [Option<Buckets>; 2] = [None, None];
+    let mut itl_overflow = [false, false];
     for line in body.lines() {
         let Some((name, value)) = metric_line(line) else {
             continue;
@@ -471,6 +641,16 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
             prompt_seconds.add(value, names.sum);
         } else if names.predicted_seconds.contains(&name) {
             predicted_seconds.add(value, names.sum);
+        } else if names.busy_per_decode.contains(&name) {
+            busy_per_decode.add(value, names.sum);
+        } else if names.realtime.contains(&name) {
+            let mode = label_value(line, "mode");
+            if let Some(index) = ["decode", "prefill_compute", "prefill_cache"]
+                .iter()
+                .position(|known| mode.as_deref() == Some(*known))
+            {
+                realtime[index].add(value, true);
+            }
         } else if names.kv_used.contains(&name) {
             kv_used.add(value, names.sum);
         } else if names.kv_cached.contains(&name) {
@@ -527,6 +707,15 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
                 if let Some((rank, part)) = hist_part(group, name) {
                     hists[which][rank].add(part, value);
                 }
+            }
+            if let Some(rank) = name
+                .strip_suffix("_bucket")
+                .and_then(|base| names.itl.iter().position(|candidate| *candidate == base))
+                .filter(|rank| *rank < 2)
+                && let Some(le) = label_value(line, "le").and_then(|le| bucket_bound(&le))
+            {
+                let buckets = itl_buckets[rank].get_or_insert_with(Buckets::default);
+                itl_overflow[rank] |= !buckets.add(le, value);
             }
         }
         if let Some(rank) = names
@@ -613,8 +802,28 @@ pub fn parse_metrics_full(backend: Backend, body: &str) -> (MetricsSample, Optio
         predicted_total: predicted.0.and_then(finite_u64),
         prompt_seconds: prompt_seconds.0,
         predicted_seconds: predicted_seconds.0,
+        busy_per_decode: busy_per_decode.0,
+        realtime: Realtime {
+            decode: realtime[0].0.and_then(finite_u64),
+            prefill_compute: realtime[1].0.and_then(finite_u64),
+            prefill_cache: realtime[2].0.and_then(finite_u64),
+        },
+        itl_buckets: (0..2)
+            .find(|rank| itl_buckets[*rank].is_some())
+            .filter(|rank| !itl_overflow[*rank])
+            .and_then(|rank| itl_buckets[rank]),
     };
     (sample, facts)
+}
+
+/// A bucket's `le` label: a finite bound ≥ 0 or `+Inf`.
+fn bucket_bound(le: &str) -> Option<f64> {
+    if le.eq_ignore_ascii_case("+inf") || le.eq_ignore_ascii_case("inf") {
+        return Some(f64::INFINITY);
+    }
+    le.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
 /// `(rank, is_count)` when `name` is `<base>_sum` or `<base>_count` of a
@@ -755,7 +964,8 @@ fn label_value(line: &str, key: &str) -> Option<String> {
 /// left out. Only the keys in [`CACHE_KEYS`] and `sleep_state` are kept,
 /// so the result is small whatever the line holds. `is_streaming` is
 /// kept too: the non-streaming series of `num_requests_total` is counted
-/// on its own (#133).
+/// on its own (#133). So is `mode`, which splits SGLang's
+/// `realtime_tokens_total` (DER-451).
 fn labels_of(line: &str) -> Vec<(&str, String)> {
     let mut out = Vec::new();
     let Some(open) = line.find('{') else {
@@ -808,7 +1018,8 @@ fn labels_of(line: &str) -> Vec<(&str, String)> {
         }
         if !too_long
             && value.is_ascii()
-            && (key == "sleep_state" || key == "is_streaming" || CACHE_KEYS.contains(&key))
+            && (matches!(key, "sleep_state" | "is_streaming" | "mode" | "le")
+                || CACHE_KEYS.contains(&key))
         {
             out.push((key, value));
         }
@@ -2191,6 +2402,9 @@ fn max_ratio(old: Option<f64>, value: f64) -> Option<f64> {
 pub struct DecodedCounter {
     last: HashMap<String, u64>,
     fresh_at: HashMap<String, Instant>,
+    /// When each model's processing gauge was read; a read whose counter
+    /// is unknown still gives one ([`Self::observe_unknown`]).
+    processing_at: HashMap<String, Instant>,
     /// How long a read stays fresh, when not [`FRESH`] (activity fallback).
     window: HashMap<String, Duration>,
     processing: HashMap<String, f64>,
@@ -2209,6 +2423,21 @@ impl DecodedCounter {
         self.total = self.total.saturating_add(delta);
         self.fresh_at.insert(model.to_owned(), at);
         self.window.remove(model);
+        self.note_processing(model, processing, at);
+    }
+
+    /// A read of `model` whose counter is unknown (DER-451: llama.cpp with
+    /// several streams and no `/slots`): its processing gauge is kept, and
+    /// the box total is not fresh until a counter comes back. The baseline
+    /// stays, so a counter that returns adds only what it rose since.
+    pub fn observe_unknown(&mut self, model: &str, processing: Option<f64>, at: Instant) {
+        self.fresh_at.remove(model);
+        self.window.remove(model);
+        self.note_processing(model, processing, at);
+    }
+
+    fn note_processing(&mut self, model: &str, processing: Option<f64>, at: Instant) {
+        self.processing_at.insert(model.to_owned(), at);
         if let Some(processing) = processing {
             self.processing.insert(model.to_owned(), processing);
         }
@@ -2238,6 +2467,13 @@ impl DecodedCounter {
         self.processing.remove(model);
     }
 
+    /// `model`'s counter is now read from another source (DER-451): take
+    /// `value` as its baseline, adding nothing, so the switch neither
+    /// counts the new counter's whole value nor reads as a restart.
+    pub fn rebase(&mut self, model: &str, value: u64) {
+        self.last.insert(model.to_owned(), value);
+    }
+
     /// Running sum when `/running` is up and every ready model was read
     /// within the last second. Zero ready models is a measured total.
     #[must_use]
@@ -2258,7 +2494,7 @@ impl DecodedCounter {
     /// Gauge from a metrics read that is still ≤ 1 s old.
     #[must_use]
     pub fn requests_processing(&self, model: &str, now: Instant) -> Option<f64> {
-        let at = self.fresh_at.get(model)?;
+        let at = self.processing_at.get(model)?;
         if now.saturating_duration_since(*at) > FRESH {
             return None;
         }
@@ -2689,6 +2925,70 @@ fn finite_u64(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C.1 (DER-451): the inter-token latency buckets are summed by `le`
+    /// over label sets in any series order, a restart reads as no window,
+    /// and llama.cpp, with no histogram, has none.
+    #[test]
+    fn itl_buckets_sum_by_le_and_a_fall_is_no_window() {
+        let body = "vllm:inter_token_latency_seconds_bucket{le=\"+Inf\",engine=\"0\"} 10\n\
+            vllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.05\"} 9\n\
+            vllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.01\"} 2\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"0.01\",engine=\"1\"} 2\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"0.05\",engine=\"1\"} 10\n\
+            vllm:inter_token_latency_seconds_bucket{le=\"+Inf\",engine=\"1\"} 10\n";
+        let buckets = parse_metrics_for(Backend::Vllm, body)
+            .itl_buckets
+            .expect("buckets");
+        let got: Vec<(f64, f64)> = buckets.iter().collect();
+        assert_eq!(got, vec![(0.01, 4.0), (0.05, 19.0), (f64::INFINITY, 20.0)]);
+        assert_eq!(buckets.quantile(0.5), Some(0.01 + 0.04 * 6.0 / 15.0));
+        assert_eq!(buckets.max_bound(), Some((0.05, true)));
+        assert_eq!(buckets.since(&buckets).map(|b| b.total()), Some(0.0));
+        let mut later = Buckets::default();
+        for (le, count) in [(0.01, 1.0), (0.05, 2.0), (f64::INFINITY, 3.0)] {
+            assert!(later.add(le, count));
+        }
+        assert_eq!(later.since(&buckets), None, "a restart");
+        assert_eq!(parse_metrics_for(Backend::LlamaCpp, body).itl_buckets, None);
+    }
+
+    /// F2 (DER-451): SGLang's `realtime_tokens_total` split by `mode`
+    /// wherever the label sits, each mode summed across the other labels
+    /// (two TP ranks here), an unknown mode left out, absent when the
+    /// server does not export it.
+    #[test]
+    fn sglang_realtime_tokens_by_mode_in_any_label_order() {
+        let body = "\
+# TYPE sglang:realtime_tokens_total counter
+sglang:realtime_tokens_total{mode=\"decode\",model_name=\"m\",tp_rank=\"0\"} 100
+sglang:realtime_tokens_total{model_name=\"m\",tp_rank=\"1\",mode=\"decode\"} 20
+sglang:realtime_tokens_total{model_name=\"m\",mode=\"prefill_compute\",tp_rank=\"0\"} 3000
+sglang:realtime_tokens_total{ tp_rank=\"0\", mode=\"prefill_cache\"} 9000
+sglang:realtime_tokens_total{mode=\"other\"} 5
+sglang:realtime_tokens_total 7
+sglang:generation_tokens_total{model_name=\"m\"} 80
+";
+        let sample = parse_metrics_for(Backend::SgLang, body);
+        assert_eq!(
+            sample.realtime,
+            Realtime {
+                decode: Some(120),
+                prefill_compute: Some(3000),
+                prefill_cache: Some(9000),
+            }
+        );
+        assert_eq!(
+            sample.n_decode_total,
+            Some(80),
+            "the finish counter is kept"
+        );
+        let without = parse_metrics_for(Backend::SgLang, "sglang:generation_tokens_total 80\n");
+        assert_eq!(without.realtime, Realtime::default());
+        // Not an SGLang name for the other engines.
+        let vllm = parse_metrics_for(Backend::Vllm, body);
+        assert_eq!(vllm.realtime, Realtime::default());
+    }
 
     const STRATA: &str = include_str!("../../../fixtures/llama/strata-metrics.json");
 

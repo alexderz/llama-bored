@@ -28,12 +28,19 @@
 //! content; tool calls appended as `[call name] arguments`. The caller keeps
 //! only the tails, through the console sanitiser.
 //!
+//! Each message of a chat request is also hashed whole, role and tool
+//! calls included, so the poller can tell which of IN's messages this
+//! request appended (DER-451, [`new_input_chars`]). Only the hashes and
+//! roles are kept, never more text.
+//!
 //! The poller reads at most [`CAPTURE_CAP`] bytes: a capture of a 160k-token
 //! agent prompt measured 0.84 MiB (bodies grow by a third in base64), so
 //! 2 MiB covers a 200k context. A larger capture is skipped, not truncated
 //! (a cut JSON document does not parse).
 
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::OnceLock;
 
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -47,6 +54,26 @@ pub const INPUT_CAP_CHARS: usize = 32_768;
 /// Tool calls kept from one response.
 const MAX_CALLS: usize = 16;
 
+/// Most messages of one request hashed. A longer request keeps none, and
+/// its new part is not known from the messages.
+pub const MAX_MESSAGES: usize = 4096;
+
+/// The keyed hasher of every message mark, made once per run so marks of
+/// two captures compare and a hash says nothing outside this process.
+fn message_hasher() -> &'static RandomState {
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    STATE.get_or_init(RandomState::new)
+}
+
+/// One request message as the diff sees it (DER-451): its whole JSON
+/// hashed, and whether IN can show it (a `user`, `tool` or `function`
+/// message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageMark {
+    pub hash: u64,
+    pub in_role: bool,
+}
+
 /// The text of one finished exchange, before tail cutting and sanitising.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureText {
@@ -58,6 +85,13 @@ pub struct CaptureText {
     pub input_note: String,
     /// The assistant's answer.
     pub output: String,
+    /// Every message of a chat request, in order (DER-451). Empty for a
+    /// completions prompt or past [`MAX_MESSAGES`].
+    pub messages: Vec<MessageMark>,
+    /// The messages [`Self::input`] is made of: each one's index in
+    /// [`Self::messages`] and the character of `input` it starts at, 0
+    /// when the cap cut its start.
+    pub input_parts: Vec<(usize, usize)>,
 }
 
 /// Parse one capture. `None` when it is not a capture object or a body is
@@ -68,12 +102,78 @@ pub fn parse_capture(bytes: &[u8]) -> Option<CaptureText> {
     let request = base64_decode(&capture.req_body)?;
     let response = base64_decode(&capture.resp_body)?;
     drop(capture);
-    let (input, input_note) = request_text(&request);
+    let (input, input_note, messages, input_parts) = request_text(&request);
     Some(CaptureText {
         input,
         input_note,
         output: response_text(&response),
+        messages,
+        input_parts,
     })
+}
+
+/// Characters at the end of `text.input` that this request appended
+/// (DER-451). `previous` are the message lists of earlier requests to the
+/// same model; the one sharing the longest message prefix is this
+/// conversation's last request, so other conversations in between do not
+/// matter. The new part starts at the first appended `user` or `tool`
+/// message: an appended assistant message is the reply OUT already showed.
+///
+/// `Some(input length)` when IN's first message is new (a new
+/// conversation shares no prefix), `Some(0)` when nothing IN shows is new
+/// (a retry of the same request). `None` when either side has no message
+/// list, so the caller falls back to the uncached token count.
+#[must_use]
+pub fn new_input_chars<'a>(
+    previous: impl IntoIterator<Item = &'a [MessageMark]>,
+    text: &CaptureText,
+) -> Option<usize> {
+    if text.messages.is_empty() || text.input_parts.is_empty() {
+        return None;
+    }
+    let common = previous
+        .into_iter()
+        .filter(|marks| !marks.is_empty())
+        .map(|marks| {
+            marks
+                .iter()
+                .zip(&text.messages)
+                .take_while(|(left, right)| left.hash == right.hash)
+                .count()
+        })
+        .max()?;
+    let Some(first) = (common..text.messages.len()).find(|index| text.messages[*index].in_role)
+    else {
+        return Some(0);
+    };
+    let chars = text.input.chars().count();
+    match text
+        .input_parts
+        .iter()
+        .position(|(index, _)| *index >= first)
+    {
+        Some(0) => Some(chars),
+        Some(at) => Some(chars.saturating_sub(text.input_parts[at].1)),
+        None => Some(0),
+    }
+}
+
+/// `new` of a raw text of `raw` characters, as characters of the `shown`
+/// cells IN draws from its last `cap` characters, sanitised (DER-451).
+/// Proportional, since sanitising can change the length; at least one
+/// character when anything is new.
+#[must_use]
+pub fn shown_new(new: usize, raw: usize, cap: usize, shown: usize) -> usize {
+    let tail = raw.min(cap);
+    let new = new.min(tail);
+    if new == 0 || tail == 0 {
+        return 0;
+    }
+    if new == tail {
+        return shown;
+    }
+    let scaled = (shown as f64 * new as f64 / tail as f64).round() as usize;
+    scaled.clamp(1, shown)
 }
 
 #[derive(Deserialize)]
@@ -82,17 +182,18 @@ struct CaptureJson {
     resp_body: String,
 }
 
-/// IN of a chat request and its title note, or a completions prompt.
-fn request_text(body: &[u8]) -> (String, String) {
+/// IN of a chat request, its title note, the message marks and IN's parts;
+/// or a completions prompt, with no marks.
+fn request_text(body: &[u8]) -> (String, String, Vec<MessageMark>, Vec<(usize, usize)>) {
     let Ok(request) = serde_json::from_slice::<RequestJson>(body) else {
-        return (String::new(), String::new());
+        return Default::default();
     };
-    let prompt = |text: String| (cap_tail(text), String::new());
+    let prompt = |text: String| (cap_tail(text), String::new(), Vec::new(), Vec::new());
     match (request.messages.0, request.prompt) {
         (Some(recent), _) => recent.finish(),
         (None, Some(PromptJson::One(text))) => prompt(text),
         (None, Some(PromptJson::Many(texts))) => prompt(texts.last().cloned().unwrap_or_default()),
-        (None, _) => (String::new(), String::new()),
+        (None, _) => Default::default(),
     }
 }
 
@@ -145,6 +246,17 @@ struct Recent(Option<RecentText>);
 struct RecentText {
     /// The last `user` message.
     last_user: String,
+    /// Its message index.
+    last_user_at: usize,
+    /// Every message's mark (DER-451); cleared past [`MAX_MESSAGES`].
+    marks: Vec<MessageMark>,
+    /// Messages seen, the index of the next one.
+    count: usize,
+    /// Each run message's index and the byte of `run` it starts at, plus
+    /// [`Self::run_cut`].
+    run_parts: Vec<(usize, usize)>,
+    /// Bytes cut from the head of `run` since it was last cleared.
+    run_cut: usize,
     /// Whether the last message seen is a `user` one.
     ends_with_user: bool,
     /// User and tool messages since the last assistant one, one per line.
@@ -159,12 +271,24 @@ struct RecentText {
 const TOOL_MARK: &str = "[tool]";
 
 impl RecentText {
-    fn add(&mut self, message: MessageJson) {
+    fn add(&mut self, hash: u64, message: MessageJson) {
+        let index = self.count;
+        self.count += 1;
         let role = message.role.as_deref().unwrap_or_default();
         let tool = matches!(role, "tool" | "function");
+        if self.count <= MAX_MESSAGES {
+            self.marks.push(MessageMark {
+                hash,
+                in_role: matches!(role, "user" | "tool" | "function"),
+            });
+        } else {
+            self.marks.clear();
+        }
         match role {
             "assistant" => {
                 self.run.clear();
+                self.run_parts.clear();
+                self.run_cut = 0;
                 self.users = 0;
                 self.tools = 0;
             }
@@ -172,20 +296,22 @@ impl RecentText {
                 self.seen = true;
                 let text = message.content.map(ContentJson::text).unwrap_or_default();
                 if !self.run.is_empty() {
-                    push_capped(&mut self.run, "\n");
+                    self.push_run("\n");
                 }
+                self.run_parts.push((index, self.run_cut + self.run.len()));
                 if tool {
                     self.tools += 1;
-                    push_capped(&mut self.run, TOOL_MARK);
+                    self.push_run(TOOL_MARK);
                     if !text.is_empty() {
-                        push_capped(&mut self.run, " ");
+                        self.push_run(" ");
                     }
                 } else {
                     self.users += 1;
                 }
-                push_capped(&mut self.run, &text);
+                self.push_run(&text);
                 if !tool {
                     self.last_user = cap_tail(text);
+                    self.last_user_at = index;
                 }
             }
             // `system`, `developer`, unknown roles: not part of IN.
@@ -194,10 +320,22 @@ impl RecentText {
         self.ends_with_user = role == "user";
     }
 
-    /// IN and its title note.
-    fn finish(self) -> (String, String) {
+    /// [`push_capped`] onto `run`, counting the bytes its cap cuts.
+    fn push_run(&mut self, text: &str) {
+        let before = self.run.len() + text.len();
+        push_capped(&mut self.run, text);
+        self.run_cut += before - self.run.len();
+    }
+
+    /// IN, its title note, the message marks and IN's parts.
+    fn finish(self) -> (String, String, Vec<MessageMark>, Vec<(usize, usize)>) {
         if self.ends_with_user || self.tools == 0 {
-            return (self.last_user, String::new());
+            return (
+                self.last_user,
+                String::new(),
+                self.marks,
+                vec![(self.last_user_at, 0)],
+            );
         }
         let results = if self.tools == 1 {
             "1 tool result".to_owned()
@@ -209,7 +347,18 @@ impl RecentText {
             1 => format!("user + {results}"),
             n => format!("{n} user + {results}"),
         };
-        (cap_tail(self.run), note)
+        let before = self.run.len();
+        let input = cap_tail(self.run);
+        let cut = self.run_cut + before - input.len();
+        let parts = self
+            .run_parts
+            .iter()
+            .map(|(index, at)| {
+                let at = at.saturating_sub(cut).min(input.len());
+                (*index, input[..at].chars().count())
+            })
+            .collect();
+        (input, note, self.marks, parts)
     }
 }
 
@@ -223,8 +372,12 @@ impl<'de> Deserialize<'de> for Recent {
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Recent, A::Error> {
                 let mut recent = RecentText::default();
-                while let Some(message) = seq.next_element::<MessageJson>()? {
-                    recent.add(message);
+                // Each message whole, for its hash, then as the fields
+                // IN reads. One message is held at a time.
+                while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                    let hash = message_hasher().hash_one(value.to_string());
+                    let message = MessageJson::deserialize(value).map_err(de::Error::custom)?;
+                    recent.add(hash, message);
                 }
                 Ok(Recent(recent.seen.then_some(recent)))
             }
@@ -481,6 +634,147 @@ mod tests {
             "resp_body": base64_encode(resp.as_bytes()),
         }))
         .expect("json")
+    }
+
+    /// A chat request of `messages` (JSON objects), its capture parsed.
+    fn chat(messages: &[serde_json::Value]) -> CaptureText {
+        let req = serde_json::json!({"model": "m", "messages": messages}).to_string();
+        parse_capture(&capture(&req, "{}")).expect("capture")
+    }
+
+    fn msg(role: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({"role": role, "content": content})
+    }
+
+    fn call(id: &str) -> serde_json::Value {
+        serde_json::json!({"role": "assistant", "content": "ASSISTANT-CALL-TEXT",
+            "tool_calls": [{"id": id, "type": "function",
+                "function": {"name": "read", "arguments": "{}"}}]})
+    }
+
+    /// An agent's tool loop, as the captures show it (DER-451): each turn
+    /// is the last one plus an assistant tool call (empty content, shown in
+    /// OUT already) and its tool result. Another conversation's request in
+    /// between does not hide this one's last request.
+    #[test]
+    fn a_tool_loop_turn_appends_only_its_tool_result() {
+        let base = vec![
+            msg("system", "invented system prompt"),
+            msg("user", "invented task"),
+            call("c1"),
+            msg("tool", "first invented result"),
+        ];
+        let first = chat(&base);
+        let other = chat(&[msg("system", "another"), msg("user", "summarise")]);
+        let mut next = base.clone();
+        next.extend([call("c2"), msg("tool", "second invented result")]);
+        let second = chat(&next);
+        assert_eq!(second.input, "[tool] second invented result");
+        // The diff ends at the appended assistant call (the tool calls
+        // differ only in their id), which IN does not show: the new part
+        // is the tool result alone, none of the call's text.
+        let common = first
+            .messages
+            .iter()
+            .zip(&second.messages)
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert_eq!(common, base.len());
+        let appended: Vec<bool> = second.messages[common..]
+            .iter()
+            .map(|m| m.in_role)
+            .collect();
+        assert_eq!(
+            appended,
+            [false, true],
+            "an assistant call, then a tool result"
+        );
+        assert!(!second.input.contains("ASSISTANT-CALL-TEXT"));
+        let kept = [first.messages.clone(), other.messages.clone()];
+        let new = new_input_chars(kept.iter().map(Vec::as_slice), &second);
+        assert_eq!(
+            new,
+            Some("[tool] second invented result".len()),
+            "the result alone"
+        );
+        // Two results in one turn, then a third appended to the same run.
+        let mut two = next.clone();
+        two.extend([call("c3"), msg("tool", "a"), msg("tool", "b")]);
+        let two_text = chat(&two);
+        let mut three = two.clone();
+        three.push(msg("tool", "c"));
+        let three_text = chat(&three);
+        assert_eq!(three_text.input, "[tool] a\n[tool] b\n[tool] c");
+        let new = new_input_chars([two_text.messages.as_slice()], &three_text);
+        assert_eq!(new, Some("[tool] c".len()), "only the appended result");
+        // The same request again: nothing new.
+        let again = new_input_chars([three_text.messages.as_slice()], &chat(&three));
+        assert_eq!(again, Some(0));
+    }
+
+    /// A new conversation shares no prefix: all of IN is new. With no
+    /// earlier request, or a completions prompt, the diff has no answer.
+    #[test]
+    fn a_new_conversation_is_all_new_and_no_history_is_unknown() {
+        let earlier = chat(&[msg("system", "s"), msg("user", "old task"), call("c1")]);
+        let fresh = chat(&[msg("system", "s2"), msg("user", "a brand new task")]);
+        assert_eq!(
+            new_input_chars([earlier.messages.as_slice()], &fresh),
+            Some("a brand new task".len())
+        );
+        assert_eq!(new_input_chars(std::iter::empty(), &fresh), None);
+        let prompt = parse_capture(&capture(r#"{"prompt":"completion text"}"#, "{}")).unwrap();
+        assert!(prompt.messages.is_empty());
+        assert_eq!(
+            new_input_chars([earlier.messages.as_slice()], &prompt),
+            None
+        );
+    }
+
+    /// A run well past the cap, in multi-byte text: the run is cut as it
+    /// is read (past four caps of bytes) and again at the end, and each
+    /// kept message's start still points at its own `[tool]` marker,
+    /// counted in characters, not bytes. Messages cut away start at 0.
+    #[test]
+    fn a_run_past_the_cap_keeps_its_message_starts_in_characters() {
+        const RESULTS: usize = 20;
+        let body = |index: usize| format!("m{index} {}", "\u{e9}\u{4e16}".repeat(2_000));
+        let mut messages = vec![msg("system", "s"), msg("user", "task"), call("c1")];
+        messages.extend((0..RESULTS).map(|index| msg("tool", &body(index))));
+        let read: usize = (0..RESULTS).map(|index| body(index).len() + 8).sum();
+        assert!(read > 4 * INPUT_CAP_CHARS, "the run is cut while read");
+        let text = chat(&messages);
+        assert_eq!(text.input.chars().count(), INPUT_CAP_CHARS);
+        assert!(text.input.len() > INPUT_CAP_CHARS, "multi-byte");
+        assert_eq!(text.input_parts.len(), RESULTS);
+        let chars: Vec<char> = text.input.chars().collect();
+        let kept: Vec<_> = text.input_parts.iter().filter(|(_, at)| *at > 0).collect();
+        assert!(kept.len() >= 7 && kept.len() < RESULTS, "{}", kept.len());
+        for (index, at) in &kept {
+            let head: String = chars[*at..].iter().take(12).collect();
+            let expect = format!("[tool] m{} ", index - 3);
+            assert!(
+                head.starts_with(&expect),
+                "{head:?} at {at} is not {expect:?}"
+            );
+        }
+        // The last result appended to the previous request's run: exactly
+        // its own characters are new.
+        let earlier = chat(&messages[..messages.len() - 1]);
+        let new = new_input_chars([earlier.messages.as_slice()], &text);
+        assert_eq!(
+            new,
+            Some("[tool] ".len() + body(RESULTS - 1).chars().count())
+        );
+    }
+
+    #[test]
+    fn shown_new_scales_onto_the_cells_drawn() {
+        assert_eq!(shown_new(300, 2_000, 8_192, 2_000), 300);
+        assert_eq!(shown_new(300, 20_000, 8_192, 8_192), 300);
+        assert_eq!(shown_new(9_000, 20_000, 8_192, 8_000), 8_000);
+        assert_eq!(shown_new(1, 1_000, 1_000, 10), 1, "anything new shows");
+        assert_eq!(shown_new(0, 1_000, 1_000, 10), 0);
     }
 
     #[test]

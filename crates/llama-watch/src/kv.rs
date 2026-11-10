@@ -120,6 +120,8 @@ mod tests {
             ctx_used: Some(held),
             resets: crate::resets::ResetCounts::default(),
             last_reset: None,
+            input_chars: None,
+            output_chars: None,
         }
     }
 

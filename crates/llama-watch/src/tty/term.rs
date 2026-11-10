@@ -42,6 +42,9 @@ const MAX_ROWS: u16 = 512;
 /// single-spaced meter bars (`▇`; `▄` in halves mode). `▔` (U+2594) is in that font too but
 /// is not drawn, so it is not here.
 ///
+/// `°` (U+00B0) is Latin-1, so both llama-hack and eurlatgr draw it. Heat
+/// numbers use it (`CPU 68°▆`); it is dropped when a line is tight.
+///
 /// The very last is the gauge segment U+E584 (#165,
 /// `llama_core::glyph::SEGMENT`): a private-use scalar only llama-hack
 /// carries (`packaging/fonts/build-psf.py` appends it, `tests/tty_font.rs`
@@ -49,7 +52,7 @@ const MAX_ROWS: u16 = 512;
 /// halves mode draws `▄` in its place.
 pub const GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
+    '\u{fffd}', '°', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 /// Columns and rows reported for the terminal.

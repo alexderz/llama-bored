@@ -356,6 +356,9 @@ pub enum InvalidWatchConfig {
         /// What is wrong with the path.
         reason: String,
     },
+    /// Invalid GPU selection or per-device override.
+    #[error("gpu: {reason}")]
+    Gpu { reason: String },
     /// `[jobs] stale_s` is outside 10..=3600.
     #[error("jobs.stale_s {stale_s} is outside 10..=3600")]
     JobsStale {
@@ -995,6 +998,240 @@ fn printable_ascii(text: &str, cap: usize) -> String {
         .collect()
 }
 
+/// Device selection: all GPUs, or explicit index, UUID, PCI address or name selectors.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum GpuDevices {
+    /// `"all"` selects all discovered devices.
+    All(String),
+    /// Explicit device selectors.
+    Selectors(Vec<String>),
+}
+
+impl Default for GpuDevices {
+    fn default() -> Self {
+        Self::All("all".into())
+    }
+}
+
+/// Optional per-device GPU selection and presentation.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuConfig {
+    /// `"all"` (default), or a list of device selectors.
+    #[serde(default)]
+    pub devices: GpuDevices,
+    /// Short labels, keyed by selector.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// Idle draw in watts, keyed by selector.
+    #[serde(default)]
+    pub idle_w: std::collections::BTreeMap<String, f64>,
+    /// Blower or card fan, keyed by selector. The value is
+    /// `"<hwmon name>/fanN"` ([`parse_gpu_fan`]). The chip is resolved by
+    /// its hwmon `name`, and only `fanN_input` is read.
+    #[serde(default)]
+    pub fan: std::collections::BTreeMap<String, String>,
+}
+
+/// `"<hwmon name>/fanN"`. `None` when the chip name or the fan number is
+/// not a plain token. `fan0` is rejected; hwmon fans are numbered from 1.
+pub(crate) fn parse_gpu_fan(value: &str) -> Option<(String, u32)> {
+    let (chip, fan) = value.split_once('/')?;
+    let chip_ok = !chip.is_empty()
+        && chip.len() <= 32
+        && chip
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if !chip_ok || chip == "." || chip == ".." {
+        return None;
+    }
+    let number = fan.strip_prefix("fan")?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let channel: u32 = number.parse().ok()?;
+    if channel == 0 || channel > 32 {
+        return None;
+    }
+    Some((chip.to_owned(), channel))
+}
+
+/// Short display name from an NVML device name.
+///
+/// Vendor and family words are dropped. A model token keeps the part before
+/// a hyphen, so `NVIDIA GeForce RTX 3090` is `3090` and
+/// `Tesla V100-PCIE-32GB` is `V100`. With nothing usable, the label is
+/// `GPU` plus the NVML index.
+pub fn short_gpu_label(name: &str, index: u32) -> String {
+    const FILLER: &[&str] = &["nvidia", "geforce", "tesla", "quadro", "rtx", "gtx"];
+    let mut parts = Vec::new();
+    for word in name.split_whitespace() {
+        let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+        if bare.is_empty()
+            || FILLER
+                .iter()
+                .any(|filler| bare.eq_ignore_ascii_case(filler))
+        {
+            continue;
+        }
+        parts.push(bare);
+    }
+    if let Some(token) = parts
+        .iter()
+        .find(|token| token.chars().any(|c| c.is_ascii_digit()))
+    {
+        let model = token.split('-').next().unwrap_or(token);
+        if !model.is_empty() {
+            return model.to_owned();
+        }
+    }
+    parts
+        .first()
+        .map(|token| (*token).to_owned())
+        .unwrap_or_else(|| format!("GPU{index}"))
+}
+
+impl GpuConfig {
+    /// Match an index, UUID, PCI bus address, or case-insensitive full name.
+    pub fn matches(selector: &str, device: &crate::sources::gpu::GpuDeviceIdentity) -> bool {
+        Self::rank(selector, device).is_some()
+    }
+
+    /// Specificity of a matching selector: uuid, then PCI, then name, then index.
+    /// Equal ranks keep the lexicographically first key.
+    fn rank(selector: &str, device: &crate::sources::gpu::GpuDeviceIdentity) -> Option<u8> {
+        fn pci(s: &str) -> Option<(u32, u8, u8, u8)> {
+            let mut parts = s.split([':', '.']);
+            let (domain, bus, slot, function) =
+                (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((
+                u32::from_str_radix(domain, 16).ok()?,
+                u8::from_str_radix(bus, 16).ok()?,
+                u8::from_str_radix(slot, 16).ok()?,
+                u8::from_str_radix(function, 16).ok()?,
+            ))
+        }
+        if device
+            .uuid
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(selector))
+        {
+            return Some(0);
+        }
+        if device
+            .pci_bus_id
+            .as_deref()
+            .and_then(pci)
+            .is_some_and(|bus| pci(selector) == Some(bus))
+        {
+            return Some(1);
+        }
+        if device
+            .name
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(selector))
+        {
+            return Some(2);
+        }
+        if selector.parse::<u32>().ok() == Some(device.index) {
+            return Some(3);
+        }
+        None
+    }
+
+    fn best<'a, T>(
+        map: &'a std::collections::BTreeMap<String, T>,
+        device: &crate::sources::gpu::GpuDeviceIdentity,
+    ) -> Option<&'a T> {
+        map.iter()
+            .filter_map(|(selector, value)| {
+                Self::rank(selector, device).map(|rank| (rank, selector.as_str(), value))
+            })
+            .min_by_key(|(rank, selector, _)| (*rank, *selector))
+            .map(|(_, _, value)| value)
+    }
+
+    pub fn selects(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> bool {
+        match &self.devices {
+            GpuDevices::All(_) => true,
+            GpuDevices::Selectors(selectors) => selectors.iter().any(|s| Self::matches(s, device)),
+        }
+    }
+
+    /// Configured or generic short display label.
+    pub fn label(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> String {
+        Self::best(&self.labels, device).map_or_else(
+            || {
+                device.name.as_deref().map_or_else(
+                    || format!("GPU{}", device.index),
+                    |name| short_gpu_label(name, device.index),
+                )
+            },
+            |label| label.clone(),
+        )
+    }
+
+    /// Configured idle draw, otherwise the legacy default.
+    pub fn idle_w(&self, device: &crate::sources::gpu::GpuDeviceIdentity, default: f64) -> f64 {
+        Self::best(&self.idle_w, device).copied().unwrap_or(default)
+    }
+
+    /// Configured `"<hwmon name>/fanN"` for this device, if any.
+    pub fn fan_spec(&self, device: &crate::sources::gpu::GpuDeviceIdentity) -> Option<&str> {
+        Self::best(&self.fan, device).map(String::as_str)
+    }
+
+    fn validate(&self) -> Result<(), InvalidWatchConfig> {
+        let bad = |reason: &str| InvalidWatchConfig::Gpu {
+            reason: reason.into(),
+        };
+        let valid_selector = |s: &str| {
+            !s.is_empty() && s.trim() == s && s.len() <= 128 && !s.chars().any(char::is_control)
+        };
+        match &self.devices {
+            GpuDevices::All(s)
+                if s.eq_ignore_ascii_case("all") || s.eq_ignore_ascii_case("default") => {}
+            GpuDevices::All(_) => {
+                return Err(bad("devices must be all, default, or a selector list"));
+            }
+            GpuDevices::Selectors(v) if !v.is_empty() && v.iter().all(|s| valid_selector(s)) => {
+                let mut seen = std::collections::BTreeSet::new();
+                if v.iter().any(|s| !seen.insert(s.to_ascii_lowercase())) {
+                    return Err(bad("duplicate device selector"));
+                }
+            }
+            GpuDevices::Selectors(_) => {
+                return Err(bad("devices must contain non-empty selectors"));
+            }
+        }
+        for (selector, label) in &self.labels {
+            if !valid_selector(selector)
+                || label.is_empty()
+                || label.trim() != label
+                || label.len() > 24
+                || label.chars().any(char::is_control)
+            {
+                return Err(bad("invalid label selector or label"));
+            }
+        }
+        for (selector, watts) in &self.idle_w {
+            if !valid_selector(selector) || !watts.is_finite() || *watts < 0.0 {
+                return Err(bad("invalid idle_w selector or wattage"));
+            }
+        }
+        for (selector, spec) in &self.fan {
+            if !valid_selector(selector) || parse_gpu_fan(spec).is_none() {
+                return Err(bad("invalid fan selector or hwmon fan"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Parsed watcher configuration, not yet checked by [`Config::validate`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1014,6 +1251,9 @@ pub struct Config {
     /// Power-weighted activity.
     #[serde(default)]
     pub load: Load,
+    /// GPU selection and per-device overrides.
+    #[serde(default)]
+    pub gpu: GpuConfig,
     /// Read-only fan panel on tty11. Off by default.
     #[serde(default)]
     pub fans: Fans,
@@ -1450,6 +1690,7 @@ impl Config {
     /// `nproc` is the logical CPU count from the caller. This function does not
     /// read the host.
     pub fn validate(&self, nproc: u32) -> Result<(), InvalidWatchConfig> {
+        self.gpu.validate()?;
         let tick_s = self.collector.tick_s;
         if !(0.05..=1.0).contains(&tick_s) {
             return Err(InvalidWatchConfig::TickS { tick_s });

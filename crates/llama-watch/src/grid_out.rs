@@ -674,6 +674,7 @@ mod tests {
             prompt_tps: None,
             prompt_last: None,
             gen_last: None,
+            rate_lines: Default::default(),
             gen_ceiling: 250.0,
             prompt_ceiling: 1500.0,
             slots: Vec::new(),
@@ -721,6 +722,7 @@ mod tests {
             mem_psi: None,
             disk_ceiling_bps: 7e9,
             tz_offset_s: 0,
+            gpus: Vec::new(),
         }
     }
 

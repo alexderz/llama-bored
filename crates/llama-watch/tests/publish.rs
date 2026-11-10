@@ -276,6 +276,21 @@ fn metrics_extras_reach_the_wire() {
     let mut llama = view(AiState::Loaded, snap.models.clone(), Some(10));
     llama.prompt_total = Some(4_000);
     let extras = Extras {
+        gpus: (0..2)
+            .map(|index| wire::GpuWire {
+                index,
+                uuid: format!("GPU-{index}"),
+                pci: format!("0000:{index:02x}:00.0"),
+                label: format!("GPU{index}"),
+                name: format!("Card {index}"),
+                gpu_pct: Some(50.0),
+                gpu_c: Some(60.0),
+                gpu_w: Some(100.0),
+                gpu_limit_w: Some(200.0),
+                vram_used_bytes: Some(100),
+                vram_total_bytes: Some(200),
+            })
+            .collect(),
         gpu_w: Some(312.5),
         gpu_limit_w: Some(600.0),
         cpu_w: Some(88.25),
@@ -355,6 +370,7 @@ fn metrics_extras_reach_the_wire() {
         .expect("publish");
     let wire = wire::parse_validated(&std::fs::read(dir.join("snapshot.json")).unwrap())
         .expect("validates");
+    assert_eq!(wire.gpus, extras.gpus);
     assert_eq!(wire.host.gpu_w, Some(312.5));
     assert_eq!(wire.host.gpu_limit_w, Some(600.0));
     assert_eq!(wire.host.cpu_w, Some(88.25));

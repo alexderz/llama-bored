@@ -2,8 +2,8 @@
 //! An accepted buffer round-trips through [`parse_validated`](llama_core::wire::parse_validated).
 
 use llama_core::wire::{
-    Ai, AiWire, Host, ModelDetail, ModelState, ModelWire, Tokens, WireSnapshot, parse_validated,
-    to_json,
+    Ai, AiWire, GpuWire, Host, ModelDetail, ModelState, ModelWire, Tokens, WireSnapshot,
+    parse_validated, to_json,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -11,6 +11,34 @@ const SEED: u64 = 0x17C0_FFEE_5A17_0017;
 
 fn sample() -> WireSnapshot {
     WireSnapshot {
+        gpus: vec![
+            GpuWire {
+                index: 0,
+                uuid: "GPU-0".into(),
+                pci: "0000:05:00.0".into(),
+                label: "V100".into(),
+                name: "Tesla V100-PCIE-32GB".into(),
+                gpu_pct: Some(10.0),
+                gpu_c: Some(40.0),
+                gpu_w: Some(30.0),
+                gpu_limit_w: Some(250.0),
+                vram_used_bytes: Some(1_000),
+                vram_total_bytes: Some(32_000_000_000),
+            },
+            GpuWire {
+                index: 1,
+                uuid: "GPU-1".into(),
+                pci: "0000:0b:00.0".into(),
+                label: "3090".into(),
+                name: "NVIDIA GeForce RTX 3090".into(),
+                gpu_pct: Some(20.0),
+                gpu_c: Some(50.0),
+                gpu_w: Some(40.0),
+                gpu_limit_w: Some(350.0),
+                vram_used_bytes: Some(2_000),
+                vram_total_bytes: Some(24_000_000_000),
+            },
+        ],
         schema: 1,
         run_id: 9,
         seq: 4,

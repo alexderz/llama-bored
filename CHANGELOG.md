@@ -4,6 +4,27 @@ All notable changes to llama-bored. Versions follow
 [Semantic Versioning](https://semver.org/); the process is in
 [docs/RELEASING.md](docs/RELEASING.md).
 
+## Unreleased
+
+### Fixed
+
+- Multi-GPU watt and VRAM totals are omitted unless every selected device reported that field. A failure of every selected device reopens NVML, and an enumeration failure waits out the existing init backoff (DER-674).
+
+### Added
+
+- llama-watch reads every selected GPU. Legacy host scalars stay aggregates, and a single GPU still omits the per-GPU list. Metrics add per-GPU series keyed by PCI bus ID and UUID. A model's GPU memory is summed across devices, with the device labels kept for a later display (DER-674).
+
+### Documentation
+
+
+- Document Fedora 45 Server installation and current two-GPU hardware (DER-674).
+
+### Fixed
+
+- Rate headlines and timeline consistently say WRITE for decode and READ for prefill, matching RECENT; token counts and generation states keep their names.
+- The READ timeline drops to 0 while a vLLM model's requests are all decoding, and shows its prefill speed only while one of them is prefilling, one prefill beside a decode included. The phase comes from the scrape's own counts: requests past their first token (time-to-first-token count minus end-to-end count) against `num_requests_running`; queued requests are not prefilling. When those counts do not add up, the read is stale, or the decode counter stalls, the timeline is unknown rather than a guess. A busy SGLang model is unknown on the timeline instead of holding its last prefill speed through its decode. The big READ number is unchanged (DER-451).
+- IN scrolls only what the request appended, at prefill speed. For a capture (vLLM, SGLang, other engines without `/slots`) each request message is hashed, and the longest message prefix shared with one of the model's last eight captured requests marks what is new; IN starts at the first appended user or tool message, since an appended assistant message is the reply OUT already showed. A retry with nothing new sits at the end; a new conversation crosses all of IN. Without a message diff the uncached tokens (`input − cached`) mark the new tail. Characters per second are tok/s times the whole text's characters per token (four when its length is not known), not the capped tail's length over the whole prompt's tokens, which made a cached 32k-token prompt's tail crawl. The rate is the live one, else earlier turns', else this turn's own, else a fast 2,000 tok/s, and a measured rate that appears takes over without a jump. vLLM's request text exists only in llama-swap's capture of the finished request, so its IN arrives after the request completes and cannot scroll during prefill. OUT keeps its rules, with the same characters-per-token fix (DER-451).
+
 ## 0.7.2 — 2026-10-29
 
 tqLLM on the dashboard, LED chains up to the header's 120 LEDs, a console that Ctrl+S can no longer freeze, and an honest prefill speed with IN and OUT that scroll from the top. Nothing in an existing config needs to change.

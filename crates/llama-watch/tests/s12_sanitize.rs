@@ -23,7 +23,11 @@ fn assert_cells_are_safe(input: &str) {
     for cell in cells {
         let ch = cell.ch;
         assert!(
-            ch == '\n' || ch == '?' || ch == UNKNOWN || ('\u{20}'..='\u{7e}').contains(&ch),
+            ch == '\n'
+                || ch == '?'
+                || ch == UNKNOWN
+                || ch == '°'
+                || ('\u{20}'..='\u{7e}').contains(&ch),
             "input {input:?} produced {ch:?}"
         );
     }
@@ -151,6 +155,7 @@ fn typography_table_prefers_the_real_glyph_then_ascii() {
         ("\u{2193}", "v"),        // ↓
         ("\u{21d2}", ">"),        // ⇒
         ("\u{d7}", "x"),          // ×
+        ("\u{b0}", "°"),          // ° degree: real glyph
         ("\u{a0}", " "),          // NBSP
         ("\u{2007}", " "),        // figure space
         ("\u{2009}", " "),        // thin space
@@ -318,6 +323,7 @@ fn every_latin1_byte_is_dropped_mapped_or_the_placeholder() {
         match cp {
             0xa0 => assert_eq!(got, " ", "NBSP"),
             0xad => assert_eq!(got, "", "soft hyphen"),
+            0xb0 => assert_eq!(got, "°", "degree sign"),
             0xd7 => assert_eq!(got, "x", "multiplication sign"),
             _ => {
                 assert_eq!(
@@ -421,7 +427,7 @@ fn hostile_frame_stays_on_the_allowlist_for_diff_and_full_repaint() {
     sanitize(&text, &mut cells);
     assert!(cells.iter().all(|cell| {
         let ch = cell.ch;
-        ch == '\n' || ch == '?' || ch == UNKNOWN || ('\u{20}'..='\u{7e}').contains(&ch)
+        ch == '\n' || ch == '?' || ch == UNKNOWN || ch == '°' || ('\u{20}'..='\u{7e}').contains(&ch)
     }));
 
     let mut planted = vec![
@@ -693,7 +699,7 @@ fn parse_number(bytes: &[u8]) -> Option<(u16, usize)> {
 /// allowlist has to change this test too.
 const ALLOWED_GLYPHS: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
+    '\u{fffd}', '°', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 fn match_glyph(bytes: &[u8]) -> Option<usize> {

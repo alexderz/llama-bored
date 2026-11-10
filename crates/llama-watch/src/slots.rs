@@ -1,8 +1,8 @@
 //! `/upstream/<model>/slots`: declared fields, tail text, prompt rate, and
 //! each slot's held context and drops by reason for the snapshot (#10, #9).
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use llama_core::backend::Backend;
 use llama_core::rate::{counter_delta, delta_per_s};
@@ -11,6 +11,7 @@ use serde::de::IgnoredAny;
 
 use crate::activity::{ActivityRow, model_key};
 use crate::config::PromptView;
+use crate::lcpp_tokens::SlotTokens;
 use crate::resets::{DISPLACED_MODELS, Displaced, PENDING_TTL, ResetCounts, ResetReason, classify};
 use crate::tty::chat_template::clean;
 use crate::tty::ctx_history::{MAX_SLOTS as MAX_TRACKED_SLOTS, dropped};
@@ -53,6 +54,13 @@ pub struct SlotView {
     /// Sanitised generated tail from this poll, or the previous tail when
     /// text was skipped.
     pub output: Vec<Cell>,
+    /// Characters of the whole prompt [`Self::input`] is the tail of, when
+    /// its text was read. Scroll speed uses it with the prompt's tokens
+    /// (DER-451).
+    pub input_chars: Option<usize>,
+    /// Characters of the whole generated text [`Self::output`] is the tail
+    /// of, when this poll read it.
+    pub output_chars: Option<usize>,
     /// Context the slot holds (#10): `n_prompt_tokens`, and an idle slot
     /// keeps its last value (its KV cache stays). `None` until `/slots`
     /// gave a prompt count.
@@ -63,6 +71,52 @@ pub struct SlotView {
     pub resets: ResetCounts,
     /// The last decided reason (#9).
     pub last_reset: Option<ResetReason>,
+}
+
+/// One in-flight llama.cpp task's own decode rate (DER-451, F5): its
+/// `n_decoded` rise over the wall time between `/slots` reads, over the
+/// last [`SLOT_RATE_WINDOW`]. RECENT's in-flight rows show it instead of
+/// the model-wide WRITE.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotRate {
+    /// The display name, as in [`SlotView::model`].
+    pub model: String,
+    pub slot: i64,
+    pub id_task: i64,
+    pub gen_tps: f64,
+}
+
+/// [`SlotRate`]'s window.
+pub const SLOT_RATE_WINDOW: Duration = Duration::from_secs(2);
+/// A task's rate needs reads at least this far apart.
+const SLOT_RATE_MIN_SPAN: Duration = Duration::from_millis(500);
+/// Reads kept per task.
+const SLOT_RATE_READS: usize = 32;
+
+/// One in-flight task's reads (DER-451).
+#[derive(Debug)]
+struct StreamMark {
+    /// Display name.
+    model: String,
+    /// The `/slots` read that first saw it in flight.
+    first_seen: Instant,
+    /// `(read at, n_decoded)` once it decodes, oldest first.
+    decoded: VecDeque<(Instant, u64)>,
+}
+
+impl StreamMark {
+    fn gen_tps(&self) -> Option<f64> {
+        let &(newest_at, newest) = self.decoded.back()?;
+        let &(base_at, base) = self
+            .decoded
+            .iter()
+            .rev()
+            .find(|(at, _)| newest_at.saturating_duration_since(*at) >= SLOT_RATE_WINDOW)
+            .or_else(|| self.decoded.front())?;
+        let span = newest_at.saturating_duration_since(base_at);
+        (span >= SLOT_RATE_MIN_SPAN)
+            .then(|| newest.saturating_sub(base) as f64 / span.as_secs_f64())
+    }
 }
 
 /// The one slot that both IN and OUT show.
@@ -77,6 +131,75 @@ pub fn pick_slot(slots: &[SlotView]) -> Option<&SlotView> {
     slots
         .iter()
         .max_by_key(|slot| (slot.is_processing, slot.id_task))
+}
+
+/// How long IN and OUT stay on a stream they picked before an ended one
+/// gives way to another (DER-451, F6).
+pub const PIN_DWELL: Duration = Duration::from_secs(5);
+
+/// The stream IN and OUT follow (DER-451, F6). It stays on its
+/// `(model, slot, id_task)` while that runs; once it ends, and has been
+/// shown for [`PIN_DWELL`], it moves to the oldest stream still running,
+/// by when this picker first saw each in flight. Task ids of different
+/// servers are never compared. With nothing running it stays on the
+/// stream it showed last.
+#[derive(Debug, Default)]
+pub struct StreamPin {
+    /// When each in-flight `(model, slot, id_task)` was first seen.
+    first_seen: HashMap<(String, i64, i64), Instant>,
+    /// The stream shown, and when it was picked.
+    pinned: Option<((String, i64, i64), Instant)>,
+}
+
+impl StreamPin {
+    /// The slot to show in `slots` at `now`.
+    pub fn pick<'a>(&mut self, slots: &'a [SlotView], now: Instant) -> Option<&'a SlotView> {
+        let key = |slot: &SlotView| (slot.model.clone(), slot.id, slot.id_task);
+        let busy: Vec<&SlotView> = slots
+            .iter()
+            .filter(|slot| slot.is_processing && slot.id_task >= 0)
+            .collect();
+        for slot in &busy {
+            self.first_seen.entry(key(slot)).or_insert(now);
+        }
+        self.first_seen
+            .retain(|seen, _| busy.iter().any(|slot| key(slot) == *seen));
+        if let Some((pinned, at)) = &self.pinned
+            && let Some(slot) = slots.iter().find(|slot| key(slot) == *pinned)
+            && (slot.is_processing
+                || busy.is_empty()
+                || now.saturating_duration_since(*at) < PIN_DWELL)
+        {
+            return Some(slot);
+        }
+        let oldest = busy.iter().copied().min_by(|a, b| {
+            let seen = |slot: &SlotView| self.first_seen.get(&key(slot)).copied();
+            seen(a)
+                .cmp(&seen(b))
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.id_task.cmp(&b.id_task))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(slot) = oldest {
+            self.pinned = Some((key(slot), now));
+            return Some(slot);
+        }
+        // Nothing runs and the stream shown is gone: the newest task of
+        // the first model with one, never comparing servers' task ids.
+        let model = slots
+            .iter()
+            .find(|slot| slot.id_task >= 0)
+            .or_else(|| slots.first())
+            .map(|slot| slot.model.clone())?;
+        let own: Vec<SlotView> = slots
+            .iter()
+            .filter(|slot| slot.model == model)
+            .cloned()
+            .collect();
+        let picked = pick_slot(&own).map(key)?;
+        self.pinned = Some((picked.clone(), now));
+        slots.iter().find(|slot| key(slot) == picked)
+    }
 }
 
 impl SlotView {
@@ -126,6 +249,8 @@ pub fn whole_prompt(
 
 #[derive(Debug, Default)]
 struct Tracked {
+    chart_phase: Option<ChartPhase>,
+    phase_decoded: Option<u64>,
     model_id: String,
     model: String,
     id: i64,
@@ -139,6 +264,8 @@ struct Tracked {
     prompt_cached: Option<u64>,
     input: Vec<Cell>,
     output: Vec<Cell>,
+    input_chars: Option<usize>,
+    output_chars: Option<usize>,
     captured_task: Option<i64>,
 }
 
@@ -263,6 +390,13 @@ fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
         .is_some_and(|split| split.whole.abs_diff(prompt) <= (prompt / 200).max(8))
 }
 
+/// Phase observed for a current task, not a rate measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartPhase {
+    Prefill,
+    Decode,
+}
+
 /// Slot numbers and tails across polls.
 ///
 /// [`Self::without_text`] builds a book that never keeps llama text: the
@@ -270,10 +404,22 @@ fn row_matches(row: &ActivityRow, prompt: u64) -> bool {
 /// strings are not even allocated (RR-LV1, `tty.show_text = false`).
 #[derive(Debug, Default)]
 pub struct SlotBook {
+    phase_at: HashMap<String, Instant>,
+    phase_round: HashSet<String>,
     text_off: bool,
     prompt_view: PromptView,
     slots: Vec<Tracked>,
-    last_processed: HashMap<(String, i64), u64>,
+    /// `n_prompt_tokens_processed` by `(model id, slot, id_task)`: a task
+    /// that replaced another between two reads counts all it processed,
+    /// not its difference from the old task's count (DER-451).
+    last_processed: HashMap<(String, i64, i64), u64>,
+    /// Prompt tokens each model's slots processed while this book saw them
+    /// in flight, summed over tasks: the counter of its READ aggregate
+    /// (DER-451). A task first seen in flight counts all it processed; one
+    /// first seen already idle is not counted.
+    processed_total: HashMap<String, u64>,
+    /// In-flight tasks by `(model id, slot, id_task)` (DER-451).
+    streams: HashMap<(String, i64, i64), StreamMark>,
     last_at: Option<Instant>,
     round_delta: u64,
     round_seen: bool,
@@ -305,6 +451,8 @@ pub struct SlotBook {
 impl SlotBook {
     /// Start a slots phase. Deltas from [`Self::apply`] land in [`Self::finish_round`].
     pub fn begin_round(&mut self) {
+        self.phase_at.clear();
+        self.phase_round.clear();
         self.round_delta = 0;
         self.round_seen = false;
         self.round_prefilling = false;
@@ -320,11 +468,11 @@ impl SlotBook {
     /// Reports a true 0 and drops the progress baseline, so the next busy
     /// episode's first round only sets a baseline — as on startup — rather
     /// than dividing its first batch by however long this idle gap was.
-    /// [`Self::last_processed`]'s per-slot counters are left alone: a new
-    /// task's lower count already reads as a reset ([`counter_delta`]),
-    /// and that reset's delta lands in the fresh baseline round, never
-    /// applied to the rate.
+    /// [`Self::last_processed`]'s per-task counters are left alone: a new
+    /// task counts all it processed, and that lands in the fresh baseline
+    /// round, never applied to the rate.
     pub fn idle(&mut self) {
+        self.phase_at.clear();
         self.prompt_tps = Some(0.0);
         self.last_at = None;
         self.last_progress_at = None;
@@ -511,16 +659,19 @@ impl SlotBook {
                 return false;
             };
             self.round_seen = true;
+            self.phase_round.insert(model_id.to_owned());
             let next = parsed
                 .iter()
                 .map(|slot| {
                     self.note_processed(model_id, slot);
                     self.note_ctx(model_id, slot);
-                    tracked(model_id, display, slot, Vec::new(), Vec::new(), None)
+                    let phase = self.phase_for(model_id, slot);
+                    tracked(model_id, display, slot, Vec::new(), Vec::new(), None, phase)
                 })
                 .collect::<Vec<_>>();
             self.slots.retain(|row| row.model_id != model_id);
             self.slots.extend(next);
+            self.prune_processed(model_id);
             return true;
         }
         let Some(parsed) = parse_light(body) else {
@@ -546,6 +697,7 @@ impl SlotBook {
             vec![String::new(); parsed.len()]
         };
         self.round_seen = true;
+        self.phase_round.insert(model_id.to_owned());
         let mut next = Vec::with_capacity(parsed.len());
         for (slot, prompt) in parsed.iter().zip(prompts) {
             self.note_processed(model_id, slot);
@@ -556,33 +708,158 @@ impl SlotBook {
                 .iter()
                 .find(|row| row.model_id == model_id && row.id == slot.id);
             let mut captured_task = prev.and_then(|row| row.captured_task);
-            let input = if captured_task == Some(slot.id_task) {
-                prev.map(|row| row.input.clone()).unwrap_or_default()
+            let (input, input_chars) = if captured_task == Some(slot.id_task) {
+                (
+                    prev.map(|row| row.input.clone()).unwrap_or_default(),
+                    prev.and_then(|row| row.input_chars),
+                )
             } else {
                 captured_task = Some(slot.id_task);
-                prompt_cells(&prompt, input_tail, self.prompt_view)
+                (
+                    prompt_cells(&prompt, input_tail, self.prompt_view),
+                    whole_chars(&prompt),
+                )
             };
             let output = tail_cells(&slot.generated, output_tail);
-            next.push(tracked(
+            let mut row = tracked(
                 model_id,
                 display,
                 slot,
                 input,
                 output,
                 captured_task,
-            ));
+                self.phase_for(model_id, slot),
+            );
+            row.input_chars = input_chars;
+            row.output_chars = whole_chars(&slot.generated);
+            next.push(row);
         }
         self.slots.retain(|row| row.model_id != model_id);
         self.slots.extend(next);
+        self.prune_processed(model_id);
         true
     }
 
+    /// Keep `model_id`'s processed counters for the tasks its last body
+    /// listed only.
+    fn prune_processed(&mut self, model_id: &str) {
+        let slots = &self.slots;
+        self.last_processed.retain(|(model, id, task), _| {
+            model.as_str() != model_id
+                || slots
+                    .iter()
+                    .any(|row| row.model_id == model_id && row.id == *id && row.id_task == *task)
+        });
+    }
+
+    /// [`Self::processed_total`] of `model_id`.
+    #[must_use]
+    pub fn processed_total(&self, model_id: &str) -> u64 {
+        self.processed_total.get(model_id).copied().unwrap_or(0)
+    }
+
+    /// `model_id`'s slots in prefill in its last body: in flight with
+    /// nothing decoded yet.
+    #[must_use]
+    pub fn prefilling(&self, model_id: &str) -> usize {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing && row.n_decoded == 0)
+            .count()
+    }
+
+    /// `model_id`'s slots in flight in its last body.
+    #[must_use]
+    pub fn busy(&self, model_id: &str) -> usize {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing)
+            .count()
+    }
+
+    /// `model_id`'s slot numbers from its last body, for its token count
+    /// ([`crate::lcpp_tokens`]).
+    #[must_use]
+    pub fn tokens(&self, model_id: &str) -> Vec<SlotTokens> {
+        self.slots
+            .iter()
+            .filter(|row| row.model_id == model_id)
+            .map(|row| SlotTokens {
+                id: row.id,
+                id_task: row.id_task,
+                is_processing: row.is_processing,
+                n_decoded: row.n_decoded,
+            })
+            .collect()
+    }
+
+    fn phase_for(&self, model_id: &str, slot: &LightSlot) -> Option<ChartPhase> {
+        if !slot.is_processing || slot.id_task < 0 {
+            return None;
+        }
+        let decoded = slot.phase_decoded?;
+        if decoded == 0 {
+            return Some(ChartPhase::Prefill);
+        }
+        let prev = self.slots.iter().find(|row| {
+            row.model_id == model_id
+                && row.id == slot.id
+                && row.id_task == slot.id_task
+                && row.is_processing
+        })?;
+        // A positive value on a new task can be left over from its predecessor.
+        // Require either a same-task prefill transition or an advancing decode.
+        if prev.chart_phase == Some(ChartPhase::Decode)
+            || prev.chart_phase == Some(ChartPhase::Prefill)
+            || prev.phase_decoded.is_some_and(|n| decoded > n)
+        {
+            Some(ChartPhase::Decode)
+        } else {
+            None
+        }
+    }
+
+    /// Fresh, complete per-model phase; unknown is never coerced to zero.
+    /// The busy slots are those of the same `/slots` body (F8, DER-451),
+    /// not `/metrics` `requests_processing` read at another moment.
+    pub fn chart_phase(
+        &self,
+        model_id: &str,
+        now: Instant,
+        fresh: std::time::Duration,
+    ) -> Option<ChartPhase> {
+        if now.saturating_duration_since(*self.phase_at.get(model_id)?) > fresh {
+            return None;
+        }
+        let active_slots: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|row| row.model_id == model_id && row.is_processing)
+            .collect();
+        let mut phase = ChartPhase::Decode;
+        for slot in active_slots {
+            if slot.chart_phase? == ChartPhase::Prefill {
+                phase = ChartPhase::Prefill;
+            }
+        }
+        Some(phase)
+    }
+
     fn note_processed(&mut self, model_id: &str, slot: &LightSlot) {
-        let key = (model_id.to_owned(), slot.id);
-        let previous = self.last_processed.get(&key).copied();
-        self.round_delta = self
-            .round_delta
-            .saturating_add(counter_delta(previous, slot.n_prompt_tokens_processed));
+        let key = (model_id.to_owned(), slot.id, slot.id_task);
+        let processed = slot.n_prompt_tokens_processed;
+        // A task first seen counts all it processed (DER-451). The first
+        // round of an episode is a baseline anyway.
+        let seen = self.last_processed.get(&key).copied();
+        let delta = match seen {
+            Some(previous) => counter_delta(Some(previous), processed),
+            None => processed,
+        };
+        self.round_delta = self.round_delta.saturating_add(delta);
+        if seen.is_some() || slot.is_processing {
+            let total = self.processed_total.entry(model_id.to_owned()).or_default();
+            *total = total.saturating_add(delta);
+        }
         self.last_processed
             .insert(key, slot.n_prompt_tokens_processed);
         // llama.cpp reports `n_decoded == 0` while a slot is still in
@@ -615,6 +892,10 @@ impl SlotBook {
         if !self.round_seen {
             return;
         }
+        self.note_streams(now);
+        for model in self.phase_round.drain() {
+            self.phase_at.insert(model, now);
+        }
         let prefilling = self.round_prefilling;
         if self.last_at.is_none() {
             // First round: a baseline only, no rate yet.
@@ -638,6 +919,67 @@ impl SlotBook {
         self.last_at = Some(now);
     }
 
+    /// The in-flight tasks of the models read this round (DER-451): when
+    /// each was first seen, and its `n_decoded` once it decodes. A task
+    /// no longer in flight is forgotten.
+    fn note_streams(&mut self, now: Instant) {
+        let round = &self.phase_round;
+        let mut live: HashSet<(String, i64, i64)> = HashSet::new();
+        for row in self
+            .slots
+            .iter()
+            .filter(|row| round.contains(&row.model_id) && row.is_processing && row.id_task >= 0)
+        {
+            let key = (row.model_id.clone(), row.id, row.id_task);
+            let mark = self
+                .streams
+                .entry(key.clone())
+                .or_insert_with(|| StreamMark {
+                    model: row.model.clone(),
+                    first_seen: now,
+                    decoded: VecDeque::new(),
+                });
+            if row.n_decoded > 0 {
+                mark.decoded.push_back((now, row.n_decoded));
+                while mark.decoded.len() > SLOT_RATE_READS {
+                    mark.decoded.pop_front();
+                }
+            }
+            live.insert(key);
+        }
+        self.streams
+            .retain(|key, _| !round.contains(&key.0) || live.contains(key));
+    }
+
+    /// Each in-flight llama.cpp task's own decode rate (DER-451, F5).
+    /// None while a task has not decoded for [`SLOT_RATE_MIN_SPAN`].
+    #[must_use]
+    pub fn slot_rates(&self) -> Vec<SlotRate> {
+        let mut out: Vec<SlotRate> = self
+            .streams
+            .iter()
+            .filter_map(|((_, slot, id_task), mark)| {
+                Some(SlotRate {
+                    model: mark.model.clone(),
+                    slot: *slot,
+                    id_task: *id_task,
+                    gen_tps: mark.gen_tps().filter(|v| v.is_finite())?,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.model, a.slot).cmp(&(&b.model, b.slot)));
+        out
+    }
+
+    /// When the `/slots` reads first saw `(model id, slot, id_task)` in
+    /// flight (DER-451).
+    #[must_use]
+    pub fn first_seen(&self, model_id: &str, slot: i64, id_task: i64) -> Option<Instant> {
+        self.streams
+            .get(&(model_id.to_owned(), slot, id_task))
+            .map(|mark| mark.first_seen)
+    }
+
     /// Drop slots whose model is no longer being polled. Their held
     /// context is forgotten; their drop counts stay, and so do the
     /// conversations they lost, for their own TTL (#45): a conversation
@@ -645,6 +987,8 @@ impl SlotBook {
     pub fn retain_models(&mut self, model_ids: &[&str]) {
         self.slots
             .retain(|row| model_ids.iter().any(|id| *id == row.model_id));
+        self.streams
+            .retain(|key, _| model_ids.iter().any(|id| *id == key.0));
         self.text
             .retain(|model, _| model_ids.contains(&model.as_str()));
         self.settle(|model| !model_ids.contains(&model));
@@ -673,6 +1017,8 @@ impl SlotBook {
                 prompt_cached: row.prompt_cached,
                 input: row.input.clone(),
                 output: row.output.clone(),
+                input_chars: row.input_chars,
+                output_chars: row.output_chars,
                 ctx_used: self.ctx_of(row).and_then(|track| track.held),
                 resets: self
                     .ctx_of(row)
@@ -700,8 +1046,11 @@ fn tracked(
     input: Vec<Cell>,
     output: Vec<Cell>,
     captured_task: Option<i64>,
+    chart_phase: Option<ChartPhase>,
 ) -> Tracked {
     Tracked {
+        chart_phase,
+        phase_decoded: slot.phase_decoded,
         model_id: model_id.to_owned(),
         model: display.to_owned(),
         id: slot.id,
@@ -715,11 +1064,20 @@ fn tracked(
         prompt_cached: slot.n_prompt_tokens_cache,
         input,
         output,
+        input_chars: None,
+        output_chars: None,
         captured_task,
     }
 }
 
+/// Characters of a whole text before its tail is cut; `None` when empty.
+fn whole_chars(text: &str) -> Option<usize> {
+    let chars = text.chars().count();
+    (chars > 0).then_some(chars)
+}
+
 struct LightSlot {
+    phase_decoded: Option<u64>,
     id: i64,
     id_task: i64,
     is_processing: bool,
@@ -810,11 +1168,16 @@ impl LightSlot {
         held: Option<u64>,
         cached: Option<u64>,
         processed: u64,
-        next_token: &[NextTokenJson],
+        next_token: &Option<Vec<NextTokenJson>>,
         n_ctx: Option<u64>,
     ) -> Self {
-        let n_decoded = next_token.first().map_or(0, |token| token.n_decoded);
+        let phase_decoded = next_token
+            .as_ref()
+            .and_then(|tokens| tokens.first())
+            .and_then(|token| token.n_decoded);
+        let n_decoded = phase_decoded.unwrap_or(0);
         Self {
+            phase_decoded,
             id,
             id_task,
             is_processing,
@@ -886,7 +1249,7 @@ struct SlotJsonLight {
     #[serde(default)]
     n_prompt_tokens_processed: u64,
     #[serde(default)]
-    next_token: Vec<NextTokenJson>,
+    next_token: Option<Vec<NextTokenJson>>,
     /// Present only with `LLAMA_SERVER_SLOTS_DEBUG=1` on current
     /// llama-server (#66); skipped, never allocated, here.
     #[serde(default)]
@@ -914,7 +1277,7 @@ struct SlotJsonNumbers {
     #[serde(default)]
     n_prompt_tokens_processed: u64,
     #[serde(default)]
-    next_token: Vec<NextTokenJson>,
+    next_token: Option<Vec<NextTokenJson>>,
     // No `prompt` or `generated` field: serde skips undeclared keys without
     // building their strings.
 }
@@ -932,7 +1295,7 @@ fn missing_task() -> i64 {
 #[derive(Debug, Deserialize)]
 struct NextTokenJson {
     #[serde(default)]
-    n_decoded: u64,
+    n_decoded: Option<u64>,
 }
 
 #[cfg(test)]
@@ -985,6 +1348,31 @@ mod tests {
                 .any(|ch| ch == '\u{1b}' || (ch != '\n' && ch < ' '))
         );
         assert!(!format!("{slots:?}").contains("DROP_ME_GRAMMAR"));
+    }
+
+    /// The whole prompt and reply lengths ride with their capped tails, so
+    /// scroll speed does not divide a 256-character tail by the whole
+    /// prompt's tokens (DER-451). The prompt is read once per task; its
+    /// length stays with the kept tail.
+    #[test]
+    fn slots_keep_whole_text_lengths_beside_the_tails() {
+        let mut book = SlotBook::default();
+        let prompt = "A".repeat(1_000);
+        assert!(book.apply(
+            "m",
+            "Model",
+            &body(4, &prompt, &"B".repeat(700), 3, 2),
+            256,
+            256
+        ));
+        let slots = book.slots();
+        assert_eq!(slots[0].input.len(), 256);
+        assert_eq!(slots[0].input_chars, Some(1_000));
+        assert_eq!(slots[0].output_chars, Some(700));
+        assert!(book.apply("m", "Model", &body(4, "", &"B".repeat(900), 3, 3), 256, 256));
+        let slots = book.slots();
+        assert_eq!(slots[0].input_chars, Some(1_000), "same task, same prompt");
+        assert_eq!(slots[0].output_chars, Some(900));
     }
 
     #[test]
@@ -1714,6 +2102,37 @@ mod tests {
         assert!((reset - 5.0).abs() < 1e-6, "{reset}");
     }
 
+    /// CCR-6 corrected (DER-451): a slot finishes task 1 at 5,000
+    /// processed and starts task 2 between two reads, which is at 6,000
+    /// by the next one. The round credits task 2's 6,000, not the 1,000
+    /// difference from the old task's count. With 1, 2 and 4 slots doing
+    /// the same the round credits each new task in full.
+    #[test]
+    fn a_task_change_between_reads_counts_the_new_tasks_whole_count() {
+        for n in [1i64, 2, 4] {
+            let mut book = SlotBook::default();
+            let t = Instant::now();
+            let bodies = |task: i64, processed: u64| -> Vec<u8> {
+                let slots: Vec<String> = (0..n)
+                    .map(|id| {
+                        format!(
+                            r#"{{"id":{id},"id_task":{},"is_processing":true,"n_prompt_tokens_processed":{processed},"next_token":[{{"n_decoded":0}}]}}"#,
+                            task * 10 + id
+                        )
+                    })
+                    .collect();
+                format!("[{}]", slots.join(",")).into_bytes()
+            };
+            book.begin_round();
+            assert!(book.apply("cpp", "cpp", &bodies(1, 5000), 0, 0));
+            book.finish_round(t);
+            book.begin_round();
+            assert!(book.apply("cpp", "cpp", &bodies(2, 6000), 0, 0));
+            book.finish_round(t + Duration::from_secs(1));
+            assert_eq!(book.prompt_tps(), Some(6000.0 * n as f64), "{n} slots");
+        }
+    }
+
     /// A slot in prefill, `is_processing` with `n_decoded == 0`, whose
     /// prompt text.
     fn prefilling(processed: u64) -> Vec<u8> {
@@ -1827,5 +2246,143 @@ mod tests {
         book.finish_round(resumed + Duration::from_secs(1));
         let rate = book.prompt_tps().expect("rate");
         assert!((rate - 2048.0).abs() < 1e-6, "{rate}");
+    }
+
+    fn view(model: &str, id: i64, id_task: i64, busy: bool) -> SlotView {
+        SlotView {
+            model: model.to_owned(),
+            id,
+            id_task,
+            is_processing: busy,
+            n_prompt_tokens: 0,
+            n_prompt_tokens_processed: 0,
+            n_decoded: 0,
+            n_ctx: None,
+            ctx_prompt: None,
+            prompt_cached: None,
+            input: Vec::new(),
+            output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
+            ctx_used: None,
+            resets: ResetCounts::default(),
+            last_reset: None,
+        }
+    }
+
+    fn picked(pin: &mut StreamPin, slots: &[SlotView], now: Instant) -> (String, i64, i64) {
+        let slot = pin.pick(slots, now).expect("a slot");
+        (slot.model.clone(), slot.id, slot.id_task)
+    }
+
+    /// F6, N=1: one stream is shown while it runs, and stays shown once
+    /// it ends with nothing else running.
+    #[test]
+    fn the_pin_follows_one_stream_and_rests_on_it() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let busy = [view("m", 0, 10, true)];
+        assert_eq!(picked(&mut pin, &busy, t0), ("m".into(), 0, 10));
+        let ended = [view("m", 0, 10, false)];
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(1)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(60)),
+            ("m".into(), 0, 10)
+        );
+    }
+
+    /// F6, N=2: a stream that starts on another slot does not take IN and
+    /// OUT from the one shown; when that ends the next is shown, but not
+    /// before it was shown for PIN_DWELL.
+    #[test]
+    fn a_new_stream_does_not_steal_the_pin_and_an_end_waits_its_dwell() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let one = [view("m", 0, 10, true), view("m", 1, 4, false)];
+        assert_eq!(picked(&mut pin, &one, t0), ("m".into(), 0, 10));
+        // Slot 1 starts a newer task: the pin stays.
+        let two = [view("m", 0, 10, true), view("m", 1, 11, true)];
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &two, at), ("m".into(), 0, 10));
+        // Task 10 ends 2 s after it was pinned: held until 5 s.
+        let ended = [view("m", 0, 10, false), view("m", 1, 11, true)];
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + Duration::from_secs(2)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + PIN_DWELL - Duration::from_millis(1)),
+            ("m".into(), 0, 10)
+        );
+        assert_eq!(
+            picked(&mut pin, &ended, t0 + PIN_DWELL),
+            ("m".into(), 1, 11)
+        );
+        // A long-running pin ends past its dwell: it moves at once.
+        let back = [view("m", 0, 12, true), view("m", 1, 11, false)];
+        let later = t0 + Duration::from_secs(30);
+        assert_eq!(picked(&mut pin, &back, later), ("m".into(), 0, 12));
+    }
+
+    /// F6, N=4: when the shown stream ends, IN and OUT move to the oldest
+    /// one still running by when it was first seen, not the lowest slot
+    /// or the newest task.
+    #[test]
+    fn an_ended_pin_moves_to_the_oldest_of_four_streams() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let mut slots = vec![
+            view("m", 0, 1, true),
+            view("m", 1, 0, false),
+            view("m", 2, 0, false),
+            view("m", 3, 0, false),
+        ];
+        assert_eq!(picked(&mut pin, &slots, t0), ("m".into(), 0, 1));
+        // Slot 3 starts first, then slot 1, then slot 2.
+        for (step, (slot, task)) in [(3usize, 5i64), (1, 9), (2, 7)].into_iter().enumerate() {
+            slots[slot] = view("m", slot as i64, task, true);
+            let at = t0 + Duration::from_secs(1 + step as u64);
+            assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 0, 1));
+        }
+        slots[0] = view("m", 0, 1, false);
+        let at = t0 + Duration::from_secs(10);
+        assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 3, 5));
+        // That one ends too: slot 1, seen before slot 2's lower task id.
+        slots[3] = view("m", 3, 5, false);
+        let at = at + PIN_DWELL;
+        assert_eq!(picked(&mut pin, &slots, at), ("m".into(), 1, 9));
+    }
+
+    /// CCR-5 corrected (F6): servers number tasks on their own, so a big
+    /// task id on one is not newer than a small one on another. The pin
+    /// moves to the stream seen first.
+    #[test]
+    fn task_ids_of_different_servers_are_not_compared() {
+        let mut pin = StreamPin::default();
+        let t0 = Instant::now();
+        let first = [view("a", 0, 300_000, true), view("b", 0, 6, false)];
+        assert_eq!(picked(&mut pin, &first, t0), ("a".into(), 0, 300_000));
+        let both = [view("a", 0, 300_000, true), view("b", 0, 7, true)];
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &both, at), ("a".into(), 0, 300_000));
+        // Fresh picker: b's task is seen first and wins over a's bigger id.
+        let mut pin = StreamPin::default();
+        let b_only = [view("a", 0, 299_999, false), view("b", 0, 7, true)];
+        assert_eq!(picked(&mut pin, &b_only, t0), ("b".into(), 0, 7));
+        let at = t0 + Duration::from_secs(1);
+        assert_eq!(picked(&mut pin, &both, at), ("b".into(), 0, 7));
+        let b_done = [view("a", 0, 300_000, true), view("b", 0, 7, false)];
+        assert_eq!(
+            picked(&mut pin, &b_done, t0 + PIN_DWELL),
+            ("a".into(), 0, 300_000)
+        );
+        // Nothing runs and the pin is gone: the first model's newest task,
+        // not the biggest id across servers.
+        let mut pin = StreamPin::default();
+        let idle = [view("b", 0, 7, false), view("a", 0, 300_000, false)];
+        assert_eq!(picked(&mut pin, &idle, t0), ("b".into(), 0, 7));
     }
 }

@@ -963,8 +963,9 @@ fn busy_frame() -> TtyModel {
         activity_w: Some(280.0),
         gen_tps: Some(54.2),
         prompt_tps: Some(1200.0),
-        prompt_last: Some(4096),
+        prompt_last: Some(4096.0),
         gen_last: None,
+        rate_lines: Default::default(),
         gen_ceiling: 250.0,
         prompt_ceiling: 1500.0,
         slots: vec![slot(0, true), slot(1, true), slot(2, false)],
@@ -1063,6 +1064,7 @@ fn busy_frame() -> TtyModel {
         mem_psi: None,
         disk_ceiling_bps: 7e9,
         tz_offset_s: 0,
+        gpus: Vec::new(),
     }
 }
 

@@ -586,6 +586,7 @@ pub fn render(scrape: &Scrape<'_>) -> String {
     }
 
     host(&mut out, snap);
+    gpus(&mut out, snap);
     // #70: loads llama-watch suspects its own reads caused. The watcher
     // sends each id once, so every row is its own series.
     let suspects: Vec<Row<'_>> = snap
@@ -649,6 +650,61 @@ pub fn render(scrape: &Scrape<'_>) -> String {
 }
 
 /// Host series: ratios 0 to 1, temperatures, power and bytes.
+// Separate families preserve the existing unlabelled primary-GPU series.
+fn gpus(out: &mut Out, snap: &WireSnapshot) {
+    macro_rules! gpu_family {
+        ($field:ident, $name:literal, $help:literal) => {{
+            if snap.gpus.iter().any(|g| g.$field.is_some()) {
+                out.family($name, "gauge", $help);
+                for gpu in &snap.gpus {
+                    if let Some(value) = gpu.$field {
+                        out.sample(
+                            $name,
+                            &[
+                                ("uuid", &gpu.uuid),
+                                ("pci", &gpu.pci),
+                                ("label", &gpu.label),
+                                ("name", &gpu.name),
+                            ],
+                            &value.to_string(),
+                        );
+                    }
+                }
+            }
+        }};
+    }
+    gpu_family!(
+        gpu_pct,
+        "llamabored_gpu_device_utilization_percent",
+        "GPU device utilisation, percent."
+    );
+    gpu_family!(
+        gpu_c,
+        "llamabored_gpu_device_celsius",
+        "GPU device temperature, Celsius."
+    );
+    gpu_family!(
+        gpu_w,
+        "llamabored_gpu_device_power_watts",
+        "GPU device power draw, watts."
+    );
+    gpu_family!(
+        gpu_limit_w,
+        "llamabored_gpu_device_power_limit_watts",
+        "GPU device power limit, watts."
+    );
+    gpu_family!(
+        vram_used_bytes,
+        "llamabored_gpu_device_memory_used_bytes",
+        "GPU device memory in use, bytes."
+    );
+    gpu_family!(
+        vram_total_bytes,
+        "llamabored_gpu_device_memory_total_bytes",
+        "GPU device total memory, bytes."
+    );
+}
+
 fn host(out: &mut Out, snap: &WireSnapshot) {
     let host = &snap.host;
     out.gauge_opt(

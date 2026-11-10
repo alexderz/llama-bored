@@ -614,6 +614,8 @@ mod tests {
             last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
         }
     }
 

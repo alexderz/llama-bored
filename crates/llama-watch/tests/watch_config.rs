@@ -356,6 +356,7 @@ enum Rule {
     GridPath,
     JobsDir,
     JobsStale,
+    Gpu,
 }
 
 fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
@@ -397,6 +398,7 @@ fn rule_of(result: Result<(), InvalidWatchConfig>) -> Rule {
         Err(InvalidWatchConfig::GridPath { .. }) => Rule::GridPath,
         Err(InvalidWatchConfig::JobsDir { .. }) => Rule::JobsDir,
         Err(InvalidWatchConfig::JobsStale { .. }) => Rule::JobsStale,
+        Err(InvalidWatchConfig::Gpu { .. }) => Rule::Gpu,
     }
 }
 
@@ -2009,4 +2011,152 @@ fn jobs_dir_is_an_absolute_path_and_stale_s_is_bounded() {
         Some(std::path::Path::new("/var/lib/llama-bored/jobs"))
     );
     cfg.validate(8).expect("jobs dir with llama off");
+}
+
+#[test]
+fn gpu_config_accepts_pci_selectors_and_rejects_invalid_values() {
+    let cfg: Config = toml::from_str(
+        r#"
+[gpu]
+devices = ["0000:05:00.0", "GPU-abc"]
+[gpu.labels]
+"0000:05:00.0" = "V100"
+[gpu.idle_w]
+"GPU-abc" = 30.0
+"#,
+    )
+    .expect("GPU config parses");
+    cfg.validate(32).expect("GPU config validates");
+    for text in [
+        "[gpu]\ndevices = []",
+        "[gpu]\ndevices = \"bogus\"",
+        "[gpu]\ndevices = [\"GPU-a\", \"gpu-A\"]",
+        "[gpu.labels]\n\"x\" = \"\"",
+        "[gpu.idle_w]\n\"x\" = -1.0",
+    ] {
+        let invalid: Config = toml::from_str(text).expect("parse invalid values");
+        assert!(invalid.validate(32).is_err(), "{text}");
+    }
+    assert!(toml::from_str::<Config>("[gpu]\nunknown = true").is_err());
+    let cfg: Config = toml::from_str("[gpu.fan]\n\"0000:05:00.0\" = \"nct6798/fan1\"\n")
+        .expect("fan table parses");
+    cfg.validate(32).expect("fan table validates");
+    assert_eq!(
+        cfg.gpu.fan.get("0000:05:00.0").map(String::as_str),
+        Some("nct6798/fan1")
+    );
+    for text in [
+        "[gpu.fan]\n\"x\" = \"nct6798\"",
+        "[gpu.fan]\n\"x\" = \"nct6798/pwm1\"",
+        "[gpu.fan]\n\"x\" = \"nct6798/fan0\"",
+        "[gpu.fan]\n\"x\" = \"../nct/fan1\"",
+        "[gpu.fan]\n\"x\" = \"../fan1\"",
+        "[gpu.fan]\n\"x\" = \"./fan1\"",
+    ] {
+        let invalid: Config = toml::from_str(text).expect("fan values parse");
+        assert!(invalid.validate(32).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn gpu_fan_spec_prefers_the_most_specific_selector() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABC".into()),
+        pci_bus_id: Some("00000000:05:00.0".into()),
+        name: Some("Tesla V100-PCIE-32GB".into()),
+    };
+    let mut cfg = GpuConfig::default();
+    cfg.fan.insert("1".into(), "other/fan2".into());
+    cfg.fan.insert("0000:05:00.0".into(), "nct6798/fan1".into());
+    assert_eq!(cfg.fan_spec(&device), Some("nct6798/fan1"));
+}
+
+#[test]
+fn gpu_selectors_match_case_insensitive_identity_and_pci_domain_width() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABCD".into()),
+        pci_bus_id: Some("00000000:0B:00.0".into()),
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    for selector in [
+        "1",
+        "gpu-abcd",
+        "0000:0b:00.0",
+        "00000000:0B:00.0",
+        "nvidia geforce rtx 3090",
+    ] {
+        assert!(GpuConfig::matches(selector, &device), "{selector}");
+    }
+    assert!(!GpuConfig::matches("2", &device));
+    let short = GpuDeviceIdentity {
+        pci_bus_id: Some("0000:0b:00.0".into()),
+        ..device.clone()
+    };
+    assert!(GpuConfig::matches("00000000:0B:00.0", &short));
+    let v100 = GpuDeviceIdentity {
+        index: 0,
+        uuid: None,
+        pci_bus_id: Some("00000000:05:00.0".into()),
+        name: Some("Tesla V100-PCIE-32GB".into()),
+    };
+    assert!(GpuConfig::matches("0000:05:00.0", &v100));
+    assert!(GpuConfig::matches("00000000:05:00.0", &v100));
+}
+
+#[test]
+fn short_gpu_labels_drop_vendor_words() {
+    use llama_watch::config::{GpuConfig, short_gpu_label};
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    assert_eq!(short_gpu_label("NVIDIA GeForce RTX 3090", 1), "3090");
+    assert_eq!(short_gpu_label("Tesla V100-PCIE-32GB", 0), "V100");
+    assert_eq!(short_gpu_label("   ", 4), "GPU4");
+    let named = GpuDeviceIdentity {
+        index: 1,
+        uuid: None,
+        pci_bus_id: None,
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    assert_eq!(GpuConfig::default().label(&named), "3090");
+}
+
+#[test]
+fn the_most_specific_gpu_override_wins() {
+    use llama_watch::config::GpuConfig;
+    use llama_watch::sources::gpu::GpuDeviceIdentity;
+    let device = GpuDeviceIdentity {
+        index: 1,
+        uuid: Some("GPU-ABC".into()),
+        pci_bus_id: Some("00000000:0B:00.0".into()),
+        name: Some("NVIDIA GeForce RTX 3090".into()),
+    };
+    let mut cfg = GpuConfig::default();
+    cfg.labels.insert("1".into(), "by-index".into());
+    cfg.labels
+        .insert("NVIDIA GeForce RTX 3090".into(), "by-name".into());
+    cfg.labels.insert("0000:0b:00.0".into(), "by-pci".into());
+    cfg.labels.insert("GPU-ABC".into(), "by-uuid".into());
+    cfg.idle_w.insert("1".into(), 1.0);
+    cfg.idle_w.insert("NVIDIA GeForce RTX 3090".into(), 2.0);
+    cfg.idle_w.insert("0000:0b:00.0".into(), 3.0);
+    cfg.idle_w.insert("GPU-ABC".into(), 4.0);
+    assert_eq!(cfg.label(&device), "by-uuid");
+    assert_eq!(cfg.idle_w(&device, 0.0), 4.0);
+    cfg.labels.remove("GPU-ABC");
+    cfg.idle_w.remove("GPU-ABC");
+    assert_eq!(cfg.label(&device), "by-pci");
+    assert_eq!(cfg.idle_w(&device, 0.0), 3.0);
+    cfg.labels.remove("0000:0b:00.0");
+    cfg.idle_w.remove("0000:0b:00.0");
+    assert_eq!(cfg.label(&device), "by-name");
+    assert_eq!(cfg.idle_w(&device, 0.0), 2.0);
+    cfg.labels.remove("NVIDIA GeForce RTX 3090");
+    cfg.idle_w.remove("NVIDIA GeForce RTX 3090");
+    assert_eq!(cfg.label(&device), "by-index");
+    assert_eq!(cfg.idle_w(&device, 0.0), 1.0);
 }

@@ -13,8 +13,10 @@
 
 use super::{SourceError, SourceId};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
-use nvml_wrapper::enums::device::UsedGpuMemory;
-use nvml_wrapper::struct_wrappers::device::ProcessInfo;
+use nvml_wrapper::enums::device::{SampleValue, UsedGpuMemory};
+use nvml_wrapper::struct_wrappers::device::{FieldValueSample, ProcessInfo};
+use nvml_wrapper::structs::device::FieldId;
+use nvml_wrapper::sys_exports::field_id::NVML_FI_DEV_MEMORY_TEMP;
 use nvml_wrapper::{Device, Nvml};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -101,8 +103,88 @@ pub trait GpuBackend {
         Ok(Vec::new())
     }
 
+    /// Enumerate devices; legacy backends expose a single anonymous device.
+    fn devices(&mut self) -> Result<Vec<GpuDeviceIdentity>, GpuError> {
+        Ok(vec![GpuDeviceIdentity {
+            index: 0,
+            uuid: None,
+            pci_bus_id: None,
+            name: None,
+        }])
+    }
+    /// Read a device independently; legacy backends implement device zero.
+    fn device_reading(&mut self, index: u32, processes: bool) -> GpuDeviceReading {
+        if index != 0 {
+            return GpuDeviceReading::unavailable(index, "unknown GPU device");
+        }
+        GpuDeviceReading {
+            index,
+            util_pct: self.util_pct(),
+            temp_c: self.temp_c(),
+            memory: self.memory_info(),
+            power_mw: self.power_usage(),
+            power_limit_mw: self.enforced_power_limit(),
+            // Legacy backends have no memory-junction field.
+            mem_temp_c: None,
+            processes: if processes {
+                match self.compute_processes() {
+                    Ok(items) => ProcessRead::Ready(items),
+                    Err(err) => ProcessRead::Failed(err.to_string()),
+                }
+            } else {
+                ProcessRead::Cached
+            },
+        }
+    }
+
     /// Drop the live library handle. Safe to call when nothing is loaded.
     fn disconnect(&mut self);
+}
+
+/// Physical device identity. Missing metadata does not hide the device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuDeviceIdentity {
+    /// NVML index for reads; not a stable identity.
+    pub index: u32,
+    pub uuid: Option<String>,
+    pub pci_bus_id: Option<String>,
+    pub name: Option<String>,
+}
+/// Independent per-device fields; failures do not hide sibling fields or devices.
+#[derive(Debug)]
+pub struct GpuDeviceReading {
+    pub index: u32,
+    pub util_pct: Result<f32, GpuError>,
+    pub temp_c: Result<f32, GpuError>,
+    pub memory: Result<(u64, u64), GpuError>,
+    pub power_mw: Result<u32, GpuError>,
+    pub power_limit_mw: Result<u32, GpuError>,
+    /// Memory-junction temperature in °C from `NVML_FI_DEV_MEMORY_TEMP`.
+    /// `None` when the card has no such sensor, the read failed, or the
+    /// value is not a plausible temperature. Never `Some(0)` for a miss:
+    /// the line omits the number. This wrapper has no hotspot field;
+    /// hotspot comes from hwmon, not from an invented NVML query.
+    pub mem_temp_c: Option<f32>,
+    pub processes: ProcessRead,
+}
+impl GpuDeviceReading {
+    fn unavailable(index: u32, reason: &str) -> Self {
+        Self {
+            index,
+            util_pct: Err(GpuError::new(reason)),
+            temp_c: Err(GpuError::new(reason)),
+            memory: Err(GpuError::new(reason)),
+            power_mw: Err(GpuError::new(reason)),
+            power_limit_mw: Err(GpuError::new(reason)),
+            mem_temp_c: None,
+            processes: ProcessRead::Failed(reason.into()),
+        }
+    }
+}
+#[derive(Debug)]
+pub struct GpuDeviceSample {
+    pub identity: GpuDeviceIdentity,
+    pub reading: GpuDeviceReading,
 }
 
 /// One compute process on the GPU. Memory is bytes, or absent when NVML
@@ -194,6 +276,27 @@ fn retain_compute(listed: Vec<ProcessInfo>) -> Vec<ComputeProcess> {
     processes
 }
 
+/// Merge engine lists for one device without double-counting a process that
+/// appears in both. Either engine may be unsupported on a given device.
+fn merge_engine_processes(
+    compute: Result<Vec<ComputeProcess>, GpuError>,
+    graphics: Result<Vec<ComputeProcess>, GpuError>,
+) -> Result<Vec<ComputeProcess>, GpuError> {
+    let (compute, graphics) = match (compute, graphics) {
+        (Err(err), Err(_)) => return Err(err),
+        (compute, graphics) => (compute.unwrap_or_default(), graphics.unwrap_or_default()),
+    };
+    let mut merged = compute;
+    for process in graphics {
+        if let Some(existing) = merged.iter_mut().find(|row| row.pid == process.pid) {
+            existing.memory_bytes = existing.memory_bytes.max(process.memory_bytes);
+        } else {
+            merged.push(process);
+        }
+    }
+    Ok(merged)
+}
+
 /// VRAM and power from one extra read. Independent of util and temperature.
 #[derive(Debug)]
 #[must_use]
@@ -256,23 +359,8 @@ impl<B: GpuBackend> GpuSource<B> {
     /// attempts wait 1, then 2, 4, … reads, capped at 60. A successful init
     /// resets that sequence to one read.
     pub fn read(&mut self) -> GpuSample {
-        if !self.ready {
-            if self.init_wait > 0 {
-                self.init_wait -= 1;
-                return self.init_backoff_sample();
-            }
-            if let Err(err) = self.backend.init() {
-                // A failed init may still have kept a handle. Drop it.
-                self.backend.disconnect();
-                self.init_error = format!("init: {err}");
-                self.init_wait = self.init_backoff;
-                self.init_backoff = self.init_backoff.saturating_mul(2).min(INIT_BACKOFF_MAX);
-                return self.init_backoff_sample();
-            }
-            self.ready = true;
-            self.init_backoff = 1;
-            self.init_wait = 0;
-            self.init_error.clear();
+        if !self.ensure_ready() {
+            return self.init_backoff_sample();
         }
         let util = self.backend.util_pct();
         let temp = self.backend.temp_c();
@@ -292,6 +380,90 @@ impl<B: GpuBackend> GpuSource<B> {
             gpu_c: None,
             error: Some(SourceError::new(SourceId::Gpu, message)),
         }
+    }
+
+    fn note_session_failure(&mut self, message: String, backoff: bool) {
+        self.backend.disconnect();
+        self.ready = false;
+        self.processes_at = None;
+        self.init_error = message;
+        if backoff {
+            self.init_wait = self.init_backoff;
+            self.init_backoff = self.init_backoff.saturating_mul(2).min(INIT_BACKOFF_MAX);
+        }
+    }
+
+    fn ensure_ready(&mut self) -> bool {
+        if !self.ready {
+            if self.init_wait > 0 {
+                self.init_wait -= 1;
+                return false;
+            }
+            if let Err(err) = self.backend.init() {
+                // A failed init may still have kept a handle. Drop it.
+                self.backend.disconnect();
+                self.init_error = format!("init: {err}");
+                self.init_wait = self.init_backoff;
+                self.init_backoff = self.init_backoff.saturating_mul(2).min(INIT_BACKOFF_MAX);
+                return false;
+            }
+            self.ready = true;
+            self.init_backoff = 1;
+            self.init_wait = 0;
+            self.init_error.clear();
+        }
+        true
+    }
+    /// Read all devices in PCI order; session enumeration failures disconnect,
+    /// while individual device and field failures remain isolated.
+    pub fn read_devices(&mut self, now: Instant) -> Result<Vec<GpuDeviceSample>, GpuError> {
+        if !self.ensure_ready() {
+            return Err(GpuError::new(self.init_error.clone()));
+        }
+        let mut devices = match self.backend.devices() {
+            Ok(devices) => devices,
+            Err(err) => {
+                // A card falling off the bus must not reopen NVML every tick.
+                self.note_session_failure(err.to_string(), true);
+                return Err(err);
+            }
+        };
+        devices.sort_by(|a, b| match (&a.pci_bus_id, &b.pci_bus_id) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.index.cmp(&b.index),
+        });
+        let processes = self
+            .processes_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= PROCESS_EVERY);
+        if processes {
+            self.processes_at = Some(now);
+        }
+        let rows: Vec<_> = devices
+            .into_iter()
+            .map(|identity| {
+                let reading = self.backend.device_reading(identity.index, processes);
+                GpuDeviceSample { identity, reading }
+            })
+            .collect();
+        // One failed device stays. If every selected device failed util or
+        // temperature, drop the session as the one-GPU path does. The next
+        // read opens NVML immediately; enumeration failure is what backs off.
+        if !rows.is_empty()
+            && rows.iter().all(|row| {
+                read_failure_message(&row.reading.util_pct, &row.reading.temp_c).is_some()
+            })
+        {
+            let message = rows
+                .iter()
+                .filter_map(|row| read_failure_message(&row.reading.util_pct, &row.reading.temp_c))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.note_session_failure(message.clone(), false);
+            return Err(GpuError::new(message));
+        }
+        Ok(rows)
     }
 
     /// VRAM and power. Does not drop the session when a call fails.
@@ -398,6 +570,32 @@ impl NvidiaGpu {
     }
 }
 
+fn identities_from_count(
+    count: u32,
+    mut open: impl FnMut(u32) -> Result<GpuDeviceIdentity, ()>,
+) -> Result<Vec<GpuDeviceIdentity>, GpuError> {
+    let mut devices = Vec::new();
+    let mut failed = 0u32;
+    for index in 0..count {
+        match open(index) {
+            Ok(identity) => devices.push(identity),
+            Err(()) => {
+                failed += 1;
+                devices.push(GpuDeviceIdentity {
+                    index,
+                    uuid: None,
+                    pci_bus_id: None,
+                    name: None,
+                });
+            }
+        }
+    }
+    if count > 0 && failed == count {
+        return Err(GpuError::new("every GPU device open failed"));
+    }
+    Ok(devices)
+}
+
 impl GpuBackend for NvidiaGpu {
     fn init(&mut self) -> Result<(), GpuError> {
         self.library = None;
@@ -434,7 +632,84 @@ impl GpuBackend for NvidiaGpu {
     }
 
     fn compute_processes(&mut self) -> Result<Vec<ComputeProcess>, GpuError> {
-        Ok(retain_compute(self.device()?.running_compute_processes()?))
+        let device = self.device()?;
+        merge_engine_processes(
+            device
+                .running_compute_processes()
+                .map(retain_compute)
+                .map_err(GpuError::from),
+            device
+                .running_graphics_processes()
+                .map(retain_compute)
+                .map_err(GpuError::from),
+        )
+    }
+
+    fn devices(&mut self) -> Result<Vec<GpuDeviceIdentity>, GpuError> {
+        let library = self
+            .library
+            .as_ref()
+            .ok_or_else(|| GpuError::new("GPU library is not initialised"))?;
+        let count = library.device_count()?;
+        identities_from_count(count, |index| match library.device_by_index(index) {
+            Ok(device) => Ok(GpuDeviceIdentity {
+                index,
+                uuid: device.uuid().ok(),
+                pci_bus_id: device.pci_info().ok().map(|info| info.bus_id),
+                name: device.name().ok(),
+            }),
+            Err(_) => Err(()),
+        })
+    }
+    fn device_reading(&mut self, index: u32, processes: bool) -> GpuDeviceReading {
+        let device = self
+            .library
+            .as_ref()
+            .ok_or_else(|| GpuError::new("GPU library is not initialised"))
+            .and_then(|library| library.device_by_index(index).map_err(GpuError::from));
+        let device = match device {
+            Ok(device) => device,
+            Err(err) => return GpuDeviceReading::unavailable(index, &err.to_string()),
+        };
+        GpuDeviceReading {
+            index,
+            util_pct: device
+                .utilization_rates()
+                .map(|v| v.gpu as f32)
+                .map_err(GpuError::from),
+            temp_c: device
+                .temperature(TemperatureSensor::Gpu)
+                .map(|v| v as f32)
+                .map_err(GpuError::from),
+            memory: device
+                .memory_info()
+                .map(|v| (v.used, v.total))
+                .map_err(GpuError::from),
+            power_mw: device.power_usage().map_err(GpuError::from),
+            power_limit_mw: device.enforced_power_limit().map_err(GpuError::from),
+            // A miss is None. It does not drop the session and it is not 0.
+            mem_temp_c: device
+                .field_values_for(&[FieldId(NVML_FI_DEV_MEMORY_TEMP)])
+                .ok()
+                .and_then(memory_celsius),
+            processes: if processes {
+                match merge_engine_processes(
+                    device
+                        .running_compute_processes()
+                        .map(retain_compute)
+                        .map_err(GpuError::from),
+                    device
+                        .running_graphics_processes()
+                        .map(retain_compute)
+                        .map_err(GpuError::from),
+                ) {
+                    Ok(items) => ProcessRead::Ready(items),
+                    Err(err) => ProcessRead::Failed(err.to_string()),
+                }
+            } else {
+                ProcessRead::Cached
+            },
+        }
     }
 
     fn disconnect(&mut self) {
@@ -442,14 +717,88 @@ impl GpuBackend for NvidiaGpu {
     }
 }
 
+/// Degrees from one `NVML_FI_DEV_MEMORY_TEMP` sample list.
+///
+/// The outer call already failed into `None` before this runs. An
+/// unsupported field, a sample error, a non-finite value, zero, or anything
+/// outside 5..127 °C is omitted. Zero is not a reading: a failed sensor
+/// must not paint `0°` or leave a hole where a number was.
+fn memory_celsius(
+    samples: Vec<Result<FieldValueSample, nvml_wrapper::error::NvmlError>>,
+) -> Option<f32> {
+    let sample = samples.into_iter().next()?.ok()?;
+    let degrees = match sample.value.ok()? {
+        SampleValue::U32(v) => f64::from(v),
+        SampleValue::U64(v) => v as f64,
+        SampleValue::I64(v) => v as f64,
+        SampleValue::F64(v) => v,
+    };
+    if !degrees.is_finite() {
+        return None;
+    }
+    let rounded = degrees.round();
+    if !(5.0..127.0).contains(&rounded) {
+        return None;
+    }
+    Some(rounded as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nvml_wrapper::enums::device::UsedGpuMemory;
+    use nvml_wrapper::error::NvmlError;
     use nvml_wrapper::struct_wrappers::device::ProcessInfo;
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn memory_sample(value: Result<SampleValue, NvmlError>) -> FieldValueSample {
+        FieldValueSample {
+            field: FieldId(NVML_FI_DEV_MEMORY_TEMP),
+            timestamp: 0,
+            latency: 0,
+            value,
+        }
+    }
+
+    #[test]
+    fn memory_temp_omits_errors_zero_and_implausible() {
+        assert_eq!(memory_celsius(vec![]), None);
+        assert_eq!(memory_celsius(vec![Err(NvmlError::NotSupported)]), None);
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Err(NvmlError::NotSupported)))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(0))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::I64(4))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(127))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::I64(-3))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::F64(f64::NAN))))]),
+            None
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::F64(92.2))))]),
+            Some(92.0)
+        );
+        assert_eq!(
+            memory_celsius(vec![Ok(memory_sample(Ok(SampleValue::U32(92))))]),
+            Some(92.0)
+        );
+    }
 
     #[derive(Default)]
     struct Probe {
@@ -535,6 +884,26 @@ mod tests {
             probe: Arc::clone(&probe),
         };
         (GpuSource::new(backend), probe)
+    }
+
+    #[test]
+    fn engine_processes_merge_and_tolerate_one_unsupported_engine() {
+        let p = |pid, memory_bytes| ComputeProcess { pid, memory_bytes };
+        assert_eq!(
+            merge_engine_processes(Ok(vec![p(1, 100)]), Ok(vec![p(1, 150), p(2, 40)])).unwrap(),
+            vec![p(1, 150), p(2, 40)]
+        );
+        assert_eq!(
+            merge_engine_processes(Err(GpuError::new("unsupported")), Ok(vec![p(2, 40)])).unwrap(),
+            vec![p(2, 40)]
+        );
+        assert!(
+            merge_engine_processes(
+                Err(GpuError::new("compute")),
+                Err(GpuError::new("graphics"))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1195,5 +1564,169 @@ mod tests {
         );
         assert!(second.gpu_pct.is_some());
         assert!(second.gpu_c.is_some());
+    }
+    struct MultiFake {
+        init_count: usize,
+        disconnect_count: usize,
+        fail_enum: bool,
+        fail_reads: bool,
+    }
+    impl GpuBackend for MultiFake {
+        fn init(&mut self) -> Result<(), GpuError> {
+            self.init_count += 1;
+            Ok(())
+        }
+        fn util_pct(&mut self) -> Result<f32, GpuError> {
+            Ok(1.0)
+        }
+        fn temp_c(&mut self) -> Result<f32, GpuError> {
+            Ok(2.0)
+        }
+        fn disconnect(&mut self) {
+            self.disconnect_count += 1;
+        }
+        fn devices(&mut self) -> Result<Vec<GpuDeviceIdentity>, GpuError> {
+            if self.fail_enum {
+                self.fail_enum = false;
+                return Err(GpuError::new("enumeration"));
+            }
+            Ok(vec![
+                GpuDeviceIdentity {
+                    index: 0,
+                    uuid: Some("zero".into()),
+                    pci_bus_id: Some("0000:20:00.0".into()),
+                    name: Some("first".into()),
+                },
+                GpuDeviceIdentity {
+                    index: 1,
+                    uuid: Some("one".into()),
+                    pci_bus_id: Some("0000:02:00.0".into()),
+                    name: Some("second".into()),
+                },
+            ])
+        }
+        fn device_reading(&mut self, index: u32, processes: bool) -> GpuDeviceReading {
+            let mut reading = GpuDeviceReading::unavailable(index, "failure");
+            if !self.fail_reads && index == 1 {
+                reading.util_pct = Ok(25.0);
+                reading.temp_c = Ok(55.0);
+                reading.mem_temp_c = None;
+            }
+            reading.processes = if processes {
+                ProcessRead::Ready(vec![ComputeProcess {
+                    pid: index,
+                    memory_bytes: 7,
+                }])
+            } else {
+                ProcessRead::Cached
+            };
+            reading
+        }
+    }
+    #[test]
+    fn multi_device_sort_isolation_and_process_throttle() {
+        let mut source = GpuSource::new(MultiFake {
+            init_count: 0,
+            disconnect_count: 0,
+            fail_enum: false,
+            fail_reads: false,
+        });
+        let now = Instant::now();
+        let samples = source.read_devices(now).unwrap();
+        assert_eq!(
+            samples.iter().map(|v| v.identity.index).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(samples[0].identity.uuid.as_deref(), Some("one"));
+        assert_eq!(samples[0].reading.util_pct.as_ref().unwrap(), &25.0);
+        assert!(samples[0].reading.memory.is_err());
+        assert!(samples[1].reading.util_pct.is_err());
+        assert!(matches!(
+            samples[0].reading.processes,
+            ProcessRead::Ready(_)
+        ));
+        let cached = source
+            .read_devices(now + Duration::from_millis(500))
+            .unwrap();
+        assert!(
+            cached
+                .iter()
+                .all(|v| matches!(v.reading.processes, ProcessRead::Cached))
+        );
+        assert!(matches!(
+            source.read_devices(now + Duration::from_secs(1)).unwrap()[0]
+                .reading
+                .processes,
+            ProcessRead::Ready(_)
+        ));
+        assert_eq!(source.backend.init_count, 1);
+        assert_eq!(source.backend.disconnect_count, 0);
+    }
+    #[test]
+    fn every_selected_device_failing_drops_the_session_immediately() {
+        let mut source = GpuSource::new(MultiFake {
+            init_count: 0,
+            disconnect_count: 0,
+            fail_enum: false,
+            fail_reads: true,
+        });
+        let now = Instant::now();
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(source.backend.disconnect_count, 1);
+        source.backend.fail_reads = false;
+        assert_eq!(source.read_devices(now).unwrap().len(), 2);
+        assert_eq!(source.backend.init_count, 2);
+    }
+    #[test]
+    fn every_device_open_failing_is_a_session_error() {
+        let err = identities_from_count(2, |_| Err(())).unwrap_err();
+        assert!(err.to_string().contains("every GPU device open failed"));
+        let rows = identities_from_count(2, |index| {
+            if index == 0 {
+                Err(())
+            } else {
+                Ok(GpuDeviceIdentity {
+                    index,
+                    uuid: Some("u".into()),
+                    pci_bus_id: None,
+                    name: None,
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].uuid.is_none());
+        assert_eq!(rows[1].uuid.as_deref(), Some("u"));
+    }
+    #[test]
+    fn multi_device_enumeration_failure_disconnects_then_reconnects() {
+        let mut source = GpuSource::new(MultiFake {
+            init_count: 0,
+            disconnect_count: 0,
+            fail_enum: true,
+            fail_reads: false,
+        });
+        let now = Instant::now();
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(source.backend.disconnect_count, 1);
+        assert_eq!(source.backend.init_count, 1);
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(source.backend.init_count, 1);
+        assert_eq!(source.read_devices(now).unwrap().len(), 2);
+        assert_eq!(source.backend.init_count, 2);
+    }
+    #[test]
+    fn legacy_backend_multi_read_keeps_init_backoff_and_defaults() {
+        let (mut source, probe) = scripted(&[Err("offline"), Ok(())], &[Ok(42.0)], &[Ok(60.0)]);
+        let now = Instant::now();
+        assert!(source.read_devices(now).is_err());
+        assert!(source.read_devices(now).is_err());
+        assert_eq!(probe.init_calls(), 1);
+        let rows = source.read_devices(now).unwrap();
+        assert_eq!(probe.init_calls(), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity.index, 0);
+        assert_eq!(*rows[0].reading.util_pct.as_ref().unwrap(), 42.0);
+        assert!(matches!(&rows[0].reading.processes, ProcessRead::Ready(p) if p.is_empty()));
     }
 }

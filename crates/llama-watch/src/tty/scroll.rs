@@ -9,6 +9,23 @@
 //! falls back the same way. Either change keeps the characters already
 //! shown, so the text does not jump.
 //!
+//! Characters per second are tok/s times the characters per token of the
+//! whole text the panel shows a tail of: its full length over its token
+//! count, else four. The panel's own text is capped (`input_tail_chars`),
+//! so its length over the whole prompt's tokens would crawl: a cached
+//! 32k-token prompt with an 8k-character tail moved at a quarter character
+//! per token, crossing in the time a cold prefill of the whole prompt
+//! takes instead of the time its tail takes (DER-451).
+//!
+//! IN crosses only what this request appended (DER-451): the burst starts
+//! at the first new character, the text before it already passed. The new
+//! part is the capture's message diff when the poller has one, else the
+//! uncached tokens (`input − cached`) at the characters per token above,
+//! counted back from the end, else the whole text. IN moves at prefill
+//! speed, so with no live, history or own rate it uses a fast
+//! [`FAST_PREFILL_TPS`] instead of the two-second crossing, and the first
+//! real rate to appear takes over without a jump. OUT keeps both rules.
+//!
 //! A streaming update (the text grows while it is generated) keeps the tail
 //! and does not jump back to the top. Text shorter than the panel is the
 //! layout's concern: a scroll of zero starts at the top, and a window that
@@ -23,6 +40,10 @@ const HISTORY: usize = 5;
 const FALLBACK_SECS: f64 = 2.0;
 /// Characters per token when the turn has no token count.
 const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
+/// Prefill tok/s IN assumes until a measured rate is known (DER-451). A
+/// prefill usually ends before a slow scroll would, so this is fast: an
+/// 8,192-character tail crosses in about a second.
+pub const FAST_PREFILL_TPS: f64 = 2_000.0;
 /// Activity rows remembered so a row is counted once.
 const SEEN_MAX: usize = 512;
 
@@ -49,6 +70,16 @@ pub struct Sample<'a> {
     pub output: &'a [char],
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Characters of the whole prompt that [`Self::input`] is a tail of,
+    /// when known. Not the length of `input`, which is capped.
+    pub input_chars: Option<usize>,
+    /// Characters of the whole reply that [`Self::output`] is a tail of.
+    pub output_chars: Option<usize>,
+    /// Of [`Self::input_tokens`], those the engine reused from its cache.
+    pub input_cached: Option<u64>,
+    /// Characters at the end of [`Self::input`] that this request
+    /// appended, when the capture's messages tell (DER-451).
+    pub input_new: Option<usize>,
     /// Live prefill tok/s (`/slots` or tqLLM). Not a held burst speed.
     pub live_prompt: Option<f64>,
     /// Live generation tok/s. Not a wall-clock spike from a burst engine.
@@ -126,15 +157,69 @@ fn positive(rate: Option<f64>) -> Option<f64> {
     rate.filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
-fn chars_per_sec(chars: usize, tokens: Option<u64>, tps: Option<f64>) -> f64 {
-    let Some(tps) = tps else {
-        return chars as f64 / FALLBACK_SECS;
-    };
-    let per_token = match tokens {
-        Some(n) if n > 0 => chars as f64 / n as f64,
+/// Characters per token of a text of `whole` characters and `tokens`
+/// tokens, else [`DEFAULT_CHARS_PER_TOKEN`].
+fn per_token(whole: Option<usize>, tokens: Option<u64>) -> f64 {
+    match (whole, tokens) {
+        (Some(chars), Some(n)) if chars > 0 && n > 0 => chars as f64 / n as f64,
         _ => DEFAULT_CHARS_PER_TOKEN,
+    }
+}
+
+/// `shown` is the panel's text, `whole` the full text it is a tail of. Its
+/// tokens are the whole text's, so only `whole` is divided by them.
+fn chars_per_sec(shown: usize, whole: Option<usize>, tokens: Option<u64>, tps: Option<f64>) -> f64 {
+    let Some(tps) = tps else {
+        return shown as f64 / FALLBACK_SECS;
     };
-    tps * per_token
+    tps * per_token(whole, tokens)
+}
+
+/// Uncached tokens past twice the message diff's that still read as the
+/// diff (DER-451). An agent turn's uncached count also holds the re-sent
+/// tool call, template tokens and the cache's block rounding: up to about
+/// 2,000 tokens over its new messages on real turns. A cache miss is a
+/// whole prompt.
+const MISS_SLACK_TOKENS: f64 = 4_096.0;
+
+/// Characters at the end of IN's `shown` text that this request appended
+/// (DER-451): the message diff, else the uncached tokens at the text's
+/// characters per token, else all of it. When the uncached tokens are far
+/// more than the diff's (a cache miss: evicted, reloaded, or a rewritten
+/// history), the larger estimate wins, so a miss is not under-scrolled.
+fn new_input(
+    shown: usize,
+    diff: Option<usize>,
+    whole: Option<usize>,
+    tokens: Option<u64>,
+    cached: Option<u64>,
+) -> usize {
+    let per = per_token(whole, tokens);
+    let uncached = match (tokens, cached) {
+        (Some(tokens), Some(cached)) if tokens > 0 => Some(tokens.saturating_sub(cached)),
+        _ => None,
+    };
+    let estimate = uncached.map(|uncached| {
+        let chars = uncached as f64 * per;
+        if chars.is_finite() && chars < shown as f64 {
+            chars.ceil() as usize
+        } else {
+            shown
+        }
+    });
+    match (diff, uncached, estimate) {
+        (Some(new), Some(uncached), Some(estimate)) => {
+            let new = new.min(shown);
+            if uncached as f64 > 2.0 * (new as f64 / per) + MISS_SLACK_TOKENS {
+                estimate.max(new)
+            } else {
+                new
+            }
+        }
+        (Some(new), ..) => new.min(shown),
+        (None, _, Some(estimate)) => estimate,
+        _ => shown,
+    }
 }
 
 /// `next` continues `prev`: it grew in place, including a head the cap trimmed.
@@ -157,6 +242,12 @@ fn continues(prev: &[char], next: &[char]) -> bool {
 /// Speed inputs for one panel of one frame.
 struct Pace<'a> {
     tokens: Option<u64>,
+    /// Characters of the whole text, when known.
+    chars: Option<usize>,
+    /// Characters at the end of the text to cross; `None` is all of it.
+    new: Option<usize>,
+    /// Tok/s when no rate is known; `None` crosses in [`FALLBACK_SECS`].
+    default_tps: Option<f64>,
     live: Option<f64>,
     own: Option<f64>,
     history: &'a VecDeque<f64>,
@@ -209,8 +300,8 @@ impl Panel {
             self.request = request;
             return;
         }
-        let tps = choose(pace.live, pace.history, pace.own);
-        let cps = chars_per_sec(text.len(), pace.tokens, tps);
+        let tps = choose(pace.live, pace.history, pace.own).or(pace.default_tps);
+        let cps = chars_per_sec(text.len(), pace.chars, pace.tokens, tps);
         if self.request == request && self.text.as_slice() == text {
             self.retarget(cps, now);
             return;
@@ -221,9 +312,11 @@ impl Panel {
             self.mode = Mode::Tail;
             return;
         }
+        // Only the new part crosses: what came before it has passed.
+        let passed = text.len() - pace.new.unwrap_or(text.len()).min(text.len());
         self.mode = Mode::Burst {
             at: now,
-            passed: 0.0,
+            passed: passed as f64,
             chars_per_sec: cps,
         };
     }
@@ -327,6 +420,15 @@ impl Motion {
             sample.input,
             Pace {
                 tokens: sample.input_tokens,
+                chars: sample.input_chars,
+                new: Some(new_input(
+                    sample.input.len(),
+                    sample.input_new,
+                    sample.input_chars,
+                    sample.input_tokens,
+                    sample.input_cached,
+                )),
+                default_tps: Some(FAST_PREFILL_TPS),
                 live: sample.live_prompt,
                 own: own_prompt,
                 history: &prompt_hist,
@@ -338,6 +440,9 @@ impl Motion {
             sample.output,
             Pace {
                 tokens: sample.output_tokens,
+                chars: sample.output_chars,
+                new: None,
+                default_tps: None,
                 live: sample.live_gen,
                 own: own_gen,
                 history: &gen_hist,
@@ -411,6 +516,10 @@ mod tests {
             output,
             input_tokens: Some(input.len() as u64),
             output_tokens: Some(output.len() as u64),
+            input_chars: Some(input.len()),
+            output_chars: Some(output.len()),
+            input_cached: None,
+            input_new: None,
             live_prompt,
             live_gen,
             rows,
@@ -566,6 +675,182 @@ mod tests {
         sample.output_tokens = None;
         let view = motion.update(&sample, now);
         assert!((view.out_cps.expect("cps") - 40.0).abs() < 1e-9);
+    }
+
+    /// An 8,192-character IN tail of a 32,178-token prompt, 29,952 of them
+    /// cached, read at 3,000 tok/s (DER-451). At four characters per token
+    /// the tail is about 2,048 tokens and crosses in under a second. Its
+    /// own length over the whole prompt's tokens would take 10.7 s, the
+    /// time to prefill all 32,178 tokens cold.
+    #[test]
+    fn a_capped_tail_of_a_cached_prompt_crosses_at_the_prefill_rate() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let tail = chars(&"t".repeat(8_192));
+        let rows = [turn(1, 3_000.0, 30.0)];
+        let mut sample = sample(1, &tail, &[], &rows, None, None);
+        sample.input_tokens = Some(32_178);
+        sample.input_chars = None;
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 12_000.0).abs() < 1e-9);
+        let crossed = motion.update(&sample, now + std::time::Duration::from_millis(683));
+        assert_eq!(crossed.inn, Some(8_192), "the tail is through in 0.68 s");
+
+        // The whole prompt's length is known: its own characters per token.
+        let mut motion = Motion::default();
+        sample.input_chars = Some(96_534);
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 9_000.0).abs() < 1e-9);
+    }
+
+    /// A 24,576-character OUT tail of a 10,000-token reply that was 40,000
+    /// characters in all (DER-451): four characters per token, not 2.5.
+    #[test]
+    fn a_capped_reply_tail_uses_the_whole_reply_per_token() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let tail = chars(&"r".repeat(24_576));
+        let rows = [turn(1, 3_000.0, 30.0)];
+        let mut sample = sample(1, &[], &tail, &rows, None, None);
+        sample.output_tokens = Some(10_000);
+        sample.output_chars = Some(40_000);
+        let view = motion.update(&sample, now);
+        assert!((view.out_cps.expect("cps") - 120.0).abs() < 1e-9);
+    }
+
+    /// An agent turn (DER-451): IN holds the conversation tail, and the
+    /// capture's message diff says only the last 300 characters, the tool
+    /// result, were appended. The burst starts at that result and crosses
+    /// only it, at the prefill rate.
+    #[test]
+    fn a_tool_loop_turn_scrolls_only_the_appended_tool_result() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let text = chars(&format!("{}{}", "o".repeat(1_700), "n".repeat(300)));
+        let rows = [turn(1, 1_000.0, 30.0)];
+        let mut sample = sample(1, &text, &[], &rows, None, None);
+        sample.input_new = Some(300);
+        sample.input_tokens = None;
+        let first = motion.update(&sample, now);
+        assert_eq!(first.inn, Some(1_700), "starts at the new part");
+        assert_eq!(first.in_cps, Some(4_000.0));
+        let done = motion.update(&sample, now + std::time::Duration::from_millis(75));
+        assert_eq!(done.inn, Some(2_000), "300 characters in 75 ms");
+        // A retry appended nothing IN shows: it sits at the end.
+        let mut retry = sample.clone();
+        retry.request = 2;
+        retry.input_new = Some(0);
+        let mut motion = Motion::default();
+        assert_eq!(motion.update(&retry, now).inn, Some(2_000));
+    }
+
+    /// No diff: the uncached tokens, counted back from the end, are new;
+    /// with nothing cached (a new conversation) all of it is.
+    #[test]
+    fn without_a_diff_the_uncached_tokens_mark_the_new_tail() {
+        let now = Instant::now();
+        let text = chars(&"x".repeat(8_192));
+        let rows = [turn(1, 1_000.0, 30.0)];
+        let mut sample = sample(1, &text, &[], &rows, None, None);
+        sample.input_chars = None;
+        sample.input_tokens = Some(32_178);
+        sample.input_cached = Some(31_678);
+        let view = Motion::default().update(&sample, now);
+        assert_eq!(view.inn, Some(8_192 - 2_000), "500 tokens at four each");
+        sample.input_cached = Some(0);
+        let view = Motion::default().update(&sample, now);
+        assert_eq!(view.inn, Some(0), "a new conversation crosses everything");
+        sample.input_cached = None;
+        let view = Motion::default().update(&sample, now);
+        assert_eq!(view.inn, Some(0), "an unknown cache crosses everything");
+    }
+
+    /// A cache miss (DER-451): the diff says one small message is new, the
+    /// engine says nothing was cached. The uncached estimate wins. An agent
+    /// turn whose uncached count is the diff plus about 2,000 tokens of
+    /// re-sent call, template and block rounding keeps the diff.
+    #[test]
+    fn a_cache_miss_beats_a_small_diff_but_an_agent_turn_does_not() {
+        let now = Instant::now();
+        let text = chars(&"x".repeat(8_192));
+        let rows = [turn(1, 1_000.0, 30.0)];
+        let mut sample = sample(1, &text, &[], &rows, None, None);
+        sample.input_chars = None;
+        // A rewritten conversation: 100 new characters, nothing cached.
+        sample.input_new = Some(100);
+        sample.input_tokens = Some(26_659);
+        sample.input_cached = Some(0);
+        assert_eq!(Motion::default().update(&sample, now).inn, Some(0));
+        // An agent turn: 884 new characters, 2,226 uncached tokens.
+        sample.input_new = Some(884);
+        sample.input_tokens = Some(32_178);
+        sample.input_cached = Some(29_952);
+        assert_eq!(
+            Motion::default().update(&sample, now).inn,
+            Some(8_192 - 884)
+        );
+        // No cached count: the diff alone.
+        sample.input_new = Some(100);
+        sample.input_cached = None;
+        assert_eq!(
+            Motion::default().update(&sample, now).inn,
+            Some(8_192 - 100)
+        );
+    }
+
+    /// No rate at all: IN uses the fast default, not two seconds, and the
+    /// first measured rate takes over without a jump.
+    #[test]
+    fn an_unknown_prefill_rate_is_fast_and_a_real_one_takes_over() {
+        let mut motion = Motion::default();
+        let start = Instant::now();
+        let text = chars(&"x".repeat(80_000));
+        let mut sample = sample(1, &text, &[], &[], None, None);
+        sample.input_chars = None;
+        sample.input_tokens = None;
+        let first = motion.update(&sample, start);
+        assert_eq!(first.in_cps, Some(FAST_PREFILL_TPS * 4.0));
+        let half = start + std::time::Duration::from_millis(500);
+        assert_eq!(motion.update(&sample, half).inn, Some(4_000));
+        let rows = [turn(1, 500.0, 30.0)];
+        let mut rated = sample.clone();
+        rated.rows = &rows;
+        let view = motion.update(&rated, half);
+        assert_eq!(view.inn, Some(4_000), "no jump");
+        assert_eq!(view.in_cps, Some(2_000.0), "this turn's own rate");
+        let later = motion.update(&rated, half + std::time::Duration::from_secs(1));
+        assert_eq!(later.inn, Some(6_000));
+    }
+
+    /// Earlier turns' prefill rate is used before the fast default.
+    #[test]
+    fn the_history_prefill_rate_beats_the_default() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let first = chars("first prompt");
+        let rows = [turn(1, 300.0, 30.0)];
+        motion.update(&sample(1, &first, &[], &rows, None, None), now);
+        let second = chars("second prompt");
+        let mut next = sample(2, &second, &[], &rows, None, None);
+        next.input_chars = None;
+        next.input_tokens = None;
+        let view = motion.update(&next, now);
+        assert_eq!(view.in_cps, Some(1_200.0), "300 tok/s, four per token");
+    }
+
+    /// Text that is not capped is its own whole: the speed is what it was.
+    #[test]
+    fn an_uncapped_text_keeps_its_own_characters_per_token() {
+        let mut motion = Motion::default();
+        let now = Instant::now();
+        let text = chars(&"u".repeat(600));
+        let rows = [turn(1, 100.0, 10.0)];
+        let mut sample = sample(1, &text, &text, &rows, None, None);
+        sample.input_tokens = Some(200);
+        sample.output_tokens = Some(300);
+        let view = motion.update(&sample, now);
+        assert!((view.in_cps.expect("cps") - 300.0).abs() < 1e-9);
+        assert!((view.out_cps.expect("cps") - 20.0).abs() < 1e-9);
     }
 
     /// Seven completed turns. The last burst averages only the previous

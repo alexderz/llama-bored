@@ -507,3 +507,22 @@ enabled = true
 #label = "pres"
 #order = 74
 # <<< spec example
+
+
+# By default all detected GPUs are sampled. To restrict the watcher, use
+# NVML index, UUID, PCI bus ID or a case-insensitive device name:
+# [gpu]
+# devices = ["0000:05:00.0", "0000:0b:00.0"]
+# PCI selectors match NVML's 8-digit domain form too, case-insensitive:
+# 0000:0b:00.0 and 00000000:0B:00.0 are the same bus.
+# [gpu.labels]
+# "0000:05:00.0" = "V100"
+# "0000:0b:00.0" = "3090"
+# [gpu.idle_w]
+# "0000:05:00.0" = 25.0
+# Devices without an override use load.gpu_idle_w.
+# A device with no label gets a short name from NVML, such as 3090 or V100.
+# Optional blower rpm, drawn on that card's GPU row. The chip is the hwmon
+# `name` (never the hwmon number). Only fanN_input is read; pwm is not touched.
+# [gpu.fan]
+# "0000:05:00.0" = "nct6798/fan1"

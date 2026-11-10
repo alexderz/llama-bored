@@ -134,7 +134,7 @@ fn hostile_fonts_do_not_panic() {
 /// are U+2581..=U+2588, which this list already contains.
 const DRAWN: &[char] = &[
     '█', '▌', '▐', '░', '▒', '▓', '▀', '▄', '·', '…', '≈', '’', '‘', '“', '”', '–', '—', '•',
-    '\u{fffd}', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
+    '\u{fffd}', '°', '▁', '▂', '▃', '▅', '▆', '▇', '\u{e584}',
 ];
 
 fn shipped(size: &str) -> Psf2 {

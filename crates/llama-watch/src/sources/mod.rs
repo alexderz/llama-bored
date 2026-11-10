@@ -3,6 +3,7 @@ pub mod cmdline;
 pub mod events;
 pub mod fans;
 pub mod gpu;
+pub mod gpu_fan;
 pub mod hostio;
 pub mod hwmon;
 pub mod llamaswap;

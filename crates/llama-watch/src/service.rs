@@ -25,7 +25,7 @@ use crate::metrics::EngineLive;
 use crate::poller::{self, CaptureView, LlamaDetail, ModelEngineLive, ModelSetup, PollLatencies};
 use crate::publish::{Extras, PublishError, Publisher, SlotCtx};
 use crate::setup_rules::{LiveCtx, Rules};
-use crate::slots::{SlotView, pick_slot};
+use crate::slots::SlotView;
 use crate::sources::Roots;
 use crate::sources::gpu::{GpuBackend, NvidiaGpu};
 use crate::sources::proc::count_cpus;
@@ -488,8 +488,12 @@ struct TickState {
     ctx_sizes: BTreeMap<String, u64>,
     /// Last non-zero decode rate for the dim GEN digits (#163).
     gen_last: Option<f64>,
+    /// Last non-zero READ rate for the dim READ digits (DER-451).
+    prompt_last: Option<f64>,
     /// IN/OUT burst scroll (#188).
     motion: crate::tty::scroll::Motion,
+    /// The stream IN and OUT follow (DER-451, F6).
+    pin: crate::slots::StreamPin,
 }
 
 impl TickState {
@@ -506,6 +510,8 @@ impl TickState {
                 activity: Vec::new(),
                 gen_tps: None,
                 prompt_tps: None,
+                chart_prompt_tps: None,
+                streams: Default::default(),
                 latencies: PollLatencies::default(),
                 prompt_cache: Vec::new(),
                 capture: None,
@@ -534,7 +540,9 @@ impl TickState {
             flights: crate::inflight::Tracker::default(),
             ctx_sizes: BTreeMap::new(),
             gen_last: None,
+            prompt_last: None,
             motion: crate::tty::scroll::Motion::default(),
+            pin: crate::slots::StreamPin::default(),
         }
     }
 }
@@ -607,7 +615,9 @@ fn tick_once<Feed, Samp, Pub, Rend, Clk, Ntf, Stp, Lg>(
         (Some(at), Some(count)) => Some((at, count)),
         _ => None,
     };
-    state.chart.ingest(mono, decoded, state.detail.prompt_tps);
+    state
+        .chart
+        .ingest(mono, decoded, state.detail.chart_prompt_tps);
     let running: Vec<String> = state
         .llama
         .models
@@ -1001,6 +1011,9 @@ fn tty_model(
     if let Some(rate) = tick.detail.gen_tps.filter(|v| v.is_finite() && *v > 0.0) {
         tick.gen_last = Some(rate);
     }
+    if let Some(rate) = tick.detail.prompt_tps.filter(|v| v.is_finite() && *v > 0.0) {
+        tick.prompt_last = Some(rate);
+    }
     let watch = watch_state(sample, &tick.detail, tick.heard, ctx.llama_enabled);
     let (model_loading, model_stopping) = header_swap(sample, watch);
     let no_slots = first_without_slots(sample, watch);
@@ -1015,19 +1028,30 @@ fn tty_model(
                 .first()
                 .is_some_and(|model| model.name == capture.model)
     });
+    // DER-451 (F6): one sticky pick for IN, OUT and their scroll.
+    let picked_key = tick
+        .pin
+        .pick(&tick.detail.slots, mono)
+        .map(|slot| (slot.model.clone(), slot.id, slot.id_task));
+    let picked = picked_key.as_ref().and_then(|(model, id, task)| {
+        tick.detail
+            .slots
+            .iter()
+            .find(|slot| slot.model == *model && slot.id == *id && slot.id_task == *task)
+    });
     // With text off the poller keeps none, and nothing here reads the slot
     // tails either, so no llama text can reach the frame (RR-LV1).
     let mut text = if !ctx.show_text {
         FrameText::default()
     } else if let Some(capture) = capture {
-        capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap)
+        let running = tick.detail.streams.running.unwrap_or(0);
+        let mut text = capture_text(capture, &mut tick.replay, ctx.input_cap, ctx.output_cap);
+        text.in_title = capture_in_title(&capture.input_note, running);
+        text
     } else {
-        frame_text(
-            &tick.detail.slots,
-            &mut tick.replay,
-            ctx.input_cap,
-            ctx.output_cap,
-        )
+        let mut text = frame_text(picked, &mut tick.replay, ctx.input_cap, ctx.output_cap);
+        text.in_title = slot_in_title(picked, &tick.detail.slots);
+        text
     };
     if ctx.show_text {
         apply_scroll(
@@ -1035,6 +1059,7 @@ fn tty_model(
             &mut tick.motion,
             &tick.detail,
             capture,
+            picked,
             &sample.snapshot.models,
             mono,
         );
@@ -1112,8 +1137,9 @@ fn tty_model(
         activity_w: sample.activity_w,
         gen_tps: tick.detail.gen_tps,
         prompt_tps: tick.detail.prompt_tps,
-        prompt_last: prompt_last(&tick.detail.slots),
+        prompt_last: tick.prompt_last,
         gen_last: tick.gen_last,
+        rate_lines: rate_lines(&tick.detail.streams),
         gen_ceiling: ctx.gen_ceiling,
         prompt_ceiling: ctx.prompt_ceiling,
         slots: {
@@ -1233,6 +1259,7 @@ fn tty_model(
         mem_psi: sample.host_io.mem_psi.map(f64::from),
         disk_ceiling_bps: ctx.disk_ceiling_bps,
         tz_offset_s: zone.offset_at(unix_secs_of(wall)),
+        gpus: tty_gpus(&sample.gpu_devices),
     }
 }
 
@@ -1302,13 +1329,82 @@ fn setup_view(
         info: model.backend.as_ref(),
         engine: Some(&setup.engine),
     };
-    let rows = rules.rows(&setup.found, &live);
+    let mut rows = rules.rows(&setup.found, &live);
+    if let Some(text) = spanned_cards(&sample.gpu_devices, &sample.gpu_processes.list) {
+        rows.push(layout::SetupRow {
+            label: "gpus".to_owned(),
+            items: vec![layout::SetupItem {
+                sep: String::new(),
+                text,
+                dim: false,
+                text_value: false,
+            }],
+        });
+    }
     Some(SetupView {
         id: setup.id,
         name: setup.name,
         more: sample.snapshot.models.len() - 1,
         rows,
     })
+}
+
+/// Cards the busiest GPU process spans, in PCI order (`3090 + V100` is the
+/// device order, not the order the labels were first stored). `None` for a
+/// single selected GPU, so the SETUP block stays unchanged.
+fn spanned_cards(
+    devices: &[crate::collector::GpuDeviceTelemetry],
+    processes: &[crate::collector::GpuProcess],
+) -> Option<String> {
+    if devices.len() < 2 {
+        return None;
+    }
+    let process = processes
+        .iter()
+        .filter(|process| !process.device_labels.is_empty())
+        .max_by_key(|process| process.memory_bytes)?;
+    let mut labels: Vec<String> = devices
+        .iter()
+        .filter(|device| {
+            process
+                .device_labels
+                .iter()
+                .any(|label| label == &device.label)
+        })
+        .map(|device| device.label.clone())
+        .collect();
+    for label in &process.device_labels {
+        if !labels.iter().any(|have| have == label) {
+            labels.push(label.clone());
+        }
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join(" + "))
+    }
+}
+
+fn tty_gpus(devices: &[crate::collector::GpuDeviceTelemetry]) -> Vec<layout::TtyGpu> {
+    if devices.len() < 2 {
+        return Vec::new();
+    }
+    devices
+        .iter()
+        .map(|device| layout::TtyGpu {
+            label: device.label.clone(),
+            util_pct: pct(device.util_pct),
+            temp_c: temp_i(device.temp_c),
+            mem_temp_c: temp_i(device.mem_temp_c),
+            // nvml-wrapper 0.13 has no hotspot field. A junction reading
+            // comes from hwmon and is drawn on the card line from there.
+            hotspot_c: None,
+            vram_used_gb: device.extra.vram_used.map(gib),
+            vram_total_gb: device.extra.vram_total.map(gib),
+            fan_rpm: device.fan_rpm,
+            fan_pwm: device.fan_pwm,
+        })
+        .collect()
 }
 
 /// The SETUP entry that [`setup_view`] would show, and the snapshot model
@@ -1396,30 +1492,61 @@ fn live_token_rates(detail: &LlamaDetail, models: &[ModelInfo]) -> (Option<f64>,
     (prompt_live, gen_live)
 }
 
+/// Whose text the panels show, and the token and character counts of the
+/// whole prompt and reply that IN and OUT are tails of (DER-451).
+#[derive(Debug, Default, PartialEq)]
+struct ScrollIdentity {
+    model: String,
+    request: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    input_chars: Option<usize>,
+    output_chars: Option<usize>,
+    /// Of `input_tokens`, those the engine reused from its cache.
+    input_cached: Option<u64>,
+    /// Characters at the end of IN that this request appended, when the
+    /// capture's messages tell.
+    input_new: Option<usize>,
+}
+
 fn scroll_identity(
     detail: &LlamaDetail,
     capture: Option<&CaptureView>,
-) -> (String, u64, Option<u64>, Option<u64>) {
+    picked: Option<&SlotView>,
+) -> ScrollIdentity {
     if let Some(capture) = capture {
         let row = detail.activity.iter().find(|row| row.id == capture.id);
         let model = row
             .map(|row| row.model.clone())
             .unwrap_or_else(|| capture.model.clone());
         let request = u64::try_from(capture.id.max(0)).unwrap_or(0);
-        return (
+        let prompt = row.and_then(ActivityRow::prompt);
+        return ScrollIdentity {
             model,
             request,
-            row.and_then(|row| row.input_tokens),
-            row.and_then(|row| row.output_tokens),
-        );
+            input_tokens: prompt.map(|split| split.whole),
+            output_tokens: row.and_then(|row| row.output_tokens),
+            // A capture's IN is the newest messages, not a tail of the
+            // prompt its tokens count: four characters per token.
+            input_chars: None,
+            output_chars: capture.output_chars,
+            input_cached: row
+                .filter(|row| row.cached_tokens.is_some())
+                .and(prompt)
+                .map(|split| split.cached),
+            input_new: capture.input_new,
+        };
     }
-    let Some(slot) = pick_slot(&detail.slots) else {
+    let Some(slot) = picked else {
         let model = detail
             .setup
             .first()
             .map(|setup| setup.key.clone())
             .unwrap_or_default();
-        return (model, 0, None, None);
+        return ScrollIdentity {
+            model,
+            ..ScrollIdentity::default()
+        };
     };
     let model = detail
         .setup
@@ -1436,12 +1563,23 @@ fn scroll_identity(
             .wrapping_add(slot.id_task as u64)
             .max(1)
     };
-    (
+    ScrollIdentity {
         model,
         request,
-        (slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens),
-        (slot.n_decoded > 0).then_some(slot.n_decoded),
-    )
+        input_tokens: slot
+            .prompt_total()
+            .or((slot.n_prompt_tokens > 0).then_some(slot.n_prompt_tokens)),
+        output_tokens: (slot.n_decoded > 0).then_some(slot.n_decoded),
+        // The whole prompt's characters go only with its whole token count.
+        // While it prefills, the count is what the slot holds so far, and
+        // the pair would cross IN many times too fast: four per token then.
+        input_chars: slot.prompt_total().and(slot.input_chars),
+        output_chars: slot.output_chars,
+        // While it prefills, a slot's token count is only what it holds so
+        // far, so the uncached part is not known until it decodes.
+        input_cached: slot.prompt_total().and(slot.prompt_cached),
+        input_new: None,
+    }
 }
 
 fn apply_scroll(
@@ -1449,10 +1587,11 @@ fn apply_scroll(
     motion: &mut crate::tty::scroll::Motion,
     detail: &LlamaDetail,
     capture: Option<&CaptureView>,
+    picked: Option<&SlotView>,
     models: &[ModelInfo],
     now: Instant,
 ) {
-    let (model, request, input_tokens, output_tokens) = scroll_identity(detail, capture);
+    let identity = scroll_identity(detail, capture, picked);
     let input = text_chars(&text.in_lines);
     let output = text_chars(&text.out_lines);
     let rows: Vec<crate::tty::scroll::Turn> = detail
@@ -1468,12 +1607,16 @@ fn apply_scroll(
     let (live_prompt, live_gen) = live_token_rates(detail, models);
     let view = motion.update(
         &crate::tty::scroll::Sample {
-            model: &model,
-            request,
+            model: &identity.model,
+            request: identity.request,
             input: &input,
             output: &output,
-            input_tokens,
-            output_tokens,
+            input_tokens: identity.input_tokens,
+            output_tokens: identity.output_tokens,
+            input_chars: identity.input_chars,
+            output_chars: identity.output_chars,
+            input_cached: identity.input_cached,
+            input_new: identity.input_new,
             live_prompt,
             live_gen,
             rows: &rows,
@@ -1484,18 +1627,18 @@ fn apply_scroll(
     text.out_scroll = view.out;
 }
 
-/// IN and OUT for one frame, both from [`pick_slot`]. Advances the OUT
-/// replay cursor. IN keeps no cursor: it is rebuilt from the picked slot on
-/// every frame, so a slot switch swaps it at once. OUT's cursor goes through
-/// [`align_shown`], which drops to 0 when the new slot's tail shares nothing
-/// with the old one.
+/// IN and OUT for one frame, both from the picked slot
+/// ([`crate::slots::StreamPin`]). Advances the OUT replay cursor. IN keeps
+/// no cursor: it is rebuilt from the picked slot on every frame, so a slot
+/// switch swaps it at once. OUT's cursor goes through [`align_shown`],
+/// which drops to 0 when the new slot's tail shares nothing with the old
+/// one.
 fn frame_text(
-    slots: &[SlotView],
+    picked: Option<&SlotView>,
     replay: &mut OutReplay,
     input_cap: usize,
     output_cap: usize,
 ) -> FrameText {
-    let picked = pick_slot(slots);
     let output = picked.map_or_else(Vec::new, |slot| sanitised_chars(&slot.output));
     note_output(replay, &output, output_cap);
     let input = picked.map_or_else(Vec::new, |slot| sanitised_chars(&slot.input));
@@ -1525,7 +1668,7 @@ fn capture_text(
     note_output(replay, &output, output_cap);
     let input = cap_chars(&sanitised_chars(&capture.input), input_cap);
     FrameText {
-        in_title: capture_in_title(&capture.input_note),
+        in_title: capture_in_title(&capture.input_note, 0),
         out_title: CAPTURE_OUT_TITLE.to_owned(),
         in_lines: chars_lines(&input),
         out_lines: chars_lines(&replay.tail),
@@ -1540,14 +1683,53 @@ fn capture_text(
 const CAPTURE_IN_TITLE: &str = "IN (last request)";
 
 /// `IN (last request)`, or `IN (last request · 3 tool results)` for a tool
-/// loop (#38).
-fn capture_in_title(note: &str) -> String {
-    if note.is_empty() {
-        CAPTURE_IN_TITLE.to_owned()
+/// loop (#38). With two or more requests running it is not the live one:
+/// `IN (last finished · 2 running)` (DER-451, C.4).
+fn capture_in_title(note: &str, running: u32) -> String {
+    let head = if running >= 2 {
+        format!("IN (last finished \u{00B7} {running} running")
     } else {
-        format!("IN (last request \u{00B7} {note})")
+        "IN (last request".to_owned()
+    };
+    if note.is_empty() && running < 2 {
+        CAPTURE_IN_TITLE.to_owned()
+    } else if note.is_empty() {
+        format!("{head})")
+    } else {
+        format!("{head} \u{00B7} {note})")
     }
 }
+
+/// Most characters of a model name in the IN title.
+const IN_TITLE_MODEL_CHARS: usize = 24;
+
+/// The IN title over a slot (DER-451, F6): `IN · <model> slot 2/4 · 3 busy`
+/// when its model has two or more slots, or two or more slots are busy;
+/// plain `IN` for one slot running one stream. The slot is 1-based of its
+/// model's slots; busy counts every model's.
+fn slot_in_title(picked: Option<&SlotView>, slots: &[SlotView]) -> String {
+    let Some(slot) = picked else {
+        return "IN".to_owned();
+    };
+    let own = slots
+        .iter()
+        .filter(|other| other.model == slot.model)
+        .count();
+    let busy = slots.iter().filter(|other| other.is_processing).count();
+    if own < 2 && busy < 2 {
+        return "IN".to_owned();
+    }
+    let model: String = slot.model.chars().take(IN_TITLE_MODEL_CHARS).collect();
+    let mut title = format!(
+        "IN \u{00B7} {model} slot {}/{own}",
+        slot.id.saturating_add(1)
+    );
+    if busy >= 2 {
+        title.push_str(&format!(" \u{00B7} {busy} busy"));
+    }
+    title
+}
+
 const CAPTURE_OUT_TITLE: &str = "OUT (last response)";
 
 /// The IN/OUT part of a [`TtyModel`]. Empty when `tty.show_text = false`.
@@ -2108,6 +2290,8 @@ fn strata_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
                     ctx_used: Some(held),
                     resets: Default::default(),
                     last_reset: None,
+                    input_chars: None,
+                    output_chars: None,
                 }
             })
         })
@@ -2225,6 +2409,8 @@ fn tqllm_views(live: &[ModelEngineLive]) -> Vec<SlotView> {
                     ctx_used: Some(prompt + decoded),
                     resets: Default::default(),
                     last_reset: None,
+                    input_chars: None,
+                    output_chars: None,
                 }
             })
         })
@@ -2356,7 +2542,7 @@ fn note_poll(state: &mut TickState, mono: Instant, wall: SystemTime) {
         // The llama.cpp headline is a completed-turn average, not this
         // in-flight slot's own measurement.
         prompt_tps: None,
-        gen_tps: state.detail.gen_tps,
+        slot_gen: &state.detail.streams.slot_gen,
     };
     state.flights.poll(&poll, mono, wall);
 }
@@ -2446,9 +2632,17 @@ fn layout_requests(
     flights.chain(finished).collect()
 }
 
-fn prompt_last(slots: &[SlotView]) -> Option<u64> {
-    // #78: the whole prompt once known, else what the slot holds.
-    pick_slot(slots).map(|slot| slot.prompt_total().unwrap_or(slot.n_prompt_tokens))
+/// The lines under WRITE and READ from the poller's streams (DER-451).
+fn rate_lines(streams: &crate::poller::Streams) -> crate::tty::layout::RateLines {
+    crate::tty::layout::RateLines {
+        running: streams.running,
+        queued: streams.queued,
+        prefilling: streams.prefilling,
+        itl_p50: streams.itl_p50,
+        itl_max: streams.itl_max,
+        read_active: streams.read_active,
+        read_solo: streams.read_solo,
+    }
 }
 
 fn health(sample: &WatchSample, detail: &LlamaDetail, state: WatchState) -> Vec<HealthSeg> {
@@ -2652,6 +2846,31 @@ fn publish_extras(sample: &WatchSample, tick: &TickState, ctx: &FrameCtx) -> Ext
         }
     }
     Extras {
+        gpus: if sample.gpu_devices.len() > 1 {
+            sample
+                .gpu_devices
+                .iter()
+                .map(|gpu| llama_core::wire::GpuWire {
+                    index: gpu.identity.index,
+                    uuid: gpu.identity.uuid.clone().unwrap_or_default(),
+                    pci: gpu.identity.pci_bus_id.clone().unwrap_or_default(),
+                    label: gpu.label.clone(),
+                    name: gpu
+                        .identity
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| gpu.label.clone()),
+                    gpu_pct: gpu.util_pct,
+                    gpu_c: gpu.temp_c,
+                    gpu_w: gpu.extra.power_mw.map(|mw| mw as f32 / 1000.0),
+                    gpu_limit_w: gpu.extra.power_limit_mw.map(|mw| mw as f32 / 1000.0),
+                    vram_used_bytes: gpu.extra.vram_used,
+                    vram_total_bytes: gpu.extra.vram_total,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         gpu_w: sample.gpu.power_mw.map(|mw| f64::from(mw) / 1000.0),
         gpu_limit_w: sample.gpu.power_limit_mw.map(|mw| f64::from(mw) / 1000.0),
         cpu_w: sample.cpu_w,
@@ -2827,6 +3046,7 @@ fn format_span(duration: Duration) -> String {
 mod tests {
     use super::*;
     use crate::jobs::{Job, JobState};
+    use crate::slots::pick_slot;
     use llama_core::backend::{Backend, BackendInfo};
 
     fn job_at(name: &str, state: JobState, mtime: SystemTime) -> Job {
@@ -2915,6 +3135,31 @@ mod tests {
         );
     }
 
+    /// A prefilling slot holds only part of its prompt: the whole prompt's
+    /// characters do not go with that partial count, or IN would cross many
+    /// times too fast. Once it decodes, the whole count is known and they
+    /// pair (DER-451).
+    #[test]
+    fn a_prefilling_slot_does_not_pair_whole_chars_with_partial_tokens() {
+        let mut tick = TickState::new(2, 6);
+        let mut busy = slot(0, 7, true, &"p".repeat(40_000), "");
+        busy.n_prompt_tokens = 800;
+        busy.prompt_cached = Some(500);
+        busy.n_prompt_tokens_processed = 300;
+        tick.detail.slots = vec![busy.clone()];
+        let id = scroll_identity(&tick.detail, None, pick_slot(&tick.detail.slots));
+        assert_eq!(id.input_tokens, Some(800));
+        assert_eq!(id.input_chars, None, "partial tokens: four per token");
+        assert_eq!(id.input_cached, None);
+        busy.n_decoded = 1;
+        busy.n_prompt_tokens_processed = 9_500;
+        tick.detail.slots = vec![busy];
+        let id = scroll_identity(&tick.detail, None, pick_slot(&tick.detail.slots));
+        assert_eq!(id.input_tokens, Some(10_000));
+        assert_eq!(id.input_chars, Some(40_000));
+        assert_eq!(id.input_cached, Some(500));
+    }
+
     /// #188: a llama.cpp headline average is not a live slot rate; scroll
     /// starts at the top and uses this model's completed-turn history.
     #[test]
@@ -2968,8 +3213,10 @@ mod tests {
             &ctx,
         );
         let at = moved.in_scroll.expect("the burst is still scrolling");
+        // Still prefilling, so its whole token count is not known: four
+        // characters per token (DER-451).
         assert!(
-            (at as f64 - 5.0).abs() < 2.0,
+            (at as f64 - 20.0).abs() < 2.0,
             "the per-model completed-turn history is 5 tok/s, not headline 400: {at}"
         );
 
@@ -2987,6 +3234,140 @@ mod tests {
             streamed.in_scroll, None,
             "a streaming growth stays on the tail"
         );
+    }
+
+    /// A llama.cpp slot as `/slots` reads during a long decode (DER-451
+    /// regression report): one task, a short cached prompt, 19,000 tokens
+    /// out and growing, the reply past `output_tail_chars`. `prompt` and
+    /// `generated` are left out when `/slots` has no text.
+    fn long_decode_body(text: bool, prompt: &str, generated: &str, decoded: u64) -> Vec<u8> {
+        let mut slot = serde_json::json!({
+            "id": 0,
+            "id_task": 41_471,
+            "is_processing": true,
+            "n_ctx": 98_304,
+            "n_prompt_tokens": 42 + 59 + decoded - 1,
+            "n_prompt_tokens_processed": 59,
+            "n_prompt_tokens_cache": 42,
+            "next_token": [{"n_decoded": decoded, "has_next_token": true, "stopped_eos": false}],
+        });
+        if text {
+            slot["prompt"] = prompt.into();
+            slot["generated"] = generated.into();
+        }
+        serde_json::to_vec(&serde_json::json!([slot])).expect("json")
+    }
+
+    /// Polls a long llama.cpp decode through `SlotBook` and the frame, as
+    /// the service does, and returns each frame's IN and OUT.
+    fn long_decode_frames(text: bool, prompt_chars: usize) -> Vec<crate::tty::layout::TtyModel> {
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("m", "ready", Some(llama))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        tick.detail.setup = vec![ModelSetup {
+            key: "m".to_owned(),
+            id: "m".to_owned(),
+            name: "m".to_owned(),
+            ..ModelSetup::default()
+        }];
+        tick.detail.gen_tps = Some(38.0);
+        tick.detail.activity = vec![scroll_row(1, 40.0)];
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        ctx.input_cap = 8_192;
+        ctx.output_cap = 24_576;
+        if !text {
+            // What the poller keeps for a textless model: its last finished
+            // capture, a short probe.
+            tick.detail.capture = Some(CaptureView {
+                model: "m".to_owned(),
+                id: 968,
+                input: secret_cells("Yo"),
+                input_note: String::new(),
+                output: secret_cells("Ok"),
+                over_slots: true,
+                output_chars: Some(2),
+                input_new: Some(2),
+            });
+        }
+        let prompt: String = (0..)
+            .map(|word| format!("p{word} "))
+            .take_while({
+                let mut chars = 0;
+                move |word| {
+                    chars += word.len();
+                    chars <= prompt_chars
+                }
+            })
+            .collect();
+        let mut book = crate::slots::SlotBook::default();
+        let t0 = Instant::now();
+        let mut frames = Vec::new();
+        for poll in 0..40u64 {
+            let decoded = 19_000 + 12 * poll;
+            let generated: String = (0..decoded * 4)
+                .map(|word| {
+                    if word % 9 == 8 {
+                        format!("w{word}\n")
+                    } else {
+                        format!("w{word} ")
+                    }
+                })
+                .collect();
+            let body = long_decode_body(text, &prompt, &generated, decoded);
+            assert!(book.apply("m", "m", &body, ctx.input_cap, ctx.output_cap));
+            tick.detail.slots = book.slots();
+            let now = t0 + Duration::from_millis(250 * poll);
+            frames.push(tty_model(
+                &sample,
+                &mut tick,
+                now,
+                UNIX_EPOCH,
+                Zone::utc(),
+                &ctx,
+            ));
+        }
+        frames
+    }
+
+    /// DER-451 regression report: on a long llama.cpp decode IN and OUT
+    /// showed a word or two. With `/slots` text, OUT streams its tail
+    /// (`None` after the first frame, never a burst) and IN crosses its
+    /// prompt once, then rests; with none, both panels show the last
+    /// capture whole and come to rest.
+    #[test]
+    fn a_long_llama_cpp_decode_streams_out_and_keeps_in_still() {
+        for prompt_chars in [400, 30_000] {
+            let frames = long_decode_frames(true, prompt_chars);
+            for (poll, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.in_title, "IN", "live slot text, poll {poll}");
+                let input = text_of(&frame.in_lines).chars().count();
+                assert!(input + 8 >= prompt_chars.min(8_192), "poll {poll}: {input}");
+                let output = text_of(&frame.out_lines).chars().count();
+                assert!(output > 20_000, "poll {poll}: OUT is the reply tail");
+                if poll > 0 {
+                    assert_eq!(frame.out_scroll, None, "poll {poll}: OUT streams");
+                    assert!(frame.in_scroll >= frames[poll - 1].in_scroll, "poll {poll}");
+                }
+            }
+            let rest = frames.last().expect("frames").in_scroll;
+            assert_eq!(frames[30].in_scroll, rest, "IN has come to rest");
+        }
+        let frames = long_decode_frames(false, 0);
+        let rest = frames.last().expect("frames");
+        for (poll, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.in_title, CAPTURE_IN_TITLE, "poll {poll}");
+            assert_eq!(text_of(&frame.in_lines), "Yo");
+            assert_eq!(text_of(&frame.out_lines), "Ok");
+            if poll >= 30 {
+                assert_eq!(frame.in_scroll, rest.in_scroll, "poll {poll}");
+                assert_eq!(frame.out_scroll, rest.out_scroll, "poll {poll}");
+            }
+        }
     }
 
     fn scroll_row(seq: u64, speed: f64) -> crate::activity::ActivityRow {
@@ -3324,7 +3705,7 @@ mod tests {
                 activity: &rows,
                 ids: &ids,
                 prompt_tps: Some(2_000.0),
-                gen_tps: None,
+                slot_gen: &[],
             },
             now,
             UNIX_EPOCH,
@@ -3487,7 +3868,7 @@ mod tests {
                 activity: &[],
                 ids: &[],
                 prompt_tps: None,
-                gen_tps: None,
+                slot_gen: &[],
             },
             now,
             UNIX_EPOCH,
@@ -3620,6 +4001,8 @@ mod tests {
             last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
         };
         let slots = layout_slots(&[view], &CtxBook::new(6));
         assert_eq!(slots[0].ctx_prompt, Some(91_000));
@@ -3717,6 +4100,9 @@ mod tests {
             last_reset: None,
             input: secret_cells(input),
             output: secret_cells(output),
+            // Untrimmed, as SlotBook sets them for a text it read whole.
+            input_chars: Some(input.chars().count()).filter(|n| *n > 0),
+            output_chars: Some(output.chars().count()).filter(|n| *n > 0),
         }
     }
 
@@ -3739,7 +4125,7 @@ mod tests {
         ];
         assert_eq!(pick_slot(&slots).map(|s| s.id), Some(2));
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         let inn = text_of(&text.in_lines);
         let out = text_of(&text.out_lines);
         assert!(
@@ -3748,7 +4134,6 @@ mod tests {
         );
         assert!(!inn.contains("hi"), "{inn:?}");
         assert_eq!(out, "BUSY-OUT");
-        assert_eq!(prompt_last(&slots), Some(0));
     }
 
     #[test]
@@ -3759,7 +4144,7 @@ mod tests {
             slot(2, 7, true, "OLD-IN", "OLD-OUT"),
         ];
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "NEW-IN");
         assert_eq!(text_of(&text.out_lines), "NEW-OUT");
     }
@@ -3773,7 +4158,7 @@ mod tests {
             slot(3, -1, false, "", ""),
         ];
         let mut replay = OutReplay::default();
-        let text = frame_text(&slots, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&slots), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "LAST-IN");
         assert_eq!(text_of(&text.out_lines), "LAST-OUT");
         assert!(pick_slot(&[]).is_none());
@@ -3786,18 +4171,18 @@ mod tests {
             slot(0, 4, true, "PROMPT-A", "alpha output"),
             slot(1, 2, false, "PROMPT-B-OLD", "zzz"),
         ];
-        frame_text(&first, &mut replay, 8192, 8192);
+        frame_text(pick_slot(&first), &mut replay, 8192, 8192);
         // Let the replay finish, then grow the same slot: the cursor keeps
         // what is already on screen.
         for _ in 0..10 {
-            frame_text(&first, &mut replay, 8192, 8192);
+            frame_text(pick_slot(&first), &mut replay, 8192, 8192);
         }
         assert_eq!(replay.frame, None);
         let grown = [
             slot(0, 4, true, "PROMPT-A", "alpha output more"),
             slot(1, 2, false, "PROMPT-B-OLD", "zzz"),
         ];
-        let text = frame_text(&grown, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&grown), &mut replay, 8192, 8192);
         assert_eq!(text.out_shown, "alpha output".len());
         assert_eq!(text.replay_frame, Some(0));
         assert_eq!(text_of(&text.in_lines), "PROMPT-A");
@@ -3808,7 +4193,7 @@ mod tests {
             slot(0, 4, false, "PROMPT-A", "alpha output more"),
             slot(1, 6, true, "PROMPT-B", "beta"),
         ];
-        let text = frame_text(&switched, &mut replay, 8192, 8192);
+        let text = frame_text(pick_slot(&switched), &mut replay, 8192, 8192);
         assert_eq!(text_of(&text.in_lines), "PROMPT-B");
         assert_eq!(text_of(&text.out_lines), "beta");
         assert_eq!(text.out_shown, 0);
@@ -4075,10 +4460,14 @@ mod tests {
                         last_reset: None,
                         input: secret_cells(SECRET_IN),
                         output: secret_cells(SECRET_OUT),
+                        input_chars: None,
+                        output_chars: None,
                     }],
                     activity: Vec::new(),
                     gen_tps: Some(40.0),
                     prompt_tps: Some(0.0),
+                    chart_prompt_tps: Some(0.0),
+                    streams: Default::default(),
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
@@ -4233,6 +4622,8 @@ mod tests {
                     activity: Vec::new(),
                     gen_tps: None,
                     prompt_tps: None,
+                    chart_prompt_tps: None,
+                    streams: Default::default(),
                     latencies: crate::poller::PollLatencies::default(),
                     prompt_cache: Vec::new(),
                     capture: None,
@@ -4296,6 +4687,61 @@ mod tests {
         // #33: no model loaded.
         sample.snapshot.models.clear();
         assert_eq!(model_detail(&sample, WatchState::Ready), "engine --");
+    }
+
+    #[test]
+    fn setup_names_cards_in_pci_order_and_skips_one_gpu() {
+        let rules = Rules::builtin();
+        let mut sample = backend_sample(vec![served(
+            "Qwen 35B",
+            "ready",
+            Some(BackendInfo {
+                kind: Backend::LlamaCpp,
+                ..BackendInfo::default()
+            }),
+        )]);
+        let device = |index: u32, label: &str, pci: &str| crate::collector::GpuDeviceTelemetry {
+            identity: crate::sources::gpu::GpuDeviceIdentity {
+                index,
+                uuid: None,
+                pci_bus_id: Some(pci.to_owned()),
+                name: None,
+            },
+            label: label.to_owned(),
+            util_pct: Some(1.0),
+            temp_c: Some(40.0),
+            extra: crate::collector::GpuExtra {
+                vram_used: Some(1),
+                vram_total: Some(2),
+                power_mw: Some(1_000),
+                power_limit_mw: Some(2_000),
+            },
+            mem_temp_c: None,
+            fan_rpm: None,
+            fan_pwm: None,
+        };
+        sample.gpu_devices = vec![
+            device(0, "V100", "0000:05:00.0"),
+            device(1, "3090", "0000:0b:00.0"),
+        ];
+        sample.gpu_processes.list = vec![crate::collector::GpuProcess {
+            pid: 9,
+            memory_bytes: 20_000_000_000,
+            name: "llama-server".to_owned(),
+            device_labels: vec!["3090".to_owned(), "V100".to_owned()],
+        }];
+        let detail = TickState::new(2, 6).detail;
+        let view = setup_view(&sample, &detail, WatchState::Ready, &rules).expect("setup");
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.label == "gpus")
+            .expect("gpus row");
+        assert_eq!(row.items[0].text, "V100 + 3090");
+        sample.gpu_devices.pop();
+        let one = setup_view(&sample, &detail, WatchState::Ready, &rules).expect("one");
+        assert!(one.rows.iter().all(|row| row.label != "gpus"));
+        assert!(spanned_cards(&[], &sample.gpu_processes.list).is_none());
     }
 
     /// #52: SETUP shows the model generating now, else the one RECENT saw
@@ -4390,6 +4836,8 @@ mod tests {
             last_reset: None,
             input: Vec::new(),
             output: Vec::new(),
+            input_chars: None,
+            output_chars: None,
         }];
         assert_eq!(
             shown(&sample, &detail).map(|v| v.0),
@@ -5577,6 +6025,8 @@ mod tests {
             input_note: String::new(),
             output: cells("An invented answer."),
             over_slots: false,
+            output_chars: None,
+            input_new: None,
         });
         let model = tty_model(&sample, &mut tick, now, wall, Zone::utc(), &ctx);
         assert_eq!(model.in_title, CAPTURE_IN_TITLE);
@@ -5632,6 +6082,8 @@ mod tests {
             input_note: String::new(),
             output: cells("An invented answer."),
             over_slots: false,
+            output_chars: None,
+            input_new: None,
         };
         // A capture not meant to stand in for slots is not used.
         tick.detail.capture = Some(capture.clone());
@@ -5842,6 +6294,7 @@ mod tests {
             pid,
             memory_bytes,
             name: name.to_owned(),
+            device_labels: Vec::new(),
         }
     }
 
@@ -6298,6 +6751,7 @@ mod tests {
                     errors: std::collections::BTreeSet::new(),
                 },
                 gpu: crate::collector::GpuExtra::default(),
+                gpu_devices: Vec::new(),
                 cpu_w: None,
                 activity_w: None,
                 load_source: crate::collector::LoadSource::Util,
@@ -6408,5 +6862,100 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    /// F6: the IN title over a slot names the model, the slot of its
+    /// slots and the busy count; one slot running one stream stays `IN`.
+    #[test]
+    fn the_slot_in_title_names_the_stream_shown() {
+        let one = [slot(0, 3, true, "p", "o")];
+        assert_eq!(slot_in_title(one.first(), &one), "IN");
+        assert_eq!(slot_in_title(None, &one), "IN");
+        let four = [
+            slot(0, 3, true, "p", "o"),
+            slot(1, 4, true, "p", "o"),
+            slot(2, 5, false, "p", "o"),
+            slot(3, 6, true, "p", "o"),
+        ];
+        assert_eq!(
+            slot_in_title(four.get(1), &four),
+            "IN \u{00B7} m slot 2/4 \u{00B7} 3 busy"
+        );
+        let quiet = [slot(0, 3, true, "p", "o"), slot(1, 4, false, "p", "o")];
+        assert_eq!(
+            slot_in_title(quiet.first(), &quiet),
+            "IN \u{00B7} m slot 1/2"
+        );
+    }
+
+    /// C.4: over a capture with two or more requests running, IN says it
+    /// is the last one finished, not the live one.
+    #[test]
+    fn the_capture_in_title_says_last_finished_while_others_run() {
+        assert_eq!(capture_in_title("", 0), "IN (last request)");
+        assert_eq!(capture_in_title("", 1), "IN (last request)");
+        assert_eq!(
+            capture_in_title("3 tool results", 1),
+            "IN (last request \u{00B7} 3 tool results)"
+        );
+        assert_eq!(
+            capture_in_title("", 2),
+            "IN (last finished \u{00B7} 2 running)"
+        );
+        assert_eq!(
+            capture_in_title("3 tool results", 4),
+            "IN (last finished \u{00B7} 4 running \u{00B7} 3 tool results)"
+        );
+    }
+
+    /// F6 through the frame: a newer task on another slot does not move IN
+    /// and OUT off the stream shown; once that ends and its dwell passed
+    /// they move to the one still running, and the title follows.
+    #[test]
+    fn in_and_out_stay_on_their_stream_while_another_starts() {
+        let llama = BackendInfo {
+            kind: Backend::LlamaCpp,
+            ..BackendInfo::default()
+        };
+        let sample = backend_sample(vec![served("m", "ready", Some(llama))]);
+        let mut tick = TickState::new(2, 6);
+        tick.heard = true;
+        let mut ctx = frame_ctx(None, true);
+        ctx.show_text = true;
+        let t0 = Instant::now();
+        let frame = |tick: &mut TickState, slots: Vec<SlotView>, at: Duration| {
+            tick.detail.slots = slots;
+            tty_model(&sample, tick, t0 + at, UNIX_EPOCH, Zone::utc(), &ctx)
+        };
+        let first = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, true, "ZEROIN", "ZEROOUT"),
+                slot(1, 4, false, "", ""),
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(first.in_title, "IN \u{00B7} m slot 1/2");
+        let both = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, true, "ZEROIN", "ZEROOUT"),
+                slot(1, 11, true, "ONEIN", "ONEOUT"),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(both.in_title, "IN \u{00B7} m slot 1/2 \u{00B7} 2 busy");
+        assert!(text_of(&both.out_lines).contains("ZEROOUT"));
+        assert!(!text_of(&both.out_lines).contains("ONEOUT"));
+        let moved = frame(
+            &mut tick,
+            vec![
+                slot(0, 10, false, "ZEROIN", "ZEROOUT"),
+                slot(1, 11, true, "ONEIN", "ONEOUT"),
+            ],
+            Duration::from_secs(6),
+        );
+        assert_eq!(moved.in_title, "IN \u{00B7} m slot 2/2");
+        assert!(text_of(&moved.in_lines).contains("ONEIN"));
     }
 }
